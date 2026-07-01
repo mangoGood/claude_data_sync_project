@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS chinese_person_info (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    gender VARCHAR(10),
+    birth_date DATE,
+    id_card VARCHAR(20),
+    phone VARCHAR(20),
+    email VARCHAR(100),
+    address VARCHAR(255),
+    occupation VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

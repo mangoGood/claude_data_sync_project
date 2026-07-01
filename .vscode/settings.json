@@ -1,0 +1,19 @@
+{
+    "java.compile.nullAnalysis.mode": "automatic",
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "java.project.sourcePaths": [
+        "java-backend/src/main/java",
+        "migration-common/src/main/java",
+        "migration-full/src/main/java",
+        "migration-capture/src/main/java",
+        "migration-extract/src/main/java",
+        "migration-increment/src/main/java",
+        "migration-thl/src/main/java",
+        "migration-agent/src/main/java"
+    ],
+    "java.project.outputPath": "java-backend/target/classes",
+    "maven.terminal.useJavaHome": true,
+    "java.import.maven.enabled": true,
+    "java.import.exclusions": [],
+    "java.server.launchMode": "Standard"
+}
