@@ -321,18 +321,30 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                 Map<String, List<String>> enumValuesMap = parseEnumSetValuesMap(enumSetValuesStr);
 
                 String columnFullTypesStr = tableInfo.get("column_full_types");
-                String[] columnFullTypes = columnFullTypesStr != null ? columnFullTypesStr.split(",") : new String[0];
+                // 括号感知切分：enum('a','b','c')/set(...)/decimal(20,4) 内含逗号，naive split 会导致
+                // 其后所有列的完整类型整体错位（如 bigint unsigned 拿到 "'c')" 而丢失 unsigned 重建）
+                String[] columnFullTypes = columnFullTypesStr != null
+                        ? splitTopLevelCommas(columnFullTypesStr) : new String[0];
 
                 if ("INSERT".equals(operation) || "DELETE".equals(operation)) {
                     List<String> allRowValues = extractAllRowValuesFromWriteDelete(eventData);
                     if (!allRowValues.isEmpty()) {
                         List<String> formattedRows = new ArrayList<>();
+                        ArrayList<ArrayList<Object>> typedRows = new ArrayList<>();
                         for (String rowValues : allRowValues) {
                             List<String> values = parseValueList(rowValues, columnCount);
                             formattedRows.add(formatRowData(values, columnTypes, columnFullTypes, columnNames, enumValuesMap));
+                            if (typedRows != null) {
+                                ArrayList<Object> typed = typeRowValues(values, columnTypes, columnFullTypes, columnNames, enumValuesMap);
+                                if (typed != null) typedRows.add(typed); else typedRows = null; // 任一行无法类型化则整体回退
+                            }
                         }
                         thlEvent.addMetadata("rows_data", formattedRows);
                         thlEvent.addMetadata("row_data", formattedRows.get(0));
+                        if (typedRows != null) {
+                            // 类型化值管道：供增量端 PreparedStatement 参数绑定，消除 SQL 字面量拼接
+                            thlEvent.addMetadata("rows_typed", typedRows);
+                        }
                         if (formattedRows.size() > 1) {
                             thlEvent.addMetadata("multi_row", true);
                         }
@@ -342,14 +354,24 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                     if (!allBeforeAfter.isEmpty()) {
                         List<String> formattedAfterRows = new ArrayList<>();
                         List<String> formattedBeforeRows = new ArrayList<>();
+                        ArrayList<ArrayList<Object>> typedAfterRows = new ArrayList<>();
+                        ArrayList<ArrayList<Object>> typedBeforeRows = new ArrayList<>();
                         for (String[] beforeAfter : allBeforeAfter) {
                             if (beforeAfter[1] != null) {
                                 List<String> afterValues = parseValueList(beforeAfter[1], columnCount);
                                 formattedAfterRows.add(formatRowData(afterValues, columnTypes, columnFullTypes, columnNames, enumValuesMap));
+                                if (typedAfterRows != null) {
+                                    ArrayList<Object> typed = typeRowValues(afterValues, columnTypes, columnFullTypes, columnNames, enumValuesMap);
+                                    if (typed != null) typedAfterRows.add(typed); else typedAfterRows = null;
+                                }
                             }
                             if (beforeAfter[0] != null) {
                                 List<String> beforeValues = parseValueList(beforeAfter[0], columnCount);
                                 formattedBeforeRows.add(formatRowData(beforeValues, columnTypes, columnFullTypes, columnNames, enumValuesMap));
+                                if (typedBeforeRows != null) {
+                                    ArrayList<Object> typed = typeRowValues(beforeValues, columnTypes, columnFullTypes, columnNames, enumValuesMap);
+                                    if (typed != null) typedBeforeRows.add(typed); else typedBeforeRows = null;
+                                }
                             }
                         }
                         if (!formattedAfterRows.isEmpty()) {
@@ -359,6 +381,12 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                         if (!formattedBeforeRows.isEmpty()) {
                             thlEvent.addMetadata("row_data_before", formattedBeforeRows.get(0));
                             thlEvent.addMetadata("rows_data_before", formattedBeforeRows);
+                        }
+                        // 类型化值：UPDATE 需 before/after 同时可类型化且行数配对，否则整体回退文本路径
+                        if (typedAfterRows != null && typedBeforeRows != null
+                                && !typedAfterRows.isEmpty() && typedAfterRows.size() == typedBeforeRows.size()) {
+                            thlEvent.addMetadata("rows_typed", typedAfterRows);
+                            thlEvent.addMetadata("rows_before_typed", typedBeforeRows);
                         }
                         if (formattedAfterRows.size() > 1) {
                             thlEvent.addMetadata("multi_row", true);
@@ -714,6 +742,143 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return sb.toString();
     }
 
+    /**
+     * 类型化值管道：把 .cap 文本值按列类型转换为可直接用于 PreparedStatement 参数绑定的 Java 对象，
+     * 与 {@link #formatRowData} 逐分支对应（语义一致），但产出类型化值而非 SQL 字面量——
+     * 增量端据此以参数绑定执行，机制性消除引号/字面量/日期格式一类的拼接 bug。
+     *
+     * <p>白名单外或无法可靠解析的值返回 null（调用方整行回退旧文本路径，行为零风险）。
+     * 类型选择：bit/binary/blob → byte[]，tinyint(1) → Boolean，enum/set → 标签 String，
+     * 无符号负值 → 重建后的十进制 String，其余（数字/文本/时间）→ String
+     * （PG 连接串 stringtype=unspecified 下由服务端按列类型推断）。
+     */
+    private ArrayList<Object> typeRowValues(List<String> values, String[] columnTypes, String[] columnFullTypes,
+                                            String[] columnNames, Map<String, List<String>> enumValuesMap) {
+        ArrayList<Object> typed = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            String value = values.get(i);
+            String type = i < columnTypes.length ? columnTypes[i] : "";
+            String fullType = i < columnFullTypes.length ? columnFullTypes[i] : "";
+            String colName = i < columnNames.length ? columnNames[i] : "";
+            String lowerFull = fullType == null ? "" : fullType.toLowerCase();
+
+            if (value == null || "null".equalsIgnoreCase(value)) {
+                typed.add(null);
+            } else if (isBinaryType(type) || isBlobType(type)) {
+                if (value.matches("\\[B@[0-9a-f]+")) {
+                    typed.add(null); // 与文本路径一致：无法还原的 byte[] toString 按 null 处理
+                } else if (value.startsWith("0x") || value.startsWith("0X")) {
+                    try {
+                        typed.add(hexStringToByteArray(value.substring(2)));
+                    } catch (Exception e) {
+                        return null;
+                    }
+                } else {
+                    typed.add(value);
+                }
+            } else if (isTextType(type) || isJsonType(type)) {
+                if (value.startsWith("0x") || value.startsWith("0X")) {
+                    if (isJsonType(type)) {
+                        try {
+                            byte[] jsonBytes = hexStringToByteArray(value.substring(2));
+                            typed.add(com.github.shyiko.mysql.binlog.event.deserialization.json.JsonBinary.parseAsString(jsonBytes));
+                        } catch (Exception e) {
+                            return null; // JSON binary 解码失败：回退文本路径的 CAST 处理
+                        }
+                    } else {
+                        typed.add(hexToString(value.substring(2)));
+                    }
+                } else {
+                    typed.add(value);
+                }
+            } else if (isBitType(type)) {
+                Long bitVal = parseBitValue(value);
+                if (bitVal == null) {
+                    return null;
+                }
+                typed.add(bitValueToBytes(bitVal, lowerFull));
+            } else if (lowerFull.contains("tinyint(1)") && !lowerFull.contains("unsigned")) {
+                if ("1".equals(value) || "true".equalsIgnoreCase(value)) {
+                    typed.add(Boolean.TRUE);
+                } else if ("0".equals(value) || "false".equalsIgnoreCase(value)) {
+                    typed.add(Boolean.FALSE);
+                } else {
+                    return null;
+                }
+            } else if (isEnumType(type) && enumValuesMap.containsKey(colName)) {
+                List<String> enumValues = enumValuesMap.get(colName);
+                try {
+                    int idx = Integer.parseInt(value.trim()) - 1;
+                    typed.add(idx >= 0 && idx < enumValues.size() ? enumValues.get(idx) : value);
+                } catch (NumberFormatException e) {
+                    typed.add(value);
+                }
+            } else if (isSetType(type) && enumValuesMap.containsKey(colName)) {
+                List<String> setValues = enumValuesMap.get(colName);
+                try {
+                    long bitMask = Long.parseLong(value.trim());
+                    StringBuilder setSb = new StringBuilder();
+                    for (int j = 0; j < setValues.size(); j++) {
+                        if ((bitMask & (1L << j)) != 0) {
+                            if (setSb.length() > 0) setSb.append(",");
+                            setSb.append(setValues.get(j));
+                        }
+                    }
+                    typed.add(setSb.toString());
+                } catch (NumberFormatException e) {
+                    typed.add(value);
+                }
+            } else if (isDatetimeType(type)) {
+                typed.add(formatDatetimeValue(value));
+            } else if (isUnsignedType(fullType) && value.matches("-\\d+")) {
+                typed.add(convertToUnsigned(value, fullType));
+            } else {
+                // 数字/普通文本/时间字符串：原样字符串，由目标端按列类型推断
+                typed.add(value);
+            }
+        }
+        return typed;
+    }
+
+    /** 解析 .cap 中 BIT 值的各种文本形态（十进制 / 0x十六进制 / BitSet toString）为位值。 */
+    private Long parseBitValue(String value) {
+        try {
+            if (value.startsWith("0x") || value.startsWith("0X")) {
+                return Long.parseLong(value.substring(2), 16);
+            }
+            if (value.matches("\\d+")) {
+                return Long.parseLong(value);
+            }
+            if (value.startsWith("{") && value.endsWith("}")) {
+                String inner = value.substring(1, value.length() - 1).trim();
+                if (inner.isEmpty()) return 0L;
+                long bits = 0;
+                for (String bit : inner.split(",")) {
+                    bits |= (1L << Integer.parseInt(bit.trim()));
+                }
+                return bits;
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        return null;
+    }
+
+    /** 按 bit(N) 宽度把位值转为大端 byte[]（与全量路径 mysql 驱动返回的 BIT byte[] 形态一致）。 */
+    private byte[] bitValueToBytes(long bitVal, String lowerFullType) {
+        int bits = 1;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("bit\\((\\d+)\\)").matcher(lowerFullType);
+        if (m.find()) {
+            bits = Integer.parseInt(m.group(1));
+        }
+        int nbytes = Math.max(1, (bits + 7) / 8);
+        byte[] out = new byte[nbytes];
+        for (int b = 0; b < nbytes; b++) {
+            out[nbytes - 1 - b] = (byte) ((bitVal >> (b * 8)) & 0xFF);
+        }
+        return out;
+    }
+
     private boolean isUnsignedType(String fullType) {
         if (fullType == null) return false;
         return fullType.toLowerCase().contains("unsigned");
@@ -754,6 +919,23 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return type.toLowerCase().equals("set");
     }
 
+    /** 按顶层逗号切分（忽略括号内逗号），用于 COLUMN_TYPE 列表（enum/set/decimal 等类型体内含逗号）。 */
+    static String[] splitTopLevelCommas(String s) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0, start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == ',' && depth == 0) {
+                parts.add(s.substring(start, i));
+                start = i + 1;
+            }
+        }
+        parts.add(s.substring(start));
+        return parts.toArray(new String[0]);
+    }
+
     private boolean isBinaryType(String type) {
         if (type == null) return false;
         String lower = type.toLowerCase();
@@ -788,12 +970,8 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
     private String hexToString(String hex) {
         if (hex == null || hex.isEmpty()) return "";
         try {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < hex.length(); i += 2) {
-                String str = hex.substring(i, Math.min(i + 2, hex.length()));
-                sb.append((char) Integer.parseInt(str, 16));
-            }
-            return sb.toString();
+            // 必须按 UTF-8 整体解码：逐字节 (char) 强转是 Latin-1 语义，中文/emoji 等多字节字符会乱码
+            return new String(hexStringToByteArray(hex), java.nio.charset.StandardCharsets.UTF_8);
         } catch (Exception e) {
             return hex;
         }

@@ -31,6 +31,7 @@ public class ContinuousIncrementMain {
 
     private Connection targetConnection;
     private THLToSqlConverter sqlConverter;
+    private TypedDmlConverter typedDmlConverter;
     private SeqnoCheckpointManager checkpointManager;
     private Properties props;
 
@@ -56,6 +57,7 @@ public class ContinuousIncrementMain {
     private int thlRetentionCount = 2;
 
     public static void main(String[] args) {
+        com.migration.common.OracleNetCompat.apply();
         logger.info("=== 增量同步服务启动 ===");
 
         String configPath = null;
@@ -131,6 +133,8 @@ public class ContinuousIncrementMain {
         connectToTargetDatabase();
 
         sqlConverter = new THLToSqlConverter(props);
+        // 类型化值管道（mysql→pg）：值经 PreparedStatement 参数绑定执行，事件不适用时自动回退文本路径
+        typedDmlConverter = new TypedDmlConverter(props);
         // 注入 SchemaEvolutionService，启用 DDL 自动应用和在线 DDL 影子表过滤
         sqlConverter.setSchemaEvolutionService(
                 new com.migration.increment.schema.SchemaEvolutionService(props, targetConnection));
@@ -157,7 +161,9 @@ public class ContinuousIncrementMain {
             if (jdbcUrl != null && !jdbcUrl.isEmpty()) {
                 url = jdbcUrl;
             } else {
-                url = "jdbc:postgresql://" + targetHost + ":" + targetPort + "/" + targetDatabase;
+                // stringtype=unspecified：字符串参数由 PG 按列类型推断（interval/jsonb/时间等绑定依赖）
+                url = "jdbc:postgresql://" + targetHost + ":" + targetPort + "/" + targetDatabase
+                        + "?stringtype=unspecified";
             }
         } else {
             url = "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
@@ -284,9 +290,15 @@ public class ContinuousIncrementMain {
                     continue;
                 }
 
-                List<String> sqlStatements = sqlConverter.convertToSql(event);
+                // 类型化值管道优先（mysql→pg 且事件带 rows_typed）；不适用返回 null 走文本路径
+                List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
+                List<String> sqlStatements = (typedDmls == null)
+                        ? sqlConverter.convertToSql(event)
+                        : java.util.Collections.emptyList();
 
-                if (sqlStatements != null && !sqlStatements.isEmpty()) {
+                if (typedDmls != null && !typedDmls.isEmpty()) {
+                    logger.info("为seqno={}生成了{}条参数化SQL（类型化值管道）", event.getSeqno(), typedDmls.size());
+                } else if (sqlStatements != null && !sqlStatements.isEmpty()) {
                     logger.info("为seqno={}生成了{}条SQL语句", sqlStatements.size(), event.getSeqno());
                 }
 
@@ -301,6 +313,39 @@ public class ContinuousIncrementMain {
                         targetConnection.setAutoCommit(false);
                     }
 
+                    if (typedDmls != null) {
+                        // 类型化路径：PreparedStatement 参数绑定执行
+                        for (ParameterizedDml dml : typedDmls) {
+                            try {
+                                logger.info("执行参数化SQL (seqno={}): {}", event.getSeqno(), dml);
+                                executeTypedInTransaction(dml);
+                                eventCount++;
+                            } catch (SQLException e) {
+                                String errorMsg = e.getMessage();
+                                if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contains("duplicate key"))) {
+                                    logger.warn("重复键忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                                } else if (errorMsg != null && (errorMsg.contains("Connection") || errorMsg.contains("timed out"))) {
+                                    logger.error("目标库连接异常 (seqno={}): {}, 尝试重连", event.getSeqno(), errorMsg);
+                                    reconnectTargetDatabase();
+                                    try {
+                                        executeTypedInTransaction(dml);
+                                        eventCount++;
+                                        logger.info("重连后参数化SQL重试成功 (seqno={})", event.getSeqno());
+                                    } catch (SQLException retryEx) {
+                                        txFailed = true;
+                                        logger.error("重连后参数化SQL重试失败 (seqno={}): {}", event.getSeqno(), retryEx.getMessage());
+                                        writeErrorStatus("E3004", "不可恢复的SQL错误: " + retryEx.getMessage(), event.getSeqno());
+                                        break;
+                                    }
+                                } else {
+                                    txFailed = true;
+                                    logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}", event.getSeqno(), dml, errorMsg);
+                                    writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event.getSeqno());
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
                     for (String sql : sqlStatements) {
                         try {
                             logger.info("执行SQL (seqno={}): {}", event.getSeqno(), sql.substring(0, Math.min(300, sql.length())));
@@ -340,6 +385,7 @@ public class ContinuousIncrementMain {
                             }
                         }
                     }
+                    } // end 文本路径 else
 
                     if (txFailed) {
                         targetConnection.rollback();
@@ -501,6 +547,23 @@ public class ContinuousIncrementMain {
             int updateCount = stmt.getUpdateCount();
             logger.info("SQL执行完成: autoCommit={}, hasResultSet={}, updateCount={}", 
                 targetConnection.getAutoCommit(), hasResultSet, updateCount);
+        }
+    }
+
+    /**
+     * 类型化值管道：以 PreparedStatement 参数绑定执行单条 DML（值永不拼接进 SQL 文本）。
+     * 事务边界由调用方控制。
+     */
+    private void executeTypedInTransaction(ParameterizedDml dml) throws SQLException {
+        if (targetConnection == null || targetConnection.isClosed()) {
+            throw new SQLException("目标数据库连接不可用");
+        }
+        try (PreparedStatement ps = targetConnection.prepareStatement(dml.getSql())) {
+            List<Object> params = dml.getParams();
+            for (int i = 0; i < params.size(); i++) {
+                ps.setObject(i + 1, params.get(i));
+            }
+            ps.executeUpdate();
         }
     }
 

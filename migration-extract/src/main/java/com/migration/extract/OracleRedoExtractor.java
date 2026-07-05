@@ -178,6 +178,7 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
                 if (insertCols != null && !insertCols.isEmpty()) {
                     thlEvent.addMetadata("insert_column_names", String.join(",", insertCols));
                 }
+                attachTypedRow(thlEvent, "rows_typed", rowData.newValues, insertTypes);
 
                 List<String> allRows = new ArrayList<>();
                 allRows.add(formattedRow);
@@ -207,6 +208,7 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
                 if (changedCols != null && !changedCols.isEmpty()) {
                     thlEvent.addMetadata("update_column_names", String.join(",", changedCols));
                 }
+                attachTypedRow(thlEvent, "rows_typed", rowData.newValues, newTypes);
             }
             if (rowData.oldValues != null && !rowData.oldValues.isEmpty()) {
                 List<String> beforeCols = extractTupleColumnNames(
@@ -219,6 +221,7 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
                 if (beforeCols != null && !beforeCols.isEmpty()) {
                     thlEvent.addMetadata("update_before_column_names", String.join(",", beforeCols));
                 }
+                attachTypedRow(thlEvent, "rows_before_typed", rowData.oldValues, oldTypes);
             }
             if (rowData.newValues == null && rowData.oldValues == null && rowData.sqlRedo != null) {
                 thlEvent.addMetadata("sql_redo", rowData.sqlRedo);
@@ -241,6 +244,7 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
                         : rowData.columnTypes;
                 String formattedRow = formatRowData(rowData.oldValues, rowData.columnNames, delTypes);
                 thlEvent.addMetadata("row_data", formattedRow);
+                attachTypedRow(thlEvent, "rows_typed", rowData.oldValues, delTypes);
             } else if (rowData.sqlRedo != null) {
                 thlEvent.addMetadata("sql_redo", rowData.sqlRedo);
             }
@@ -470,6 +474,82 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
             aligned.add(type);
         }
         return aligned;
+    }
+
+    /**
+     * 类型化值管道：把 redo tuple 文本值按（已对齐的）Oracle 列类型转为类型化 Java 值并挂到事件元数据，
+     * 供增量端 PreparedStatement 参数绑定执行。任一值无法可靠类型化则整行放弃（回退文本路径）。
+     */
+    private void attachTypedRow(com.migration.thl.THLEvent thlEvent, String key,
+                                List<String> values, List<String> types) {
+        ArrayList<Object> typed = typeTupleValues(values, types);
+        if (typed != null) {
+            ArrayList<ArrayList<Object>> rows = new ArrayList<>();
+            rows.add(typed);
+            thlEvent.addMetadata(key, rows);
+        }
+    }
+
+    /**
+     * redo tuple 值 → 类型化 Java 值：RAW/BLOB → byte[]（HEXTORAW('..')/裸十六进制），
+     * 其余（NUMBER/字符串/ISO 日期时间）→ String（PG stringtype=unspecified 下由服务端按列类型推断），
+     * NULL → null。出现函数包装（TO_DATE 等）或未知形态返回 null 整行回退。
+     */
+    private ArrayList<Object> typeTupleValues(List<String> values, List<String> types) {
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+        ArrayList<Object> typed = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            String value = values.get(i);
+            String type = (types != null && i < types.size() && types.get(i) != null) ? types.get(i) : "";
+            String upperType = type.toUpperCase();
+
+            if (value == null) {
+                typed.add(null);
+                continue;
+            }
+            String trimmed = value.trim();
+            if (isBinaryType(upperType)) {
+                byte[] bytes = parseOracleBinary(trimmed);
+                if (bytes == null) {
+                    return null;
+                }
+                typed.add(bytes);
+            } else if (trimmed.regionMatches(true, 0, "TO_DATE(", 0, 8)
+                    || trimmed.regionMatches(true, 0, "TO_TIMESTAMP(", 0, 13)
+                    || trimmed.regionMatches(true, 0, "HEXTORAW(", 0, 9)
+                    || trimmed.regionMatches(true, 0, "EMPTY_", 0, 6)) {
+                // 非二进制列出现函数包装：交给文本路径处理
+                return null;
+            } else {
+                typed.add(value);
+            }
+        }
+        return typed;
+    }
+
+    /** 解析 RAW/BLOB 值：HEXTORAW('AB01') 或裸十六进制 → byte[]；无法解析返回 null。 */
+    private byte[] parseOracleBinary(String v) {
+        String hex = null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?i)HEXTORAW\\('([0-9A-Fa-f]*)'\\)").matcher(v);
+        if (m.matches()) {
+            hex = m.group(1);
+        } else if (v.matches("[0-9A-Fa-f]*")) {
+            hex = v;
+        }
+        if (hex == null) {
+            return null;
+        }
+        if (hex.length() % 2 != 0) {
+            return null;
+        }
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
     }
 
     /**

@@ -187,6 +187,7 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
 
             String formattedRow = formatRowData(rowData.newValues, rowData.columnNames, rowData.columnTypes);
             thlEvent.addMetadata("row_data", formattedRow);
+            attachTypedRow(thlEvent, "rows_typed", rowData.newValues, rowData.columnTypes);
 
             if (rowData.newValues != null && rowData.newValues.size() > 1) {
                 List<String> allRows = new ArrayList<>();
@@ -206,10 +207,12 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
             if (rowData.newValues != null) {
                 String formattedNew = formatRowData(rowData.newValues, rowData.columnNames, rowData.columnTypes);
                 thlEvent.addMetadata("row_data", formattedNew);
+                attachTypedRow(thlEvent, "rows_typed", rowData.newValues, rowData.columnTypes);
             }
             if (rowData.oldValues != null) {
                 String formattedOld = formatRowData(rowData.oldValues, rowData.columnNames, rowData.columnTypes);
                 thlEvent.addMetadata("row_data_before", formattedOld);
+                attachTypedRow(thlEvent, "rows_before_typed", rowData.oldValues, rowData.columnTypes);
             }
         }
     }
@@ -223,7 +226,66 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
 
             String formattedRow = formatRowData(rowData.oldValues, rowData.columnNames, rowData.columnTypes);
             thlEvent.addMetadata("row_data", formattedRow);
+            attachTypedRow(thlEvent, "rows_typed", rowData.oldValues, rowData.columnTypes);
         }
+    }
+
+    /**
+     * 类型化值管道：把 WAL tuple 文本值按 PG 列类型转为类型化 Java 值挂到事件元数据，
+     * 供增量端（pg→mysql）PreparedStatement 参数绑定执行。无法可靠类型化则整行放弃（回退文本路径）。
+     */
+    private void attachTypedRow(THLEvent thlEvent, String key, List<String> values, List<String> types) {
+        ArrayList<Object> typed = typeWalValues(values, types);
+        if (typed != null) {
+            ArrayList<ArrayList<Object>> rows = new ArrayList<>();
+            rows.add(typed);
+            thlEvent.addMetadata(key, rows);
+        }
+    }
+
+    /**
+     * WAL tuple 值 → 类型化 Java 值：boolean → Boolean，bytea(\x十六进制) → byte[]，
+     * 其余（数字/文本/ISO 时间/uuid/json 等）→ String（MySQL 预编译参数由服务端按列类型强转），
+     * NULL → null。未知形态返回 null 整行回退。
+     */
+    private ArrayList<Object> typeWalValues(List<String> values, List<String> types) {
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+        ArrayList<Object> typed = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            String value = values.get(i);
+            String type = (types != null && i < types.size() && types.get(i) != null)
+                    ? types.get(i).toLowerCase() : "";
+
+            if (value == null) {
+                typed.add(null);
+                continue;
+            }
+            String trimmed = value.trim();
+            if (isBooleanType(type)) {
+                if ("t".equalsIgnoreCase(trimmed) || "true".equalsIgnoreCase(trimmed)) {
+                    typed.add(Boolean.TRUE);
+                } else if ("f".equalsIgnoreCase(trimmed) || "false".equalsIgnoreCase(trimmed)) {
+                    typed.add(Boolean.FALSE);
+                } else {
+                    return null;
+                }
+            } else if (type.contains("bytea")) {
+                String hex = trimmed.startsWith("\\x") ? trimmed.substring(2) : null;
+                if (hex == null || hex.length() % 2 != 0 || !hex.matches("[0-9A-Fa-f]*")) {
+                    return null;
+                }
+                byte[] out = new byte[hex.length() / 2];
+                for (int b = 0; b < out.length; b++) {
+                    out[b] = (byte) Integer.parseInt(hex.substring(b * 2, b * 2 + 2), 16);
+                }
+                typed.add(out);
+            } else {
+                typed.add(value);
+            }
+        }
+        return typed;
     }
 
     private void populateTableMetadata(THLEvent thlEvent, WalRowData rowData) {

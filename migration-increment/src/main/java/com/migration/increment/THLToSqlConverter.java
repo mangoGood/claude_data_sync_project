@@ -726,7 +726,20 @@ public class THLToSqlConverter {
         if (s == null || s.isEmpty()) {
             return getColumnTypes(metadata);
         }
-        return s.split("\\s*,\\s*");
+        // 括号感知切分：enum('a','b','c') 等类型体内含逗号，naive split 会让其后列类型错位
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        int depth = 0, start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == ',' && depth == 0) {
+                parts.add(s.substring(start, i).trim());
+                start = i + 1;
+            }
+        }
+        parts.add(s.substring(start).trim());
+        return parts.toArray(new String[0]);
     }
 
     private String formatPostgresValueByType(Object value, String lowerType) {
