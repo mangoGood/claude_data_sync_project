@@ -9,7 +9,9 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 进度管理类，负责管理迁移进度的业务逻辑
+ * 进度管理类，负责管理迁移进度的业务逻辑。
+ * 底层 ProgressDatabase 为单一 H2 连接，所有落库方法加 synchronized，
+ * 供全量并行迁移的多个 worker 线程安全共享。
  */
 public class ProgressManager {
     private static final Logger logger = LoggerFactory.getLogger(ProgressManager.class);
@@ -57,7 +59,7 @@ public class ProgressManager {
     /**
      * 开始表的迁移
      */
-    public MigrationProgress startMigration(String tableName, long totalRows) throws SQLException {
+    public synchronized MigrationProgress startMigration(String tableName, long totalRows) throws SQLException {
         if (!enabled) {
             return null;
         }
@@ -89,7 +91,7 @@ public class ProgressManager {
     /**
      * 更新迁移进度
      */
-    public void updateProgress(String tableName, long migratedRows, Long lastMigratedId) throws SQLException {
+    public synchronized void updateProgress(String tableName, long migratedRows, Long lastMigratedId) throws SQLException {
         if (!enabled) {
             return;
         }
@@ -119,7 +121,7 @@ public class ProgressManager {
     /**
      * 完成表的迁移
      */
-    public void completeMigration(String tableName) throws SQLException {
+    public synchronized void completeMigration(String tableName) throws SQLException {
         if (!enabled) {
             return;
         }
@@ -138,7 +140,7 @@ public class ProgressManager {
     /**
      * 标记迁移失败
      */
-    public void failMigration(String tableName, String errorMessage) throws SQLException {
+    public synchronized void failMigration(String tableName, String errorMessage) throws SQLException {
         if (!enabled) {
             return;
         }
@@ -157,7 +159,7 @@ public class ProgressManager {
     /**
      * 获取表的迁移进度
      */
-    public MigrationProgress getProgress(String tableName) throws SQLException {
+    public synchronized MigrationProgress getProgress(String tableName) throws SQLException {
         if (!enabled) {
             return null;
         }
@@ -168,7 +170,7 @@ public class ProgressManager {
     /**
      * 获取所有迁移进度
      */
-    public List<MigrationProgress> getAllProgress() throws SQLException {
+    public synchronized List<MigrationProgress> getAllProgress() throws SQLException {
         if (!enabled) {
             return null;
         }
@@ -179,7 +181,7 @@ public class ProgressManager {
     /**
      * 获取未完成的迁移进度
      */
-    public List<MigrationProgress> getIncompleteProgress() throws SQLException {
+    public synchronized List<MigrationProgress> getIncompleteProgress() throws SQLException {
         if (!enabled) {
             return null;
         }
@@ -190,7 +192,7 @@ public class ProgressManager {
     /**
      * 检查是否有未完成的迁移
      */
-    public boolean hasIncompleteProgress() throws SQLException {
+    public synchronized boolean hasIncompleteProgress() throws SQLException {
         if (!enabled) {
             return false;
         }
@@ -201,7 +203,7 @@ public class ProgressManager {
     /**
      * 删除表的迁移进度
      */
-    public void deleteProgress(String tableName) throws SQLException {
+    public synchronized void deleteProgress(String tableName) throws SQLException {
         if (!enabled) {
             return;
         }
@@ -214,7 +216,7 @@ public class ProgressManager {
     /**
      * 清空所有迁移进度
      */
-    public void clearAllProgress() throws SQLException {
+    public synchronized void clearAllProgress() throws SQLException {
         if (!enabled) {
             return;
         }
@@ -227,7 +229,7 @@ public class ProgressManager {
     /**
      * 重置表的迁移进度（重新开始）
      */
-    public void resetProgress(String tableName) throws SQLException {
+    public synchronized void resetProgress(String tableName) throws SQLException {
         if (!enabled) {
             return;
         }
@@ -244,7 +246,7 @@ public class ProgressManager {
     /**
      * 打印迁移进度摘要
      */
-    public void printProgressSummary() throws SQLException {
+    public synchronized void printProgressSummary() throws SQLException {
         if (!enabled) {
             logger.info("进度管理器已禁用");
             return;

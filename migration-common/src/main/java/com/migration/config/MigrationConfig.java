@@ -16,6 +16,7 @@ public class MigrationConfig {
     private boolean enableResume;
     private boolean enableIncremental;
     private boolean recordCheckpoint;
+    private int fullParallelism;
     private Set<String> includedDatabases;
     private Set<String> includedTables;
     private String checkpointDbPath;
@@ -77,7 +78,14 @@ public class MigrationConfig {
         enableResume = Boolean.parseBoolean(props.getProperty("migration.enable.resume", "true"));
         enableIncremental = Boolean.parseBoolean(props.getProperty("migration.enable.incremental", "false"));
         recordCheckpoint = Boolean.parseBoolean(props.getProperty("migration.record.checkpoint", "true"));
-        
+
+        // 全量数据迁移的表级并行度：>1 时按表并行搬数（每个 worker 独立连接对）；1 = 原串行行为
+        fullParallelism = Integer.parseInt(props.getProperty("migration.full.parallelism", "4"));
+        if (fullParallelism < 1) {
+            fullParallelism = 1;
+        }
+
+
         includedDatabases = parseStringSet(props.getProperty("migration.included.databases", ""));
         includedTables = parseStringSet(props.getProperty("migration.included.tables", ""));
         
@@ -106,6 +114,11 @@ public class MigrationConfig {
 
     public DatabaseConfig getTargetConfig() {
         return targetConfig;
+    }
+
+    /** 全量数据迁移的表级并行度（migration.full.parallelism，默认 4，最小 1）。 */
+    public int getFullParallelism() {
+        return fullParallelism;
     }
 
     public int getBatchSize() {

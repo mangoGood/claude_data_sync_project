@@ -21,6 +21,7 @@ public class Main {
     private static final Logger logger = LoggerFactory.getLogger(Main.class);
 
     public static void main(String[] args) {
+        com.migration.common.OracleNetCompat.apply();
         logger.info("========================================");
         logger.info("数据库全量迁移工具启动");
         logger.info("========================================");
@@ -218,14 +219,21 @@ public class Main {
             logger.info("\n========================================");
             logger.info("开始迁移数据");
             logger.info("========================================");
-            
-            DataMigration dataMigration = new DataMigration(
-                sourceConn, targetConn, 
-                config.getBatchSize(), 
-                config.isContinueOnError(),
-                progressManager
-            );
-            dataMigration.migrateAllData(tables);
+
+            int parallelism = Math.min(config.getFullParallelism(), tables.size());
+            if (parallelism > 1) {
+                // 表级并行：每个 worker 独立连接对，从共享队列领表（详见 ParallelDataMigration）
+                new com.migration.full.migration.ParallelDataMigration(config, progressManager)
+                        .migrateAllData(tables, parallelism);
+            } else {
+                DataMigration dataMigration = new DataMigration(
+                    sourceConn, targetConn,
+                    config.getBatchSize(),
+                    config.isContinueOnError(),
+                    progressManager
+                );
+                dataMigration.migrateAllData(tables);
+            }
             logger.info("数据迁移完成");
         }
 
