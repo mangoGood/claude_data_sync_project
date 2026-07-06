@@ -274,6 +274,37 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
         client = new BinaryLogClient(host, port, user, password);
         client.setServerId(serverId);
+
+        // 反序列化模式改造：
+        // 1) 符号感知 TIME2：连接器默认实现丢负号（-100:00:00 → +924:00:00），用自定义行反序列化器修正；
+        // 2) CHAR_AND_BINARY_AS_BYTE_ARRAY：binlog 协议不区分 VARBINARY/VARCHAR，默认按字符集解码
+        //    会把二进制字节按字符串损坏——统一按 byte[] 交付（serializeValue 转 0x hex，
+        //    extractor 端按列类型分别做 UTF-8 文本解码或保持二进制）。
+        // 注意：兼容模式必须在注册自定义反序列化器之后设置，才能传播到它们。
+        java.util.Map<Long, com.github.shyiko.mysql.binlog.event.TableMapEventData> tableMapShared =
+                new java.util.HashMap<>();
+        com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer eventDeserializer =
+                new com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer();
+        eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.TABLE_MAP,
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.SharedTableMapDeserializer(tableMapShared));
+        eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.WRITE_ROWS,
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared));
+        eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_WRITE_ROWS,
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared)
+                        .setMayContainExtraInformation(true));
+        eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.UPDATE_ROWS,
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared));
+        eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_UPDATE_ROWS,
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared)
+                        .setMayContainExtraInformation(true));
+        eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.DELETE_ROWS,
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared));
+        eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_DELETE_ROWS,
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared)
+                        .setMayContainExtraInformation(true));
+        eventDeserializer.setCompatibilityMode(
+                com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer.CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY);
+        client.setEventDeserializer(eventDeserializer);
         if (binlogFile != null && !binlogFile.isEmpty()) {
             client.setBinlogFilename(binlogFile);
             client.setBinlogPosition(binlogPosition);
