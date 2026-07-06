@@ -70,6 +70,7 @@ public class AgentMain {
     private ApplicationContext springContext;
     
     public static void main(String[] args) {
+        com.migration.common.OracleNetCompat.apply();
         AgentMain agent = new AgentMain();
         agent.start();
         

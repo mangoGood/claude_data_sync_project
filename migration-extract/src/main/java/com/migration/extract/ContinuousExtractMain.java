@@ -52,6 +52,7 @@ public class ContinuousExtractMain {
     private ThlEncryptionService thlEncryptionService;
 
     public static void main(String[] args) {
+        com.migration.common.OracleNetCompat.apply();
         String configPath = null;
         for (int i = 0; i < args.length; i++) {
             if ("--config".equals(args[i]) && i + 1 < args.length) {

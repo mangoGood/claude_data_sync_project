@@ -31,7 +31,8 @@
         <spring.boot.version>3.1.5</spring.boot.version>
         <mysql.connector.version>8.0.33</mysql.connector.version>
         <postgresql.version>42.7.10</postgresql.version>
-        <oracle.jdbc.version>23.3.0.23.09</oracle.jdbc.version>
+        <!-- 23.3 thin 驱动经本机 OrbStack 端口转发握手即断(ORA-17800)，21.9+javaNetNio=false 已验证可用 -->
+        <oracle.jdbc.version>21.9.0.0</oracle.jdbc.version>
         <binlog.version>0.29.2</binlog.version>
         <h2.version>2.2.224</h2.version>
         <slf4j.version>2.0.9</slf4j.version>
@@ -100,7 +101,7 @@
             </dependency>
             <dependency>
                 <groupId>com.oracle.database.jdbc</groupId>
-                <artifactId>ojdbc11</artifactId>
+                <artifactId>ojdbc8</artifactId>
                 <version>${oracle.jdbc.version}</version>
             </dependency>
             <dependency>
