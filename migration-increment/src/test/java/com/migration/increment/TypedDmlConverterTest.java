@@ -117,7 +117,7 @@ class TypedDmlConverterTest {
     }
 
     @Test
-    @DisplayName("回退条件：缺 rows_typed / 列值不齐 / 非 DML / 非 mysql→pg 均返回 null")
+    @DisplayName("回退条件：缺 rows_typed / 列值不齐 / 非 DML / 不支持的库对均返回 null")
     void fallbackConditions() {
         // 缺 rows_typed
         assertNull(converter.convert(event("INSERT")));
@@ -129,10 +129,10 @@ class TypedDmlConverterTest {
         THLEvent q = event("QUERY");
         q.addMetadata("rows_typed", rows(typedRow("1", "a", null, null)));
         assertNull(converter.convert(q));
-        // 目标非 PG：整个转换器禁用
+        // 不支持的库对（oracle 为目标未覆盖）：整个转换器禁用
         Properties p = new Properties();
         p.setProperty("source.db.type", "mysql");
-        p.setProperty("target.db.type", "mysql");
+        p.setProperty("target.db.type", "oracle");
         assertNull(new TypedDmlConverter(p).convert(eventWithRows()));
         // 显式开关关闭
         Properties p2 = new Properties();
@@ -210,12 +210,80 @@ class TypedDmlConverterTest {
     }
 
     @Test
-    @DisplayName("同构链路（mysql→mysql / oracle→mysql）不启用类型化管道")
-    void homogeneousPairsDisabled() {
+    @DisplayName("未覆盖的跨库对（oracle→mysql / 任何以 oracle 为目标）不启用类型化管道")
+    void uncoveredPairsDisabled() {
         Properties p = new Properties();
         p.setProperty("source.db.type", "oracle");
         p.setProperty("target.db.type", "mysql");
         assertNull(new TypedDmlConverter(p).convert(eventWithRows()));
+
+        Properties p2 = new Properties();
+        p2.setProperty("source.db.type", "postgresql");
+        p2.setProperty("target.db.type", "oracle");
+        assertNull(new TypedDmlConverter(p2).convert(eventWithRows()));
+    }
+
+    @Test
+    @DisplayName("mysql→mysql（同构）：反引号 + 目标库限定 + ON DUPLICATE KEY UPDATE")
+    void mysqlToMysqlHomogeneous() {
+        Properties p = new Properties();
+        p.setProperty("source.db.type", "mysql");
+        p.setProperty("target.db.type", "mysql");
+        p.setProperty("target.db.database", "tgt_db");
+        TypedDmlConverter c = new TypedDmlConverter(p);
+
+        THLEvent e = new THLEvent();
+        e.setSeqno(1);
+        e.addMetadata("event_type", "INSERT");
+        e.addMetadata("database_name", "src_db");
+        e.addMetadata("table_name", "bt");
+        e.addMetadata("column_names", "id,name,c_bool,c_bit");
+        e.addMetadata("primary_keys", "id");
+        e.addMetadata("rows_typed", rows(typedRow("1", "alice", Boolean.TRUE, new byte[]{(byte) 0xaa})));
+
+        ParameterizedDml dml = c.convert(e).get(0);
+        assertEquals("INSERT INTO `tgt_db`.`bt` (`id`, `name`, `c_bool`, `c_bit`) VALUES (?, ?, ?, ?)"
+                + " ON DUPLICATE KEY UPDATE `id` = VALUES(`id`), `name` = VALUES(`name`), "
+                + "`c_bool` = VALUES(`c_bool`), `c_bit` = VALUES(`c_bit`)",
+                dml.getSql());
+        assertEquals(Boolean.TRUE, dml.getParams().get(2));
+        assertArrayEquals(new byte[]{(byte) 0xaa}, (byte[]) dml.getParams().get(3));
+    }
+
+    @Test
+    @DisplayName("postgresql→postgresql（同构）：小写双引号 + ON CONFLICT DO NOTHING")
+    void pgToPgHomogeneous() {
+        Properties p = new Properties();
+        p.setProperty("source.db.type", "postgresql");
+        p.setProperty("target.db.type", "postgresql");
+        TypedDmlConverter c = new TypedDmlConverter(p);
+
+        THLEvent e = new THLEvent();
+        e.setSeqno(1);
+        e.addMetadata("event_type", "INSERT");
+        e.addMetadata("database_name", "public");
+        e.addMetadata("table_name", "bt");
+        e.addMetadata("column_names", "id,name,c_bool,c_bin");
+        e.addMetadata("primary_keys", "id");
+        e.addMetadata("rows_typed", rows(typedRow("1", "alice", Boolean.TRUE, new byte[]{1, 2})));
+
+        ParameterizedDml dml = c.convert(e).get(0);
+        assertEquals("INSERT INTO \"bt\" (\"id\", \"name\", \"c_bool\", \"c_bin\") VALUES (?, ?, ?, ?)"
+                + " ON CONFLICT (\"id\") DO NOTHING", dml.getSql());
+        assertEquals(Boolean.TRUE, dml.getParams().get(2));
+
+        // UPDATE：WHERE 主键，小写双引号
+        THLEvent u = new THLEvent();
+        u.setSeqno(2);
+        u.addMetadata("event_type", "UPDATE");
+        u.addMetadata("database_name", "public");
+        u.addMetadata("table_name", "bt");
+        u.addMetadata("column_names", "id,name,c_bool,c_bin");
+        u.addMetadata("primary_keys", "id");
+        u.addMetadata("rows_typed", rows(typedRow("1", "bob", Boolean.FALSE, null)));
+        u.addMetadata("rows_before_typed", rows(typedRow("1", "alice", Boolean.TRUE, null)));
+        ParameterizedDml ud = c.convert(u).get(0);
+        assertEquals("UPDATE \"bt\" SET \"id\"=?, \"name\"=?, \"c_bool\"=?, \"c_bin\"=? WHERE \"id\"=?", ud.getSql());
     }
 
     @Test

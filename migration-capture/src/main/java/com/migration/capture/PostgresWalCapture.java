@@ -52,6 +52,12 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
     private volatile boolean backpressurePaused = false;
     private String backpressureSignalPath;
 
+    // 双向同步/环路防护（active-active 双活）：与 MySQL 侧同一套 origin 标记机制。
+    // apply 端在每个应用事务里先写 __sync_origin 标记行，capture 端读到带标记的事务即判定
+    // "复制而来"，跳过其业务数据事件、不回传，打断 A→B→A 回环。
+    private boolean bidirectionalEnabled;
+    private com.migration.common.bidi.BidiLoopGuard loopGuard;
+
     @Override
     protected void doInitialize() throws Exception {
         host = props.getProperty("source.db.host", "localhost");
@@ -67,6 +73,13 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         publicationName = props.getProperty("capture.wal.publication.name", "migration_pub_" + taskId.replaceAll("[^a-z0-9_]", "_"));
 
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
+
+        bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
+        loopGuard = new com.migration.common.bidi.BidiLoopGuard(bidirectionalEnabled);
+        if (bidirectionalEnabled) {
+            logger.info("PostgreSQL WAL Capture: 双向同步/环路防护已启用，将跳过带 {} 标记的复制事务",
+                    com.migration.common.bidi.BidiConstants.MARKER_TABLE);
+        }
 
         if (startLsn.isEmpty()) {
             startLsn = null;
@@ -483,6 +496,30 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
 
             long timestamp = System.currentTimeMillis();
             long xid = 0;
+
+            // 双向同步/环路防护：前向单遍事务标记状态机。与 MySQL 侧一致，但 PG 的
+            // extract 依赖 BEGIN/COMMIT 做事务分帧（不像 MySQL bidi 直接丢弃事务控制），
+            // 故此处 BEGIN/COMMIT 照常写出，只跳过 __sync_origin 标记事件与被标记事务的业务 DML。
+            if (bidirectionalEnabled) {
+                if ("BEGIN".equals(eventType) || "COMMIT".equals(eventType)) {
+                    loopGuard.onTransactionBoundary();
+                } else {
+                    boolean isDataEvent = "INSERT".equals(eventType)
+                            || "UPDATE".equals(eventType) || "DELETE".equals(eventType);
+                    if (isDataEvent) {
+                        String tbl = extractPgTableName(eventDataStr);
+                        // origin 标记行事件：置位并丢弃（标记表不外传），后续本事务数据将被跳过
+                        if (com.migration.common.bidi.BidiConstants.MARKER_TABLE.equals(tbl)) {
+                            loopGuard.onOriginMarker();
+                            return;
+                        }
+                        // 当前事务带 origin 标记 → 对端复制而来的写入，跳过、不回传
+                        if (loopGuard.shouldSkipReplicatedData()) {
+                            return;
+                        }
+                    }
+                }
+            }
 
             StringBuilder sb = new StringBuilder();
             sb.append(eventType).append(FIELD_SEP);
@@ -956,6 +993,13 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         if (walData.startsWith("U")) return "UPDATE";
         if (walData.startsWith("D")) return "DELETE";
         return "WAL_EVENT";
+    }
+
+    /** 从 pgoutput 解析结果里提取表名（格式 "schema:xxx table:yyy ..."），用于环路防护识别标记表。 */
+    private String extractPgTableName(String eventDataStr) {
+        if (eventDataStr == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("table:(\\S+)").matcher(eventDataStr);
+        return m.find() ? m.group(1) : null;
     }
 
     private long parseLsnToLong(String lsn) {

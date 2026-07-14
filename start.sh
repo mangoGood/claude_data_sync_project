@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================
-# 启动整个数据同步/灾备/订阅项目：
-#   1. Docker 起 MySQL(33306) + Kafka(29092) + Zookeeper
-#   2. 初始化数据库（幂等）并确保 admin/admin123 可登录
-#   3. 需要时构建模块
-#   4. 启动数据同步进程 migration-agent (AgentMain)
-#   5. 启动后端 java-backend (spring-boot:run, 端口 38080)
+# 启动整个数据同步/灾备/订阅项目（假定环境已由 ./create_env.sh 创建过）：
+#   1. 启动已存在的基础设施 container：MySQL(33306) + Kafka(29092) + Zookeeper
+#   2. 需要时构建模块
+#   3. 启动数据同步进程 migration-agent (AgentMain)
+#   4. 启动后端 java-backend (spring-boot:run, 端口 38080)
 # 用法: ./start.sh
+# 首次搭建环境、或执行过 ./remove_env.sh 之后，请先运行 ./create_env.sh。
 # ============================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
 COMPOSE_FILE="docker-compose-synctask.yml"
+DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
@@ -34,9 +35,28 @@ export MIGRATION_AGENT_MYSQL_DB_URL="$DB_URL"
 export MIGRATION_AGENT_MYSQL_DB_USER="root"
 export MIGRATION_AGENT_MYSQL_DB_PASSWORD="rootpassword"
 
-# ---- 1. Docker 基础设施 ----
+# ---- 凭证加密主密钥（agent 与 backend 共用，缺失则退化为内置开发默认密钥）----
+# 由 create_env.sh 首次创建环境时生成并落盘，每次启动都注入同一份，
+# 避免主密钥"只活在某次手工导出的 shell 里"，导致下次重启后旧的 ENC: 密文全部无法解密。
+MASTER_KEY_FILE="$PROJECT_DIR/.synctask_master_key"
+if [ -f "$MASTER_KEY_FILE" ]; then
+  export SYNCTASK_MASTER_KEY="$(cat "$MASTER_KEY_FILE")"
+else
+  echo "[start] ⚠ 未找到 $MASTER_KEY_FILE，将使用内置开发默认主密钥（不安全，且与此前手工设置过自定义密钥加密的数据不兼容）。建议运行 ./create_env.sh 生成持久化主密钥。"
+fi
+
+# ---- 1. 启动已存在的 Docker 基础设施（不创建）----
+if ! docker inspect synctask-mysql >/dev/null 2>&1; then
+  echo "[start] ✗ 未找到 synctask-mysql 等 container，环境尚未创建。请先运行 ./create_env.sh"
+  exit 1
+fi
 echo "[start] 启动 Docker 基础设施 (mysql:33306, kafka:29092, zookeeper)..."
-docker compose -f "$COMPOSE_FILE" up -d
+docker compose -f "$COMPOSE_FILE" start
+
+if docker inspect synctask-mongo-a >/dev/null 2>&1; then
+  echo "[start] 启动 Mongo/ES 基础设施 (mongo-a:27117, mongo-b:27118, es:9200)..."
+  docker compose -f "$DB_COMPOSE_FILE" start
+fi
 
 echo "[start] 等待 MySQL 健康检查通过..."
 status=""
@@ -51,25 +71,16 @@ fi
 
 echo "[start] 等待 Kafka (localhost:29092)..."
 for i in $(seq 1 30); do nc -z localhost 29092 2>/dev/null && break; sleep 2; done
+# 提示：若 Kafka 反复没有就绪，很可能是 stop/start 间隔太久导致 ZK ephemeral 节点未过期，
+# 触发 KeeperException$NodeExistsException 崩溃循环；此时需 ./remove_env.sh 后再 ./create_env.sh 重建。
 
-# ---- 2. 初始化数据库（幂等）+ 重置 admin 密码为 admin123 ----
-echo "[start] 初始化数据库（database.sql, --force 容忍 MySQL 不兼容语句）..."
-docker exec -i synctask-mysql mysql -uroot -prootpassword --force \
-  < java-backend/src/main/resources/database.sql >/dev/null 2>&1 || true
-if command -v htpasswd >/dev/null 2>&1; then
-  HASH="$(htpasswd -bnBC 10 "" admin123 | tr -d '\n' | sed 's/^[^:]*://; s/^\$2y\$/\$2a\$/')"
-  docker exec -i synctask-mysql mysql -uroot -prootpassword \
-    -e "UPDATE sync_task_db.users SET password='$HASH' WHERE username IN ('admin','user1','user2');" \
-    >/dev/null 2>&1 || true
-fi
-
-# ---- 3. 首次运行时构建（缺 jar 才构建）----
+# ---- 2. 首次运行时构建（缺 jar 才构建）----
 if [ ! -f migration-agent/target/migration-agent-1.0.0.jar ]; then
   echo "[start] 首次构建模块 (mvn package, 跳过测试)..."
   mvn -q -Dmaven.test.skip=true package
 fi
 
-# ---- 4. 启动数据同步进程 (AgentMain) ----
+# ---- 3. 启动数据同步进程 (AgentMain) ----
 if pgrep -f 'migration-agent/target/migration-agent-1.0.0.jar' >/dev/null 2>&1; then
   echo "[start] agent 已在运行，跳过"
 else
@@ -79,7 +90,7 @@ else
   echo $! > "$LOG_DIR/agent.pid"
 fi
 
-# ---- 5. 启动后端 (spring-boot:run, 38080) ----
+# ---- 4. 启动后端 (spring-boot:run, 38080) ----
 if lsof -ti tcp:38080 >/dev/null 2>&1; then
   echo "[start] 38080 已被占用，后端可能已在运行，跳过"
 else
@@ -88,7 +99,7 @@ else
       > "$LOG_DIR/backend.out" 2>&1 & echo $! > "$LOG_DIR/backend.pid" )
 fi
 
-# ---- 6. 等待就绪 ----
+# ---- 5. 等待就绪 ----
 echo "[start] 等待后端就绪 (localhost:38080)..."
 for i in $(seq 1 60); do
   code="$(curl -s -m2 -o /dev/null -w '%{http_code}' http://localhost:38080/ 2>/dev/null || echo 000)"

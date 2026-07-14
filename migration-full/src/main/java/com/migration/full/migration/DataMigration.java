@@ -1,5 +1,6 @@
 package com.migration.full.migration;
 
+import com.migration.config.DatabaseConfig;
 import com.migration.db.DatabaseConnection;
 import com.migration.model.ColumnInfo;
 import com.migration.model.TableInfo;
@@ -15,6 +16,11 @@ import java.sql.*;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class DataMigration {
     private static final Logger logger = LoggerFactory.getLogger(DataMigration.class);
@@ -32,9 +38,20 @@ public class DataMigration {
     private SqlDialect targetDialect;
     // 跨库类型/值翻译器：按源→目标库对集中处理值转换（取代散落的 convertXToYValue 分发）
     private TypeTranslator translator;
+    // 单表 PK 范围分片并行：大表按数值型主键切分为多段，各段独立连接对并发搬数
+    private boolean shardEnabled;
+    private long shardMinRows;
+    private int shardCount;
 
     public DataMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection,
                         int batchSize, boolean continueOnError, ProgressManager progressManager) {
+        this(sourceConnection, targetConnection, batchSize, continueOnError, progressManager,
+                false, Long.MAX_VALUE, 1);
+    }
+
+    public DataMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection,
+                        int batchSize, boolean continueOnError, ProgressManager progressManager,
+                        boolean shardEnabled, long shardMinRows, int shardCount) {
         this.sourceConnection = sourceConnection;
         this.targetConnection = targetConnection;
         this.batchSize = batchSize;
@@ -46,6 +63,9 @@ public class DataMigration {
         this.sourceDialect = SqlDialect.forType(sourceConnection.getConfig().getDbType());
         this.targetDialect = SqlDialect.forType(targetConnection.getConfig().getDbType());
         this.translator = TypeTranslator.forPair(sourceConnection.getConfig().getDbType(), targetConnection.getConfig().getDbType());
+        this.shardEnabled = shardEnabled;
+        this.shardMinRows = shardMinRows;
+        this.shardCount = Math.max(1, shardCount);
     }
 
     private boolean sourceIsOracle() {
@@ -92,10 +112,282 @@ public class DataMigration {
         
         List<String> columns = getColumnNames(table);
         String columnList = String.join(", ", columns);
-        
+
         String primaryKeyColumn = getPrimaryKeyColumn(table);
-        
+
+        if (shardEnabled && shardCount > 1 && primaryKeyColumn != null && totalRows >= shardMinRows
+                && !hasUnresumableProgress(tableName)) {
+            long[] bounds = queryNumericPkBounds(tableName, primaryKeyColumn);
+            if (bounds != null) {
+                return migrateTableDataSharded(table, columnList, totalRows, primaryKeyColumn, bounds[0], bounds[1]);
+            }
+        }
+
         return migrateDataBatch(table, columnList, totalRows, primaryKeyColumn);
+    }
+
+    /**
+     * 是否存在尚未完成的断点续传进度。分片并行不支持从单个 lastMigratedId 续传
+     * （多个并发游标各有各的位置），存在这种情况时退化为串行迁移以保证续传正确性。
+     */
+    private boolean hasUnresumableProgress(String tableName) {
+        if (progressManager == null || !progressManager.isEnabled()) {
+            return false;
+        }
+        try {
+            MigrationProgress existing = progressManager.getProgress(tableName);
+            return existing != null && !"COMPLETED".equals(existing.getStatus()) && existing.getLastMigratedId() != 0;
+        } catch (SQLException e) {
+            logger.warn("读取表 {} 已有进度失败，跳过分片评估: {}", tableName, e.getMessage());
+            return true;
+        }
+    }
+
+    /**
+     * 查询数值型主键的 [MIN, MAX] 边界，用于切分分片范围。
+     * 主键非数值类型（字符串/UUID 等）时返回 null，调用方回退到无分片的单游标分页。
+     */
+    private long[] queryNumericPkBounds(String tableName, String pkColumn) throws SQLException {
+        String sql = "SELECT MIN(" + sourceQuoteIdentifier(pkColumn) + "), MAX(" + sourceQuoteIdentifier(pkColumn) +
+                ") FROM " + sourceQuoteIdentifier(tableName);
+        try (Statement stmt = sourceConnection.getConnection().createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            if (rs.next()) {
+                Object minObj = rs.getObject(1);
+                Object maxObj = rs.getObject(2);
+                if (minObj instanceof Number && maxObj instanceof Number) {
+                    long min = ((Number) minObj).longValue();
+                    long max = ((Number) maxObj).longValue();
+                    if (max > min) {
+                        return new long[]{min, max};
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 单表 PK 范围分片并行迁移：按数值型主键把 [minId, maxId] 均分为多段，
+     * 每段用独立源/目标连接对并发搬数（{@link DatabaseConnection} 非线程安全，不可跨线程共享）。
+     * 进度聚合写入同一张 migration_progress 记录（{@link ProgressManager} 落库方法已 synchronized）。
+     */
+    private int[] migrateTableDataSharded(TableInfo table, String columnList, long totalRows,
+                                          String primaryKeyColumn, long minId, long maxId) throws SQLException {
+        String tableName = table.getTableName();
+        long span = maxId - minId + 1;
+        int shards = (int) Math.max(1, Math.min(shardCount, span));
+        long width = (span + shards - 1) / shards;
+
+        logger.info("表 {} 启用 PK 范围分片并行迁移，总行数: {}，PK 范围: [{}, {}]，分片数: {}",
+                tableName, totalRows, minId, maxId, shards);
+
+        if (progressManager != null && progressManager.isEnabled()) {
+            try {
+                progressManager.startMigration(tableName, totalRows);
+            } catch (SQLException e) {
+                logger.error("获取迁移进度失败", e);
+            }
+        }
+
+        DatabaseConfig sourceCfg = sourceConnection.getConfig();
+        DatabaseConfig targetCfg = targetConnection.getConfig();
+
+        AtomicLong aggregateRows = new AtomicLong(0);
+        AtomicLong maxSeenId = new AtomicLong(minId - 1);
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failCount = new AtomicInteger(0);
+        AtomicBoolean abort = new AtomicBoolean(false);
+        AtomicReference<SQLException> firstError = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(shards);
+
+        // 进度落库由单独的低频 reporter 线程统一执行（而非每个分片线程各自落库）：
+        // 分片并发写 H2（AUTO_SERVER 模式）曾在实测中把 agent 侧的进度轮询连接
+        // 阻塞到整次迁移结束才报 "Connection is broken"——本质是把落库频率从
+        // "1 次/批" 放大成 "shards 次/批" 后打满了 H2 的 TCP accept 线程。
+        // 聚合计数（aggregateRows/maxSeenId）本身仍是分片线程内的纯内存原子操作，
+        // 不受此影响；这里只把"写库"这一步收敛到每秒 1 次。
+        AtomicBoolean shardingDone = new AtomicBoolean(false);
+        Thread progressReporter = new Thread(() -> {
+            while (!shardingDone.get()) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                if (progressManager != null && progressManager.isEnabled()) {
+                    try {
+                        progressManager.updateProgress(tableName, aggregateRows.get(), maxSeenId.get());
+                    } catch (SQLException e) {
+                        logger.error("更新进度失败", e);
+                    }
+                }
+            }
+        }, "shard-progress-reporter-" + tableName);
+        progressReporter.setDaemon(true);
+        progressReporter.start();
+
+        for (int i = 0; i < shards; i++) {
+            final long lowerExclusive = (i == 0) ? (minId - 1) : (minId + (long) i * width - 1);
+            final long upperInclusive = (i == shards - 1) ? maxId : Math.min(maxId, minId + (long) (i + 1) * width - 1);
+            Thread worker = new Thread(() -> {
+                DatabaseConnection shardSrc = new DatabaseConnection(sourceCfg);
+                DatabaseConnection shardTgt = new DatabaseConnection(targetCfg);
+                try {
+                    int[] r = copyShardRange(shardSrc, shardTgt, table, columnList, primaryKeyColumn,
+                            lowerExclusive, upperInclusive, tableName, aggregateRows, maxSeenId, abort);
+                    successCount.addAndGet(r[0]);
+                    failCount.addAndGet(r[1]);
+                } catch (SQLException e) {
+                    logger.error("表 {} 分片 ({}, {}] 迁移失败", tableName, lowerExclusive, upperInclusive, e);
+                    if (!continueOnError) {
+                        firstError.compareAndSet(null, e);
+                        abort.set(true);
+                    }
+                } finally {
+                    shardSrc.close();
+                    shardTgt.close();
+                    latch.countDown();
+                }
+            }, "shard-" + tableName + "-" + i);
+            worker.setDaemon(false);
+            worker.start();
+        }
+
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            shardingDone.set(true);
+            progressReporter.interrupt();
+            throw new SQLException("分片并行迁移被中断", e);
+        }
+        shardingDone.set(true);
+        progressReporter.interrupt();
+
+        SQLException error = firstError.get();
+        if (error != null) {
+            if (progressManager != null && progressManager.isEnabled()) {
+                try { progressManager.failMigration(tableName, error.getMessage()); } catch (SQLException ignore) { }
+            }
+            throw error;
+        }
+
+        logger.info("表 {} 分片并行迁移完成，成功: {}, 失败: {}", tableName, successCount.get(), failCount.get());
+        if (progressManager != null && progressManager.isEnabled()) {
+            try {
+                progressManager.updateProgress(tableName, aggregateRows.get(), maxSeenId.get());
+                progressManager.completeMigration(tableName);
+            } catch (SQLException e) { logger.error("标记迁移完成失败", e); }
+        }
+        return new int[]{successCount.get(), failCount.get()};
+    }
+
+    /** 分片 worker：分页搬运 (lowerExclusive, upperInclusive] 范围内的数据，聚合进度写入共享的 aggregateRows/maxSeenId。 */
+    private int[] copyShardRange(DatabaseConnection shardSrc, DatabaseConnection shardTgt, TableInfo table,
+                                 String columnList, String primaryKeyColumn,
+                                 long lowerExclusive, long upperInclusive, String tableName,
+                                 AtomicLong aggregateRows, AtomicLong maxSeenId, AtomicBoolean abort) throws SQLException {
+        int successCount = 0;
+        int failCount = 0;
+        String sourceQuoteColumnList = buildSourceQuotedColumnList(table);
+        String insertSql = "INSERT INTO " + targetQuoteIdentifier(tableName) + " (" + columnList + ") VALUES (" +
+                String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
+
+        Connection targetConn = shardTgt.getConnection();
+        PreparedStatement insertStmt = targetConn.prepareStatement(insertSql);
+        final int pageSize = 1000;
+        long currentLastId = lowerExclusive;
+
+        try {
+            while (!abort.get() && currentLastId < upperInclusive) {
+                // 每页用独立连接：避免 Oracle 源端 PGA 累积（ORA-04036），做法与串行分页路径一致
+                Connection pageConn = shardSrc.getConnection();
+                String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName) +
+                        " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? AND " +
+                        sourceQuoteIdentifier(primaryKeyColumn) + " <= ? ORDER BY " +
+                        sourceQuoteIdentifier(primaryKeyColumn) + " " + sourceDialect.limitClause(pageSize);
+                PreparedStatement selectStmt = pageConn.prepareStatement(pageSql);
+                selectStmt.setLong(1, currentLastId);
+                selectStmt.setLong(2, upperInclusive);
+                ResultSet rs = selectStmt.executeQuery();
+                ResultSetMetaData metaData = rs.getMetaData();
+                int columnCount = metaData.getColumnCount();
+                int batchCount = 0;
+                int pageRows = 0;
+                while (rs.next()) {
+                    try {
+                        if (targetConn.isClosed()) {
+                            targetConn = shardTgt.getConnection();
+                            insertStmt = targetConn.prepareStatement(insertSql);
+                        }
+                        for (int i = 1; i <= columnCount; i++) {
+                            Object value = readColumnValue(rs, i, metaData, table);
+                            value = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
+                            insertStmt.setObject(i, value);
+                        }
+                        for (int i = 1; i <= columnCount; i++) {
+                            if (metaData.getColumnName(i).equals(primaryKeyColumn)) {
+                                Object idValue = rs.getObject(i);
+                                if (idValue instanceof Number) {
+                                    currentLastId = ((Number) idValue).longValue();
+                                }
+                                break;
+                            }
+                        }
+                        insertStmt.addBatch();
+                        batchCount++;
+                        if (batchCount >= batchSize) {
+                            int[] results = insertStmt.executeBatch();
+                            successCount += countSuccess(results);
+                            failCount += countFailures(results);
+                            batchCount = 0;
+                        }
+                        pageRows++;
+                    } catch (SQLException e) {
+                        if (isDuplicateKeyError(e)) {
+                            logger.warn("主键冲突，跳过该行，表: {}", tableName);
+                        } else {
+                            failCount++;
+                            logger.error("插入数据失败，表: {}", tableName, e);
+                            if (!continueOnError) { throw e; }
+                            try {
+                                if (targetConn.isClosed()) { targetConn = shardTgt.getConnection(); }
+                                insertStmt = targetConn.prepareStatement(insertSql);
+                            } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
+                        }
+                    }
+                }
+                if (batchCount > 0) {
+                    try {
+                        int[] results = insertStmt.executeBatch();
+                        successCount += countSuccess(results);
+                        failCount += countFailures(results);
+                    } catch (SQLException e) {
+                        if (!isDuplicateKeyError(e)) {
+                            logger.error("执行批数据失败，表: {}", tableName, e);
+                            if (!continueOnError) { throw e; }
+                        }
+                    }
+                }
+                rs.close();
+                selectStmt.close();
+                try { pageConn.close(); } catch (SQLException e) { /* ignore */ }
+
+                // 仅更新内存中的聚合计数（纯原子操作，无 DB I/O）；落库由外层统一的
+                // 低频 progressReporter 线程完成，避免 shards 个线程各自落库造成的写压力
+                aggregateRows.addAndGet(pageRows);
+                final long pageLastId = currentLastId;
+                maxSeenId.updateAndGet(prev -> Math.max(prev, pageLastId));
+
+                if (pageRows < pageSize) break;
+            }
+        } finally {
+            try { insertStmt.close(); } catch (SQLException e) { /* ignore */ }
+        }
+
+        return new int[]{successCount, failCount};
     }
 
     private int[] migrateDataBatch(TableInfo table, String columnList, long totalRows, String primaryKeyColumn) throws SQLException {

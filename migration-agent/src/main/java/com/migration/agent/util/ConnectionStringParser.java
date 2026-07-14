@@ -12,8 +12,14 @@ public class ConnectionStringParser {
     private static final Pattern PG_PATTERN = 
         Pattern.compile("postgresql://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
     
-    private static final Pattern ORACLE_PATTERN = 
+    private static final Pattern ORACLE_PATTERN =
         Pattern.compile("oracle://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+
+    private static final Pattern MONGO_PATTERN =
+        Pattern.compile("mongodb://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+
+    private static final Pattern ELASTIC_PATTERN =
+        Pattern.compile("elastic://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
     
     private static final Pattern JDBC_MYSQL_PATTERN =
         Pattern.compile("jdbc:mysql://([^:]+):(\\d+)/([^?]+)(?:\\?.*)?");
@@ -91,8 +97,8 @@ public class ConnectionStringParser {
         
         @Override
         public String toString() {
-            // 协议名（mysql/postgresql/oracle）由方言归一，未知类型回退 mysql
-            String protocol = SqlDialect.forType(type).getType();
+            // 协议名（mysql/postgresql/oracle）由方言归一，未知类型回退 mysql；mongodb 不走 SQL 方言
+            String protocol = "mongodb".equalsIgnoreCase(type) ? "mongodb" : SqlDialect.forType(type).getType();
             return String.format("%s://%s:***@%s:%d/%s", protocol, username, host, port, database);
         }
     }
@@ -119,24 +125,32 @@ public class ConnectionStringParser {
             pattern = PG_PATTERN;
         } else if (trimmed.startsWith("oracle://")) {
             pattern = ORACLE_PATTERN;
+        } else if (trimmed.startsWith("mongodb://")) {
+            pattern = MONGO_PATTERN;
+        } else if (trimmed.startsWith("elastic://")) {
+            pattern = ELASTIC_PATTERN;
         } else {
             pattern = MYSQL_PATTERN;
         }
-        
+
         Matcher matcher = pattern.matcher(trimmed);
-        
+
         if (!matcher.matches()) {
             String expectedFormat;
             if (pattern == PG_PATTERN) {
                 expectedFormat = "postgresql://user:pass@host:port/db";
             } else if (pattern == ORACLE_PATTERN) {
                 expectedFormat = "oracle://user:pass@host:port/service";
+            } else if (pattern == MONGO_PATTERN) {
+                expectedFormat = "mongodb://user:pass@host:port";
+            } else if (pattern == ELASTIC_PATTERN) {
+                expectedFormat = "elastic://user:pass@host:port";
             } else {
                 expectedFormat = "mysql://user:pass@host:port/db";
             }
             throw new IllegalArgumentException("Invalid connection string format. Expected: " + expectedFormat);
         }
-        
+
         ConnectionInfo info = new ConnectionInfo();
         info.setUsername(matcher.group(1));
         info.setPassword(matcher.group(2));
@@ -147,10 +161,14 @@ public class ConnectionStringParser {
             info.setType("postgresql");
         } else if (trimmed.startsWith("oracle://")) {
             info.setType("oracle");
+        } else if (trimmed.startsWith("mongodb://")) {
+            info.setType("mongodb");
+        } else if (trimmed.startsWith("elastic://")) {
+            info.setType("elasticsearch");
         } else {
             info.setType("mysql");
         }
-        
+
         return info;
     }
 

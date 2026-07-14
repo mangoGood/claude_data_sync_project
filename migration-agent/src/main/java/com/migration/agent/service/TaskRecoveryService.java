@@ -150,7 +150,7 @@ public class TaskRecoveryService {
                 logger.info("Full-only task {} was in {} state (progress: {}%), resuming migration",
                     taskId, status, progress);
                 try {
-                    taskProcessService.startMigrationForTask(taskId);
+                    taskProcessService.startMigrationForTask(taskId, taskMessage);
                     sendStatus(taskId, "STARTING", "Task recovered, resuming migration", progress);
                 } catch (Exception e) {
                     logger.error("Error resuming full migration for task: {}", taskId, e);
@@ -166,7 +166,7 @@ public class TaskRecoveryService {
             default:
                 logger.warn("Unknown status {} for full-only task {}, treating as new task", status, taskId);
                 try {
-                    taskProcessService.startMigrationForTask(taskId);
+                    taskProcessService.startMigrationForTask(taskId, taskMessage);
                     sendStatus(taskId, "STARTING", "Task recovered, starting migration", 0);
                 } catch (Exception e) {
                     logger.error("Error starting migration for task: {}", taskId, e);

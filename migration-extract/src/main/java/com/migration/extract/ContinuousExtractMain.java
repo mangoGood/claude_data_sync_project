@@ -1,5 +1,6 @@
 package com.migration.extract;
 
+import com.migration.common.watch.DirectoryChangeWatcher;
 import com.migration.thl.EncryptedTHLFileWriter;
 import com.migration.thl.THLFileWriter;
 import com.migration.thl.THLEvent;
@@ -29,6 +30,10 @@ public class ContinuousExtractMain {
     private String inputDir;
     private String outputDir;
     private long scanInterval;
+    /** 事件驱动开关：true 时用 WatchService 监听 .cap 输入目录变更（默认），false 回退固定间隔轮询。 */
+    private boolean watchEnabled;
+    /** 事件驱动下的兜底超时（ms）：无文件事件时仍周期性重扫，保证心跳/背压逻辑照常运行。 */
+    private long watchFallbackMs;
     private AtomicBoolean running = new AtomicBoolean(true);
     private String captureType;
 
@@ -50,6 +55,14 @@ public class ContinuousExtractMain {
 
     /** THL 加密服务 */
     private ThlEncryptionService thlEncryptionService;
+
+    // ---- 真实吞吐/积压指标（写入 binlog_output/ 供 agent 采集，取代随机 mock 数据）----
+    /** 当前统计窗口起点 */
+    private long rateWindowStartMs = System.currentTimeMillis();
+    /** 当前统计窗口内累计抽取事件数 */
+    private long rateWindowEvents = 0;
+    /** 吞吐率统计窗口（ms）：窗口结束才折算成 events/sec 落盘，避免抖动 */
+    private static final long RATE_WINDOW_MS = 1000;
 
     public static void main(String[] args) {
         com.migration.common.OracleNetCompat.apply();
@@ -82,6 +95,8 @@ public class ContinuousExtractMain {
                 }
             }
         }
+        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
+        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
 
         String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
         String captureType = props.getProperty("capture.type", "binlog").toLowerCase();
@@ -110,6 +125,8 @@ public class ContinuousExtractMain {
         this.outputDir = props.getProperty("extract.output.dir",
                 "files/" + props.getProperty("task.id", "unknown") + "/thl_output");
         this.scanInterval = Long.parseLong(props.getProperty("extract.scan.interval", "3000"));
+        this.watchEnabled = Boolean.parseBoolean(props.getProperty("extract.watch.enabled", "true"));
+        this.watchFallbackMs = Long.parseLong(props.getProperty("extract.watch.fallback.ms", "1000"));
         this.progressRecordFile = outputDir + "/.extract_progress";
         this.captureType = props.getProperty("capture.type", "binlog").toLowerCase();
 
@@ -187,28 +204,54 @@ public class ContinuousExtractMain {
     }
 
     public void start() {
-        logger.info("Starting continuous binlog extraction...");
-
-        while (running.get()) {
+        DirectoryChangeWatcher watcher = null;
+        if (watchEnabled) {
             try {
-                int eventsThisRound = scanAndProcessFiles();
-
-                if (eventsThisRound > 0) {
-                    lastRealEventTime = System.currentTimeMillis();
-                }
-
-                writeHeartbeatIfNeeded();
-
-                // 背压控制：检测 THL 输出目录积压量，超阈值时暂停 capture
-                applyBackpressureIfNeeded();
-
-                Thread.sleep(scanInterval);
-            } catch (InterruptedException e) {
-                logger.info("Extract thread interrupted");
-                break;
-            } catch (Exception e) {
-                logger.error("Error during file scanning", e);
+                watcher = new DirectoryChangeWatcher(inputDir);
+                logger.info("Starting continuous binlog extraction (event-driven WatchService, fallback {}ms)...", watchFallbackMs);
+            } catch (IOException e) {
+                logger.warn("初始化 .cap 目录监听失败，回退固定轮询 {}ms: {}", scanInterval, e.getMessage());
+                watcher = null;
             }
+        }
+        if (watcher == null) {
+            logger.info("Starting continuous binlog extraction (fixed polling {}ms)...", scanInterval);
+        }
+
+        try {
+            while (running.get()) {
+                try {
+                    int eventsThisRound = scanAndProcessFiles();
+
+                    if (eventsThisRound > 0) {
+                        lastRealEventTime = System.currentTimeMillis();
+                    }
+
+                    writeHeartbeatIfNeeded();
+
+                    // 背压控制：检测 THL 输出目录积压量，超阈值时暂停 capture
+                    applyBackpressureIfNeeded();
+
+                    // 真实指标：抽取吞吐率(events/sec) + cap/thl 两级积压量，落盘供 agent 采集
+                    writeThroughputAndQueueMetrics(eventsThisRound);
+
+                    // 事件驱动：阻塞到 capture 写入 .cap 立即唤醒（Linux inotify ~ms），或兜底超时；
+                    // 回退模式：固定间隔轮询
+                    if (watcher != null) {
+                        watcher.awaitChange(watchFallbackMs);
+                    } else {
+                        Thread.sleep(scanInterval);
+                    }
+                } catch (InterruptedException e) {
+                    logger.info("Extract thread interrupted");
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    logger.error("Error during file scanning", e);
+                }
+            }
+        } finally {
+            if (watcher != null) watcher.close();
         }
 
         closeCurrentThlWriter();
@@ -243,6 +286,68 @@ public class ContinuousExtractMain {
             backpressureController.checkAndApplyBackpressure(pendingCount);
         } catch (Exception e) {
             logger.debug("背压检测异常: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 写入真实吞吐/积压指标到 {@code binlog_output/}，供 agent 的 collectMetrics 采集：
+     * <ul>
+     *   <li>{@code capture_rate}：抽取吞吐率 events/sec（RATE_WINDOW_MS 窗口内真实计数折算，非随机数）；</li>
+     *   <li>{@code capture_queue_depth}：未抽取完的 .cap 文件数（source→extract 积压）；</li>
+     *   <li>{@code extract_queue_depth}：待 increment 消费的 .thl 文件数（extract→apply 积压）。</li>
+     * </ul>
+     */
+    private void writeThroughputAndQueueMetrics(int eventsThisRound) {
+        try {
+            // 吞吐率：窗口内累计事件数，满窗才折算落盘
+            rateWindowEvents += Math.max(0, eventsThisRound);
+            long now = System.currentTimeMillis();
+            long elapsed = now - rateWindowStartMs;
+            if (elapsed >= RATE_WINDOW_MS) {
+                long ratePerSec = elapsed > 0 ? (rateWindowEvents * 1000L) / elapsed : 0;
+                writeLongMetric("capture_rate", ratePerSec);
+                rateWindowStartMs = now;
+                rateWindowEvents = 0;
+            }
+
+            // cap 积压：尚未标记 completed 的 .cap 文件数
+            long capBacklog = 0;
+            File inputDirFile = new File(inputDir);
+            File[] capFiles = inputDirFile.listFiles((dir, name) ->
+                    name.startsWith("binlog_") && name.endsWith(".cap"));
+            if (capFiles != null) {
+                for (File f : capFiles) {
+                    FileProgress p = fileProgressMap.get(f.getName());
+                    if (p == null || !p.completed) capBacklog++;
+                }
+            }
+            writeLongMetric("capture_queue_depth", capBacklog);
+
+            // thl 积压：输出目录 .thl 文件数（与背压同口径）
+            File outputDirFile = new File(outputDir);
+            File[] thlFiles = outputDirFile.listFiles((dir, name) ->
+                    name.endsWith(".thl") && !name.startsWith("."));
+            writeLongMetric("extract_queue_depth", thlFiles != null ? thlFiles.length : 0);
+        } catch (Exception e) {
+            logger.debug("写入吞吐/积压指标失败: {}", e.getMessage());
+        }
+    }
+
+    /** 原子写入单值指标文件到 binlog_output/（agent 侧按行读取 long）。 */
+    private void writeLongMetric(String fileName, long value) {
+        File dir = new File(inputDir);
+        if (!dir.exists() && !dir.mkdirs()) return;
+        File tmp = new File(dir, fileName + ".tmp");
+        File dst = new File(dir, fileName);
+        try (java.io.FileWriter w = new java.io.FileWriter(tmp, false)) {
+            w.write(Long.toString(value));
+        } catch (IOException e) {
+            logger.debug("写指标 {} 失败: {}", fileName, e.getMessage());
+            return;
+        }
+        // rename 原子替换，避免 agent 读到半截内容
+        if (!tmp.renameTo(dst)) {
+            tmp.delete();
         }
     }
 

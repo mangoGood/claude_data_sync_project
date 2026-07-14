@@ -92,7 +92,39 @@ public class MetricsPersistenceService {
         if (instance == null) {
             instance = new MetricsPersistenceService(dbUrl, dbUser, dbPassword, flushIntervalMs, batchSize);
             instance.checkInitialized();
+            instance.startRetentionCleanup();
         }
+    }
+
+    /**
+     * 每日清理超过保留期的指标数据，防止时序表无限增长。
+     * 落盘量估算：每任务 30s 一行、每行约 120B → ~350KB/天/任务（H2 含索引约 2 倍膨胀），
+     * 默认保留 7 天 → 每任务稳态上限约 5MB。保留天数可用系统属性/环境变量
+     * metrics.retention.days / METRICS_RETENTION_DAYS 调整。
+     */
+    private void startRetentionCleanup() {
+        int retentionDays;
+        try {
+            retentionDays = Integer.parseInt(System.getProperty("metrics.retention.days",
+                    System.getenv().getOrDefault("METRICS_RETENTION_DAYS", "7")));
+        } catch (NumberFormatException e) {
+            retentionDays = 7;
+        }
+        final int days = Math.max(1, retentionDays);
+        java.util.concurrent.ScheduledExecutorService cleaner =
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "metrics-retention-cleaner");
+                    t.setDaemon(true);
+                    return t;
+                });
+        cleaner.scheduleAtFixedRate(() -> {
+            try {
+                cleanupOldMetrics(days);
+            } catch (Exception e) {
+                logger.warn("Metrics retention cleanup failed: {}", e.getMessage());
+            }
+        }, 5, 24 * 60, java.util.concurrent.TimeUnit.MINUTES);
+        logger.info("Metrics retention cleanup scheduled: keep {} days, run daily", days);
     }
 
     private void checkInitialized() {

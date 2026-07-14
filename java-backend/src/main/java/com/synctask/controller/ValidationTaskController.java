@@ -34,6 +34,9 @@ public class ValidationTaskController {
                 map.put("name", w.getName());
                 map.put("status", w.getStatus().name());
                 map.put("taskType", w.getTaskType() != null ? w.getTaskType() : "SYNC");
+                // 前端按源/目标类型过滤内容对比支持范围（仅同构 SQL 任务支持内容对比）
+                map.put("sourceType", w.getSourceType() != null ? w.getSourceType() : "mysql");
+                map.put("targetType", w.getTargetType() != null ? w.getTargetType() : "mysql");
                 map.put("createdAt", w.getCreatedAt());
                 return map;
             }).collect(Collectors.toList());
@@ -117,6 +120,17 @@ public class ValidationTaskController {
         }
     }
 
+    @PostMapping("/{id}/repair")
+    public ResponseEntity<?> repairValidationTask(@PathVariable String id, Authentication authentication) {
+        try {
+            Long userId = getUserId(authentication);
+            Map<String, Object> result = validationTaskService.repairValidationTask(id, userId);
+            return ResponseEntity.ok(Map.of("success", true, "data", result));
+        } catch (Exception e) {
+            return ResponseEntity.ok(Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
     private Long getUserId(Authentication authentication) {
         if (authentication != null && authentication.getPrincipal() instanceof com.synctask.security.UserPrincipal) {
             return ((com.synctask.security.UserPrincipal) authentication.getPrincipal()).getId();
@@ -131,6 +145,7 @@ public class ValidationTaskController {
         map.put("workflowId", task.getWorkflowId());
         map.put("workflowName", task.getWorkflowName());
         map.put("compareType", task.getCompareType());
+        map.put("sourceIsMongo", task.getSourceConnection() != null && task.getSourceConnection().startsWith("mongodb"));
         map.put("taskType", task.getTaskType() != null ? task.getTaskType() : "SYNC");
         map.put("status", task.getStatus().name());
         map.put("totalTables", task.getTotalTables());
@@ -142,6 +157,8 @@ public class ValidationTaskController {
         map.put("createdAt", task.getCreatedAt());
         map.put("startedAt", task.getStartedAt());
         map.put("completedAt", task.getCompletedAt());
+        map.put("repairStatus", task.getRepairStatus());
+        map.put("repairedAt", task.getRepairedAt());
         return map;
     }
 
@@ -152,6 +169,7 @@ public class ValidationTaskController {
         map.put("workflowId", task.getWorkflowId());
         map.put("workflowName", task.getWorkflowName());
         map.put("compareType", task.getCompareType());
+        map.put("sourceIsMongo", task.getSourceConnection() != null && task.getSourceConnection().startsWith("mongodb"));
         map.put("taskType", task.getTaskType() != null ? task.getTaskType() : "SYNC");
         map.put("compareResult", task.getCompareResult());
         map.put("status", task.getStatus().name());
@@ -164,6 +182,9 @@ public class ValidationTaskController {
         map.put("createdAt", task.getCreatedAt());
         map.put("startedAt", task.getStartedAt());
         map.put("completedAt", task.getCompletedAt());
+        map.put("repairStatus", task.getRepairStatus());
+        map.put("repairedAt", task.getRepairedAt());
+        map.put("repairSummary", task.getRepairSummary());
         return map;
     }
 }

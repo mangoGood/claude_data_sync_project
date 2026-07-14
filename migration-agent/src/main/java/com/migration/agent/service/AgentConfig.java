@@ -24,14 +24,18 @@ public class AgentConfig {
     }
 
     private void loadDefaults() {
-        props.setProperty("kafka.bootstrap.servers", "192.168.117.2:19092");
+        // 默认值统一为本机地址（可被 agent.properties 或 MIGRATION_AGENT_* 环境变量覆盖）；不再硬编码内网 IP。
+        props.setProperty("kafka.bootstrap.servers", "localhost:29092");
         props.setProperty("kafka.consumer.group.id", "migration-agent-group");
         props.setProperty("kafka.topic.task-created", "sync-task-created");
         props.setProperty("kafka.topic.task-status", "sync-task-status");
 
-        props.setProperty("mysql.db.url", "jdbc:mysql://192.168.107.2:3306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
+        props.setProperty("mysql.db.url", "jdbc:mysql://localhost:33306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
         props.setProperty("mysql.db.user", "root");
         props.setProperty("mysql.db.password", "rootpassword");
+
+        // agent HTTP 服务的 CORS 允许来源（backend 页面来源，默认 38080；旧值 8082 已过时）
+        props.setProperty("agent.cors.allowed-origin", "http://localhost:38080");
 
         props.setProperty("h2.metadata.user", "sa");
         props.setProperty("h2.metadata.password", "");
@@ -41,6 +45,8 @@ public class AgentConfig {
         props.setProperty("jar.extract.path", "migration-extract/target/migration-extract-1.0.0.jar");
         props.setProperty("jar.increment.path", "migration-increment/target/migration-increment-1.0.0.jar");
         props.setProperty("jar.subscribe.path", "migration-subscribe/target/migration-subscribe-1.0.0.jar");
+        props.setProperty("jar.mongo.path", "migration-mongo/target/migration-mongo-1.0.0.jar");
+        props.setProperty("jar.elastic.path", "migration-elastic/target/migration-elastic-1.0.0.jar");
 
         props.setProperty("monitor.capture.interval.ms", "30000");
         props.setProperty("monitor.extract.interval.ms", "30000");
@@ -146,6 +152,14 @@ public class AgentConfig {
         return props.getProperty("jar.subscribe.path");
     }
 
+    public String getMongoJarPath() {
+        return props.getProperty("jar.mongo.path");
+    }
+
+    public String getElasticJarPath() {
+        return props.getProperty("jar.elastic.path");
+    }
+
     public long getCaptureMonitorIntervalMs() {
         return Long.parseLong(props.getProperty("monitor.capture.interval.ms"));
     }
@@ -164,6 +178,10 @@ public class AgentConfig {
 
     public int getHttpServerPort() {
         return Integer.parseInt(props.getProperty("http.server.port"));
+    }
+
+    public String getAgentCorsAllowedOrigin() {
+        return props.getProperty("agent.cors.allowed-origin", "http://localhost:38080");
     }
 
     public int getRetryMaxAttempts() {

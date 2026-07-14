@@ -29,6 +29,18 @@ public interface TypeTranslator {
     Object convertValue(Object value, String sourceTypeName, ResultSet rs, int colIndex) throws SQLException;
 
     /**
+     * 增量「文本字面量」路径的逐值转换：把源端 THL 里的 SQL 字面量转换为目标库可写入的字面量。
+     * 与 {@link #convertValue}（全量对象路径）在同一 per-pair 实现里成对存在——两条链路的值语义
+     * 集中一处维护，杜绝"增量端改了、全量端没改"这类行为漂移。默认原样返回（同构 / 无需转换）。
+     *
+     * @param rawLiteral       源端 SQL 字面量（如 {@code "1"}、{@code "0xaa"}、{@code "E'\\xaa'"}、{@code "'t'::uuid"}）
+     * @param sourceColumnType 源端列类型（尽量带宽度，如 tinyint(1)/bit(8)，或 PG 的 boolean/bytea/uuid）
+     */
+    default String convertLiteral(String rawLiteral, String sourceColumnType) {
+        return rawLiteral;
+    }
+
+    /**
      * 按源/目标库类型选择翻译器。分发优先级与历史实现
      * （SchemaMigration.createTable / DataMigration 值转换分支）保持一致，
      * 对全部受支持的库对（mysql↔mysql、mysql→pg、pg→mysql、oracle→pg）行为完全等价。

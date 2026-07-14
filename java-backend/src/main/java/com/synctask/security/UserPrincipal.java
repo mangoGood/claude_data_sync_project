@@ -13,15 +13,17 @@ public class UserPrincipal implements UserDetails {
     private String password;
     private String email;
     private String role;
+    private Integer tokenVersion;
     private Collection<? extends GrantedAuthority> authorities;
 
     public UserPrincipal(Long id, String username, String password, String email, String role,
-                         Collection<? extends GrantedAuthority> authorities) {
+                         Integer tokenVersion, Collection<? extends GrantedAuthority> authorities) {
         this.id = id;
         this.username = username;
         this.password = password;
         this.email = email;
         this.role = role;
+        this.tokenVersion = tokenVersion;
         this.authorities = authorities;
     }
 
@@ -36,8 +38,13 @@ public class UserPrincipal implements UserDetails {
                 user.getPassword(),
                 user.getEmail(),
                 user.getRole(),
+                user.getTokenVersion() != null ? user.getTokenVersion() : 0,
                 authorities
         );
+    }
+
+    public Integer getTokenVersion() {
+        return tokenVersion;
     }
 
     public Long getId() {

@@ -353,7 +353,9 @@ public class AdvancedFeaturesController {
             ResourceQuota quota = quotaService.updateQuota(getUserId(auth),
                     (Integer) req.get("maxTasks"), (Integer) req.get("maxConcurrentTasks"),
                     req.get("maxStorageMb") != null ? ((Number) req.get("maxStorageMb")).longValue() : null,
-                    (Integer) req.get("apiRateLimitPerMin"));
+                    (Integer) req.get("apiRateLimitPerMin"),
+                    req.get("maxIncrementRowsPerSec") != null ? ((Number) req.get("maxIncrementRowsPerSec")).intValue() : null,
+                    req.get("maxFullSyncConcurrentTables") != null ? ((Number) req.get("maxFullSyncConcurrentTables")).intValue() : null);
             return ResponseEntity.ok(Map.of("success", true, "data", quota));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));

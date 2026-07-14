@@ -38,6 +38,13 @@ public interface WorkflowRepository extends JpaRepository<Workflow, String> {
     
     List<Workflow> findByUserIdAndStatusAndIsDeletedFalse(Long userId, WorkflowStatus status);
 
+    /** 按状态取任务，排除指定 taskType（用于异常任务列表过滤掉 DR_SHADOW 隐藏影子任务），下推到 DB 查询。 */
+    @Query("SELECT w FROM Workflow w WHERE w.userId = :userId AND w.isDeleted = false " +
+           "AND w.status = :status AND w.taskType <> :excludeTaskType")
+    List<Workflow> findByUserIdAndStatusExcludingTaskType(@Param("userId") Long userId,
+                                                          @Param("status") WorkflowStatus status,
+                                                          @Param("excludeTaskType") String excludeTaskType);
+
     @Query("SELECT w FROM Workflow w WHERE w.userId = :userId AND w.isDeleted = false AND w.taskType = :taskType")
     Page<Workflow> findByUserIdAndTaskType(@Param("userId") Long userId, @Param("taskType") String taskType, Pageable pageable);
 
@@ -51,4 +58,6 @@ public interface WorkflowRepository extends JpaRepository<Workflow, String> {
     @Query("SELECT w FROM Workflow w WHERE w.userId = :userId AND w.isDeleted = false AND w.taskType = :taskType AND " +
            "(LOWER(w.name) LIKE LOWER(CONCAT('%', :keyword, '%')) OR LOWER(w.id) LIKE LOWER(CONCAT('%', :keyword, '%'))) AND w.status = :status")
     Page<Workflow> findByUserIdAndTaskTypeAndKeywordAndStatus(@Param("userId") Long userId, @Param("taskType") String taskType, @Param("keyword") String keyword, @Param("status") WorkflowStatus status, Pageable pageable);
+
+    boolean existsByUserIdAndTaskTypeAndNameAndIsDeletedFalse(Long userId, String taskType, String name);
 }

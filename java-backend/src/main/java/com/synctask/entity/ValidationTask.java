@@ -23,14 +23,23 @@ public class ValidationTask {
     @Column(name = "user_id", nullable = false)
     private Long userId;
 
+    // 连接串含口令：落库前 AES-GCM 加密，读取自动解密（兼容历史明文行）。
     @Column(name = "source_connection", columnDefinition = "TEXT")
+    @Convert(converter = com.synctask.security.EncryptedStringConverter.class)
     private String sourceConnection;
 
     @Column(name = "target_connection", columnDefinition = "TEXT")
+    @Convert(converter = com.synctask.security.EncryptedStringConverter.class)
     private String targetConnection;
 
     @Column(name = "sync_objects", columnDefinition = "TEXT")
     private String syncObjects;
+
+    @Column(name = "source_db_name")
+    private String sourceDbName;
+
+    @Column(name = "target_db_name")
+    private String targetDbName;
 
     @Column(name = "compare_type")
     private String compareType = "ROW_COUNT";
@@ -75,6 +84,17 @@ public class ValidationTask {
     @Column(name = "is_deleted")
     private Boolean isDeleted = false;
 
+    /** 差异修复状态：NONE(未修复)/REPAIRING/REPAIRED(修复后复核全部一致)/PARTIAL(仍有残留差异)/FAILED */
+    @Column(name = "repair_status", length = 20)
+    private String repairStatus = "NONE";
+
+    @Column(name = "repaired_at")
+    private LocalDateTime repairedAt;
+
+    /** 修复结果摘要 JSON：按表记录 inserted/updated/deleted/errors，以及修复后复核行数 */
+    @Column(name = "repair_summary", columnDefinition = "LONGTEXT")
+    private String repairSummary;
+
     public enum ValidationStatus {
         PENDING,
         RUNNING,
@@ -110,6 +130,12 @@ public class ValidationTask {
 
     public String getSyncObjects() { return syncObjects; }
     public void setSyncObjects(String syncObjects) { this.syncObjects = syncObjects; }
+
+    public String getSourceDbName() { return sourceDbName; }
+    public void setSourceDbName(String sourceDbName) { this.sourceDbName = sourceDbName; }
+
+    public String getTargetDbName() { return targetDbName; }
+    public void setTargetDbName(String targetDbName) { this.targetDbName = targetDbName; }
 
     public ValidationStatus getStatus() { return status; }
     public void setStatus(ValidationStatus status) { this.status = status; }
@@ -152,4 +178,13 @@ public class ValidationTask {
 
     public String getCompareResult() { return compareResult; }
     public void setCompareResult(String compareResult) { this.compareResult = compareResult; }
+
+    public String getRepairStatus() { return repairStatus; }
+    public void setRepairStatus(String repairStatus) { this.repairStatus = repairStatus; }
+
+    public LocalDateTime getRepairedAt() { return repairedAt; }
+    public void setRepairedAt(LocalDateTime repairedAt) { this.repairedAt = repairedAt; }
+
+    public String getRepairSummary() { return repairSummary; }
+    public void setRepairSummary(String repairSummary) { this.repairSummary = repairSummary; }
 }

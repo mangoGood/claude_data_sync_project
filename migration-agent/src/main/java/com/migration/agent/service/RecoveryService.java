@@ -28,7 +28,7 @@ public class RecoveryService {
         
         String sql = "SELECT id, name, user_id, source_connection, target_connection, " +
                      "migration_mode, status, progress, created_at, sync_objects, source_db_name, " +
-                     "source_type, target_type, task_type " +
+                     "source_type, target_type, task_type, dr_mode " +
                      "FROM workflows " +
                      "WHERE status IN ('STARTING', 'FULL_MIGRATING', 'FULL_COMPLETED', 'INCREMENT_RUNNING', 'SUBSCRIBE_RUNNING', 'SWITCHING') " +
                      "AND is_deleted = 0 " +
@@ -58,7 +58,7 @@ public class RecoveryService {
     public RecoveryTask getTaskById(String taskId) {
         String sql = "SELECT id, name, user_id, source_connection, target_connection, " +
                      "migration_mode, status, progress, created_at, sync_objects, source_db_name, " +
-                     "source_type, target_type, task_type " +
+                     "source_type, target_type, task_type, dr_mode " +
                      "FROM workflows WHERE id = ?";
         
         try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
@@ -83,8 +83,10 @@ public class RecoveryService {
         task.setTaskId(rs.getString("id"));
         task.setTaskName(rs.getString("name"));
         task.setUserId(rs.getLong("user_id"));
-        task.setSourceConnection(rs.getString("source_connection"));
-        task.setTargetConnection(rs.getString("target_connection"));
+        // workflows 表的连接串是 AES-GCM 静态加密的（backend JPA converter 只在后端侧解密），
+        // agent 直连 DB 读出的是 ENC: 密文，恢复前必须解密，否则连接串解析失败、任务恢复即失败
+        task.setSourceConnection(com.migration.common.crypto.CredentialCipher.decrypt(rs.getString("source_connection")));
+        task.setTargetConnection(com.migration.common.crypto.CredentialCipher.decrypt(rs.getString("target_connection")));
         task.setMigrationMode(rs.getString("migration_mode"));
         task.setStatus(rs.getString("status"));
         task.setProgress(rs.getInt("progress"));
@@ -114,6 +116,12 @@ public class RecoveryService {
         } catch (SQLException e) {
             logger.debug("task_type column not found in workflows table, using default SYNC");
             task.setTaskType("SYNC");
+        }
+
+        try {
+            task.setDrMode(rs.getString("dr_mode"));
+        } catch (SQLException e) {
+            logger.debug("dr_mode column not found in workflows table, leaving null");
         }
         
         return task;

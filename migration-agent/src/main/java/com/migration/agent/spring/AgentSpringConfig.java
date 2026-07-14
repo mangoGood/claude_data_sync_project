@@ -47,8 +47,8 @@ public class AgentSpringConfig {
     }
 
     @Bean
-    public ConfigService configService() {
+    public ConfigService configService(AgentConfig agentConfig) {
         logger.info("Initializing ConfigService bean");
-        return new ConfigService();
+        return new ConfigService(agentConfig);
     }
 }

@@ -6,7 +6,7 @@ import java.io.File;
 public class ConfigServiceTest {
     public static void main(String[] args) {
         try {
-            ConfigService configService = new ConfigService();
+            ConfigService configService = new ConfigService(new AgentConfig());
             
             TaskMessage taskMessage = new TaskMessage();
             taskMessage.setTaskId("test-task-001");

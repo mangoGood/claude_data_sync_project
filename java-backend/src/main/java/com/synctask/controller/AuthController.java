@@ -1,11 +1,13 @@
 package com.synctask.controller;
 
+import com.synctask.dto.ChangePasswordRequest;
 import com.synctask.dto.JwtResponse;
 import com.synctask.dto.LoginRequest;
 import com.synctask.dto.RegisterRequest;
 import com.synctask.entity.AuditLog;
 import com.synctask.entity.User;
 import com.synctask.repository.UserRepository;
+import com.synctask.security.UserPrincipal;
 import com.synctask.service.AuditLogService;
 import com.synctask.service.AuthService;
 import jakarta.validation.Valid;
@@ -96,6 +98,26 @@ public class AuthController {
             User user = authService.getCurrentUser(authentication);
             return ResponseEntity.ok(new ApiResponse(true, "获取用户信息成功", user));
         } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    @PostMapping("/change-password")
+    public ResponseEntity<?> changePassword(
+            @Valid @RequestBody ChangePasswordRequest request,
+            Authentication authentication) {
+        if (authentication == null || !(authentication.getPrincipal() instanceof UserPrincipal)) {
+            return ResponseEntity.status(401).body(new ApiResponse(false, "未登录或登录已过期"));
+        }
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        Map<String, Object> details = new HashMap<>();
+        details.put("username", userPrincipal.getUsername());
+        try {
+            authService.changePassword(userPrincipal.getId(), request);
+            auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.CHANGE_PASSWORD, null, details);
+            return ResponseEntity.ok(new ApiResponse(true, "密码修改成功"));
+        } catch (Exception e) {
+            auditLogService.logFailure(userPrincipal.getId(), AuditLog.Action.CHANGE_PASSWORD, null, details, e.getMessage());
             return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
         }
     }

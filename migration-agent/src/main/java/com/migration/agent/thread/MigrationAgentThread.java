@@ -66,6 +66,17 @@ public class MigrationAgentThread implements Runnable {
         if ("SUBSCRIBE".equals(taskType)) {
             return new SubscribeTask(taskMessage, kafkaProducer, taskStateService, config);
         }
+        // MongoDB 副本集同步：独立单进程管线（全量+Change Streams 增量），
+        // 不走 SQL 侧的 capture/extract/increment；断点续传由 mongo 子进程的
+        // resume token checkpoint 自理，故 skipFullMigration 也路由到同一执行器。
+        if ("mongodb".equalsIgnoreCase(taskMessage.getSourceType())) {
+            return new MongoSyncTask(taskMessage, kafkaProducer, taskStateService, config);
+        }
+        // MySQL → Elasticsearch：同为独立单进程管线（全量 JDBC + binlog 直读增量），
+        // 断点续传由 elastic 子进程的 binlog 位点 checkpoint 自理。
+        if ("elasticsearch".equalsIgnoreCase(taskMessage.getTargetType())) {
+            return new ElasticSyncTask(taskMessage, kafkaProducer, taskStateService, config);
+        }
         if (skipFullMigration) {
             return new IncrementSyncTask(taskMessage, kafkaProducer, taskStateService, config);
         }

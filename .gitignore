@@ -4,3 +4,4 @@ logs/
 *.db
 target/
 files/
+.synctask_master_key

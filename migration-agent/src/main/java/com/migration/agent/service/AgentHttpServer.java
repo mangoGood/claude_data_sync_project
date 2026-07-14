@@ -33,15 +33,18 @@ public class AgentHttpServer {
     private final String allowedOrigin;
     private final CheckpointVisualizationService checkpointVisualizationService;
     private final TableLatencyService tableLatencyService;
+    private final DiagnosticsBundleService diagnosticsBundleService;
     private final Map<String, FanoutDispatcherService> fanoutServices = new java.util.concurrent.ConcurrentHashMap<>();
 
     public AgentHttpServer(AgentMain agentMain) {
         this.agentMain = agentMain;
         this.config = new AgentConfig();
         this.apiToken = System.getenv("AGENT_API_TOKEN");
-        this.allowedOrigin = System.getenv().getOrDefault("AGENT_CORS_ORIGIN", "http://localhost:8082");
+        // CORS 允许来源：环境变量优先，否则取 agent.properties/默认（已更新为 backend 的 38080）
+        this.allowedOrigin = System.getenv().getOrDefault("AGENT_CORS_ORIGIN", config.getAgentCorsAllowedOrigin());
         this.checkpointVisualizationService = new CheckpointVisualizationService();
         this.tableLatencyService = new TableLatencyService();
+        this.diagnosticsBundleService = new DiagnosticsBundleService();
         this.gson = new GsonBuilder()
             .registerTypeAdapter(LocalDateTime.class, (JsonSerializer<LocalDateTime>) (src, typeOfSrc, context) ->
                 context.serialize(src.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)))
@@ -77,9 +80,15 @@ public class AgentHttpServer {
             server.createContext("/api/checkpoint", this::handleCheckpointVisualization);
             server.createContext("/api/table-latency", this::handleTableLatency);
             server.createContext("/api/fanout", this::handleFanout);
+            server.createContext("/api/diagnostics", this::handleDiagnostics);
 
             server.start();
             logger.info("Agent HTTP Server started on port {}", port);
+            if (apiToken == null || apiToken.isEmpty()) {
+                logger.warn("⚠ 未配置 AGENT_API_TOKEN：敏感接口（主备倒换 failover / 启动增量 start-increment / " +
+                    "排障包下载 diagnostics）将返回 401 拒绝。只读监控接口不受影响。" +
+                    "如需启用这些操作，请设置 AGENT_API_TOKEN 环境变量并让调用方带上 Bearer token。");
+            }
         } catch (IOException e) {
             logger.error("Failed to start Agent HTTP Server", e);
         }
@@ -175,7 +184,7 @@ public class AgentHttpServer {
 
     private void handleStatus(HttpExchange exchange) throws IOException {
         if (handleCorsPreflight(exchange)) return;
-        if (!checkAuth(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
         if (!"GET".equals(exchange.getRequestMethod())) {
             sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
             return;
@@ -197,7 +206,7 @@ public class AgentHttpServer {
 
     private void handleMetrics(HttpExchange exchange) throws IOException {
         if (handleCorsPreflight(exchange)) return;
-        if (!checkAuth(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
         if (!"GET".equals(exchange.getRequestMethod())) {
             sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
             return;
@@ -208,12 +217,6 @@ public class AgentHttpServer {
 
             if (path.equals("/api/metrics/prometheus")) {
                 handlePrometheusInternal(exchange);
-                return;
-            }
-
-            if (path.equals("/api/metrics/demo")) {
-                injectDemoMetrics();
-                sendResponse(exchange, 200, Map.of("success", true, "message", "Demo metrics injected"));
                 return;
             }
 
@@ -325,7 +328,7 @@ public class AgentHttpServer {
 
     private void handleCheckpointVisualization(HttpExchange exchange) throws IOException {
         if (handleCorsPreflight(exchange)) return;
-        if (!checkAuth(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
         if (!"GET".equals(exchange.getRequestMethod())) {
             sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
             return;
@@ -350,7 +353,7 @@ public class AgentHttpServer {
 
     private void handleTableLatency(HttpExchange exchange) throws IOException {
         if (handleCorsPreflight(exchange)) return;
-        if (!checkAuth(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
         if (!"GET".equals(exchange.getRequestMethod())) {
             sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
             return;
@@ -373,9 +376,48 @@ public class AgentHttpServer {
         }
     }
 
-    private void handleFanout(HttpExchange exchange) throws IOException {
+    /**
+     * 排障压缩包下载：GET /api/diagnostics/{taskId} -> zip（日志尾部 + 脱敏 config + checkpoint + THL 尾部）。
+     */
+    private void handleDiagnostics(HttpExchange exchange) throws IOException {
         if (handleCorsPreflight(exchange)) return;
         if (!checkAuth(exchange)) return;
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+
+        try {
+            String path = exchange.getRequestURI().getPath();
+            String[] parts = path.split("/");
+            // /api/diagnostics/{taskId}
+            if (parts.length < 4 || parts[3].isEmpty()) {
+                sendResponse(exchange, 400, Map.of("success", false, "message", "taskId is required in path"));
+                return;
+            }
+            String taskId = parts[3];
+            byte[] zipBytes = diagnosticsBundleService.buildBundle(taskId);
+
+            addCorsHeaders(exchange);
+            exchange.getResponseHeaders().set("Content-Type", "application/zip");
+            exchange.getResponseHeaders().set("Content-Disposition",
+                    "attachment; filename=\"diagnostics-" + taskId + ".zip\"");
+            exchange.sendResponseHeaders(200, zipBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(zipBytes);
+            }
+        } catch (IOException e) {
+            logger.warn("Error building diagnostics bundle: {}", e.getMessage());
+            sendResponse(exchange, 404, Map.of("success", false, "message", e.getMessage()));
+        } catch (Exception e) {
+            logger.error("Error handling diagnostics request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    private void handleFanout(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
         if (!"GET".equals(exchange.getRequestMethod())) {
             sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
             return;
@@ -430,8 +472,13 @@ public class AgentHttpServer {
     }
 
     private boolean checkAuth(HttpExchange exchange) throws IOException {
+        // 未配置 AGENT_API_TOKEN 时，敏感端点（此方法的所有调用方：failover/start-increment/
+        // metrics/checkpoint/table-latency/fanout/diagnostics）一律拒绝，而不是放行。
+        // 排障包下载、主备倒换等操作不能在零鉴权下裸奔。health/status 不走 checkAuth，仍可探活。
         if (apiToken == null || apiToken.isEmpty()) {
-            return true;
+            sendResponse(exchange, 401, Map.of("success", false,
+                "message", "Agent 未配置 AGENT_API_TOKEN，敏感接口已禁用。请设置该环境变量后重启 agent。"));
+            return false;
         }
         String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
@@ -444,21 +491,16 @@ public class AgentHttpServer {
         return false;
     }
 
-    private void injectDemoMetrics() {
-        String demoTaskId = "demo-task-001";
-        MetricsService.TaskMetrics metrics = MetricsService.getInstance().getOrCreateTaskMetrics(demoTaskId);
-        metrics.recordCaptureRate(1200 + (long)(Math.random() * 300));
-        metrics.recordE2eLatency(50 + (long)(Math.random() * 100));
-        metrics.recordQueueDepth("capture", 200 + (long)(Math.random() * 100));
-        metrics.recordQueueDepth("extract", 150 + (long)(Math.random() * 80));
-        metrics.recordQueueDepth("apply", 100 + (long)(Math.random() * 50));
-        metrics.recordCheckpointLag(2 + (long)(Math.random() * 5));
-        metrics.incrementEventsCaptured(1000 + (long)(Math.random() * 500));
-        metrics.incrementEventsApplied(950 + (long)(Math.random() * 400));
-        metrics.updateProcessStatus("capture", "RUNNING", 12345, "2h 30m", 0, "CLOSED");
-        metrics.updateProcessStatus("extract", "RUNNING", 12346, "2h 30m", 0, "CLOSED");
-        metrics.updateProcessStatus("apply", "RUNNING", 12347, "2h 28m", 1, "CLOSED");
-        logger.info("Demo metrics injected for task: {}", demoTaskId);
+    /**
+     * 只读监控端点（metrics/checkpoint/table-latency/fanout/status）的鉴权：
+     * 仅暴露运行指标/位点，不含凭证——未配置 token 时放行（保证监控页可用），
+     * 配置了 token 时则强制校验（可选加固）。与敏感端点的"缺 token 即拒"区分开。
+     */
+    private boolean checkAuthOptional(HttpExchange exchange) throws IOException {
+        if (apiToken == null || apiToken.isEmpty()) {
+            return true;
+        }
+        return checkAuth(exchange);
     }
 
     private String readRequestBody(HttpExchange exchange) throws IOException {

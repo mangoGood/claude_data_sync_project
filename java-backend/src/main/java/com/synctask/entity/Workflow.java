@@ -13,10 +13,13 @@ public class Workflow {
     @Column(nullable = false)
     private String name;
 
-    @Column(name = "source_connection")
+    // 连接串含数据库口令：落库前 AES-GCM 加密（DB 存 ENC: 密文），读取自动解密。列放宽为 TEXT 容纳密文。
+    @Column(name = "source_connection", columnDefinition = "TEXT")
+    @Convert(converter = com.synctask.security.EncryptedStringConverter.class)
     private String sourceConnection;
 
-    @Column(name = "target_connection")
+    @Column(name = "target_connection", columnDefinition = "TEXT")
+    @Convert(converter = com.synctask.security.EncryptedStringConverter.class)
     private String targetConnection;
 
     @Enumerated(EnumType.STRING)
@@ -96,6 +99,12 @@ public class Workflow {
     @Column(name = "dr_status", length = 20)
     private String drStatus;
 
+    @Column(name = "dr_mode", length = 20)
+    private String drMode;
+
+    @Column(name = "dr_peer_workflow_id", length = 36)
+    private String drPeerWorkflowId;
+
     @Column(name = "dr_switch_count")
     private Integer drSwitchCount = 0;
 
@@ -117,7 +126,9 @@ public class Workflow {
     @Column(name = "subscribe_format", length = 20)
     private String subscribeFormat = "DEBEZIUM_JSON";
 
+    // fanout 多目标连接串（含口令）：同样落库前加密。
     @Column(name = "target_connections", columnDefinition = "TEXT")
+    @Convert(converter = com.synctask.security.EncryptedStringConverter.class)
     private String targetConnections;
 
     @Column(name = "fanout_enabled")
@@ -375,6 +386,22 @@ public class Workflow {
 
     public void setDrStatus(String drStatus) {
         this.drStatus = drStatus;
+    }
+
+    public String getDrMode() {
+        return drMode;
+    }
+
+    public void setDrMode(String drMode) {
+        this.drMode = drMode;
+    }
+
+    public String getDrPeerWorkflowId() {
+        return drPeerWorkflowId;
+    }
+
+    public void setDrPeerWorkflowId(String drPeerWorkflowId) {
+        this.drPeerWorkflowId = drPeerWorkflowId;
     }
 
     public Integer getDrSwitchCount() {

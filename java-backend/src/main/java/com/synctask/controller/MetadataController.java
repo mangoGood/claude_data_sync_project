@@ -198,11 +198,12 @@ public class MetadataController {
             String migrationMode = request.get("migrationMode");
             String sourceType = request.get("sourceType");
             String targetType = request.get("targetType");
-            
-            logger.info("校验数据库同步条件: mode={}, sourceType={}, targetType={}", migrationMode, sourceType, targetType);
-            
+            String drMode = request.get("drMode");
+
+            logger.info("校验数据库同步条件: mode={}, sourceType={}, targetType={}, drMode={}", migrationMode, sourceType, targetType, drMode);
+
             ValidationResult result = metadataService.validateForMigration(
-                sourceConnection, targetConnection, migrationMode, sourceType, targetType);
+                sourceConnection, targetConnection, migrationMode, sourceType, targetType, drMode);
             
             return ResponseEntity.ok(Map.of(
                 "success", true,

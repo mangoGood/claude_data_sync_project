@@ -28,7 +28,49 @@ public class WorkflowService {
     
     private static final Logger logger = LoggerFactory.getLogger(WorkflowService.class);
     private static final Gson gson = new Gson();
-    
+
+    /** 任务名白名单：中英文、数字、空格、常见连接符。禁止 < > " ' & 等可用于 XSS 的字符（前端渲染已转义，此为纵深防御）。 */
+    private static final java.util.regex.Pattern TASK_NAME_PATTERN =
+            java.util.regex.Pattern.compile("^[\\u4e00-\\u9fa5A-Za-z0-9 _\\-.()（）\\[\\]]{1,100}$");
+
+    private void validateTaskName(String name) {
+        if (name == null || name.isEmpty()) {
+            throw new RuntimeException("任务名称不能为空");
+        }
+        if (!TASK_NAME_PATTERN.matcher(name).matches()) {
+            throw new RuntimeException("任务名称包含非法字符，仅允许中英文、数字、空格及 _-.()[] 等符号，长度不超过100");
+        }
+    }
+
+    /**
+     * 非 SQL 管线类型的配对约束（均仅限实时同步任务，灾备/订阅链路走 SQL 管线不适用）：
+     * <ul>
+     *   <li>MongoDB 只支持 mongodb→mongodb（副本集到副本集）；</li>
+     *   <li>Elasticsearch 只能作为目标，且源必须是 MySQL（binlog 增量捕获）。</li>
+     * </ul>
+     */
+    private void validateMongoTypePairing(String sourceType, String targetType, String taskType) {
+        boolean srcMongo = "mongodb".equalsIgnoreCase(sourceType);
+        boolean tgtMongo = "mongodb".equalsIgnoreCase(targetType);
+        boolean srcEs = "elasticsearch".equalsIgnoreCase(sourceType);
+        boolean tgtEs = "elasticsearch".equalsIgnoreCase(targetType);
+        if (!srcMongo && !tgtMongo && !srcEs && !tgtEs) {
+            return;
+        }
+        if (srcMongo != tgtMongo) {
+            throw new RuntimeException("MongoDB 只能与 MongoDB 互相同步，不支持与其它数据库类型组合");
+        }
+        if (srcEs) {
+            throw new RuntimeException("Elasticsearch 不支持作为同步源，仅支持 MySQL 到 Elasticsearch");
+        }
+        if (tgtEs && !"mysql".equalsIgnoreCase(sourceType)) {
+            throw new RuntimeException("到 Elasticsearch 的同步目前仅支持 MySQL 源");
+        }
+        if (taskType != null && !"SYNC".equals(taskType)) {
+            throw new RuntimeException("MongoDB/Elasticsearch 同步目前仅支持实时同步任务，不支持灾备/订阅");
+        }
+    }
+
     @Autowired
     private WorkflowRepository workflowRepository;
 
@@ -40,20 +82,51 @@ public class WorkflowService {
 
     @Transactional
     public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId, String taskType) {
+        return createWorkflow(name, sourceType, targetType, userId, taskType, null);
+    }
+
+    @Transactional
+    public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId,
+                                   String taskType, String drMode) {
+        String effectiveTaskType = taskType != null ? taskType : "SYNC";
+        String effectiveName = name != null ? name.trim() : name;
+        validateTaskName(effectiveName);
+        if (workflowRepository.existsByUserIdAndTaskTypeAndNameAndIsDeletedFalse(userId, effectiveTaskType, effectiveName)) {
+            throw new RuntimeException("已存在同名任务，请更换任务名称");
+        }
+
+        String effectiveSourceType = sourceType != null ? sourceType : "mysql";
+        String effectiveTargetType = targetType != null ? targetType : "mysql";
+        validateMongoTypePairing(effectiveSourceType, effectiveTargetType, effectiveTaskType);
+
         Workflow workflow = new Workflow();
         workflow.setId(UUID.randomUUID().toString());
-        workflow.setName(name);
-        workflow.setSourceType(sourceType != null ? sourceType : "mysql");
-        workflow.setTargetType(targetType != null ? targetType : "mysql");
+        workflow.setName(effectiveName);
+        workflow.setSourceType(effectiveSourceType);
+        workflow.setTargetType(effectiveTargetType);
         workflow.setStatus(WorkflowStatus.CONFIGURING);
         workflow.setUserId(userId);
         workflow.setProgress(0);
         workflow.setIsBilling(false);
-        workflow.setTaskType(taskType != null ? taskType : "SYNC");
+        workflow.setTaskType(effectiveTaskType);
 
         if ("DR".equals(taskType)) {
             workflow.setMigrationMode("fullAndIncre");
             workflow.setDrStatus("DR_CONFIGURING");
+            // 灾备方向：默认单向。双向（active-active 防回环）依赖 capture 侧的 origin 标记跳过，
+            // 目前 MySQL binlog 与 PostgreSQL WAL 两条 capture 均已实现，故支持 mysql↔mysql 与 pg↔pg；
+            // 其它类型（Oracle/Mongo/ES）capture 侧未实现防回环，暂不支持双向。
+            String effectiveDrMode = "BIDIRECTIONAL".equalsIgnoreCase(drMode) ? "BIDIRECTIONAL" : "UNIDIRECTIONAL";
+            if ("BIDIRECTIONAL".equals(effectiveDrMode)) {
+                String st = workflow.getSourceType();
+                String tt = workflow.getTargetType();
+                boolean bothMysql = "mysql".equalsIgnoreCase(st) && "mysql".equalsIgnoreCase(tt);
+                boolean bothPg = "postgresql".equalsIgnoreCase(st) && "postgresql".equalsIgnoreCase(tt);
+                if (!bothMysql && !bothPg) {
+                    throw new RuntimeException("双向灾备目前仅支持 MySQL↔MySQL 或 PostgreSQL↔PostgreSQL");
+                }
+            }
+            workflow.setDrMode(effectiveDrMode);
         }
 
         Workflow savedWorkflow = workflowRepository.save(workflow);
@@ -73,6 +146,10 @@ public class WorkflowService {
         if (workflow.getStatus() != WorkflowStatus.CONFIGURING) {
             throw new RuntimeException("只能修改配置中的任务，当前状态: " + workflow.getStatus().name());
         }
+
+        String newSourceType = sourceType != null ? sourceType : workflow.getSourceType();
+        String newTargetType = targetType != null ? targetType : workflow.getTargetType();
+        validateMongoTypePairing(newSourceType, newTargetType, workflow.getTaskType());
 
         if (sourceConnection != null) workflow.setSourceConnection(sourceConnection);
         if (targetConnection != null) workflow.setTargetConnection(targetConnection);
@@ -144,7 +221,38 @@ public class WorkflowService {
             }
             workflow.setMigrationMode("subscribe");
         }
-        
+
+        // 双向灾备：创建隐藏的反向影子任务（B→A，仅增量）。此刻只建行不启动——
+        // 若立即启动，反向全量会把尚未初始化的 B 反灌回 A；等正向进入增量同步
+        // （KafkaConsumerService 监听到 INCREMENT_RUNNING）后再自动启动反向通道，
+        // 反向 capture 从 B 的最新位点起步，天然跳过正向全量灌入 B 的存量数据。
+        if (isDrTask && "BIDIRECTIONAL".equals(workflow.getDrMode()) && workflow.getDrPeerWorkflowId() == null) {
+            Workflow shadow = new Workflow();
+            shadow.setId(UUID.randomUUID().toString());
+            shadow.setName(workflow.getName() + "-反向");
+            shadow.setTaskType("DR_SHADOW");
+            shadow.setDrMode("BIDIRECTIONAL");
+            shadow.setDrPeerWorkflowId(workflow.getId());
+            shadow.setUserId(workflow.getUserId());
+            shadow.setStatus(WorkflowStatus.CONFIGURING);
+            shadow.setProgress(0);
+            shadow.setIsBilling(false);
+            shadow.setMigrationMode("fullAndIncre");
+            shadow.setSourceConnection(workflow.getTargetConnection());
+            shadow.setTargetConnection(workflow.getSourceConnection());
+            shadow.setSourceType(workflow.getTargetType());
+            shadow.setTargetType(workflow.getSourceType());
+            shadow.setSourceDbName(workflow.getTargetDbName());
+            shadow.setTargetDbName(workflow.getSourceDbName());
+            // 反向通道镜像正向的同步对象集（灾备两端库名/表集一致）；为空则由 agent 在
+            // 反向源库上自动发现——继承可避免把 B 实例上无关的库卷进反向同步
+            shadow.setSyncObjects(workflow.getSyncObjects());
+            workflowRepository.save(shadow);
+            workflow.setDrPeerWorkflowId(shadow.getId());
+            addLog(workflowId, WorkflowLog.LogLevel.INFO,
+                    "双向灾备：已创建反向同步通道（影子任务 " + shadow.getId() + "），将在正向进入增量同步后自动启动");
+        }
+
         workflow.setStatus(WorkflowStatus.PENDING);
         workflow.setIsBilling(true);
         workflowRepository.save(workflow);
@@ -161,21 +269,33 @@ public class WorkflowService {
         return workflow;
     }
 
+    /** 分页参数上限：防止 pageSize 传超大值一次拉全表打挂内存/DB。page 至少为 1。 */
+    private static final int MAX_PAGE_SIZE = 200;
+
+    private static int clampPageSize(int pageSize) {
+        if (pageSize < 1) return 10;
+        return Math.min(pageSize, MAX_PAGE_SIZE);
+    }
+
+    private static int clampPage(int page) {
+        return Math.max(page, 1);
+    }
+
     public Page<Workflow> getWorkflowsByUserId(Long userId, int page, int pageSize, String sortBy, String sortDirection) {
         String fieldName = mapSortField(sortBy);
-        
+
         Sort.Direction direction = sortDirection.equalsIgnoreCase("ASC") ? Sort.Direction.ASC : Sort.Direction.DESC;
         Sort sort = Sort.by(direction, fieldName);
-        Pageable pageable = PageRequest.of(page - 1, pageSize, sort);
+        Pageable pageable = PageRequest.of(clampPage(page) - 1, clampPageSize(pageSize), sort);
         return workflowRepository.findByUserId(userId, pageable);
     }
-    
+
     public Page<Workflow> getWorkflowsByUserIdAndFilters(Long userId, String keyword, String status, String taskType, int page, int pageSize, String sortBy, String sortDirection) {
         String fieldName = mapSortField(sortBy);
-        
+
         Sort.Direction direction = sortDirection.equalsIgnoreCase("ASC") ? Sort.Direction.ASC : Sort.Direction.DESC;
         Sort sort = Sort.by(direction, fieldName);
-        Pageable pageable = PageRequest.of(page - 1, pageSize, sort);
+        Pageable pageable = PageRequest.of(clampPage(page) - 1, clampPageSize(pageSize), sort);
         
         boolean hasKeyword = keyword != null && !keyword.trim().isEmpty();
         boolean hasStatus = status != null && !status.trim().isEmpty();
@@ -209,7 +329,9 @@ public class WorkflowService {
     }
     
     public List<Workflow> getFailedWorkflowsByUserId(Long userId) {
-        return workflowRepository.findByUserIdAndStatusAndIsDeletedFalse(userId, WorkflowStatus.FAILED);
+        // DR_SHADOW 是双向灾备的隐藏反向通道，不在任何列表中直接展示。
+        // 过滤下推到 DB 查询，避免先全量取回再内存 filter。
+        return workflowRepository.findByUserIdAndStatusExcludingTaskType(userId, WorkflowStatus.FAILED, "DR_SHADOW");
     }
     
     private String mapSortField(String sortBy) {
@@ -243,12 +365,103 @@ public class WorkflowService {
         return workflowLogRepository.findByWorkflowIdOrderByCreatedAtDesc(workflow.getId());
     }
 
+    /** 构造发给 agent 的任务控制消息（stop/resume/terminate 级联共用的字段装配）。 */
+    private TaskCreatedMessage buildControlMessage(Workflow w, String messageType, String currentStatus) {
+        TaskCreatedMessage message = new TaskCreatedMessage();
+        message.setTaskId(w.getId());
+        message.setTaskName(w.getName());
+        message.setUserId(w.getUserId());
+        message.setSourceConnection(w.getSourceConnection());
+        message.setTargetConnection(w.getTargetConnection());
+        message.setMigrationMode(w.getMigrationMode());
+        message.setCreatedAt(w.getCreatedAt());
+        message.setMessageType(messageType);
+        message.setCurrentStatus(currentStatus);
+        message.setSourceType(w.getSourceType());
+        message.setTargetType(w.getTargetType());
+        message.setSourceDbName(w.getSourceDbName());
+        message.setTargetDbName(w.getTargetDbName());
+        message.setTaskType(w.getTaskType());
+        message.setDrMode(w.getDrMode());
+        message.setSyncObjects(parseSyncObjects(w.getSyncObjects()));
+        return message;
+    }
+
+    /**
+     * 双向灾备：把主任务的控制操作级联到反向影子任务（用户不可见，必须跟随主任务生命周期，
+     * 否则会留下无人管理的反向同步进程）。级联失败只记日志，不阻断主任务操作。
+     */
+    private void cascadeBidiShadow(Workflow primary, String action) {
+        if (!"DR".equals(primary.getTaskType()) || !"BIDIRECTIONAL".equals(primary.getDrMode())
+                || primary.getDrPeerWorkflowId() == null) {
+            return;
+        }
+        Workflow shadow = workflowRepository.findById(primary.getDrPeerWorkflowId()).orElse(null);
+        if (shadow == null) {
+            return;
+        }
+
+        WorkflowStatus st = shadow.getStatus();
+        boolean shadowActive = st == WorkflowStatus.PENDING || st == WorkflowStatus.RECEIVED
+                || st == WorkflowStatus.STARTING || st == WorkflowStatus.INCREMENT_RUNNING
+                || st == WorkflowStatus.FULL_MIGRATING || st == WorkflowStatus.FULL_COMPLETED;
+
+        try {
+            switch (action) {
+                case "pause":
+                    if (shadowActive) {
+                        kafkaProducerService.sendControlMessage(buildControlMessage(shadow, "stop", st.name()));
+                        shadow.setStatus(WorkflowStatus.PAUSED);
+                        workflowRepository.save(shadow);
+                    }
+                    break;
+                case "resume":
+                    // 影子仍是 CONFIGURING（正向暂停/失败时还没进过增量）无需处理：
+                    // 正向恢复后进入 INCREMENT_RUNNING 时会由状态消费者自动首次启动。
+                    // PAUSED（正向暂停时一并停的）或 FAILED（反向通道也挂了）→ 从增量位点重新拉起。
+                    if (st == WorkflowStatus.PAUSED || st == WorkflowStatus.FAILED) {
+                        shadow.setStatus(WorkflowStatus.STARTING);
+                        shadow.setIsBilling(true);
+                        shadow.setErrorMessage(null);
+                        shadow.setErrorCode(null);
+                        shadow.setCompletedAt(null);
+                        workflowRepository.save(shadow);
+                        kafkaProducerService.sendControlMessage(buildControlMessage(shadow, "resume", "INCREMENT_RUNNING"));
+                    }
+                    break;
+                case "stop":
+                    if (shadowActive || st == WorkflowStatus.PAUSED) {
+                        kafkaProducerService.sendControlMessage(buildControlMessage(shadow, "terminate", st.name()));
+                    }
+                    shadow.setStatus(WorkflowStatus.COMPLETED);
+                    shadow.setCompletedAt(LocalDateTime.now());
+                    shadow.setIsBilling(false);
+                    workflowRepository.save(shadow);
+                    break;
+                case "delete":
+                    if (shadowActive) {
+                        kafkaProducerService.sendControlMessage(buildControlMessage(shadow, "terminate", st.name()));
+                    }
+                    shadow.setIsDeleted(true);
+                    shadow.setIsBilling(false);
+                    workflowRepository.save(shadow);
+                    break;
+                default:
+                    return;
+            }
+            addLog(primary.getId(), WorkflowLog.LogLevel.INFO, "双向灾备：反向通道已级联执行 " + action);
+        } catch (Exception e) {
+            addLog(primary.getId(), WorkflowLog.LogLevel.WARNING,
+                    "双向灾备：反向通道级联 " + action + " 失败: " + e.getMessage());
+        }
+    }
+
     @Transactional
     public void pauseWorkflow(String id, Long userId) {
         Workflow workflow = getWorkflowById(id, userId);
-        
+
         String currentStatus = workflow.getStatus().name();
-        
+
         TaskCreatedMessage message = new TaskCreatedMessage();
         message.setTaskId(workflow.getId());
         message.setTaskName(workflow.getName());
@@ -261,16 +474,17 @@ public class WorkflowService {
         message.setCurrentStatus(currentStatus);
         message.setSourceType(workflow.getSourceType());
         message.setTargetType(workflow.getTargetType());
-        
+
         try {
             kafkaProducerService.sendControlMessage(message);
             addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务已暂停，发送停止消息到 Kafka，当前状态: " + currentStatus);
         } catch (Exception e) {
             addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
         }
-        
+
         workflow.setStatus(WorkflowStatus.PAUSED);
         workflowRepository.save(workflow);
+        cascadeBidiShadow(workflow, "pause");
     }
 
     @Transactional
@@ -302,6 +516,7 @@ public class WorkflowService {
         } catch (Exception e) {
             addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "Kafka 恢复消息发送失败: " + e.getMessage());
         }
+        cascadeBidiShadow(workflow, "resume");
     }
 
     @Transactional
@@ -333,20 +548,22 @@ public class WorkflowService {
         workflow.setIsBilling(false);
         workflowRepository.save(workflow);
         addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务已结束，状态: 已完成");
+        cascadeBidiShadow(workflow, "stop");
     }
 
     @Transactional
     public void deleteWorkflow(String id, Long userId) {
         Workflow workflow = getWorkflowById(id, userId);
-        
+
         WorkflowStatus status = workflow.getStatus();
         if (status != WorkflowStatus.COMPLETED && status != WorkflowStatus.FAILED && status != WorkflowStatus.FULL_COMPLETED && status != WorkflowStatus.CONFIGURING) {
             throw new RuntimeException("只能删除已完成、失败或配置中的任务，当前状态: " + status.name());
         }
-        
+
         workflow.setIsDeleted(true);
         workflowRepository.save(workflow);
         addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务已删除（软删除）");
+        cascadeBidiShadow(workflow, "delete");
     }
 
     @Transactional
@@ -429,8 +646,13 @@ public class WorkflowService {
                 addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
             }
         }
+
+        // 双向灾备：主任务重试时把反向影子通道一并拉起，否则双向同步只剩单边。
+        // resume 语义会处理影子当前处于 PAUSED 的情形；仍是 CONFIGURING（尚未进过增量）
+        // 则等主任务进 INCREMENT_RUNNING 时由状态消费者自动首启（cascadeBidiShadow 内已判断）。
+        cascadeBidiShadow(workflow, "resume");
     }
-    
+
     private Map<String, Object> parseSyncObjects(String syncObjects) {
         if (syncObjects == null || syncObjects.isEmpty()) {
             return null;
@@ -470,6 +692,10 @@ public class WorkflowService {
 
         if (!"DR".equals(workflow.getTaskType())) {
             throw new RuntimeException("只有灾备任务才能执行主备倒换");
+        }
+
+        if ("BIDIRECTIONAL".equals(workflow.getDrMode())) {
+            throw new RuntimeException("双向灾备两端均可读写、实时互同步，无需主备倒换");
         }
 
         if (workflow.getStatus() != WorkflowStatus.INCREMENT_RUNNING && workflow.getStatus() != WorkflowStatus.SWITCHING) {
@@ -548,12 +774,19 @@ public class WorkflowService {
     }
 
     private boolean callAgentFailoverApi(TaskCreatedMessage message) {
-        String agentUrl = "http://localhost:8083/api/agent/failover";
+        // agent 地址与鉴权 token 均可配（环境变量优先），不再写死 localhost；
+        // agent 侧 failover 是敏感端点，配置了 AGENT_API_TOKEN 时必须带 Bearer token。
+        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentToken = System.getenv("AGENT_API_TOKEN");
+        String agentUrl = agentBase + "/api/agent/failover";
         try {
             java.net.URL url = new java.net.URL(agentUrl);
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            if (agentToken != null && !agentToken.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + agentToken);
+            }
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(30000);
             conn.setDoOutput(true);

@@ -1,6 +1,8 @@
 package com.migration.increment;
 
 import com.migration.common.MdcUtil;
+import com.migration.common.ratelimit.RowRateLimiter;
+import com.migration.common.watch.DirectoryChangeWatcher;
 import com.migration.db.ConnectionPoolManager;
 import com.migration.increment.checkpoint.SeqnoCheckpointManager;
 import com.migration.thl.EncryptedTHLFileReader;
@@ -26,6 +28,18 @@ public class ContinuousIncrementMain {
     private String targetUser;
     private String targetPassword;
     private long scanInterval;
+    /** 增量应用限速（行/秒配额落到执行层）：避免应用过快反压到 capture/binlog 读取而打挂源库。 */
+    private RowRateLimiter rowRateLimiter;
+    /** 双向同步/环路防护：启用后每个应用事务先写 origin 标记，供对端 capture 识别并跳过，防止回环。 */
+    private boolean bidirectionalEnabled;
+    /** 本节点标识（写入 origin 标记，供观测）。 */
+    private String bidiNodeId;
+    /** 标记表是否已在目标库确保存在（每进程一次）。 */
+    private boolean markerTableReady = false;
+    /** 事件驱动开关：true 时用 WatchService 监听 THL 目录变更（默认），false 回退固定间隔轮询。 */
+    private boolean watchEnabled;
+    /** 事件驱动下的兜底超时（ms）：即使无文件事件也会周期性重扫，兼作 macOS 轮询式 WatchService 的延迟上界。 */
+    private long watchFallbackMs;
     private String taskId;
     private boolean isPostgresql;
 
@@ -89,6 +103,8 @@ public class ContinuousIncrementMain {
                 }
             }
         }
+        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
+        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
 
         String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
 
@@ -123,6 +139,15 @@ public class ContinuousIncrementMain {
         targetUser = props.getProperty("target.db.username", "root");
         targetPassword = props.getProperty("target.db.password", "");
         scanInterval = Long.parseLong(props.getProperty("increment.scan.interval", "3000"));
+        long maxRowsPerSec = Long.parseLong(props.getProperty("increment.rate.limit.rows.per.sec", "0"));
+        rowRateLimiter = new RowRateLimiter(maxRowsPerSec);
+        if (!rowRateLimiter.isUnlimited()) {
+            logger.info("增量限速已启用: {} 行/秒（配额落到执行层，避免应用过快打挂源库）", maxRowsPerSec);
+        }
+        watchEnabled = Boolean.parseBoolean(props.getProperty("increment.watch.enabled", "true"));
+        watchFallbackMs = Long.parseLong(props.getProperty("increment.watch.fallback.ms", "1000"));
+        bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
+        bidiNodeId = com.migration.common.bidi.BidiConstants.nodeId(props);
         isPostgresql = "postgresql".equalsIgnoreCase(props.getProperty("target.db.type", "mysql"));
 
         String checkpointPath = "./files/" + taskId + "/checkpoint/increment_checkpoint";
@@ -172,28 +197,107 @@ public class ContinuousIncrementMain {
         targetConnection = ConnectionPoolManager.getConnection(url, targetUser, targetPassword);
         logger.info("已连接目标数据库: {}:{}/{} (类型: {})", targetHost, targetPort, targetDatabase,
                 isPostgresql ? "postgresql" : "mysql");
+        if (bidirectionalEnabled) {
+            ensureMarkerTable();
+        }
+    }
+
+    /**
+     * 双向同步：在目标库确保 origin 标记表存在。该表由本进程在每个应用事务里滚动更新一行，
+     * 目标库 binlog 记下这次行事件后，对端 capture 靠它识别"复制而来的事务"并跳过，防止回环。
+     */
+    private void ensureMarkerTable() {
+        if (markerTableReady) return;
+        String table = com.migration.common.bidi.BidiConstants.MARKER_TABLE;
+        String ddl = isPostgresql
+                ? "CREATE TABLE IF NOT EXISTS \"" + table + "\" (id INT PRIMARY KEY, node_id VARCHAR(64), last_seqno BIGINT, updated_at BIGINT)"
+                : "CREATE TABLE IF NOT EXISTS `" + table + "` (id INT PRIMARY KEY, node_id VARCHAR(64), last_seqno BIGINT, updated_at BIGINT)";
+        try (Statement st = targetConnection.createStatement()) {
+            boolean prevAuto = targetConnection.getAutoCommit();
+            if (!prevAuto) targetConnection.setAutoCommit(true);
+            st.execute(ddl);
+            markerTableReady = true;
+            logger.info("双向同步已启用，origin 标记表就绪: {} (nodeId={})", table, bidiNodeId);
+        } catch (SQLException e) {
+            logger.warn("创建 origin 标记表失败（双向防回环可能失效）: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 在当前应用事务里写入 origin 标记（作为事务首条语句，保证 binlog 里标记行事件先于业务 DML）。
+     * 单行滚动更新固定主键，每个应用事务都产生一次行事件供对端 capture 识别。
+     */
+    private void writeOriginMarker(long seqno) throws SQLException {
+        String table = com.migration.common.bidi.BidiConstants.MARKER_TABLE;
+        int id = com.migration.common.bidi.BidiConstants.MARKER_ROW_ID;
+        long now = System.currentTimeMillis();
+        String sql = isPostgresql
+                ? "INSERT INTO \"" + table + "\" (id, node_id, last_seqno, updated_at) VALUES (?, ?, ?, ?) " +
+                  "ON CONFLICT (id) DO UPDATE SET node_id=EXCLUDED.node_id, last_seqno=EXCLUDED.last_seqno, updated_at=EXCLUDED.updated_at"
+                : "INSERT INTO `" + table + "` (id, node_id, last_seqno, updated_at) VALUES (?, ?, ?, ?) " +
+                  "ON DUPLICATE KEY UPDATE node_id=VALUES(node_id), last_seqno=VALUES(last_seqno), updated_at=VALUES(updated_at)";
+        try (PreparedStatement ps = targetConnection.prepareStatement(sql)) {
+            ps.setInt(1, id);
+            ps.setString(2, bidiNodeId);
+            ps.setLong(3, seqno);
+            ps.setLong(4, now);
+            ps.executeUpdate();
+        }
     }
 
     public void start() {
-        logger.info("启动THL文件持续处理...");
+        if (watchEnabled) {
+            logger.info("启动THL文件持续处理（事件驱动: WatchService，兜底 {}ms）...", watchFallbackMs);
+            startWatchDriven();
+        } else {
+            logger.info("启动THL文件持续处理（固定轮询: {}ms）...", scanInterval);
+            startPolling();
+        }
 
+        close();
+        logger.info("增量同步服务已停止");
+    }
+
+    /** 事件驱动主循环：先处理一遍，再阻塞等待 THL 目录出现变更（或兜底超时）后立即重扫。 */
+    private void startWatchDriven() {
+        try (DirectoryChangeWatcher watcher = new DirectoryChangeWatcher(thlDirectory)) {
+            while (running.get()) {
+                try {
+                    scanAndProcessThlFiles();
+                    // 阻塞到有新 THL 写入立即唤醒（Linux inotify ~ms），或兜底超时；返回值仅用于日志
+                    watcher.awaitChange(watchFallbackMs);
+                } catch (InterruptedException e) {
+                    logger.info("增量同步线程被中断");
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (RuntimeException e) {
+                    logger.error("THL文件处理出现意外错误, 将继续处理", e);
+                } catch (Exception e) {
+                    logger.error("THL文件扫描出错", e);
+                }
+            }
+        } catch (IOException e) {
+            logger.warn("初始化目录监听失败，回退固定轮询: {}", e.getMessage());
+            startPolling();
+        }
+    }
+
+    /** 兼容回退：固定间隔轮询（increment.watch.enabled=false 时启用）。 */
+    private void startPolling() {
         while (running.get()) {
             try {
                 scanAndProcessThlFiles();
                 Thread.sleep(scanInterval);
             } catch (InterruptedException e) {
                 logger.info("增量同步线程被中断");
+                Thread.currentThread().interrupt();
                 break;
             } catch (RuntimeException e) {
-                // processThlFile 不再抛出 RuntimeException，但保留此 catch 以防万一
                 logger.error("THL文件处理出现意外错误, 将继续处理", e);
             } catch (Exception e) {
                 logger.error("THL文件扫描出错", e);
             }
         }
-
-        close();
-        logger.info("增量同步服务已停止");
     }
 
     public void stop() {
@@ -243,6 +347,33 @@ public class ContinuousIncrementMain {
             }
 
             processThlFile(thlFile, thlFile.getName().equals(latestFileName));
+        }
+
+        // 真实指标：apply 端积压 = 尚未应用完的 .thl 文件数（processedFiles != -1），落盘供 agent 采集
+        writeApplyQueueDepth(thlFiles);
+    }
+
+    /**
+     * 写入 apply 端积压量到 {@code binlog_output/apply_queue_depth}（extract→apply 积压，agent 采集）。
+     * 取代随机 mock：0 表示已追平，随 extract 领先程度增长。
+     */
+    private void writeApplyQueueDepth(File[] thlFiles) {
+        long pending = 0;
+        for (File f : thlFiles) {
+            Long seq = processedFiles.get(f.getName());
+            if (seq == null || seq != -1) pending++; // 未标记完成即视为待应用
+        }
+        try {
+            File dir = new File("./files/" + taskId + "/binlog_output");
+            if (!dir.exists() && !dir.mkdirs()) return;
+            File tmp = new File(dir, "apply_queue_depth.tmp");
+            File dst = new File(dir, "apply_queue_depth");
+            try (BufferedWriter w = new BufferedWriter(new FileWriter(tmp, false))) {
+                w.write(Long.toString(pending));
+            }
+            if (!tmp.renameTo(dst)) tmp.delete();
+        } catch (IOException e) {
+            logger.debug("写 apply_queue_depth 失败: {}", e.getMessage());
         }
     }
 
@@ -311,6 +442,16 @@ public class ContinuousIncrementMain {
                     boolean origAutoCommit = targetConnection.getAutoCommit();
                     if (origAutoCommit) {
                         targetConnection.setAutoCommit(false);
+                    }
+
+                    // 双向防回环：数据事件在应用前先写 origin 标记（事务首条语句），
+                    // 与业务 DML 原子提交进目标库 binlog，供对端 capture 识别并跳过。
+                    if (bidirectionalEnabled && isDataChangeEvent(event)) {
+                        try {
+                            writeOriginMarker(event.getSeqno());
+                        } catch (SQLException me) {
+                            logger.warn("写 origin 标记失败 (seqno={})，本事务将不带标记: {}", event.getSeqno(), me.getMessage());
+                        }
                     }
 
                     if (typedDmls != null) {
@@ -404,11 +545,23 @@ public class ContinuousIncrementMain {
                     try { targetConnection.setAutoCommit(true); } catch (SQLException ignored) {}
                 }
 
+                // 限速：按本事件实际处理的行数计入配额窗口（typedDmls 与 sqlStatements 二选一，
+                // 二者恰好对应两条互斥路径，各自的 size() 就是本事件的行数）
+                long rowsThisEvent = typedDmls != null ? typedDmls.size()
+                        : (sqlStatements != null ? sqlStatements.size() : 0);
+                try {
+                    rowRateLimiter.acquire(rowsThisEvent);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+
                 lastExecutedSeqno = event.getSeqno();
 
-                // 记录表级延迟（用于热力图）
+                // 记录表级延迟（用于热力图）：优先从事件本身的 event_type 判断操作类型，
+                // 类型化值管道命中时 sqlStatements 为空列表，仅靠 SQL 文本判断会把所有类型化路径的事件误标为 UNKNOWN
                 if (!txFailed) {
-                    String opType = determineOpType(sqlStatements);
+                    String opType = determineOpTypeFromEvent(event, sqlStatements);
                     recordTableLatency(event, opType);
                 }
 
@@ -641,6 +794,50 @@ public class ContinuousIncrementMain {
             if (upper.startsWith("CREATE") || upper.startsWith("ALTER") || upper.startsWith("DROP")) return "DDL";
         }
         return "OTHER";
+    }
+
+    /**
+     * 根据事件本身的 event_type 元数据判断操作类型（源自 mysql/oracle/pg 三种 capture 各自的命名）。
+     * 类型化值管道命中时 sqlStatements 为空列表，{@link #determineOpType} 只能靠 SQL 文本判断，
+     * 会把所有类型化路径的事件误标为 UNKNOWN；这里优先看事件自身的类型，仅在缺失/不识别时才回退文本判断。
+     */
+    /** 是否为数据变更（INSERT/UPDATE/DELETE）事件——仅这类事件写 origin 标记；DDL/心跳等不写。 */
+    private boolean isDataChangeEvent(THLEvent event) {
+        String t = (String) event.getMetadata("event_type");
+        if (t == null) return false;
+        switch (t) {
+            case "INSERT": case "WRITE_ROWS": case "EXT_WRITE_ROWS":
+            case "UPDATE": case "UPDATE_ROWS": case "EXT_UPDATE_ROWS":
+            case "DELETE": case "DELETE_ROWS": case "EXT_DELETE_ROWS":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private String determineOpTypeFromEvent(THLEvent event, List<String> sqlStatements) {
+        String eventType = (String) event.getMetadata("event_type");
+        if (eventType != null) {
+            switch (eventType) {
+                case "INSERT":
+                case "WRITE_ROWS":
+                case "EXT_WRITE_ROWS":
+                    return "INSERT";
+                case "UPDATE":
+                case "UPDATE_ROWS":
+                case "EXT_UPDATE_ROWS":
+                    return "UPDATE";
+                case "DELETE":
+                case "DELETE_ROWS":
+                case "EXT_DELETE_ROWS":
+                    return "DELETE";
+                case "QUERY":
+                    return "DDL";
+                default:
+                    break;
+            }
+        }
+        return determineOpType(sqlStatements);
     }
 
     /**

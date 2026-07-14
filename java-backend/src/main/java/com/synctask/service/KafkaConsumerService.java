@@ -31,6 +31,9 @@ public class KafkaConsumerService {
 
     @Autowired
     private SimpMessagingTemplate messagingTemplate;
+
+    @Autowired
+    private KafkaProducerService kafkaProducerService;
     
     private long serviceStartTime;
 
@@ -199,6 +202,9 @@ public class KafkaConsumerService {
             workflowRepository.save(workflow);
             logger.info("任务状态已更新: taskId={}, status={}", workflow.getId(), workflow.getStatus());
 
+            maybeLaunchBidiShadow(workflow, newStatus);
+            maybePropagateShadowFailure(workflow, newStatus);
+
             String logMessage = buildStatusLogMessage(newStatus, oldStatus, progress, 
                 workflow.getErrorMessage(), errorCode,
                 totalTables, completedTables, currentTable, currentTableProgress);
@@ -254,6 +260,64 @@ public class KafkaConsumerService {
      *       避免整条消息因 {@code valueOf} 抛 {@link IllegalArgumentException} 被整体丢弃。</li>
      * </ul>
      */
+    /**
+     * 双向灾备编排：正向主任务进入增量同步（全量已完成）后，自动启动反向影子任务（B→A 仅增量）。
+     *
+     * <p>为什么等到 INCREMENT_RUNNING 才启动：反向 capture 无 checkpoint 时从 B 的"最新"binlog
+     * 位点起步，此刻正向全量灌入 B 的存量写入已成为历史位点，天然不会被反向回传；正向增量
+     * 后续写入 B 的事务带 origin 标记，由反向 capture 的环路防护跳过。
+     *
+     * <p>幂等：INCREMENT_RUNNING 会随周期性指标上报反复出现，仅当影子仍处于 CONFIGURING
+     * （从未启动过）时才发射一次。
+     */
+    private void maybeLaunchBidiShadow(Workflow primary, WorkflowStatus newStatus) {
+        if (newStatus != WorkflowStatus.INCREMENT_RUNNING) {
+            return;
+        }
+        if (!"DR".equals(primary.getTaskType()) || !"BIDIRECTIONAL".equals(primary.getDrMode())
+                || primary.getDrPeerWorkflowId() == null) {
+            return;
+        }
+        try {
+            Workflow shadow = workflowRepository.findById(primary.getDrPeerWorkflowId()).orElse(null);
+            if (shadow == null || shadow.getStatus() != WorkflowStatus.CONFIGURING) {
+                return;
+            }
+            shadow.setStatus(WorkflowStatus.PENDING);
+            shadow.setIsBilling(true);
+            workflowRepository.save(shadow);
+            kafkaProducerService.sendTaskCreatedMessage(shadow);
+            addLog(primary.getId(), WorkflowLog.LogLevel.INFO,
+                    "双向灾备：正向已进入增量同步，反向同步通道（" + shadow.getId() + "）已自动启动");
+            logger.info("双向灾备反向通道已启动: primary={}, shadow={}", primary.getId(), shadow.getId());
+        } catch (Exception e) {
+            logger.error("双向灾备反向通道启动失败: primary={}", primary.getId(), e);
+            addLog(primary.getId(), WorkflowLog.LogLevel.WARNING,
+                    "双向灾备：反向同步通道启动失败: " + e.getMessage());
+        }
+    }
+
+    /** 反向影子任务失败时，把失败信息透出到用户可见的主任务上（不改变主任务状态，正向仍在同步）。 */
+    private void maybePropagateShadowFailure(Workflow shadow, WorkflowStatus newStatus) {
+        if (newStatus != WorkflowStatus.FAILED || !"DR_SHADOW".equals(shadow.getTaskType())
+                || shadow.getDrPeerWorkflowId() == null) {
+            return;
+        }
+        try {
+            Workflow primary = workflowRepository.findById(shadow.getDrPeerWorkflowId()).orElse(null);
+            if (primary == null) {
+                return;
+            }
+            String reason = shadow.getErrorMessage() != null ? shadow.getErrorMessage() : "未知原因";
+            primary.setErrorMessage("双向灾备反向通道（B→A）失败: " + reason);
+            workflowRepository.save(primary);
+            addLog(primary.getId(), WorkflowLog.LogLevel.ERROR,
+                    "双向灾备：反向同步通道失败: " + reason + "（正向 A→B 同步不受影响，仍在运行）");
+        } catch (Exception e) {
+            logger.error("透传反向通道失败信息出错: shadow={}", shadow.getId(), e);
+        }
+    }
+
     private WorkflowStatus parseWorkflowStatus(String status) {
         if (status == null || status.isBlank()) {
             return null;

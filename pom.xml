@@ -21,6 +21,8 @@
         <module>migration-extract</module>
         <module>migration-increment</module>
         <module>migration-subscribe</module>
+        <module>migration-mongo</module>
+        <module>migration-elastic</module>
         <module>migration-agent</module>
     </modules>
 
@@ -48,6 +50,29 @@
                 <version>${spring.boot.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+            <!-- MongoDB 驱动三件套版本必须一致：Spring Boot 3.1.5 BOM 会把 driver-core/bson
+                 压到 4.9.1，与显式引入的 driver-sync 4.11.1 混包导致 NoClassDefFoundError
+                 （StreamFactoryHelper 等 4.10+ 类缺失）。此处显式管理覆盖 BOM。 -->
+            <dependency>
+                <groupId>org.mongodb</groupId>
+                <artifactId>mongodb-driver-sync</artifactId>
+                <version>4.11.1</version>
+            </dependency>
+            <dependency>
+                <groupId>org.mongodb</groupId>
+                <artifactId>mongodb-driver-core</artifactId>
+                <version>4.11.1</version>
+            </dependency>
+            <dependency>
+                <groupId>org.mongodb</groupId>
+                <artifactId>bson</artifactId>
+                <version>4.11.1</version>
+            </dependency>
+            <dependency>
+                <groupId>org.mongodb</groupId>
+                <artifactId>bson-record-codec</artifactId>
+                <version>4.11.1</version>
             </dependency>
             <dependency>
                 <groupId>com.migration</groupId>

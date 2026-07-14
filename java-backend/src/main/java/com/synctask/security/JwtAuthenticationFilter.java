@@ -30,11 +30,21 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 Long userId = tokenProvider.getUserIdFromToken(jwt);
 
                 UserDetails userDetails = customUserDetailsService.loadUserById(userId);
-                UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
-                        userDetails, null, userDetails.getAuthorities());
-                authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
 
-                SecurityContextHolder.getContext().setAuthentication(authentication);
+                // 令牌版本校验：token 里的 tv 必须与用户当前 token_version 一致，
+                // 否则视为改密后失效的旧 token，拒绝认证（改密会递增该版本）。
+                int tokenTv = tokenProvider.getTokenVersionFromToken(jwt);
+                int currentTv = (userDetails instanceof UserPrincipal)
+                        ? ((UserPrincipal) userDetails).getTokenVersion() : 0;
+                if (tokenTv != currentTv) {
+                    logger.warn("Token 版本失效（tv=" + tokenTv + ", current=" + currentTv + "），拒绝认证: userId=" + userId);
+                } else {
+                    UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
+                            userDetails, null, userDetails.getAuthorities());
+                    authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+
+                    SecurityContextHolder.getContext().setAuthentication(authentication);
+                }
             }
         } catch (Exception ex) {
             logger.error("无法设置用户认证", ex);

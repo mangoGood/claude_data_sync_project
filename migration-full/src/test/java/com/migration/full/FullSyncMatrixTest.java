@@ -247,7 +247,6 @@ class FullSyncMatrixTest {
                     "99999999999999999999999999999999999999, 9999999999999999999999999999.9999999999," +
                     "'oracle string', TO_DATE('9999-12-31','YYYY-MM-DD'), HEXTORAW('DEADBEEF'))");
             st.execute("INSERT INTO MATRIX_ORA_TYPES (ID) VALUES (2)");
-            c.commit();
         }
         recreatePgDatabase("matrix_tgt_ora");
 

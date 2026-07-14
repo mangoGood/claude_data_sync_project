@@ -194,7 +194,7 @@ public class TaskMessageHandler {
                 logger.info("MigrationAgentThread started for {} task: {}, skipFullMigration: {}", migrationMode, taskId, skipFullMigration);
             } else {
                 if (progress < 100) {
-                    taskProcessService.startMigrationForTask(taskId);
+                    taskProcessService.startMigrationForTask(taskId, taskMessage);
                     sendStatus(taskId, "STARTING", "Task resumed, starting migration", progress);
                 } else {
                     sendStatus(taskId, "COMPLETED", "Task completed", progress);
@@ -233,7 +233,7 @@ public class TaskMessageHandler {
                 logger.info("MigrationAgentThread started for {} task: {}", migrationMode, taskId);
             } else {
                 logger.info("Full migration mode, skipping binlog process for task: {}", taskId);
-                taskProcessService.startMigrationForTask(taskId);
+                taskProcessService.startMigrationForTask(taskId, taskMessage);
             }
 
         } catch (Exception e) {

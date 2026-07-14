@@ -145,4 +145,35 @@ class TypeTranslatorTest {
         assertEquals("2024-06-15 12:30:45.123 +08:00",
                 t.convertValue("2024-06-15 12:30:45.123 +08:00", "TIMESTAMP(6) WITH TIME ZONE", null, 1));
     }
+
+    @Test
+    @DisplayName("convertLiteral mysql→pg：tinyint(1)→true/false，bit(8)→bytea 十六进制字面量")
+    void mysqlToPgLiteral() {
+        TypeTranslator t = TypeTranslator.forPair("mysql", "postgresql");
+        assertEquals("true", t.convertLiteral("1", "tinyint(1)"));
+        assertEquals("false", t.convertLiteral("0", "tinyint(1)"));
+        assertEquals("E'\\\\xaa'", t.convertLiteral("0xaa", "bit(8)"));
+        assertEquals("E'\\\\x0f'", t.convertLiteral("b'00001111'", "bit(8)"));
+        // 非布尔/位类型原样返回
+        assertEquals("'alice'", t.convertLiteral("'alice'", "varchar(50)"));
+    }
+
+    @Test
+    @DisplayName("convertLiteral pg→mysql：boolean→1/0，bytea E'\\x..'→0x..，去 ::type 后缀")
+    void pgToMysqlLiteral() {
+        TypeTranslator t = TypeTranslator.forPair("postgresql", "mysql");
+        assertEquals("1", t.convertLiteral("t", "boolean"));
+        assertEquals("0", t.convertLiteral("f", "boolean"));
+        assertEquals("0xdeadbeef", t.convertLiteral("E'\\xdeadbeef'", "bytea"));
+        assertEquals("'{\"k\":1}'", t.convertLiteral("'{\"k\":1}'::jsonb", "jsonb"));
+        assertEquals("NULL", t.convertLiteral("NULL", "boolean"));
+    }
+
+    @Test
+    @DisplayName("convertLiteral 同构：默认原样返回（无转换）")
+    void homogeneousLiteralNoop() {
+        TypeTranslator t = TypeTranslator.forPair("mysql", "mysql");
+        assertEquals("0xaa", t.convertLiteral("0xaa", "bit(8)"));
+        assertEquals("1", t.convertLiteral("1", "tinyint(1)"));
+    }
 }

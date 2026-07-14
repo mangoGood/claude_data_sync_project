@@ -20,6 +20,7 @@ public class RecoveryTask implements Serializable {
     private String sourceType;
     private String targetType;
     private String taskType;
+    private String drMode;
 
     public String getTaskId() {
         return taskId;
@@ -133,6 +134,14 @@ public class RecoveryTask implements Serializable {
         this.taskType = taskType;
     }
 
+    public String getDrMode() {
+        return drMode;
+    }
+
+    public void setDrMode(String drMode) {
+        this.drMode = drMode;
+    }
+
     public TaskMessage toTaskMessage() {
         TaskMessage message = new TaskMessage();
         message.setTaskId(this.taskId);
@@ -146,6 +155,7 @@ public class RecoveryTask implements Serializable {
         message.setSourceType(this.sourceType != null ? this.sourceType : "mysql");
         message.setTargetType(this.targetType != null ? this.targetType : "mysql");
         message.setTaskType(this.taskType != null ? this.taskType : "SYNC");
+        message.setDrMode(this.drMode);
         if (this.syncObjects != null && !this.syncObjects.isEmpty()) {
             try {
                 com.google.gson.Gson gson = new com.google.gson.Gson();

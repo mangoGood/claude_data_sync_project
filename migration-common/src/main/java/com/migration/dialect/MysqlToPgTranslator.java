@@ -93,4 +93,58 @@ public class MysqlToPgTranslator implements TypeTranslator {
 
         return value;
     }
+
+    /**
+     * 增量文本路径逐值转换（与上面 {@link #convertValue} 对象路径成对，同库对同一处维护，杜绝漂移）：
+     * tinyint(1)/bool → PG boolean 字面量 true/false；bit(N) → PG bytea 十六进制字面量 {@code E'\xHH..'}。
+     * {@code sourceColumnType} 需带宽度（COLUMN_TYPE，如 tinyint(1)/bit(8)），裸 DATA_TYPE 无法区分 tinyint(1)。
+     */
+    @Override
+    public String convertLiteral(String rawValue, String sourceColumnType) {
+        if (rawValue == null) return rawValue;
+        String trimmed = rawValue.trim();
+        if (trimmed.isEmpty() || "null".equalsIgnoreCase(trimmed)) return rawValue;
+        String t = (sourceColumnType == null) ? "" : sourceColumnType.toLowerCase();
+
+        // tinyint(1) / bool(ean) → PG boolean
+        if (t.contains("tinyint(1)") || t.startsWith("bool")) {
+            String v = stripSqlQuotes(trimmed);
+            if (v.isEmpty()) return rawValue;
+            return "0".equals(v) ? "false" : "true";
+        }
+        // bit(N) → PG bytea（把整数值转为 ceil(N/8) 字节的十六进制）
+        if (t.startsWith("bit")) {
+            String v = stripSqlQuotes(trimmed);
+            try {
+                long num;
+                String vv = v.toLowerCase();
+                if (vv.startsWith("0x")) {
+                    num = Long.parseLong(vv.substring(2), 16);
+                } else if (vv.startsWith("b'") && vv.endsWith("'")) {
+                    num = Long.parseLong(vv.substring(2, vv.length() - 1), 2);
+                } else {
+                    num = Long.parseLong(vv);
+                }
+                int bits = 1;
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile("bit\\((\\d+)\\)").matcher(t);
+                if (m.find()) bits = Integer.parseInt(m.group(1));
+                int nbytes = Math.max(1, (bits + 7) / 8);
+                StringBuilder hex = new StringBuilder();
+                for (int b = nbytes - 1; b >= 0; b--) {
+                    hex.append(String.format("%02x", (num >> (b * 8)) & 0xFF));
+                }
+                return "E'\\\\x" + hex + "'";
+            } catch (NumberFormatException e) {
+                return rawValue;
+            }
+        }
+        return rawValue;
+    }
+
+    private String stripSqlQuotes(String v) {
+        if (v.length() >= 2 && v.startsWith("'") && v.endsWith("'")) {
+            return v.substring(1, v.length() - 1);
+        }
+        return v;
+    }
 }

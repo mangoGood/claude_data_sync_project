@@ -19,6 +19,7 @@ public class TaskCreatedMessage {
     private String sourceType;
     private String targetType;
     private String taskType;
+    private String drMode;
     private String kafkaBootstrapServers;
     private String kafkaTopicPrefix;
     private String kafkaTopicStrategy;
@@ -26,6 +27,14 @@ public class TaskCreatedMessage {
 
     public TaskCreatedMessage() {
         this.messageType = "TASK_CREATED";
+    }
+
+    public String getDrMode() {
+        return drMode;
+    }
+
+    public void setDrMode(String drMode) {
+        this.drMode = drMode;
     }
 
     public String getTaskId() {

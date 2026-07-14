@@ -2,6 +2,7 @@ package com.migration.increment;
 
 import com.migration.db.ConnectionPoolManager;
 import com.migration.dialect.SqlDialect;
+import com.migration.dialect.TypeTranslator;
 import com.migration.increment.schema.SchemaEvolutionService;
 import java.io.File;
 import java.io.BufferedReader;
@@ -46,6 +47,8 @@ public class THLToSqlConverter {
     private boolean sourceIsMysql;
     private boolean targetIsPostgresql;
     private SqlDialect targetDialect;
+    // 跨库逐值转换与全量共用同一套 per-pair 实现（TypeTranslator.convertLiteral），杜绝增量/全量行为漂移
+    private TypeTranslator translator;
     private String targetDatabaseName;
 
     private SchemaEvolutionService schemaEvolutionService;
@@ -83,6 +86,9 @@ public class THLToSqlConverter {
         this.sourceIsMysql = "mysql".equalsIgnoreCase(props.getProperty("source.db.type", "mysql"));
         this.targetIsPostgresql = this.isPostgresql;
         this.targetDialect = SqlDialect.forType(props.getProperty("target.db.type", "mysql"));
+        this.translator = TypeTranslator.forPair(
+                props.getProperty("source.db.type", "mysql"),
+                props.getProperty("target.db.type", "mysql"));
         this.targetDatabaseName = props.getProperty("target.db.database", "");
 
         this.sqlClassifier = new SqlClassifier();
@@ -461,7 +467,7 @@ public class THLToSqlConverter {
             boolean changed = false;
             for (int i = 0; i < insVals.length; i++) {
                 String type = (fullTypes != null && i < fullTypes.length) ? fullTypes[i] : "";
-                String conv = convertMysqlValueToPg(insVals[i], type);
+                String conv = translator.convertLiteral(insVals[i], type);
                 if (!conv.equals(insVals[i])) { insVals[i] = conv; changed = true; }
             }
             if (changed) rowDataStr = String.join(",", insVals);
@@ -667,58 +673,8 @@ public class THLToSqlConverter {
         return formatValue(value);
     }
 
-    /**
-     * MySQL→PG 增量：把 MySQL 的 bool/bit 原始值转换为 PG 兼容字面量（其余原样返回）。
-     * 全量路径由 DataMigration.convertMysqlToPgValue 处理，增量此前缺失该转换，
-     * 导致 tinyint(1)→boolean 列写入整数、bit→bytea 列写入整数而报类型不匹配。
-     */
-    private String convertMysqlValueToPg(String rawValue, String mysqlType) {
-        if (rawValue == null) return rawValue;
-        String trimmed = rawValue.trim();
-        if (trimmed.isEmpty() || "null".equalsIgnoreCase(trimmed)) return rawValue;
-        String t = (mysqlType == null) ? "" : mysqlType.toLowerCase();
-
-        // tinyint(1) / bool(ean) → PG boolean
-        if (t.contains("tinyint(1)") || t.startsWith("bool")) {
-            String v = stripSqlQuotes(trimmed);
-            if (v.isEmpty()) return rawValue;
-            return "0".equals(v) ? "false" : "true";
-        }
-        // bit(N) → PG bytea（把整数值转为 ceil(N/8) 字节的十六进制）
-        if (t.startsWith("bit")) {
-            String v = stripSqlQuotes(trimmed);
-            try {
-                long num;
-                String vv = v.toLowerCase();
-                if (vv.startsWith("0x")) {
-                    num = Long.parseLong(vv.substring(2), 16);
-                } else if (vv.startsWith("b'") && vv.endsWith("'")) {
-                    num = Long.parseLong(vv.substring(2, vv.length() - 1), 2);
-                } else {
-                    num = Long.parseLong(vv);
-                }
-                int bits = 1;
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile("bit\\((\\d+)\\)").matcher(t);
-                if (m.find()) bits = Integer.parseInt(m.group(1));
-                int nbytes = Math.max(1, (bits + 7) / 8);
-                StringBuilder hex = new StringBuilder();
-                for (int b = nbytes - 1; b >= 0; b--) {
-                    hex.append(String.format("%02x", (num >> (b * 8)) & 0xFF));
-                }
-                return "E'\\\\x" + hex + "'";
-            } catch (NumberFormatException e) {
-                return rawValue;
-            }
-        }
-        return rawValue;
-    }
-
-    private String stripSqlQuotes(String v) {
-        if (v.length() >= 2 && v.startsWith("'") && v.endsWith("'")) {
-            return v.substring(1, v.length() - 1);
-        }
-        return v;
-    }
+    // MySQL→PG 增量逐值转换（bool/bit 字面量）已下沉到 MysqlToPgTranslator.convertLiteral，
+    // 与全量对象路径 convertValue 同处维护；增量端经 translator.convertLiteral 调用，杜绝行为漂移。
 
     /** 带宽度的完整 MySQL 列类型（COLUMN_TYPE，如 tinyint(1)/bit(8)）；缺失时回退到 DATA_TYPE。 */
     private String[] getColumnFullTypes(Map<String, Object> metadata) {
@@ -955,67 +911,14 @@ public class THLToSqlConverter {
             String val = values[i];
             String type = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : "";
 
-            result.append(convertSinglePgValueToMysql(val, type));
+            result.append(translator.convertLiteral(val, type));
         }
 
         return result.toString();
     }
 
-    private String convertSinglePgValueToMysql(String value, String pgType) {
-        if (value == null || value.equalsIgnoreCase("NULL")) {
-            return "NULL";
-        }
-
-        String lowerType = pgType.toLowerCase().trim();
-
-        if (lowerType.equals("boolean") || lowerType.equals("bool")) {
-            if (value.equals("t") || value.equals("true")) return "1";
-            if (value.equals("f") || value.equals("false")) return "0";
-            return value;
-        }
-
-        if (lowerType.contains("uuid")) {
-            if (value.startsWith("'") && value.contains("::uuid")) {
-                return value.substring(0, value.indexOf("::uuid"));
-            }
-            return value;
-        }
-
-        if (lowerType.contains("json") || lowerType.contains("jsonb")) {
-            if (value.contains("::jsonb") || value.contains("::json")) {
-                int idx = value.indexOf("::");
-                if (idx > 0) {
-                    return value.substring(0, idx);
-                }
-            }
-            return value;
-        }
-
-        if (lowerType.contains("timestamp") || lowerType.contains("date") || lowerType.contains("time")) {
-            if (value.contains("::")) {
-                int idx = value.indexOf("::");
-                if (idx > 0) {
-                    return value.substring(0, idx);
-                }
-            }
-            return value;
-        }
-
-        if (lowerType.contains("bytea")) {
-            if (value.startsWith("E'\\\\x") || value.startsWith("E'\\x")) {
-                String hexStr = value.replaceAll("^E'\\\\?x", "").replaceAll("'$", "");
-                return "0x" + hexStr;
-            }
-            return value;
-        }
-
-        if (value.contains("::")) {
-            int idx = value.indexOf("::");
-            return value.substring(0, idx);
-        }
-
-        return value;
-    }
+    // PG→MySQL 增量逐值转换（bool/bytea/去 ::type 后缀）已下沉到 PgToMysqlTranslator.convertLiteral，
+    // 与全量对象路径 convertValue 同处维护；增量端经 translator.convertLiteral 调用，杜绝行为漂移。
 
     private java.util.List<String> generateUpdateSql(THLEvent event, Map<String, Object> metadata) {
         java.util.List<String> statements = new java.util.ArrayList<>();
@@ -1066,11 +969,11 @@ public class THLToSqlConverter {
         if (sourceIsPostgresql && !targetIsPostgresql) {
             for (int i = 0; i < values.length; i++) {
                 String type = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : "";
-                values[i] = convertSinglePgValueToMysql(values[i], type);
+                values[i] = translator.convertLiteral(values[i], type);
             }
             for (int i = 0; i < beforeValues.length; i++) {
                 String type = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : "";
-                beforeValues[i] = convertSinglePgValueToMysql(beforeValues[i], type);
+                beforeValues[i] = translator.convertLiteral(beforeValues[i], type);
             }
         }
 
@@ -1079,11 +982,11 @@ public class THLToSqlConverter {
             String[] fullTypes = getColumnFullTypes(metadata);
             for (int i = 0; i < values.length; i++) {
                 String type = (fullTypes != null && i < fullTypes.length) ? fullTypes[i] : "";
-                values[i] = convertMysqlValueToPg(values[i], type);
+                values[i] = translator.convertLiteral(values[i], type);
             }
             for (int i = 0; i < beforeValues.length; i++) {
                 String type = (fullTypes != null && i < fullTypes.length) ? fullTypes[i] : "";
-                beforeValues[i] = convertMysqlValueToPg(beforeValues[i], type);
+                beforeValues[i] = translator.convertLiteral(beforeValues[i], type);
             }
         }
 
@@ -1212,7 +1115,7 @@ public class THLToSqlConverter {
         if (sourceIsPostgresql && !targetIsPostgresql) {
             for (int i = 0; i < values.length; i++) {
                 String type = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : "";
-                values[i] = convertSinglePgValueToMysql(values[i], type);
+                values[i] = translator.convertLiteral(values[i], type);
             }
         }
 
@@ -1290,7 +1193,12 @@ public class THLToSqlConverter {
         }
 
         if (classification.isUse()) {
-            statements.add(sql.trim() + (sql.trim().endsWith(";") ? "" : ";"));
+            // USE 语句也需库名映射（USE test1 → USE test2），否则后续无限定 DDL 会落到错库
+            String useSql = sql.trim();
+            if (schemaEvolutionService != null) {
+                useSql = schemaEvolutionService.rewriteSchemaIdentifiers(useSql);
+            }
+            statements.add(useSql + (useSql.endsWith(";") ? "" : ";"));
             return statements;
         }
 

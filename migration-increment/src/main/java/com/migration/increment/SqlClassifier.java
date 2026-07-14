@@ -34,8 +34,28 @@ public class SqlClassifier {
         RENAME_TABLE,
         CREATE_DATABASE,
         DROP_DATABASE,
+        CREATE_PROCEDURE,
+        ALTER_PROCEDURE,
+        DROP_PROCEDURE,
+        CREATE_FUNCTION,
+        ALTER_FUNCTION,
+        DROP_FUNCTION,
+        CREATE_TRIGGER,
+        DROP_TRIGGER,
+        CREATE_EVENT,
+        ALTER_EVENT,
+        DROP_EVENT,
         UNKNOWN_DDL
     }
+
+    /**
+     * 存储程序/触发器/事件 DDL 的正则预判。ANTLR 分类语法只覆盖表/索引/库级语句，
+     * CREATE PROCEDURE 等复杂语句体会解析失败落入 OTHER；这里在进 ANTLR 前先行识别。
+     * 兼容 binlog 中常见的 DEFINER 子句（CREATE DEFINER=`root`@`%` PROCEDURE ...）。
+     */
+    private static final java.util.regex.Pattern ROUTINE_DDL_PATTERN = java.util.regex.Pattern.compile(
+            "^\\s*(CREATE|ALTER|DROP)\\s+(?:DEFINER\\s*=\\s*\\S+\\s+)?(PROCEDURE|FUNCTION|TRIGGER|EVENT)\\b",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
 
     public enum DmlSubType {
         INSERT,
@@ -119,6 +139,17 @@ public class SqlClassifier {
         if (sql == null || sql.trim().isEmpty()) {
             result.setStatementType(StatementType.OTHER);
             result.setParseSuccess(false);
+            return result;
+        }
+
+        // 存储程序/触发器/事件 DDL：正则先行识别（见 ROUTINE_DDL_PATTERN 注释）
+        java.util.regex.Matcher routineMatcher = ROUTINE_DDL_PATTERN.matcher(sql);
+        if (routineMatcher.find()) {
+            result.setStatementType(StatementType.DDL);
+            result.setDdlSubType(DdlSubType.valueOf(
+                    routineMatcher.group(1).toUpperCase() + "_" + routineMatcher.group(2).toUpperCase()));
+            result.setNeedsDatabaseSelection(true);
+            result.setParseSuccess(true);
             return result;
         }
 

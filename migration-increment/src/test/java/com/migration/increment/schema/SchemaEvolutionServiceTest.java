@@ -197,4 +197,100 @@ class SchemaEvolutionServiceTest {
         assertNotNull(executedSql);
         assertTrue(executedSql.contains("target_db"), "数据库名应被映射");
     }
+
+    // ==================== 同步粒度策略 ====================
+
+    @Test
+    @DisplayName("表级同步：同步清单外的新表 CREATE TABLE 应被屏蔽")
+    void tableLevelShouldBlockDdlForUnselectedTable() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("migration.included.tables", "db1.t1,db1.t2");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult result = service.applyDdl(
+                "CREATE TABLE t_unselected (id INT PRIMARY KEY)", "CREATE_TABLE", "db1");
+
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, result.getStatus());
+        // 目标库不应出现该表
+        try (java.sql.Statement st = connection.createStatement();
+             java.sql.ResultSet rs = st.executeQuery(
+                     "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE UPPER(TABLE_NAME)='T_UNSELECTED'")) {
+            rs.next();
+            assertEquals(0, rs.getInt(1), "清单外新表不应被建到目标库");
+        }
+    }
+
+    @Test
+    @DisplayName("表级同步：带库限定符的清单外表 DDL 同样屏蔽")
+    void tableLevelShouldBlockQualifiedUnselectedTable() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("migration.included.tables", "db1.t1");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult result = service.applyDdl(
+                "ALTER TABLE `db1`.`t_other` ADD COLUMN c INT", "ALTER_TABLE", "db1");
+
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, result.getStatus());
+    }
+
+    @Test
+    @DisplayName("表级同步：清单内表的 DDL 正常应用")
+    void tableLevelShouldApplyDdlForSelectedTable() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("migration.included.tables", "db1.t_sel");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult created = service.applyDdl(
+                "CREATE TABLE t_sel (id INT PRIMARY KEY)", "CREATE_TABLE", "db1");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED, created.getStatus());
+
+        SchemaEvolutionService.ApplyResult altered = service.applyDdl(
+                "ALTER TABLE t_sel ADD COLUMN c INT", "ALTER_TABLE", "db1");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED, altered.getStatus());
+    }
+
+    @Test
+    @DisplayName("库级同步：范围内新表 CREATE TABLE 正常应用（不受表清单过滤影响）")
+    void dbLevelShouldApplyNewTableDdl() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("sync.db.level", "true");
+        props.setProperty("sync.db.level.databases", "db1");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult result = service.applyDdl(
+                "CREATE TABLE t_dblevel_extra (id INT PRIMARY KEY)", "CREATE_TABLE", "db1");
+
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED, result.getStatus());
+    }
+
+    @Test
+    @DisplayName("库级同步：范围外数据库的 DDL 屏蔽")
+    void dbLevelShouldBlockOutOfScopeDatabase() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("sync.db.level", "true");
+        props.setProperty("sync.db.level.databases", "db1");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult result = service.applyDdl(
+                "CREATE TABLE t_x (id INT)", "CREATE_TABLE", "other_db");
+
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, result.getStatus());
+    }
+
+    @Test
+    @DisplayName("TRIGGER/EVENT DDL：两种粒度都运行期跳过（任务结束时统一同步）")
+    void triggerAndEventDdlAlwaysDeferred() throws SQLException {
+        Properties tableProps = baseProps();
+        tableProps.setProperty("migration.included.tables", "db1.t1");
+        SchemaEvolutionService tableSvc = createService(tableProps);
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, tableSvc.applyDdl(
+                "CREATE TRIGGER trg1 BEFORE INSERT ON t1 FOR EACH ROW SET @x=1", "CREATE_TRIGGER", "db1").getStatus());
+
+        Properties dbProps = baseProps();
+        dbProps.setProperty("sync.db.level", "true");
+        dbProps.setProperty("sync.db.level.databases", "db1");
+        SchemaEvolutionService dbSvc = createService(dbProps);
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, dbSvc.applyDdl(
+                "CREATE EVENT ev1 ON SCHEDULE EVERY 1 DAY DO DELETE FROM t1", "CREATE_EVENT", "db1").getStatus());
+    }
 }

@@ -23,7 +23,7 @@ public class MetadataService {
     private static final Logger logger = LoggerFactory.getLogger(MetadataService.class);
 
     private static final Pattern CONNECTION_PATTERN = Pattern.compile(
-        "(?:mysql|postgresql|oracle)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
+        "(?:mysql|postgresql|oracle|mongodb|elastic)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
     );
 
     public static class ParsedConnection {
@@ -50,6 +50,14 @@ public class MetadataService {
         public boolean isOracle() {
             return "oracle".equals(type);
         }
+
+        public boolean isMongo() {
+            return "mongodb".equals(type);
+        }
+
+        public boolean isElastic() {
+            return "elasticsearch".equals(type);
+        }
     }
 
     public ParsedConnection parseConnection(String connectionStr) {
@@ -62,6 +70,10 @@ public class MetadataService {
             dbType = "postgresql";
         } else if (connectionStr.startsWith("oracle://")) {
             dbType = "oracle";
+        } else if (connectionStr.startsWith("mongodb://")) {
+            dbType = "mongodb";
+        } else if (connectionStr.startsWith("elastic://")) {
+            dbType = "elasticsearch";
         } else {
             dbType = "mysql";
         }
@@ -98,8 +110,38 @@ public class MetadataService {
         ParsedConnection conn = parseConnection(connectionStr);
         boolean isPg = conn.isPostgresql();
         boolean isOracle = conn.isOracle();
+        boolean isMongo = conn.isMongo();
         boolean expectPg = "postgresql".equalsIgnoreCase(expectedType);
         boolean expectOracle = "oracle".equalsIgnoreCase(expectedType);
+        boolean expectMongo = "mongodb".equalsIgnoreCase(expectedType);
+
+        // MongoDB 不走 JDBC，类型互斥后单独处理
+        if (expectMongo && !isMongo) {
+            return new ConnectionTestResult(false, "DB_TYPE_MISMATCH",
+                "期望MongoDB数据库，但连接串格式不匹配", "连接串应以 mongodb:// 开头");
+        }
+        if (!expectMongo && isMongo) {
+            return new ConnectionTestResult(false, "DB_TYPE_MISMATCH",
+                "连接串为MongoDB格式，但所选数据库类型不是MongoDB", "请检查数据库类型是否正确");
+        }
+        if (isMongo) {
+            return testMongoConnectionDetailed(conn);
+        }
+
+        // Elasticsearch 走 HTTP REST，类型互斥后单独处理
+        boolean isElastic = conn.isElastic();
+        boolean expectElastic = "elasticsearch".equalsIgnoreCase(expectedType);
+        if (expectElastic && !isElastic) {
+            return new ConnectionTestResult(false, "DB_TYPE_MISMATCH",
+                "期望Elasticsearch，但连接串格式不匹配", "连接串应以 elastic:// 开头");
+        }
+        if (!expectElastic && isElastic) {
+            return new ConnectionTestResult(false, "DB_TYPE_MISMATCH",
+                "连接串为Elasticsearch格式，但所选数据库类型不是Elasticsearch", "请检查数据库类型是否正确");
+        }
+        if (isElastic) {
+            return testElasticConnectionDetailed(conn);
+        }
 
         try {
             if (isPg) {
@@ -143,7 +185,10 @@ public class MetadataService {
                 conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "");
         }
 
-        try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
+        // 测试连接必须用一次性直连（DriverManager），不能走连接池：
+        // 测试语义是"验证当前输入的凭证"，复用池中既有连接会掩盖凭证错误，
+        // 且一次性测试不应催生常驻池。
+        try (Connection connection = java.sql.DriverManager.getConnection(jdbcUrl, conn.username, conn.password)) {
             if (connection.isValid(5)) {
                 String dbTypeName = isPg ? "PostgreSQL" : (isOracle ? "Oracle" : "MySQL");
                 return new ConnectionTestResult(true, null, dbTypeName + "连接成功", null);
@@ -182,6 +227,125 @@ public class MetadataService {
                 return new ConnectionTestResult(false, "TIMEOUT",
                     "连接超时：20秒内未连接到数据库服务器", "请检查数据库服务器是否可达，以及防火墙设置");
             }
+            return new ConnectionTestResult(false, "CONNECTION_FAILED",
+                "连接失败：" + e.getMessage(), "请检查连接参数是否正确");
+        }
+    }
+
+    /**
+     * 构建一次性 MongoClient。使用 directConnection 只连指定节点，避免驱动按副本集
+     * 配置里的内部主机名（容器 hostname 等）重路由导致不可达；副本集属性仍可通过
+     * hello 命令读取。调用方负责 close。
+     */
+    private com.mongodb.client.MongoClient buildMongoClient(ParsedConnection conn) {
+        String userInfo = "";
+        if (conn.username != null && !conn.username.isEmpty()) {
+            userInfo = urlEncode(conn.username) + ":" + urlEncode(conn.password) + "@";
+        }
+        String uri = String.format(
+            "mongodb://%s%s:%d/?authSource=admin&directConnection=true"
+                + "&connectTimeoutMS=15000&socketTimeoutMS=15000&serverSelectionTimeoutMS=15000",
+            userInfo, conn.host, conn.port);
+        return com.mongodb.client.MongoClients.create(uri);
+    }
+
+    private static String urlEncode(String s) {
+        return java.net.URLEncoder.encode(s == null ? "" : s, java.nio.charset.StandardCharsets.UTF_8)
+                .replace("+", "%20");
+    }
+
+    /** 对 Mongo 节点执行 hello 命令（4.x 之前叫 isMaster，hello 自 4.4.2 起可用并向后兼容路由）。 */
+    private org.bson.Document mongoHello(com.mongodb.client.MongoClient client) {
+        try {
+            return client.getDatabase("admin").runCommand(new org.bson.Document("hello", 1));
+        } catch (com.mongodb.MongoCommandException e) {
+            return client.getDatabase("admin").runCommand(new org.bson.Document("isMaster", 1));
+        }
+    }
+
+    /** mongos 的 hello 响应带 msg=isdbgrid（无 setName）——用于识别分片集群路由节点。 */
+    private static boolean isMongos(org.bson.Document hello) {
+        return "isdbgrid".equals(hello.getString("msg"));
+    }
+
+    private ConnectionTestResult testMongoConnectionDetailed(ParsedConnection conn) {
+        try (com.mongodb.client.MongoClient client = buildMongoClient(conn)) {
+            org.bson.Document hello = mongoHello(client);
+            String setName = hello.getString("setName");
+            String suffix = isMongos(hello)
+                    ? "（分片集群 mongos）"
+                    : (setName != null ? "（副本集: " + setName + "）" : "（独立节点，非副本集）");
+            return new ConnectionTestResult(true, null, "MongoDB连接成功" + suffix, null);
+        } catch (com.mongodb.MongoSecurityException e) {
+            return new ConnectionTestResult(false, "AUTH_FAILED",
+                "认证失败：用户名或密码错误", "请检查用户名和密码是否正确");
+        } catch (com.mongodb.MongoTimeoutException e) {
+            // 认证失败在驱动内也可能表现为服务器选择超时，从 cause 链里甄别
+            if (hasMongoAuthFailureCause(e)) {
+                return new ConnectionTestResult(false, "AUTH_FAILED",
+                    "认证失败：用户名或密码错误", "请检查用户名和密码是否正确");
+            }
+            return new ConnectionTestResult(false, "NETWORK_ERROR",
+                "网络连接失败：" + e.getMessage(), "请检查MongoDB地址和端口是否正确，以及网络是否可达");
+        } catch (Exception e) {
+            return new ConnectionTestResult(false, "CONNECTION_FAILED",
+                "连接失败：" + e.getMessage(), "请检查连接参数是否正确");
+        }
+    }
+
+    private boolean hasMongoAuthFailureCause(Throwable e) {
+        String msg = e.getMessage();
+        return msg != null && (msg.contains("Authentication failed")
+                || msg.contains("MongoSecurityException")
+                || msg.contains("SCRAM"));
+    }
+
+    // ==================== Elasticsearch（HTTP REST，不走 JDBC） ====================
+
+    /** GET {path}，返回 [statusCode, body]；网络级失败抛异常。 */
+    private String[] esHttpGet(ParsedConnection conn, String path) throws Exception {
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(15))
+                .build();
+        java.net.http.HttpRequest.Builder b = java.net.http.HttpRequest.newBuilder(
+                        java.net.URI.create("http://" + conn.host + ":" + conn.port + path))
+                .timeout(java.time.Duration.ofSeconds(15));
+        if (conn.username != null && !conn.username.isEmpty()) {
+            String basic = java.util.Base64.getEncoder().encodeToString(
+                    (conn.username + ":" + (conn.password == null ? "" : conn.password))
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            b.header("Authorization", "Basic " + basic);
+        }
+        java.net.http.HttpResponse<String> resp = client.send(b.GET().build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString());
+        return new String[]{String.valueOf(resp.statusCode()), resp.body()};
+    }
+
+    private ConnectionTestResult testElasticConnectionDetailed(ParsedConnection conn) {
+        try {
+            String[] resp = esHttpGet(conn, "/");
+            int status = Integer.parseInt(resp[0]);
+            if (status == 401 || status == 403) {
+                return new ConnectionTestResult(false, "AUTH_FAILED",
+                    "认证失败：用户名或密码错误", "请检查用户名和密码是否正确");
+            }
+            if (status >= 300) {
+                return new ConnectionTestResult(false, "CONNECTION_FAILED",
+                    "连接失败：HTTP " + status, "请检查Elasticsearch服务状态");
+            }
+            String version = "";
+            try {
+                com.google.gson.JsonObject json = com.google.gson.JsonParser.parseString(resp[1]).getAsJsonObject();
+                version = json.getAsJsonObject("version").get("number").getAsString();
+            } catch (Exception ignore) {
+                // 版本解析失败不影响连通性结论
+            }
+            return new ConnectionTestResult(true, null,
+                "Elasticsearch连接成功" + (version.isEmpty() ? "" : "（版本 " + version + "）"), null);
+        } catch (java.net.ConnectException | java.net.http.HttpConnectTimeoutException e) {
+            return new ConnectionTestResult(false, "NETWORK_ERROR",
+                "网络连接失败：" + e.getMessage(), "请检查Elasticsearch地址和端口是否正确，以及网络是否可达");
+        } catch (Exception e) {
             return new ConnectionTestResult(false, "CONNECTION_FAILED",
                 "连接失败：" + e.getMessage(), "请检查连接参数是否正确");
         }
@@ -300,7 +464,17 @@ public class MetadataService {
 
     public boolean testConnection(String connectionStr) {
         ParsedConnection conn = parseConnection(connectionStr);
-        
+
+        if (conn.isMongo()) {
+            try (com.mongodb.client.MongoClient client = buildMongoClient(conn)) {
+                client.getDatabase("admin").runCommand(new org.bson.Document("ping", 1));
+                return true;
+            } catch (Exception e) {
+                logger.error("测试MongoDB连接失败: {}", e.getMessage());
+                return false;
+            }
+        }
+
         try {
             Connection connection;
             if (conn.isPostgresql()) {
@@ -328,9 +502,24 @@ public class MetadataService {
 
     public List<String> listDatabases(String connectionStr) {
         ParsedConnection conn = parseConnection(connectionStr);
-        
+
         List<String> databases = new ArrayList<>();
-        
+
+        if (conn.isMongo()) {
+            try (com.mongodb.client.MongoClient client = buildMongoClient(conn)) {
+                for (String dbName : client.listDatabaseNames()) {
+                    if (!isMongoSystemDatabase(dbName)) {
+                        databases.add(dbName);
+                    }
+                }
+                logger.info("查询到 {} 个MongoDB数据库", databases.size());
+                return databases;
+            } catch (Exception e) {
+                logger.error("查询MongoDB数据库列表失败: {}", e.getMessage());
+                throw new RuntimeException("查询数据库列表失败: " + e.getMessage());
+            }
+        }
+
         try {
             if (conn.isPostgresql()) {
                 Class.forName("org.postgresql.Driver");
@@ -396,11 +585,35 @@ public class MetadataService {
                "sys".equalsIgnoreCase(dbName);
     }
 
+    private boolean isMongoSystemDatabase(String dbName) {
+        return "admin".equalsIgnoreCase(dbName) ||
+               "local".equalsIgnoreCase(dbName) ||
+               "config".equalsIgnoreCase(dbName);
+    }
+
     public List<TableInfo> listTables(String connectionStr, String database) {
         ParsedConnection conn = parseConnection(connectionStr);
-        
+
         List<TableInfo> tables = new ArrayList<>();
-        
+
+        if (conn.isMongo()) {
+            try (com.mongodb.client.MongoClient client = buildMongoClient(conn)) {
+                com.mongodb.client.MongoDatabase db = client.getDatabase(database);
+                for (String name : db.listCollectionNames()) {
+                    if (name.startsWith("system.")) {
+                        continue;
+                    }
+                    long docs = db.getCollection(name).estimatedDocumentCount();
+                    tables.add(new TableInfo(name, docs, "", "COLLECTION"));
+                }
+                logger.info("MongoDB数据库 {} 查询到 {} 个集合", database, tables.size());
+                return tables;
+            } catch (Exception e) {
+                logger.error("查询MongoDB集合列表失败: {}", e.getMessage());
+                throw new RuntimeException("查询表列表失败: " + e.getMessage());
+            }
+        }
+
         try {
             if (conn.isPostgresql()) {
                 Class.forName("org.postgresql.Driver");
@@ -751,7 +964,27 @@ public class MetadataService {
 
     public ValidationResult validateForMigration(String sourceConnection, String targetConnection,
                                                   String migrationMode, String sourceType, String targetType) {
+        return validateForMigration(sourceConnection, targetConnection, migrationMode, sourceType, targetType, null);
+    }
+
+    public ValidationResult validateForMigration(String sourceConnection, String targetConnection,
+                                                  String migrationMode, String sourceType, String targetType,
+                                                  String drMode) {
         ValidationResult result = new ValidationResult();
+
+        boolean sourceIsMongo = "mongodb".equalsIgnoreCase(sourceType);
+        boolean targetIsMongo = "mongodb".equalsIgnoreCase(targetType);
+        if (sourceIsMongo || targetIsMongo) {
+            return validateForMongoMigration(sourceConnection, targetConnection, migrationMode,
+                    sourceIsMongo, targetIsMongo, result);
+        }
+
+        boolean sourceIsEs = "elasticsearch".equalsIgnoreCase(sourceType);
+        boolean targetIsEs = "elasticsearch".equalsIgnoreCase(targetType);
+        if (sourceIsEs || targetIsEs) {
+            return validateForElasticMigration(sourceConnection, targetConnection, migrationMode,
+                    sourceIsEs, sourceType, result);
+        }
 
         boolean sourceIsPg = "postgresql".equalsIgnoreCase(sourceType);
         boolean sourceIsOracle = "oracle".equalsIgnoreCase(sourceType);
@@ -759,7 +992,9 @@ public class MetadataService {
         boolean bothMysql = !sourceIsPg && !sourceIsOracle && !targetIsPg;
         boolean mysqlToPg = !sourceIsPg && !sourceIsOracle && targetIsPg;
         boolean pgToMysql = sourceIsPg && !targetIsPg;
+        boolean bothPg = sourceIsPg && targetIsPg;
         boolean oracleToPg = sourceIsOracle && targetIsPg;
+        boolean bidirectional = "BIDIRECTIONAL".equalsIgnoreCase(drMode);
 
         ParsedConnection sourceConn = parseConnection(sourceConnection);
         ParsedConnection targetConn = parseConnection(targetConnection);
@@ -807,6 +1042,18 @@ public class MetadataService {
                 checkPgWalConfig(sourceDb, result);
             }
 
+            if (bothPg) {
+                // PG→PG（含单向/双向灾备）：增量捕获需要源端 WAL 为 logical。
+                if ("fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode)) {
+                    checkPgWalConfig(sourceDb, result);
+                    checkPgReplicationSlot(sourceDb, result);
+                    // 双向灾备：反向通道（B→A）的 capture 跑在目标库 B 上，故 B 也需 logical WAL。
+                    if (bidirectional) {
+                        checkPgWalConfigLabeled(targetDb, result, "目标库");
+                    }
+                }
+            }
+
             if (oracleToPg) {
                 // Oracle→PG: 检查源端Oracle的LogMiner/归档日志配置
                 checkOracleLogMinerConfig(sourceDb, result, migrationMode);
@@ -823,6 +1070,203 @@ public class MetadataService {
         result.setAllPassed(allPassed);
 
         return result;
+    }
+
+    /**
+     * MySQL → Elasticsearch 同步预校验。
+     * 检查项：类型组合（ES 仅可作目标、源必须 MySQL）、源库连接、增量所需 binlog 配置
+     * （复用 mysql→mysql 的三项检查）、目标 ES 连接/集群健康/版本。
+     */
+    private ValidationResult validateForElasticMigration(String sourceConnection, String targetConnection,
+                                                         String migrationMode, boolean sourceIsEs,
+                                                         String sourceType, ValidationResult result) {
+        if (sourceIsEs) {
+            result.addItem("类型组合", "Elasticsearch 只能作为同步目标", false,
+                    "Elasticsearch 不支持作为同步源，仅支持 MySQL 到 Elasticsearch", "error");
+            result.setAllPassed(false);
+            return result;
+        }
+        if (!"mysql".equalsIgnoreCase(sourceType)) {
+            result.addItem("类型组合", "Elasticsearch 目标仅支持 MySQL 源", false,
+                    "到 Elasticsearch 的同步目前仅支持 MySQL 源（binlog 增量捕获）", "error");
+            result.setAllPassed(false);
+            return result;
+        }
+
+        ParsedConnection sourceConn = parseConnection(sourceConnection);
+        ParsedConnection targetConn = parseConnection(targetConnection);
+        if (!targetConn.isElastic()) {
+            result.addItem("连接串格式", "Elasticsearch 连接串格式检查", false,
+                    "目标连接串应以 elastic:// 开头", "error");
+            result.setAllPassed(false);
+            return result;
+        }
+
+        // 源库：连接 + 增量所需 binlog 配置（与 mysql→mysql 相同的三项检查）
+        try (Connection sourceDb = DataSourcePoolManager.getConnection(
+                buildJdbcUrl(sourceConn), sourceConn.username, sourceConn.password)) {
+            result.addItem("源库连接", "源数据库连接检查", true, "MySQL源库连接成功", "info");
+            if ("fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode)) {
+                checkBinlogEnabled(sourceDb, result);
+                checkBinlogFormat(sourceDb, result);
+                checkBinlogRowImage(sourceDb, result);
+            }
+        } catch (SQLException e) {
+            logger.error("MySQL 源库校验失败: {}", e.getMessage());
+            result.addItem("源库连接", "源数据库连接检查", false, "连接失败: " + e.getMessage(), "error");
+        }
+
+        // 目标 ES：连接 + 集群健康 + 版本
+        try {
+            String[] info = esHttpGet(targetConn, "/");
+            int status = Integer.parseInt(info[0]);
+            if (status == 401 || status == 403) {
+                result.addItem("目标库连接", "目标Elasticsearch连接检查", false,
+                        "认证失败：用户名或密码错误", "error");
+            } else if (status >= 300) {
+                result.addItem("目标库连接", "目标Elasticsearch连接检查", false,
+                        "连接失败: HTTP " + status, "error");
+            } else {
+                result.addItem("目标库连接", "目标Elasticsearch连接检查", true,
+                        "Elasticsearch目标连接成功", "info");
+
+                String version = null;
+                try {
+                    version = com.google.gson.JsonParser.parseString(info[1]).getAsJsonObject()
+                            .getAsJsonObject("version").get("number").getAsString();
+                } catch (Exception ignore) {
+                    // 版本信息缺失不阻塞
+                }
+                result.addItem("目标库版本", "目标Elasticsearch版本检查", true,
+                        version != null ? "Elasticsearch " + version : "无法获取版本信息（非致命）",
+                        version != null ? "info" : "warning");
+
+                try {
+                    String[] health = esHttpGet(targetConn, "/_cluster/health");
+                    String clusterStatus = com.google.gson.JsonParser.parseString(health[1])
+                            .getAsJsonObject().get("status").getAsString();
+                    boolean healthy = !"red".equalsIgnoreCase(clusterStatus);
+                    result.addItem("目标集群健康", "目标Elasticsearch集群健康检查", healthy,
+                            "集群状态: " + clusterStatus + (healthy ? "" : "，red 状态无法可靠写入"),
+                            healthy ? "info" : "error");
+                } catch (Exception e) {
+                    result.addItem("目标集群健康", "目标Elasticsearch集群健康检查", true,
+                            "无法获取集群健康（非致命）: " + e.getMessage(), "warning");
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Elasticsearch 目标校验失败: {}", e.getMessage());
+            result.addItem("目标库连接", "目标Elasticsearch连接检查", false,
+                    "连接失败: " + e.getMessage(), "error");
+        }
+
+        boolean allPassed = result.getCheckItems().stream().allMatch(ValidationResult.CheckItem::isPassed);
+        result.setAllPassed(allPassed);
+        return result;
+    }
+
+    /**
+     * MongoDB 同步预校验：仅支持 mongodb→mongodb（副本集到副本集）。
+     * 检查项：类型组合互斥、源/目标连接、源/目标副本集（Change Streams 依赖副本集 oplog）、
+     * 目标节点可写（Primary）、服务器版本。
+     */
+    private ValidationResult validateForMongoMigration(String sourceConnection, String targetConnection,
+                                                       String migrationMode,
+                                                       boolean sourceIsMongo, boolean targetIsMongo,
+                                                       ValidationResult result) {
+        if (!sourceIsMongo || !targetIsMongo) {
+            result.addItem("类型组合", "MongoDB 仅支持 MongoDB 到 MongoDB 的同步", false,
+                    "MongoDB 只能与 MongoDB 互相同步，不支持与其它数据库类型组合", "error");
+            result.setAllPassed(false);
+            return result;
+        }
+
+        ParsedConnection sourceConn = parseConnection(sourceConnection);
+        ParsedConnection targetConn = parseConnection(targetConnection);
+        if (!sourceConn.isMongo() || !targetConn.isMongo()) {
+            result.addItem("连接串格式", "MongoDB 连接串格式检查", false,
+                    "连接串应以 mongodb:// 开头", "error");
+            result.setAllPassed(false);
+            return result;
+        }
+
+        checkMongoEndpoint(sourceConn, "源库", true, migrationMode, result);
+        checkMongoEndpoint(targetConn, "目标库", false, migrationMode, result);
+
+        boolean allPassed = result.getCheckItems().stream().allMatch(ValidationResult.CheckItem::isPassed);
+        result.setAllPassed(allPassed);
+        return result;
+    }
+
+    private void checkMongoEndpoint(ParsedConnection conn, String side, boolean isSource,
+                                    String migrationMode, ValidationResult result) {
+        boolean needIncrement = "fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode);
+
+        try (com.mongodb.client.MongoClient client = buildMongoClient(conn)) {
+            org.bson.Document hello = mongoHello(client);
+            result.addItem(side + "连接", side + "MongoDB连接检查", true,
+                    "MongoDB" + side + "连接成功", "info");
+
+            // 副本集/分片集群检查：源端 Change Streams 依赖副本集 oplog；分片集群经 mongos
+            // 打开的 change stream 会聚合全部 shard 的写入（官方集群级 CDC 机制），等同通过。
+            // 分片集群请直接填 mongos 地址，勿逐个 shard 直连——那会读到 chunk 迁移的孤儿文档。
+            String setName = hello.getString("setName");
+            boolean isReplicaSet = setName != null && !setName.isEmpty();
+            boolean isSharded = isMongos(hello);
+            boolean streamCapable = isReplicaSet || isSharded;
+            String topology = isSharded ? "分片集群（mongos）"
+                    : (isReplicaSet ? "副本集（" + setName + "）" : "独立节点");
+            if (isSource) {
+                boolean passed = streamCapable || !needIncrement;
+                String message = streamCapable
+                        ? "源库为" + topology + "，支持 Change Streams 增量捕获"
+                        : "源库为独立节点" + (needIncrement ? "，增量同步（Change Streams）需要副本集或分片集群（mongos）" : "，仅全量可运行，建议使用副本集");
+                result.addItem("源库副本集", "增量同步需要源库为副本集或分片集群", passed, message,
+                        needIncrement && !streamCapable ? "error" : (streamCapable ? "info" : "warning"));
+            } else {
+                String message = streamCapable
+                        ? "目标库为" + topology
+                        : "目标库为独立节点，本功能定义为副本集/分片集群间同步，建议使用副本集或 mongos";
+                result.addItem("目标库副本集", "目标库应为副本集或分片集群", streamCapable, message,
+                        streamCapable ? "info" : "error");
+
+                // 目标可写：directConnection 连的节点必须是 Primary 才能写入
+                Boolean writable = hello.getBoolean("isWritablePrimary");
+                if (writable == null) {
+                    writable = hello.getBoolean("ismaster");
+                }
+                boolean isWritable = Boolean.TRUE.equals(writable);
+                result.addItem("目标库可写", "目标节点需为 Primary（可写）", isWritable,
+                        isWritable ? "目标节点为 Primary，可写入" : "目标节点不可写（非 Primary），请连接副本集 Primary 节点",
+                        isWritable ? "info" : "error");
+            }
+
+            // 版本检查：Change Streams 需要 4.0+（resumeAfter 恢复语义稳定）
+            try {
+                org.bson.Document buildInfo = client.getDatabase("admin")
+                        .runCommand(new org.bson.Document("buildInfo", 1));
+                String version = buildInfo.getString("version");
+                boolean versionOk = true;
+                if (version != null && isSource && needIncrement) {
+                    try {
+                        int major = Integer.parseInt(version.split("\\.")[0]);
+                        versionOk = major >= 4;
+                    } catch (NumberFormatException ignore) {
+                        // 无法解析版本号时不阻塞
+                    }
+                }
+                result.addItem(side + "版本", side + "MongoDB版本检查", versionOk,
+                        "MongoDB " + version + (versionOk ? "" : "，增量同步（Change Streams）需要 4.0 及以上版本"),
+                        versionOk ? "info" : "error");
+            } catch (Exception e) {
+                result.addItem(side + "版本", side + "MongoDB版本检查", true,
+                        "无法获取版本信息（非致命）: " + e.getMessage(), "warning");
+            }
+        } catch (Exception e) {
+            logger.error("MongoDB {} 校验失败: {}", side, e.getMessage());
+            result.addItem(side + "连接", side + "MongoDB连接检查", false,
+                    "连接失败: " + e.getMessage(), "error");
+        }
     }
 
     /**
@@ -894,19 +1338,24 @@ public class MetadataService {
     }
     
     private void checkPgWalConfig(Connection conn, ValidationResult result) {
+        checkPgWalConfigLabeled(conn, result, "源库");
+    }
+
+    /** WAL 级别检查（label 区分源库/目标库；双向灾备时目标库也需 logical WAL 供反向 capture）。 */
+    private void checkPgWalConfigLabeled(Connection conn, ValidationResult result, String label) {
         try {
             try (Statement stmt = conn.createStatement();
                  ResultSet rs = stmt.executeQuery("SHOW wal_level")) {
                 if (rs.next()) {
                     String walLevel = rs.getString(1);
                     boolean passed = "logical".equalsIgnoreCase(walLevel);
-                    String message = passed ? "WAL级别为logical，支持增量同步" : 
-                        "WAL级别为" + walLevel + "，增量同步需要设置为logical";
-                    result.addItem("WAL级别", "增量同步需要源数据库WAL级别为logical", passed, message, "error");
+                    String message = passed ? label + "WAL级别为logical，支持增量同步" :
+                        label + "WAL级别为" + walLevel + "，增量同步需要设置为logical";
+                    result.addItem(label + "WAL级别", "增量同步需要" + label + "WAL级别为logical", passed, message, "error");
                 }
             }
         } catch (SQLException e) {
-            result.addItem("WAL级别", "增量同步需要源数据库WAL级别为logical", false, 
+            result.addItem(label + "WAL级别", "增量同步需要" + label + "WAL级别为logical", false,
                 "检查失败: " + e.getMessage(), "warning");
         }
     }

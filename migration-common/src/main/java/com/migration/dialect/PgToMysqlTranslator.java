@@ -145,4 +145,65 @@ public class PgToMysqlTranslator implements TypeTranslator {
 
         return value;
     }
+
+    /**
+     * 增量文本路径逐值转换（与上面 {@link #convertValue} 对象路径成对，同库对同一处维护，杜绝漂移）：
+     * boolean → 1/0；bytea {@code E'\xHH'} → MySQL {@code 0xHH}；uuid/json/时间等去掉 PG 的 {@code ::type} 类型转换后缀。
+     */
+    @Override
+    public String convertLiteral(String value, String sourceColumnType) {
+        if (value == null || value.equalsIgnoreCase("NULL")) {
+            return "NULL";
+        }
+
+        String lowerType = sourceColumnType == null ? "" : sourceColumnType.toLowerCase().trim();
+
+        if (lowerType.equals("boolean") || lowerType.equals("bool")) {
+            if (value.equals("t") || value.equals("true")) return "1";
+            if (value.equals("f") || value.equals("false")) return "0";
+            return value;
+        }
+
+        if (lowerType.contains("uuid")) {
+            if (value.startsWith("'") && value.contains("::uuid")) {
+                return value.substring(0, value.indexOf("::uuid"));
+            }
+            return value;
+        }
+
+        if (lowerType.contains("json") || lowerType.contains("jsonb")) {
+            if (value.contains("::jsonb") || value.contains("::json")) {
+                int idx = value.indexOf("::");
+                if (idx > 0) {
+                    return value.substring(0, idx);
+                }
+            }
+            return value;
+        }
+
+        if (lowerType.contains("timestamp") || lowerType.contains("date") || lowerType.contains("time")) {
+            if (value.contains("::")) {
+                int idx = value.indexOf("::");
+                if (idx > 0) {
+                    return value.substring(0, idx);
+                }
+            }
+            return value;
+        }
+
+        if (lowerType.contains("bytea")) {
+            if (value.startsWith("E'\\\\x") || value.startsWith("E'\\x")) {
+                String hexStr = value.replaceAll("^E'\\\\?x", "").replaceAll("'$", "");
+                return "0x" + hexStr;
+            }
+            return value;
+        }
+
+        if (value.contains("::")) {
+            int idx = value.indexOf("::");
+            return value.substring(0, idx);
+        }
+
+        return value;
+    }
 }

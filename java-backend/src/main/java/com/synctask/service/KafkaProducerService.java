@@ -42,6 +42,7 @@ public class KafkaProducerService {
         message.setSourceType(workflow.getSourceType());
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
+        message.setDrMode(workflow.getDrMode());
         message.setKafkaBootstrapServers(workflow.getKafkaBootstrapServers());
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());
         message.setKafkaTopicStrategy(workflow.getKafkaTopicStrategy());
@@ -86,6 +87,7 @@ public class KafkaProducerService {
         message.setSourceType(workflow.getSourceType());
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
+        message.setDrMode(workflow.getDrMode());
         message.setKafkaBootstrapServers(workflow.getKafkaBootstrapServers());
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());
         message.setKafkaTopicStrategy(workflow.getKafkaTopicStrategy());

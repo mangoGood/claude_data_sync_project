@@ -80,12 +80,14 @@ public class ContentCompareService {
                 for (String tableName : actualTables) {
                     TableCompareTask task = new TableCompareTask();
                     task.setSourceDb(isPg ? sourceConn.database : dbName);
-                    task.setTargetDb(isPg ? targetConn.database : dbName);
+                    // mysql 目标库名可能与源库名不同（如 prod -> prod_replica）：targetConn.database
+                    // 在上面已从连接串或 syncObjects 兜底解析好，不能像源库那样直接用 dbName（源库名）
+                    task.setTargetDb(isPg ? targetConn.database : targetConn.database);
                     task.setSourceTable(tableName);
                     task.setTargetTable(tableName);
 
                     String qualifiedSource = isPg ? tableName : dbName + "." + tableName;
-                    String qualifiedTarget = isPg ? tableName : dbName + "." + tableName;
+                    String qualifiedTarget = isPg ? tableName : targetConn.database + "." + tableName;
 
                     task.setPrimaryKeyColumn(detectPrimaryKey(sourceDb, qualifiedSource, isPg, sourceConn.database));
                     task.setColumns(getColumnMeta(sourceDb, qualifiedSource, isPg, sourceConn.database));

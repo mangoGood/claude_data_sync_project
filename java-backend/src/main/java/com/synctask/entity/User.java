@@ -23,6 +23,9 @@ public class User {
 
     private Boolean enabled = true;
 
+    @Column(name = "token_version", nullable = false)
+    private Integer tokenVersion = 0;
+
     @Column(name = "created_at")
     private LocalDateTime createdAt;
 
@@ -86,6 +89,14 @@ public class User {
 
     public void setEnabled(Boolean enabled) {
         this.enabled = enabled;
+    }
+
+    public Integer getTokenVersion() {
+        return tokenVersion;
+    }
+
+    public void setTokenVersion(Integer tokenVersion) {
+        this.tokenVersion = tokenVersion;
     }
 
     public LocalDateTime getCreatedAt() {

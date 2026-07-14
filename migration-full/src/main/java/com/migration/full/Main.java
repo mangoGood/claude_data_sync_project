@@ -135,11 +135,31 @@ public class Main {
                 }
 
                 migrateTables(config, sourceConn, targetConn, tables, progressManager);
+                syncStoredRoutinesIfDbLevel(config, sourceConn, targetConn, dbName);
                 logger.info("数据库 {} 迁移完成", dbName);
             } finally {
                 sourceConn.close();
                 targetConn.close();
             }
+        }
+    }
+
+    /**
+     * 库级同步：表数据迁移完成后，把该库的存储过程/函数复制到目标库。
+     * trigger/event 不在此处理——运行期同步会造成目标库双写，由 agent 在任务结束时统一同步。
+     */
+    private static void syncStoredRoutinesIfDbLevel(MigrationConfig config, DatabaseConnection sourceConn,
+                                                    DatabaseConnection targetConn, String dbName) {
+        Set<String> dbLevelDbs = config.getDbLevelDatabases();
+        if (dbLevelDbs == null || !dbLevelDbs.contains(dbName)) {
+            return;
+        }
+        try {
+            int copied = com.migration.common.sqlobj.StoredObjectSyncUtil.copyProceduresAndFunctions(
+                    sourceConn.getConnection(), targetConn.getConnection(), dbName);
+            logger.info("数据库 {} 库级同步：已复制 {} 个存储过程/函数", dbName, copied);
+        } catch (Exception e) {
+            logger.warn("数据库 {} 存储过程/函数复制失败（表数据不受影响）: {}", dbName, e.getMessage());
         }
     }
 
@@ -194,6 +214,7 @@ public class Main {
             }
 
             migrateTables(config, sourceConn, targetConn, tables, progressManager);
+            syncStoredRoutinesIfDbLevel(config, sourceConn, targetConn, config.getSourceConfig().getDatabase());
         } finally {
             sourceConn.close();
             targetConn.close();
@@ -230,7 +251,10 @@ public class Main {
                     sourceConn, targetConn,
                     config.getBatchSize(),
                     config.isContinueOnError(),
-                    progressManager
+                    progressManager,
+                    config.isShardEnabled(),
+                    config.getShardMinRows(),
+                    config.getShardCount()
                 );
                 dataMigration.migrateAllData(tables);
             }

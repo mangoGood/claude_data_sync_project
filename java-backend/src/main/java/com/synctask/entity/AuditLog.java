@@ -86,7 +86,8 @@ public class AuditLog {
         RETRY_TASK,
         FAILOVER_TASK,
         LOGIN,
-        LOGOUT
+        LOGOUT,
+        CHANGE_PASSWORD
     }
 
     /** 操作结果枚举 */

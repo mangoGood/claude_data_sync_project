@@ -93,6 +93,8 @@ public class ContinuousSubscribeMain {
                 }
             }
         }
+        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
+        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
 
         String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
 

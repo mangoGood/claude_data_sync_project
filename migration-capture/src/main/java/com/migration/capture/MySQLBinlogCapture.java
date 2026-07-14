@@ -8,6 +8,8 @@ import com.github.shyiko.mysql.binlog.event.WriteRowsEventData;
 import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData;
 import com.github.shyiko.mysql.binlog.event.DeleteRowsEventData;
 import com.github.shyiko.mysql.binlog.event.TableMapEventData;
+import com.github.shyiko.mysql.binlog.event.QueryEventData;
+import com.github.shyiko.mysql.binlog.event.XidEventData;
 import com.migration.common.AbstractCapture;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,6 +70,12 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
     // 背压控制：extract 通过信号文件通知 capture 暂停/恢复
     private volatile boolean backpressurePaused = false;
+
+    // ---- 双向同步/环路防护（active-active）----
+    /** 启用后：识别带 origin 标记的复制事务并跳过其数据事件，防止 A→B→A 回环。 */
+    private boolean bidirectionalEnabled;
+    /** 前向单遍状态机：读标记表行事件即置位，遇 BEGIN/XID 复位；带标记事务的数据事件跳过。 */
+    private com.migration.common.bidi.BidiLoopGuard loopGuard;
     private String backpressureSignalPath;
 
     /** 需要同步的数据库集合（为空表示不过滤，捕获所有） */
@@ -87,6 +95,8 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         taskId = props.getProperty("task.id", "unknown");
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         serverId = Long.parseLong(props.getProperty("capture.server.id", "65535"));
+        bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
+        loopGuard = new com.migration.common.bidi.BidiLoopGuard(bidirectionalEnabled);
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
 
         heartbeatDatabase = props.getProperty("source.db.database", "");
@@ -234,6 +244,19 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
      * 检查数据事件（Write/Update/Delete）是否应该被捕获。
      * 通过tableId查找表名，再判断是否在同步范围内。
      */
+    /** 取数据事件（Write/Update/Delete）对应的 {@code db.table} 全名；非数据事件或映射未知返回 null。 */
+    private String dataEventTableName(EventData eventData) {
+        long tableId = -1;
+        if (eventData instanceof WriteRowsEventData) {
+            tableId = ((WriteRowsEventData) eventData).getTableId();
+        } else if (eventData instanceof UpdateRowsEventData) {
+            tableId = ((UpdateRowsEventData) eventData).getTableId();
+        } else if (eventData instanceof DeleteRowsEventData) {
+            tableId = ((DeleteRowsEventData) eventData).getTableId();
+        }
+        return tableId < 0 ? null : tableIdToNameMap.get(tableId);
+    }
+
     private boolean shouldCaptureDataEvent(EventData eventData) {
         long tableId = -1;
         if (eventData instanceof WriteRowsEventData) {
@@ -462,6 +485,31 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                 tableIdToNameMap.put(tableMap.getTableId(), tableMap.getDatabase() + "." + tableMap.getTable());
             }
 
+            // 双向同步/环路防护：前向单遍事务标记状态机
+            if (bidirectionalEnabled) {
+                // 事务边界：BEGIN 开启新事务 / XID 提交，复位标记状态；双向模式下二者均不外传。
+                if (eventData instanceof QueryEventData) {
+                    String sql = ((QueryEventData) eventData).getSql();
+                    if (sql != null && "BEGIN".equalsIgnoreCase(sql.trim())) {
+                        loopGuard.onTransactionBoundary();
+                    }
+                    // 双向模式只复制 DML，不传播 DDL / 事务控制语句（BEGIN/COMMIT/CREATE/ALTER/DROP…）：
+                    // DDL 无法用行标记打标（隐式提交，与 DML 不同事务），在 active-active 里会无限回环。
+                    // schema 变更需各节点带外协调。此举也顺带滤掉 __sync_heartbeat/__sync_origin 建表 DDL。
+                    return;
+                } else if (eventData instanceof XidEventData) {
+                    loopGuard.onTransactionBoundary();
+                    return;
+                }
+                // origin 标记行事件：置位并丢弃（标记表不外传），后续本事务数据事件将被跳过
+                String markerTable = com.migration.common.bidi.BidiConstants.MARKER_TABLE;
+                String evTable = dataEventTableName(eventData);
+                if (evTable != null && evTable.endsWith("." + markerTable)) {
+                    loopGuard.onOriginMarker();
+                    return;
+                }
+            }
+
             if (isHeartbeatEvent(eventData)) {
                 long now = System.currentTimeMillis();
                 lastRpoMs = now - timestamp + clockOffsetMs;
@@ -488,6 +536,10 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                     || (eventData instanceof UpdateRowsEventData)
                     || (eventData instanceof DeleteRowsEventData);
             if (isDataEvent) {
+                // 双向防回环：当前事务带 origin 标记 → 是对端复制而来的写入，跳过、不回传
+                if (loopGuard.shouldSkipReplicatedData()) {
+                    return;
+                }
                 // 基于同步对象过滤：只捕获本任务相关的表事件，避免浪费网络和存储资源
                 if (!shouldCaptureDataEvent(eventData)) {
                     return;

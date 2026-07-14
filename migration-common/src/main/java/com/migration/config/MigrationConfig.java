@@ -17,8 +17,12 @@ public class MigrationConfig {
     private boolean enableIncremental;
     private boolean recordCheckpoint;
     private int fullParallelism;
+    private boolean shardEnabled;
+    private long shardMinRows;
+    private int shardCount;
     private Set<String> includedDatabases;
     private Set<String> includedTables;
+    private Set<String> dbLevelDatabases;
     private String checkpointDbPath;
     private String taskId;
     private String sourceDbType;
@@ -38,6 +42,8 @@ public class MigrationConfig {
         try (InputStream input = new FileInputStream(configFile)) {
             props.load(input);
         }
+        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
+        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
 
         sourceDbType = props.getProperty("source.db.type", "mysql");
         targetDbType = props.getProperty("target.db.type", "mysql");
@@ -85,9 +91,18 @@ public class MigrationConfig {
             fullParallelism = 1;
         }
 
+        // 单表内 PK 范围分片并行：大表（行数 >= shard.min.rows）按数值型主键切分为 shard.count 段并发搬数，
+        // 收益独立于表级并行（对单表/表数少于并行度的场景尤其有效）
+        shardEnabled = Boolean.parseBoolean(props.getProperty("migration.full.shard.enabled", "true"));
+        shardMinRows = Long.parseLong(props.getProperty("migration.full.shard.min.rows", "200000"));
+        shardCount = Integer.parseInt(props.getProperty("migration.full.shard.count", "4"));
+        if (shardCount < 1) {
+            shardCount = 1;
+        }
 
         includedDatabases = parseStringSet(props.getProperty("migration.included.databases", ""));
         includedTables = parseStringSet(props.getProperty("migration.included.tables", ""));
+        dbLevelDatabases = parseStringSet(props.getProperty("sync.db.level.databases", ""));
         
         String defaultCheckpointPath = taskId != null ? 
             "./files/" + taskId + "/checkpoint/checkpoint" : "./checkpoint/checkpoint";
@@ -125,6 +140,21 @@ public class MigrationConfig {
         return batchSize;
     }
 
+    /** 单表 PK 范围分片是否启用（migration.full.shard.enabled，默认 true）。 */
+    public boolean isShardEnabled() {
+        return shardEnabled;
+    }
+
+    /** 触发分片的最小行数阈值（migration.full.shard.min.rows，默认 200000）。 */
+    public long getShardMinRows() {
+        return shardMinRows;
+    }
+
+    /** 单表分片数（migration.full.shard.count，默认 4，最小 1）。 */
+    public int getShardCount() {
+        return shardCount;
+    }
+
     public boolean isDropTables() {
         return dropTables;
     }
@@ -159,6 +189,11 @@ public class MigrationConfig {
     
     public Set<String> getIncludedTables() {
         return includedTables;
+    }
+
+    /** 库级同步选中的数据库（sync.db.level.databases）：表数据迁移完成后需同步其存储过程/函数。 */
+    public Set<String> getDbLevelDatabases() {
+        return dbLevelDatabases;
     }
     
     public String getCheckpointDbPath() {

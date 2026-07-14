@@ -197,7 +197,7 @@ public class TaskProcessService {
         logger.info("Capture process started for task: {}", taskId);
     }
 
-    public void startMigrationForTask(String taskId) throws Exception {
+    public void startMigrationForTask(String taskId, TaskMessage taskMessage) throws Exception {
         if (migrationTaskManagers.containsKey(taskId)) {
             MigrationTaskManager existing = migrationTaskManagers.get(taskId);
             if (existing.isRunning()) {
@@ -208,9 +208,11 @@ public class TaskProcessService {
 
         logger.info("Starting migration-full process for task: {}", taskId);
 
+        int totalTables = calculateTotalTables(taskMessage.getSyncObjects());
+
         MigrationTaskManager migrationTaskManager = new MigrationTaskManager(
             config.getMigrationFullJarPath(), taskId, kafkaProducer,
-            null, config.getH2MetadataUser(), config.getH2MetadataPassword()
+            null, config.getH2MetadataUser(), config.getH2MetadataPassword(), totalTables
         );
 
         migrationTaskManagers.put(taskId, migrationTaskManager);
@@ -219,6 +221,24 @@ public class TaskProcessService {
         sendStatus(taskId, "MIGRATION_STARTED", "Full migration started for task: " + taskId, 0);
 
         logger.info("Migration task started for: {}", taskId);
+    }
+
+    private int calculateTotalTables(Map<String, Object> syncObjects) {
+        if (syncObjects == null || syncObjects.isEmpty()) return 0;
+        int count = 0;
+        for (Map.Entry<String, Object> entry : syncObjects.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof java.util.List) {
+                count += ((java.util.List<?>) value).size();
+            } else if (value instanceof Map) {
+                Map<?, ?> dbValue = (Map<?, ?>) value;
+                Object tablesObj = dbValue.get("tables");
+                if (tablesObj instanceof java.util.List) {
+                    count += ((java.util.List<?>) tablesObj).size();
+                }
+            }
+        }
+        return count;
     }
 
     public void monitorCaptureProcesses() {

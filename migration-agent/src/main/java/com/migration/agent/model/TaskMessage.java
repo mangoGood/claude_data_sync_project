@@ -25,6 +25,7 @@ public class TaskMessage implements Serializable {
     private String sourceType;
     private String targetType;
     private String taskType;
+    private String drMode;
     private String kafkaBootstrapServers;
     private String kafkaTopicPrefix;
     private String kafkaTopicStrategy;
@@ -214,6 +215,14 @@ public class TaskMessage implements Serializable {
 
     public void setTaskType(String taskType) {
         this.taskType = taskType;
+    }
+
+    public String getDrMode() {
+        return drMode;
+    }
+
+    public void setDrMode(String drMode) {
+        this.drMode = drMode;
     }
 
     public String getKafkaBootstrapServers() {

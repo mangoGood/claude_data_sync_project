@@ -1,5 +1,6 @@
 package com.synctask.service;
 
+import com.synctask.dto.ChangePasswordRequest;
 import com.synctask.dto.JwtResponse;
 import com.synctask.dto.LoginRequest;
 import com.synctask.dto.RegisterRequest;
@@ -68,5 +69,20 @@ public class AuthService {
         UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
         return userRepository.findById(userPrincipal.getId())
                 .orElseThrow(() -> new RuntimeException("用户不存在"));
+    }
+
+    @Transactional
+    public void changePassword(Long userId, ChangePasswordRequest request) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new RuntimeException("用户不存在"));
+
+        if (!passwordEncoder.matches(request.getOldPassword(), user.getPassword())) {
+            throw new RuntimeException("原密码不正确");
+        }
+
+        user.setPassword(passwordEncoder.encode(request.getNewPassword()));
+        // 递增令牌版本：签发过的所有旧 token（tv 不匹配）立即失效，改密后必须重新登录。
+        user.setTokenVersion((user.getTokenVersion() != null ? user.getTokenVersion() : 0) + 1);
+        userRepository.save(user);
     }
 }

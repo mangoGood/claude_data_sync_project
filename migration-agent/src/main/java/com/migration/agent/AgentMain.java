@@ -33,12 +33,13 @@ import java.util.concurrent.*;
 public class AgentMain {
     private static final Logger logger = LoggerFactory.getLogger(AgentMain.class);
     
-    private static final String KAFKA_BOOTSTRAP_SERVERS = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "192.168.117.2:19092");
+    // 默认值统一为本机地址（可被环境变量/agent.properties 覆盖）；不再硬编码内网 IP。
+    private static final String KAFKA_BOOTSTRAP_SERVERS = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092");
     private static final String CONSUMER_GROUP_ID = "migration-agent-group";
     private static final String METADATA_DB_USER = "sa";
     private static final String METADATA_DB_PASSWORD = "";
 
-    private static final String MYSQL_DB_URL = System.getenv().getOrDefault("DB_URL", "jdbc:mysql://192.168.107.2:3306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
+    private static final String MYSQL_DB_URL = System.getenv().getOrDefault("DB_URL", "jdbc:mysql://localhost:33306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
     private static final String MYSQL_DB_USER = System.getenv().getOrDefault("DB_USERNAME", "root");
     private static final String MYSQL_DB_PASSWORD = System.getenv().getOrDefault("DB_PASSWORD", "rootpassword");
     
@@ -71,6 +72,10 @@ public class AgentMain {
     
     public static void main(String[] args) {
         com.migration.common.OracleNetCompat.apply();
+        // 防御性设置：若 agent 的进度轮询恰好先于 migration-full 打开 H2 progress 库
+        // （成为 AUTO_SERVER 的持有方），同样强制绑定回环地址，避免绑到局域网 IP。
+        // 必须在任何 H2 Driver 类加载前设置（SysProperties 以 static final 读取一次）。
+        System.setProperty("h2.bindAddress", "127.0.0.1");
         AgentMain agent = new AgentMain();
         agent.start();
         
@@ -307,9 +312,12 @@ public class AgentMain {
         try {
             stopTaskById(taskId);
             stopMigrationAgentThread(taskId);
-            
+
             logger.info("Task {} terminated, all processes stopped", taskId);
-            
+
+            // 库级同步：同步进程已全部停止（无双写风险），此刻把源库 trigger/event 复制到目标库
+            com.migration.agent.service.DbObjectsSyncService.syncTriggersAndEventsAtTaskEnd(taskId);
+
         } catch (Exception e) {
             logger.error("Error handling terminate message for task: {}", taskId, e);
         }
@@ -388,7 +396,7 @@ public class AgentMain {
                 logger.info("MigrationAgentThread started for {} task: {}, skipFullMigration: {}", migrationMode, taskId, skipFullMigration);
             } else {
                 if (progress < 100) {
-                    startMigrationForTask(taskId);
+                    startMigrationForTask(taskId, taskMessage);
                     sendStatus(taskId, "STARTING", "Task resumed, starting migration", progress);
                 } else {
                     sendStatus(taskId, "COMPLETED", "Task completed", progress);
@@ -402,14 +410,27 @@ public class AgentMain {
     }
 
     private void handleFailoverMessage(TaskMessage taskMessage) {
+        // Kafka 触发的灾备切换：切换后状态置 SWITCHING，完成即释放去重令牌。
+        performFailover(taskMessage, "Kafka message", "SWITCHING", false);
+    }
+
+    /**
+     * 灾备切换统一实现（Kafka 与 HTTP 直连两条入口共用，消除此前 ~90% 重复代码）。
+     *
+     * <p>差异由参数承载：{@code restartStatus}（重启后落库状态，Kafka=SWITCHING / HTTP=INCREMENT_RUNNING）、
+     * {@code delayedGuardRelease}（去重令牌释放策略，Kafka=完成即释放 / HTTP=30s 初始化窗口后释放）。
+     * 文件清理统一取两条历史路径的并集（删除不存在文件是无害 no-op），并在删文件前统一等待进程退出。
+     */
+    private void performFailover(TaskMessage taskMessage, String trigger, String restartStatus, boolean delayedGuardRelease) {
         String taskId = taskMessage.getTaskId();
-        logger.info("Handling failover message (Kafka) for task: {}", taskId);
+        logger.info("=== FAILOVER ({}) for task: {} ===", trigger, taskId);
 
         if (!failoverInProgress.add(taskId)) {
-            logger.warn("Failover already in progress for task: {}, ignoring duplicate Kafka message", taskId);
+            logger.warn("Failover already in progress for task: {}, ignoring duplicate {}", taskId, trigger);
             return;
         }
 
+        boolean releaseScheduled = false;
         try {
             sendStatus(taskId, "SWITCHING", "Failover in progress, stopping current processes", 100);
 
@@ -417,76 +438,18 @@ public class AgentMain {
             stopTaskById(taskId);
             logger.info("All processes stopped for failover task: {}", taskId);
 
-            try { Thread.sleep(3000); } catch (InterruptedException e) { Thread.interrupted(); }
-            logger.info("Waited 3s for processes to fully terminate for failover task: {}", taskId);
+            // 删文件前统一等待子进程完全退出，避免与仍在写文件的进程竞争
+            try { Thread.sleep(3000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
 
             taskStateService.deleteTaskState(taskId);
             logger.info("Old task state from H2 deleted for failover task: {}", taskId);
 
-            java.io.File checkpointFile = new java.io.File("files/" + taskId + "/checkpoint/checkpoint");
-            if (checkpointFile.exists()) {
-                boolean deleted = checkpointFile.delete();
-                logger.info("Old checkpoint file deleted: {}, success: {}", checkpointFile.getAbsolutePath(), deleted);
-            }
-
-            java.io.File thlDir = new java.io.File("files/" + taskId + "/thl_output");
-            if (thlDir.exists()) {
-                java.io.File[] thlFiles = thlDir.listFiles();
-                if (thlFiles != null) {
-                    for (java.io.File f : thlFiles) {
-                        f.delete();
-                    }
-                }
-                logger.info("Old THL files cleaned for failover task: {}", taskId);
-            }
-
-            java.io.File binlogDir = new java.io.File("files/" + taskId + "/binlog_output");
-            if (binlogDir.exists()) {
-                java.io.File[] binlogFiles = binlogDir.listFiles();
-                if (binlogFiles != null) {
-                    for (java.io.File f : binlogFiles) {
-                        f.delete();
-                    }
-                }
-                logger.info("Old binlog files cleaned for failover task: {}", taskId);
-            }
-
-            String[] checkpointDbFiles = {
-                "files/" + taskId + "/checkpoint/checkpoint.mv.db",
-                "files/" + taskId + "/checkpoint/checkpoint.trace.db",
-                "files/" + taskId + "/checkpoint/checkpoint.lock.db",
-                "files/" + taskId + "/checkpoint/increment_checkpoint.mv.db",
-                "files/" + taskId + "/checkpoint/increment_checkpoint.trace.db",
-                "files/" + taskId + "/checkpoint/increment_checkpoint.lock.db",
-                "files/" + taskId + "/checkpoint/.increment_progress"
-            };
-            for (String dbFile : checkpointDbFiles) {
-                java.io.File f = new java.io.File(dbFile);
-                if (f.exists()) {
-                    boolean deleted = f.delete();
-                    logger.info("Deleted checkpoint file: {}, success: {}", f.getAbsolutePath(), deleted);
-                }
-            }
-            logger.info("All checkpoint DB files deleted before config update for failover task: {}", taskId);
+            cleanupFailoverArtifacts(taskId);
 
             configService.updateConfig(taskMessage);
             logger.info("Config updated for failover task: {} with swapped connections", taskId);
 
-            java.io.File configFile = new java.io.File("files/" + taskId + "/config.properties");
-            if (configFile.exists()) {
-                java.util.Properties configProps = new java.util.Properties();
-                try (java.io.InputStream cis = new java.io.FileInputStream(configFile)) {
-                    configProps.load(cis);
-                }
-                configProps.remove("capture.binlog.file");
-                configProps.remove("capture.binlog.position");
-                configProps.remove("checkpoint.binlog.file");
-                configProps.remove("checkpoint.binlog.position");
-                try (java.io.OutputStream cos = new java.io.FileOutputStream(configFile)) {
-                    configProps.store(cos, "Updated for failover - binlog position cleared");
-                }
-                logger.info("Cleared old binlog position in config for failover task: {}", taskId);
-            }
+            clearBinlogPositionInConfig(taskId);
 
             TaskStateInfo stateInfo = new TaskStateInfo(taskId);
             stateInfo.setTaskName(taskMessage.getTaskName());
@@ -496,11 +459,11 @@ public class AgentMain {
             stateInfo.setTargetConnection(taskMessage.getTargetConnection());
             stateInfo.setSourceType(taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql");
             stateInfo.setTargetType(taskMessage.getTargetType() != null ? taskMessage.getTargetType() : "mysql");
-            stateInfo.setStatus("SWITCHING");
+            stateInfo.setStatus(restartStatus);
             stateInfo.setProgress(100);
             stateInfo.setCreatedAt(taskMessage.getCreatedAt() != null ? taskMessage.getCreatedAt() : java.time.LocalDateTime.now());
             taskStateService.saveTaskState(stateInfo);
-            logger.info("Saved H2 state for failover task: {} with status SWITCHING", taskId);
+            logger.info("Saved H2 state for failover task: {} with status {}", taskId, restartStatus);
 
             MigrationAgentThread agentThread = new MigrationAgentThread(taskMessage, kafkaProducer, taskStateService, true);
             migrationAgentThreads.put(taskId, agentThread);
@@ -510,13 +473,101 @@ public class AgentMain {
             migrationAgentThreadWrappers.put(taskId, threadWrapper);
             threadWrapper.start();
 
-            logger.info("Failover task {} restarted with skipFullMigration=true, capture/extractor/increment will start", taskId);
+            logger.info("Failover task {} restarted with skipFullMigration=true", taskId);
+            sendStatus(taskId, "SWITCHING", "Failover processes starting, skipping full migration", 100);
 
+            if (delayedGuardRelease) {
+                // 保留 30s 初始化窗口，期间拒绝重复切换请求
+                releaseScheduled = true;
+                new Thread(() -> {
+                    try { Thread.sleep(30000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    failoverInProgress.remove(taskId);
+                    logger.info("Failover initialization period completed for task: {}", taskId);
+                }, "FailoverInitGuard-" + taskId).start();
+            }
         } catch (Exception e) {
-            logger.error("Error handling failover message for task: {}", taskId, e);
+            logger.error("Error handling failover ({}) for task: {}", trigger, taskId, e);
             sendStatus(taskId, "FAILED", "Error during failover: " + e.getMessage(), 0);
         } finally {
-            failoverInProgress.remove(taskId);
+            if (!releaseScheduled) {
+                failoverInProgress.remove(taskId);
+            }
+        }
+    }
+
+    /** 灾备切换的文件清理：两条历史路径删除项的并集（删不存在文件是无害 no-op）。 */
+    private void cleanupFailoverArtifacts(String taskId) {
+        java.io.File checkpointFile = new java.io.File("files/" + taskId + "/checkpoint/checkpoint");
+        if (checkpointFile.exists()) {
+            logger.info("Old checkpoint file deleted: {}, success: {}", checkpointFile.getAbsolutePath(), checkpointFile.delete());
+        }
+
+        java.io.File seqnoCheckpointFile = new java.io.File("files/" + taskId + "/checkpoint/seqno_checkpoint.json");
+        if (seqnoCheckpointFile.exists()) {
+            logger.info("Old seqno checkpoint file deleted: {}, success: {}", seqnoCheckpointFile.getAbsolutePath(), seqnoCheckpointFile.delete());
+        }
+
+        deleteDirContents(new java.io.File("files/" + taskId + "/thl_output"), "THL", taskId);
+        deleteDirContents(new java.io.File("files/" + taskId + "/binlog_output"), "binlog", taskId);
+
+        java.io.File progressDb = new java.io.File("files/" + taskId + "/migration_progress.mv.db");
+        if (progressDb.exists()) {
+            logger.info("Old migration progress DB deleted: {}, success: {}", progressDb.getAbsolutePath(), progressDb.delete());
+        }
+        java.io.File progressTrace = new java.io.File("files/" + taskId + "/migration_progress.trace.db");
+        if (progressTrace.exists()) {
+            progressTrace.delete();
+        }
+
+        String[] checkpointDbFiles = {
+            "files/" + taskId + "/checkpoint/checkpoint.mv.db",
+            "files/" + taskId + "/checkpoint/checkpoint.trace.db",
+            "files/" + taskId + "/checkpoint/checkpoint.lock.db",
+            "files/" + taskId + "/checkpoint/increment_checkpoint.mv.db",
+            "files/" + taskId + "/checkpoint/increment_checkpoint.trace.db",
+            "files/" + taskId + "/checkpoint/increment_checkpoint.lock.db",
+            "files/" + taskId + "/checkpoint/.increment_progress"
+        };
+        for (String dbFile : checkpointDbFiles) {
+            java.io.File f = new java.io.File(dbFile);
+            if (f.exists()) {
+                logger.info("Deleted checkpoint file: {}, success: {}", f.getAbsolutePath(), f.delete());
+            }
+        }
+        logger.info("All checkpoint DB files deleted before config update for failover task: {}", taskId);
+    }
+
+    private void deleteDirContents(java.io.File dir, String label, String taskId) {
+        if (dir.exists()) {
+            java.io.File[] files = dir.listFiles();
+            if (files != null) {
+                for (java.io.File f : files) {
+                    f.delete();
+                }
+            }
+            logger.info("Old {} files cleaned for failover task: {}", label, taskId);
+        }
+    }
+
+    /** 清除 config.properties 里的旧 binlog 位点，使切换后从新库当前位点开始增量。 */
+    private void clearBinlogPositionInConfig(String taskId) {
+        java.io.File configFile = new java.io.File("files/" + taskId + "/config.properties");
+        if (!configFile.exists()) return;
+        try {
+            java.util.Properties configProps = new java.util.Properties();
+            try (java.io.InputStream cis = new java.io.FileInputStream(configFile)) {
+                configProps.load(cis);
+            }
+            configProps.remove("capture.binlog.file");
+            configProps.remove("capture.binlog.position");
+            configProps.remove("checkpoint.binlog.file");
+            configProps.remove("checkpoint.binlog.position");
+            try (java.io.OutputStream cos = new java.io.FileOutputStream(configFile)) {
+                configProps.store(cos, "Updated for failover - binlog position cleared");
+            }
+            logger.info("Cleared old binlog position in config for failover task: {}", taskId);
+        } catch (Exception e) {
+            logger.warn("Failed to clear binlog position in config for failover task {}: {}", taskId, e.getMessage());
         }
     }
 
@@ -605,18 +656,22 @@ public class AgentMain {
             }
             
             if ("fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
-                MigrationAgentThread agentThread = new MigrationAgentThread(taskMessage, kafkaProducer, taskStateService, false);
+                // 双向灾备的反向影子通道（DR_SHADOW）只做增量：capture 从源库最新位点起步。
+                // 绝不能跑全量——反向全量会把灾备库反灌回主库，覆盖/冲突主库存量数据。
+                boolean skipFullMigration = "DR_SHADOW".equals(taskMessage.getTaskType());
+                MigrationAgentThread agentThread = new MigrationAgentThread(taskMessage, kafkaProducer, taskStateService, skipFullMigration);
                 migrationAgentThreads.put(taskId, agentThread);
-                
+
                 Thread threadWrapper = new Thread(agentThread, "MigrationAgentThread-" + taskId);
                 threadWrapper.setDaemon(true);
                 migrationAgentThreadWrappers.put(taskId, threadWrapper);
                 threadWrapper.start();
-                
-                logger.info("MigrationAgentThread started for {} task: {}", migrationMode, taskId);
+
+                logger.info("MigrationAgentThread started for {} task: {} (skipFullMigration={})",
+                        migrationMode, taskId, skipFullMigration);
             } else {
                 logger.info("Full migration mode, skipping binlog process for task: {}", taskId);
-                startMigrationForTask(taskId);
+                startMigrationForTask(taskId, taskMessage);
             }
             
         } catch (Exception e) {
@@ -640,7 +695,7 @@ public class AgentMain {
         logger.info("Capture process started for task: {}", taskId);
     }
     
-    private void startMigrationForTask(String taskId) throws Exception {
+    private void startMigrationForTask(String taskId, TaskMessage taskMessage) throws Exception {
         if (migrationTaskManagers.containsKey(taskId)) {
             MigrationTaskManager existing = migrationTaskManagers.get(taskId);
             if (existing.isRunning()) {
@@ -648,22 +703,42 @@ public class AgentMain {
                 return;
             }
         }
-        
+
         logger.info("Starting migration-full process for task: {}", taskId);
-        
+
+        int totalTables = calculateTotalTables(taskMessage.getSyncObjects());
+
         MigrationTaskManager migrationTaskManager = new MigrationTaskManager(
             MIGRATION_FULL_JAR_PATH, taskId, kafkaProducer,
-            null, METADATA_DB_USER, METADATA_DB_PASSWORD
+            null, METADATA_DB_USER, METADATA_DB_PASSWORD, totalTables
         );
-        
+
         migrationTaskManagers.put(taskId, migrationTaskManager);
-        
+
         migrationTaskManager.start();
         sendStatus(taskId, "MIGRATION_STARTED", "Full migration started for task: " + taskId, 0);
-        
+
         logger.info("Migration task started for: {}", taskId);
     }
-    
+
+    private int calculateTotalTables(Map<String, Object> syncObjects) {
+        if (syncObjects == null || syncObjects.isEmpty()) return 0;
+        int count = 0;
+        for (Map.Entry<String, Object> entry : syncObjects.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof java.util.List) {
+                count += ((java.util.List<?>) value).size();
+            } else if (value instanceof Map) {
+                Map<?, ?> dbValue = (Map<?, ?>) value;
+                Object tablesObj = dbValue.get("tables");
+                if (tablesObj instanceof java.util.List) {
+                    count += ((java.util.List<?>) tablesObj).size();
+                }
+            }
+        }
+        return count;
+    }
+
     private void monitorCaptureProcesses() {
         for (Map.Entry<String, ProcessManager> entry : captureManagers.entrySet()) {
             String taskId = entry.getKey();
@@ -772,6 +847,14 @@ public class AgentMain {
             return;
         }
         
+        // 双向灾备反向影子通道：恢复时同样只做增量（capture 从 checkpoint/最新位点续传），
+        // 绝不能落入全量恢复分支把灾备库反灌回主库
+        if ("DR_SHADOW".equals(recoveryTask.getTaskType())) {
+            logger.info("Task {} is a DR_SHADOW (bidirectional reverse channel), recovering as increment-only", taskId);
+            startMigrationAgentThread(taskMessage, true);
+            return;
+        }
+
         if ("fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
             recoverFullAndIncreTask(recoveryTask, taskMessage);
         } else {
@@ -833,7 +916,7 @@ public class AgentMain {
                 logger.info("Full-only task {} was in {} state (progress: {}%), resuming migration", 
                     taskId, status, progress);
                 try {
-                    startMigrationForTask(taskId);
+                    startMigrationForTask(taskId, taskMessage);
                     sendStatus(taskId, "STARTING", "Task recovered, resuming migration", progress);
                 } catch (Exception e) {
                     logger.error("Error resuming full migration for task: {}", taskId, e);
@@ -849,7 +932,7 @@ public class AgentMain {
             default:
                 logger.warn("Unknown status {} for full-only task {}, treating as new task", status, taskId);
                 try {
-                    startMigrationForTask(taskId);
+                    startMigrationForTask(taskId, taskMessage);
                     sendStatus(taskId, "STARTING", "Task recovered, starting migration", 0);
                 } catch (Exception e) {
                     logger.error("Error starting migration for task: {}", taskId, e);
@@ -877,152 +960,8 @@ public class AgentMain {
     }
 
     public void handleFailoverDirect(TaskMessage taskMessage) {
-        String taskId = taskMessage.getTaskId();
-        logger.info("=== DIRECT FAILOVER (HTTP API) for task: {} ===", taskId);
-
-        if (!failoverInProgress.add(taskId)) {
-            logger.warn("Failover already in progress for task: {}, ignoring duplicate request", taskId);
-            return;
-        }
-
-        try {
-            sendStatus(taskId, "SWITCHING", "Failover in progress, stopping current processes", 100);
-
-            stopMigrationAgentThread(taskId);
-            stopTaskById(taskId);
-            logger.info("All processes stopped for failover task: {}", taskId);
-
-            taskStateService.deleteTaskState(taskId);
-            logger.info("Old task state from H2 deleted for failover task: {}", taskId);
-
-            java.io.File checkpointFile = new java.io.File("files/" + taskId + "/checkpoint/checkpoint");
-            if (checkpointFile.exists()) {
-                boolean deleted = checkpointFile.delete();
-                logger.info("Old checkpoint file deleted: {}, success: {}", checkpointFile.getAbsolutePath(), deleted);
-            }
-
-            java.io.File seqnoCheckpointFile = new java.io.File("files/" + taskId + "/checkpoint/seqno_checkpoint.json");
-            if (seqnoCheckpointFile.exists()) {
-                boolean deleted = seqnoCheckpointFile.delete();
-                logger.info("Old seqno checkpoint file deleted: {}, success: {}", seqnoCheckpointFile.getAbsolutePath(), deleted);
-            }
-
-            java.io.File thlDir = new java.io.File("files/" + taskId + "/thl_output");
-            if (thlDir.exists()) {
-                java.io.File[] thlFiles = thlDir.listFiles();
-                if (thlFiles != null) {
-                    for (java.io.File f : thlFiles) {
-                        f.delete();
-                    }
-                }
-                logger.info("Old THL files cleaned for failover task: {}", taskId);
-            }
-
-            java.io.File binlogDir = new java.io.File("files/" + taskId + "/binlog_output");
-            if (binlogDir.exists()) {
-                java.io.File[] binlogFiles = binlogDir.listFiles();
-                if (binlogFiles != null) {
-                    for (java.io.File f : binlogFiles) {
-                        f.delete();
-                    }
-                }
-                logger.info("Old binlog files cleaned for failover task: {}", taskId);
-            }
-
-            java.io.File progressDb = new java.io.File("files/" + taskId + "/migration_progress.mv.db");
-            if (progressDb.exists()) {
-                boolean deleted = progressDb.delete();
-                logger.info("Old migration progress DB deleted: {}, success: {}", progressDb.getAbsolutePath(), deleted);
-            }
-            java.io.File progressTrace = new java.io.File("files/" + taskId + "/migration_progress.trace.db");
-            if (progressTrace.exists()) {
-                progressTrace.delete();
-            }
-
-            String[] checkpointDbFiles = {
-                "files/" + taskId + "/checkpoint/checkpoint.mv.db",
-                "files/" + taskId + "/checkpoint/checkpoint.trace.db",
-                "files/" + taskId + "/checkpoint/checkpoint.lock.db",
-                "files/" + taskId + "/checkpoint/increment_checkpoint.mv.db",
-                "files/" + taskId + "/checkpoint/increment_checkpoint.trace.db",
-                "files/" + taskId + "/checkpoint/increment_checkpoint.lock.db",
-                "files/" + taskId + "/checkpoint/.increment_progress"
-            };
-            for (String dbFile : checkpointDbFiles) {
-                java.io.File f = new java.io.File(dbFile);
-                if (f.exists()) {
-                    boolean deleted = f.delete();
-                    logger.info("Deleted checkpoint file: {}, success: {}", f.getAbsolutePath(), deleted);
-                }
-            }
-            logger.info("All checkpoint DB files deleted before config update for failover task: {}", taskId);
-
-            configService.updateConfig(taskMessage);
-            logger.info("Config updated for failover task: {} with swapped connections", taskId);
-
-            java.io.File configFile = new java.io.File("files/" + taskId + "/config.properties");
-            if (configFile.exists()) {
-                java.util.Properties configProps = new java.util.Properties();
-                try (java.io.InputStream cis = new java.io.FileInputStream(configFile)) {
-                    configProps.load(cis);
-                }
-                configProps.remove("capture.binlog.file");
-                configProps.remove("capture.binlog.position");
-                configProps.remove("checkpoint.binlog.file");
-                configProps.remove("checkpoint.binlog.position");
-                try (java.io.OutputStream cos = new java.io.FileOutputStream(configFile)) {
-                    configProps.store(cos, "Updated for failover - binlog position cleared");
-                }
-                logger.info("Cleared old binlog position in config for failover task: {}", taskId);
-            }
-
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-
-            TaskStateInfo stateInfo = new TaskStateInfo(taskId);
-            stateInfo.setTaskName(taskMessage.getTaskName());
-            stateInfo.setUserId(taskMessage.getUserId());
-            stateInfo.setMigrationMode(taskMessage.getMigrationMode());
-            stateInfo.setSourceConnection(taskMessage.getSourceConnection());
-            stateInfo.setTargetConnection(taskMessage.getTargetConnection());
-            stateInfo.setSourceType(taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql");
-            stateInfo.setTargetType(taskMessage.getTargetType() != null ? taskMessage.getTargetType() : "mysql");
-            stateInfo.setStatus("INCREMENT_RUNNING");
-            stateInfo.setProgress(100);
-            stateInfo.setCreatedAt(taskMessage.getCreatedAt() != null ? taskMessage.getCreatedAt() : java.time.LocalDateTime.now());
-            taskStateService.saveTaskState(stateInfo);
-            logger.info("Saved H2 state for failover task: {} with status INCREMENT_RUNNING", taskId);
-
-            MigrationAgentThread agentThread = new MigrationAgentThread(taskMessage, kafkaProducer, taskStateService, true);
-            migrationAgentThreads.put(taskId, agentThread);
-
-            Thread threadWrapper = new Thread(agentThread, "MigrationAgentThread-Failover-" + taskId);
-            threadWrapper.setDaemon(true);
-            migrationAgentThreadWrappers.put(taskId, threadWrapper);
-            threadWrapper.start();
-
-            logger.info("Failover task {} restarted with skipFullMigration=true", taskId);
-            sendStatus(taskId, "SWITCHING", "Failover processes starting, skipping full migration", 100);
-
-            new Thread(() -> {
-                try {
-                    Thread.sleep(30000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                failoverInProgress.remove(taskId);
-                logger.info("Failover initialization period completed for task: {}", taskId);
-            }, "FailoverInitGuard-" + taskId).start();
-
-        } catch (Exception e) {
-            logger.error("Error handling direct failover for task: {}", taskId, e);
-            sendStatus(taskId, "FAILED", "Error during failover: " + e.getMessage(), 0);
-            failoverInProgress.remove(taskId);
-        }
+        // HTTP 直连触发的灾备切换：切换后状态置 INCREMENT_RUNNING，保留 30s 初始化窗口后释放去重令牌。
+        performFailover(taskMessage, "HTTP API direct", "INCREMENT_RUNNING", true);
     }
 
     public void startIncrementDirect(TaskMessage taskMessage) {

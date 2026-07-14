@@ -48,7 +48,8 @@ public class WorkflowController {
                     request.getSourceType(),
                     request.getTargetType(),
                     userPrincipal.getId(),
-                    taskType
+                    taskType,
+                    request.getDrMode()
             );
             // 审计日志
             auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.CREATE_TASK,
@@ -326,6 +327,8 @@ public class WorkflowController {
         map.put("rto_ms", workflow.getRtoMs());
         map.put("task_type", workflow.getTaskType());
         map.put("dr_status", workflow.getDrStatus());
+        map.put("dr_mode", workflow.getDrMode());
+        map.put("dr_peer_workflow_id", workflow.getDrPeerWorkflowId());
         map.put("dr_switch_count", workflow.getDrSwitchCount());
         map.put("kafka_bootstrap_servers", workflow.getKafkaBootstrapServers());
         map.put("kafka_topic_prefix", workflow.getKafkaTopicPrefix());
@@ -339,6 +342,7 @@ public class WorkflowController {
         private String sourceType;
         private String targetType;
         private String taskType;
+        private String drMode;
 
         public String getName() { return name; }
         public void setName(String name) { this.name = name; }
@@ -348,6 +352,8 @@ public class WorkflowController {
         public void setTargetType(String targetType) { this.targetType = targetType; }
         public String getTaskType() { return taskType; }
         public void setTaskType(String taskType) { this.taskType = taskType; }
+        public String getDrMode() { return drMode; }
+        public void setDrMode(String drMode) { this.drMode = drMode; }
     }
 
     public static class UpdateConfigRequest {
