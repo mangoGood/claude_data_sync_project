@@ -23,6 +23,8 @@ public class MigrationConfig {
     private Set<String> includedDatabases;
     private Set<String> includedTables;
     private Set<String> dbLevelDatabases;
+    /** 表名映射："源库.源表" → 目标表名（仅表级同步配置，空 map = 无映射） */
+    private Map<String, String> tableNameMapping;
     private String checkpointDbPath;
     private String taskId;
     private String sourceDbType;
@@ -103,6 +105,21 @@ public class MigrationConfig {
         includedDatabases = parseStringSet(props.getProperty("migration.included.databases", ""));
         includedTables = parseStringSet(props.getProperty("migration.included.tables", ""));
         dbLevelDatabases = parseStringSet(props.getProperty("sync.db.level.databases", ""));
+
+        // 表名映射（仅表级同步下发）：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>。
+        // 全量侧目标库已由 target.db.database 决定，这里只取目标表名部分；key 保留 "源库.源表"。
+        tableNameMapping = new HashMap<>();
+        String tableMappingPrefix = "schema.mapping.table.";
+        for (String name : props.stringPropertyNames()) {
+            if (name.startsWith(tableMappingPrefix)) {
+                String key = name.substring(tableMappingPrefix.length());
+                String value = props.getProperty(name, "");
+                String targetTable = value.contains(".") ? value.substring(value.indexOf('.') + 1) : value;
+                if (!key.isEmpty() && !targetTable.isEmpty()) {
+                    tableNameMapping.put(key, targetTable);
+                }
+            }
+        }
         
         String defaultCheckpointPath = taskId != null ? 
             "./files/" + taskId + "/checkpoint/checkpoint" : "./checkpoint/checkpoint";
@@ -194,6 +211,11 @@ public class MigrationConfig {
     /** 库级同步选中的数据库（sync.db.level.databases）：表数据迁移完成后需同步其存储过程/函数。 */
     public Set<String> getDbLevelDatabases() {
         return dbLevelDatabases;
+    }
+
+    /** 表名映射："源库.源表" → 目标表名；未配置返回空 map。 */
+    public Map<String, String> getTableNameMapping() {
+        return tableNameMapping != null ? tableNameMapping : Collections.emptyMap();
     }
     
     public String getCheckpointDbPath() {

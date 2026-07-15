@@ -96,6 +96,11 @@ public class AgentConfig {
         }
     }
 
+    /** 通用属性读取（含 agent.properties / 环境变量覆盖后的最终值）。 */
+    public String getRawProperty(String key, String defaultValue) {
+        return props.getProperty(key, defaultValue);
+    }
+
     public String getKafkaBootstrapServers() {
         return props.getProperty("kafka.bootstrap.servers");
     }

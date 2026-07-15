@@ -302,9 +302,11 @@ public class ValidationTaskService {
                 }
             }
 
+            // 表名映射（表级同步）：syncObjectsMap 已压平丢失映射，显式补传给对比服务
             ContentCompareSession session = contentCompareService.startCompare(
                 sourceConnStr, targetConnStr,
-                sourceType, targetType, syncObjectsMap);
+                sourceType, targetType, syncObjectsMap,
+                parseTableMappings(task.getSyncObjects()));
 
             addLog(taskId, ValidationTaskLog.LogLevel.INFO, "内容对比会话已创建: " + session.getSessionId());
 
@@ -636,6 +638,36 @@ public class ValidationTaskService {
     }
 
     @SuppressWarnings("unchecked")
+    /**
+     * 解析 syncObjects 里表级 entry 的表名映射：db → {源表: 目标表}。
+     * 压平表清单的解析方法（parseSyncObjects / parseSyncObjectsSimple）会丢掉 tableMapping，
+     * 对比目标端取数前需要用它换算目标表名，否则映射表必报"目标表不存在/行数为 0"。
+     */
+    private Map<String, Map<String, String>> parseTableMappings(String syncObjectsJson) {
+        Map<String, Map<String, String>> result = new HashMap<>();
+        if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
+            return result;
+        }
+        try {
+            Map<String, Object> raw = gson.fromJson(syncObjectsJson, Map.class);
+            if (raw == null) return result;
+            for (Map.Entry<String, Object> entry : raw.entrySet()) {
+                if (!(entry.getValue() instanceof Map)) continue;
+                Object mappingObj = ((Map<?, ?>) entry.getValue()).get("tableMapping");
+                if (mappingObj instanceof Map) {
+                    Map<String, String> m = new HashMap<>();
+                    ((Map<?, ?>) mappingObj).forEach((k, v) -> m.put(String.valueOf(k), String.valueOf(v)));
+                    if (!m.isEmpty()) {
+                        result.put(entry.getKey(), m);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("解析 tableMapping 失败: {}", e.getMessage());
+        }
+        return result;
+    }
+
     private Map<String, List<String>> parseSyncObjectsSimple(String syncObjectsJson) {
         if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
             return new HashMap<>();
@@ -742,6 +774,9 @@ public class ValidationTaskService {
                 }
             }
 
+            // 表名映射（表级同步）：目标端行数按映射后的表名统计
+            Map<String, Map<String, String>> tableMappings = parseTableMappings(task.getSyncObjects());
+
             for (Map.Entry<String, Map<String, List<String>>> dbEntry : syncObjects.entrySet()) {
                 String sourceDbName = dbEntry.getKey();
                 String targetDbName = targetConn.database != null ? targetConn.database : sourceDbName;
@@ -749,21 +784,24 @@ public class ValidationTaskService {
 
                 if (tables == null || tables.isEmpty()) continue;
 
+                Map<String, String> dbTableMapping = tableMappings.getOrDefault(sourceDbName, Collections.emptyMap());
                 for (String tableName : tables) {
+                    String targetTableName = dbTableMapping.getOrDefault(tableName, tableName);
                     totalTables++;
-                    addLog(taskId, ValidationTaskLog.LogLevel.INFO, 
-                        "行数对比表: " + sourceDbName + "." + tableName);
+                    addLog(taskId, ValidationTaskLog.LogLevel.INFO,
+                        "行数对比表: " + sourceDbName + "." + tableName
+                            + (targetTableName.equals(tableName) ? "" : " → " + targetTableName));
 
                     try {
                         TableDiffResult diff = compareTableData(
-                            sourceDb, targetDb, sourceDbName, targetDbName, tableName);
+                            sourceDb, targetDb, sourceDbName, targetDbName, tableName, targetTableName);
 
                         totalRows += diff.totalRows;
                         mismatchedRows += diff.mismatchedRows;
 
                         Map<String, Object> tr = new LinkedHashMap<>();
                         tr.put("sourceTable", tableName);
-                        tr.put("targetTable", tableName);
+                        tr.put("targetTable", targetTableName);
                         tr.put("sourceRowCount", diff.sourceRowCount);
                         tr.put("targetRowCount", diff.targetRowCount);
 
@@ -1329,8 +1367,8 @@ public class ValidationTaskService {
         String error;
     }
 
-    private TableDiffResult compareTableData(Connection sourceDb, Connection targetDb, 
-            String sourceDbName, String targetDbName, String tableName) {
+    private TableDiffResult compareTableData(Connection sourceDb, Connection targetDb,
+            String sourceDbName, String targetDbName, String tableName, String targetTableName) {
         TableDiffResult result = new TableDiffResult();
 
         try {
@@ -1338,7 +1376,8 @@ public class ValidationTaskService {
             boolean targetIsPg = isPostgresqlConnection(targetDb);
 
             long sourceRowCount = getRowCountSafe(sourceDb, sourceDbName, tableName, sourceIsPg);
-            long targetRowCount = getRowCountSafe(targetDb, targetDbName, tableName, targetIsPg);
+            // 表名映射（表级同步）：目标端按映射后的表名取行数
+            long targetRowCount = getRowCountSafe(targetDb, targetDbName, targetTableName, targetIsPg);
 
             if (sourceRowCount < 0 || targetRowCount < 0) {
                 result.error = "获取行数失败";
@@ -1351,7 +1390,7 @@ public class ValidationTaskService {
 
             if (sourceRowCount != targetRowCount) {
                 result.mismatchedRows = Math.abs(sourceRowCount - targetRowCount);
-                addLogForCurrentTask("行数对比: 源库 " + sourceDbName + "." + tableName + " 行数=" + sourceRowCount + ", 目标库 " + targetDbName + "." + tableName + " 行数=" + targetRowCount);
+                addLogForCurrentTask("行数对比: 源库 " + sourceDbName + "." + tableName + " 行数=" + sourceRowCount + ", 目标库 " + targetDbName + "." + targetTableName + " 行数=" + targetRowCount);
             } else {
                 result.mismatchedRows = 0;
             }

@@ -60,10 +60,11 @@ public class SchemaMigration {
     }
 
     public void migrateTable(TableInfo table) throws SQLException {
-        String tableName = table.getTableName();
+        // 表名映射：目标端建表/删表一律用目标表名（未配置映射时 = 源表名）
+        String targetTableName = table.getTargetTableName();
 
         if (dropTables) {
-            dropTableIfExists(tableName);
+            dropTableIfExists(targetTableName);
         }
 
         createTable(table);
@@ -95,8 +96,39 @@ public class SchemaMigration {
             return;
         }
         createSql = cleanCreateSql(createSql);
+        createSql = renameTableInCreateSql(createSql, table.getTableName(), table.getTargetTableName());
         targetConnection.execute(createSql);
-        logger.debug("已创建表: {}", table.getTableName());
+        logger.debug("已创建表: {}", table.getTargetTableName());
+    }
+
+    /**
+     * 表名映射：把 CREATE TABLE 语句头部的表名改写为目标表名。
+     * 源端 createSql 表名固定紧跟在 "CREATE TABLE " 之后（SHOW CREATE TABLE 反引号 /
+     * PG 元数据生成双引号），锚定语句头替换，不触碰列定义/注释/默认值里的同名文本。
+     */
+    private String renameTableInCreateSql(String createSql, String sourceName, String targetName) {
+        if (targetName == null || targetName.equals(sourceName)) {
+            return createSql;
+        }
+        String[] heads = {
+                "CREATE TABLE `" + sourceName + "`",
+                "CREATE TABLE \"" + sourceName + "\"",
+                "CREATE TABLE " + sourceName
+        };
+        String[] replacements = {
+                "CREATE TABLE `" + targetName + "`",
+                "CREATE TABLE \"" + targetName + "\"",
+                "CREATE TABLE " + quoteIdentifier(targetName)
+        };
+        for (int i = 0; i < heads.length; i++) {
+            int idx = createSql.indexOf(heads[i]);
+            if (idx >= 0) {
+                return createSql.substring(0, idx) + replacements[i]
+                        + createSql.substring(idx + heads[i].length());
+            }
+        }
+        logger.warn("CREATE TABLE 语句未匹配到表名 {}，表名映射未生效: {}", sourceName, createSql);
+        return createSql;
     }
 
     // 旧的 createTableFromXToY / generate*CreateSql 已迁移到

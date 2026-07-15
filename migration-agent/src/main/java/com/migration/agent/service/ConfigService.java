@@ -170,11 +170,19 @@ public class ConfigService {
             logger.info("Target database config updated from DatabaseConfig: {}:{}", target.getHost(), target.getPort());
         }
         
+        // 表名映射（仅表级同步 entry 携带）：key = "<源库>.<源表>"，value = 目标表名。
+        // 目标库名要等 targetDbName 解析后才能确定，先收集，统一在库名映射之后写入。
+        Map<String, String> collectedTableMappings = new java.util.LinkedHashMap<>();
+        // 库名映射（entry 的 targetDb，表级/库级均可携带）：key = 源库，value = 目标库
+        Map<String, String> collectedDbMappings = new java.util.LinkedHashMap<>();
+        boolean syncObjectsUpdated = false;
+
         if (taskMessage.getSyncObjects() != null && !taskMessage.getSyncObjects().isEmpty()) {
+            syncObjectsUpdated = true;
             String syncObjectsJson = gson.toJson(taskMessage.getSyncObjects());
             props.setProperty("migration.sync.objects", syncObjectsJson);
             logger.info("Sync objects config updated: {}", syncObjectsJson);
-            
+
             StringBuilder includedDatabases = new StringBuilder();
             StringBuilder includedTables = new StringBuilder();
             StringBuilder dbLevelDatabases = new StringBuilder();
@@ -197,9 +205,21 @@ public class ConfigService {
                     }
                 } else if (value instanceof Map) {
                     Map<?, ?> dbValue = (Map<?, ?>) value;
+                    // 库名映射（targetDb 在 dbLevel 判断前读取——库级 entry 也可携带）
+                    Object targetDbObj = dbValue.get("targetDb");
+                    if (targetDbObj instanceof String) {
+                        String tgtDb = (String) targetDbObj;
+                        if (!tgtDb.isEmpty() && !tgtDb.equals(dbName)) {
+                            if (tgtDb.matches("[A-Za-z_][A-Za-z0-9_$]*")) {
+                                collectedDbMappings.put(dbName, tgtDb);
+                            } else {
+                                logger.warn("忽略非法目标库名映射: {} -> {}", dbName, tgtDb);
+                            }
+                        }
+                    }
                     // 库级同步：{"db1":{"dbLevel":true}} —— 不枚举表清单。
                     // 后续链路天然支持：capture 无表清单时按库过滤（新表 DML 自动流过）；
-                    // 全量侧空表清单 = 迁移该库全部表。
+                    // 全量侧空表清单 = 迁移该库全部表。库级不支持表名映射。
                     if (Boolean.TRUE.equals(dbValue.get("dbLevel"))) {
                         if (dbLevelDatabases.length() > 0) {
                             dbLevelDatabases.append(",");
@@ -215,6 +235,21 @@ public class ConfigService {
                                 includedTables.append(",");
                             }
                             includedTables.append(dbName).append(".").append(table.toString());
+                        }
+                    }
+                    Object mappingObj = dbValue.get("tableMapping");
+                    if (mappingObj instanceof Map) {
+                        for (Map.Entry<?, ?> m : ((Map<?, ?>) mappingObj).entrySet()) {
+                            String srcTable = String.valueOf(m.getKey());
+                            String tgtTable = String.valueOf(m.getValue());
+                            if (srcTable.isEmpty() || tgtTable.isEmpty() || srcTable.equals(tgtTable)) {
+                                continue;
+                            }
+                            if (!tgtTable.matches("[A-Za-z_][A-Za-z0-9_$]*")) {
+                                logger.warn("忽略非法目标表名映射: {}.{} -> {}", dbName, srcTable, tgtTable);
+                                continue;
+                            }
+                            collectedTableMappings.put(dbName + "." + srcTable, tgtTable);
                         }
                     }
                 }
@@ -254,15 +289,47 @@ public class ConfigService {
             logger.info("Target database name: {}", taskMessage.getTargetDbName());
         }
 
-        // 库名映射：源库名 != 目标库名时写入 schema.mapping.db.<源库>=<目标库>，供增量 DDL 改写
+        // 库名映射：schema.mapping.db.<源库>=<目标库>，供增量 DDL 改写
         // （SchemaEvolutionService/DdlIdentifierRewriter 据此把限定 DDL 的库名 test1.t5 改写为 test2.t5）。
-        // DML 侧本就靠 target.db.database 强制目标库，DDL 侧过去缺这一步导致限定 DDL 落到错库。
+        // 来源优先级：syncObjects 每库 entry 的 targetDb（新 UI 按库映射）＞ sourceDbName/targetDbName
+        // 全局字段（旧任务/DR 兼容）。重新下发同步对象时先清旧键，避免改配置后残留失效映射。
         String srcDbName = taskMessage.getSourceDbName();
         String tgtDbName = taskMessage.getTargetDbName();
+        if (syncObjectsUpdated) {
+            for (String name : props.stringPropertyNames()) {
+                if (name.startsWith("schema.mapping.db.")) {
+                    props.remove(name);
+                }
+            }
+        }
         if (srcDbName != null && !srcDbName.isEmpty() && tgtDbName != null && !tgtDbName.isEmpty()
                 && !srcDbName.equalsIgnoreCase(tgtDbName)) {
             props.setProperty("schema.mapping.db." + srcDbName, tgtDbName);
-            logger.info("库名映射已配置: {} -> {}", srcDbName, tgtDbName);
+            logger.info("库名映射已配置（全局字段）: {} -> {}", srcDbName, tgtDbName);
+        }
+        for (Map.Entry<String, String> m : collectedDbMappings.entrySet()) {
+            props.setProperty("schema.mapping.db." + m.getKey(), m.getValue());
+            logger.info("库名映射已配置: {} -> {}", m.getKey(), m.getValue());
+        }
+
+        // 表名映射（仅表级同步生效）：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>，
+        // 供全量（建表/写数）与增量（DML 改表名、DDL 经 DdlIdentifierRewriter 词法改写）消费。
+        // 重新下发同步对象时先清掉旧映射键，避免改配置后残留失效映射。
+        if (syncObjectsUpdated) {
+            for (String name : props.stringPropertyNames()) {
+                if (name.startsWith("schema.mapping.table.")) {
+                    props.remove(name);
+                }
+            }
+            for (Map.Entry<String, String> m : collectedTableMappings.entrySet()) {
+                String srcDbTable = m.getKey();
+                String srcDb = srcDbTable.substring(0, srcDbTable.indexOf('.'));
+                // 目标库优先取该库自己的映射（新 UI），再退全局 targetDbName，最后同名
+                String effectiveTargetDb = collectedDbMappings.getOrDefault(srcDb,
+                        (tgtDbName != null && !tgtDbName.isEmpty()) ? tgtDbName : srcDb);
+                props.setProperty("schema.mapping.table." + srcDbTable, effectiveTargetDb + "." + m.getValue());
+                logger.info("表名映射已配置: {} -> {}.{}", srcDbTable, effectiveTargetDb, m.getValue());
+            }
         }
 
         String sourceType = taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql";

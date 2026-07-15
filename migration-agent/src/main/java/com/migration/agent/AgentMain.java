@@ -98,8 +98,20 @@ public class AgentMain {
         AgentConfig agentConfig = springContext.getBean(AgentConfig.class);
         
         recoveryService = new RecoveryService(agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(), agentConfig.getMysqlDbPassword());
-        
-        kafkaConsumer = new KafkaConsumerService(KAFKA_BOOTSTRAP_SERVERS, CONSUMER_GROUP_ID, 
+
+        // 指标落盘（全局 H2 时序库）：监控页"任务启动以来"的历史曲线依赖它回填。
+        // 此前该服务从未被初始化 → /api/metrics/{id}/history 一律 503，前端只能靠打开页面后的
+        // 实时轮询累积数据，看起来像"从点开监控页的时间开始统计"。
+        long metricsFlushMs = Long.parseLong(
+                agentConfig.getRawProperty("metrics.persistence.flush.interval.ms", "30000"));
+        int metricsBatchSize = Integer.parseInt(
+                agentConfig.getRawProperty("metrics.persistence.batch.size", "100"));
+        com.migration.agent.service.MetricsPersistenceService.initialize(
+                "jdbc:h2:./files/agent_metrics;MODE=MySQL;AUTO_SERVER=TRUE",
+                agentConfig.getH2MetadataUser(), agentConfig.getH2MetadataPassword(),
+                metricsFlushMs, metricsBatchSize);
+
+        kafkaConsumer = new KafkaConsumerService(KAFKA_BOOTSTRAP_SERVERS, CONSUMER_GROUP_ID,
             this::handleTaskMessage);
         
         kafkaConsumer.start();

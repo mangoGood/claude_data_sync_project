@@ -45,14 +45,31 @@ public final class DdlIdentifierRewriter {
     }
 
     /**
-     * 改写库名（schema），并可选改写表名（table）。
+     * 改写库名（schema），并可选改写表名（table）——仅限定名（schema.table）形式。
      *
      * @param schemaMapper 源库名 → 目标库名
-     * @param tableMapper  (源库名, 源表名) → 目标表名；传 null 表示不改表名（当前需求仅库名映射）
+     * @param tableMapper  (源库名, 源表名) → 目标表名；传 null 表示不改表名
      */
     public static String rewrite(String sql, Function<String, String> schemaMapper,
                                  BiFunction<String, String, String> tableMapper) {
-        if (sql == null || sql.isEmpty() || schemaMapper == null) {
+        return rewrite(sql, schemaMapper, tableMapper, null);
+    }
+
+    /**
+     * 改写库名（schema）与表名（table），支持非限定表名。
+     *
+     * <p>非限定表名（{@code ALTER TABLE t1 ...}、{@code USE db; CREATE TABLE t1 ...}）没有
+     * 库名前缀可供定位，靠关键字上下文识别表名位置（CREATE/ALTER/DROP/TRUNCATE/RENAME TABLE、
+     * REFERENCES 之后），并用事件的数据库上下文 {@code defaultSchema} 作为映射 key 的库名部分。
+     *
+     * @param schemaMapper  源库名 → 目标库名（可为 null，只做表名映射）
+     * @param tableMapper   (源库名, 源表名) → 目标表名（可为 null，只做库名映射）
+     * @param defaultSchema 非限定表名的库名上下文（binlog QUERY 事件的 database）；
+     *                      null 时非限定表名不参与映射
+     */
+    public static String rewrite(String sql, Function<String, String> schemaMapper,
+                                 BiFunction<String, String, String> tableMapper, String defaultSchema) {
+        if (sql == null || sql.isEmpty() || (schemaMapper == null && tableMapper == null)) {
             return sql;
         }
         List<Token> toks;
@@ -63,6 +80,11 @@ public final class DdlIdentifierRewriter {
             logger.warn("DDL 标识符改写词法失败，返回原文: {}", e.getMessage());
             return sql;
         }
+
+        // 非限定表名的候选位置（关键字上下文识别），限定名（后跟 DOT）在主循环里被排除
+        java.util.Set<Integer> tablePositions = (tableMapper != null && defaultSchema != null)
+                ? findTableNamePositions(toks)
+                : java.util.Collections.emptySet();
 
         // 收集替换区间：[startIndex, stopIndex+1) → 新文本
         List<int[]> ranges = new ArrayList<>();   // {start, endExclusive}
@@ -79,12 +101,12 @@ public final class DdlIdentifierRewriter {
                         || (prev.getType() != MySqlClassifierLexer.DOT && !isIdent(prev));
                 if (chainStart) {
                     String srcDb = identName(t);
-                    String tgtDb = schemaMapper.apply(srcDb);
+                    String tgtDb = schemaMapper != null ? schemaMapper.apply(srcDb) : null;
                     if (tgtDb != null && !tgtDb.equals(srcDb)) {
                         ranges.add(new int[]{t.getStartIndex(), t.getStopIndex() + 1});
                         repl.add(renderIdent(tgtDb, t));
                     }
-                    // 表名映射（预留）：schema.table 的 table = next-next 标识符
+                    // 表名映射：schema.table 的 table = next-next 标识符（映射 key 用源库名）
                     if (tableMapper != null && i + 2 < toks.size() && isIdent(toks.get(i + 2))) {
                         Token tblTok = toks.get(i + 2);
                         String srcTbl = identName(tblTok);
@@ -97,11 +119,22 @@ public final class DdlIdentifierRewriter {
                 }
             } else if (t.getType() == MySqlClassifierLexer.USE && next != null && isIdent(next)) {
                 // 规则2：USE schema
-                String srcDb = identName(next);
-                String tgtDb = schemaMapper.apply(srcDb);
-                if (tgtDb != null && !tgtDb.equals(srcDb)) {
-                    ranges.add(new int[]{next.getStartIndex(), next.getStopIndex() + 1});
-                    repl.add(renderIdent(tgtDb, next));
+                if (schemaMapper != null) {
+                    String srcDb = identName(next);
+                    String tgtDb = schemaMapper.apply(srcDb);
+                    if (tgtDb != null && !tgtDb.equals(srcDb)) {
+                        ranges.add(new int[]{next.getStartIndex(), next.getStopIndex() + 1});
+                        repl.add(renderIdent(tgtDb, next));
+                    }
+                }
+            } else if (isIdent(t) && tablePositions.contains(i)
+                    && (next == null || next.getType() != MySqlClassifierLexer.DOT)) {
+                // 规则3：非限定表名（关键字上下文定位），库名上下文 = defaultSchema
+                String srcTbl = identName(t);
+                String tgtTbl = tableMapper.apply(defaultSchema, srcTbl);
+                if (tgtTbl != null && !tgtTbl.equals(srcTbl)) {
+                    ranges.add(new int[]{t.getStartIndex(), t.getStopIndex() + 1});
+                    repl.add(renderIdent(tgtTbl, t));
                 }
             }
         }
@@ -119,6 +152,84 @@ public final class DdlIdentifierRewriter {
             sb.replace(r[0], r[1], repl.get(idx));
         }
         return sb.toString();
+    }
+
+    /**
+     * 关键字上下文定位表名 token 下标：CREATE [TEMPORARY] TABLE [IF NOT EXISTS] t、
+     * ALTER TABLE t、DROP [TEMPORARY] TABLE [IF EXISTS] t1[, t2...]、TRUNCATE [TABLE] t、
+     * RENAME TABLE a TO b[, c TO d]、REFERENCES t（外键）。
+     * 限定名（db.t）的链首会被主循环的 DOT 检查排除，此处标记不产生误改。
+     */
+    private static java.util.Set<Integer> findTableNamePositions(List<Token> toks) {
+        java.util.Set<Integer> pos = new java.util.HashSet<>();
+        int n = toks.size();
+        for (int i = 0; i < n; i++) {
+            int ty = toks.get(i).getType();
+            if (ty == MySqlClassifierLexer.CREATE || ty == MySqlClassifierLexer.DROP) {
+                int j = i + 1;
+                if (j < n && toks.get(j).getType() == MySqlClassifierLexer.TEMPORARY) j++;
+                if (j >= n || toks.get(j).getType() != MySqlClassifierLexer.TABLE) continue;
+                j++;
+                if (j < n && toks.get(j).getType() == MySqlClassifierLexer.IF) {
+                    j++;
+                    if (j < n && toks.get(j).getType() == MySqlClassifierLexer.NOT) j++;
+                    if (j < n && toks.get(j).getType() == MySqlClassifierLexer.EXISTS) j++;
+                }
+                if (j < n && isIdent(toks.get(j))) {
+                    pos.add(j);
+                    if (ty == MySqlClassifierLexer.DROP) {
+                        // DROP TABLE t1, t2, db.t3 ... 逐个标记
+                        int k = qualifiedChainEnd(toks, j);
+                        while (k + 2 < n && toks.get(k + 1).getType() == MySqlClassifierLexer.COMMA
+                                && isIdent(toks.get(k + 2))) {
+                            pos.add(k + 2);
+                            k = qualifiedChainEnd(toks, k + 2);
+                        }
+                    }
+                }
+            } else if (ty == MySqlClassifierLexer.ALTER) {
+                if (i + 2 < n && toks.get(i + 1).getType() == MySqlClassifierLexer.TABLE
+                        && isIdent(toks.get(i + 2))) {
+                    pos.add(i + 2);
+                }
+            } else if (ty == MySqlClassifierLexer.TRUNCATE) {
+                int j = i + 1;
+                if (j < n && toks.get(j).getType() == MySqlClassifierLexer.TABLE) j++;
+                if (j < n && isIdent(toks.get(j))) pos.add(j);
+            } else if (ty == MySqlClassifierLexer.RENAME) {
+                if (i + 1 >= n || toks.get(i + 1).getType() != MySqlClassifierLexer.TABLE) continue;
+                int j = i + 2;
+                while (j < n && isIdent(toks.get(j))) {
+                    pos.add(j);
+                    j = qualifiedChainEnd(toks, j) + 1;
+                    if (j < n && toks.get(j).getType() == MySqlClassifierLexer.TO) {
+                        j++;
+                        if (j < n && isIdent(toks.get(j))) {
+                            pos.add(j);
+                            j = qualifiedChainEnd(toks, j) + 1;
+                        }
+                    }
+                    if (j < n && toks.get(j).getType() == MySqlClassifierLexer.COMMA) {
+                        j++;
+                    } else {
+                        break;
+                    }
+                }
+            } else if (ty == MySqlClassifierLexer.REFERENCES) {
+                if (i + 1 < n && isIdent(toks.get(i + 1))) pos.add(i + 1);
+            }
+        }
+        return pos;
+    }
+
+    /** 返回从 idx 开始的限定链（a.b.c）最后一个标识符 token 的下标。 */
+    private static int qualifiedChainEnd(List<Token> toks, int idx) {
+        int k = idx;
+        while (k + 2 < toks.size() && toks.get(k + 1).getType() == MySqlClassifierLexer.DOT
+                && isIdent(toks.get(k + 2))) {
+            k += 2;
+        }
+        return k;
     }
 
     private static boolean isIdent(Token t) {

@@ -127,6 +127,7 @@ public class Main {
                     logger.warn("数据库 {} 中没有找到任何表，跳过", dbName);
                     continue;
                 }
+                applyTableNameMapping(tables, dbName, config);
 
                 logger.info("数据库 {} 找到 {} 个表需要迁移", dbName, tables.size());
                 for (TableInfo table : tables) {
@@ -140,6 +141,32 @@ public class Main {
             } finally {
                 sourceConn.close();
                 targetConn.close();
+            }
+        }
+    }
+
+    /**
+     * 表名映射（仅表级同步下发 schema.mapping.table.*）：给 TableInfo 打上目标表名，
+     * 建表/写数用目标名，源端读取与断点进度仍用源表名。
+     * 查找精确命中优先、小写回退——适配 MySQL 源 lower_case_table_names 不区分大小写时
+     * 元数据返回的库表名大小写与映射配置不一致的场景。
+     */
+    private static void applyTableNameMapping(List<TableInfo> tables, String dbName, MigrationConfig config) {
+        java.util.Map<String, String> mapping = config.getTableNameMapping();
+        if (mapping == null || mapping.isEmpty()) {
+            return;
+        }
+        java.util.Map<String, String> mappingLower = new java.util.HashMap<>();
+        mapping.forEach((k, v) -> mappingLower.put(k.toLowerCase(), v));
+        for (TableInfo table : tables) {
+            String key = dbName + "." + table.getTableName();
+            String target = mapping.get(key);
+            if (target == null) {
+                target = mappingLower.get(key.toLowerCase());
+            }
+            if (target != null && !target.isEmpty()) {
+                table.setTargetTableName(target);
+                logger.info("表名映射: {}.{} -> {}", dbName, table.getTableName(), target);
             }
         }
     }
@@ -206,6 +233,7 @@ public class Main {
                 logger.warn("源数据库中没有找到任何表");
                 return;
             }
+            applyTableNameMapping(tables, config.getSourceConfig().getDatabase(), config);
 
             logger.info("找到 {} 个表需要迁移", tables.size());
             for (TableInfo table : tables) {

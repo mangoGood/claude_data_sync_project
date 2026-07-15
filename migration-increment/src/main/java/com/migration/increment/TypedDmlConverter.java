@@ -41,6 +41,10 @@ public class TypedDmlConverter {
     private final boolean enabled;
     private final boolean targetIsMysql;
     private final String targetDatabaseName;
+    /** 表名映射（仅表级同步下发）："源库.源表" → 目标表名，来自 schema.mapping.table.* */
+    private final Map<String, String> tableNameMapping = new java.util.HashMap<>();
+    /** 小写回退索引：适配 MySQL 源 lower_case_table_names 不区分大小写（精确命中优先） */
+    private final Map<String, String> tableNameMappingLower = new java.util.HashMap<>();
 
     public TypedDmlConverter(Properties props) {
         String source = props.getProperty("source.db.type", "mysql").toLowerCase();
@@ -55,8 +59,22 @@ public class TypedDmlConverter {
         this.enabled = switchOn && pairSupported;
         this.targetIsMysql = "mysql".equals(target);
         this.targetDatabaseName = props.getProperty("target.db.database", "");
-        logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={})",
-                enabled, source, target, switchOn);
+
+        // 表名映射：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>，DML 只需要表名部分
+        String tableMappingPrefix = "schema.mapping.table.";
+        for (String name : props.stringPropertyNames()) {
+            if (name.startsWith(tableMappingPrefix)) {
+                String key = name.substring(tableMappingPrefix.length());
+                String value = props.getProperty(name, "");
+                String targetTable = value.contains(".") ? value.substring(value.indexOf('.') + 1) : value;
+                if (!key.isEmpty() && !targetTable.isEmpty()) {
+                    tableNameMapping.put(key, targetTable);
+                    tableNameMappingLower.put(key.toLowerCase(), targetTable);
+                }
+            }
+        }
+        logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={}, tableMappings={})",
+                enabled, source, target, switchOn, tableNameMapping.size());
     }
 
     public boolean isEnabled() {
@@ -83,6 +101,19 @@ public class TypedDmlConverter {
         String table = (String) metadata.getOrDefault("table_name", "");
         if (table.isEmpty()) {
             return null;
+        }
+        // 表名映射：key 用源库名（metadata 的 database_name 是源库），仅表级同步配置。
+        // 精确命中优先，小写回退（适配 MySQL 源 lower_case_table_names 不区分大小写）。
+        if (!tableNameMapping.isEmpty()) {
+            String srcDb = (String) metadata.getOrDefault("database_name", "");
+            String key = srcDb + "." + table;
+            String mapped = tableNameMapping.get(key);
+            if (mapped == null) {
+                mapped = tableNameMappingLower.get(key.toLowerCase());
+            }
+            if (mapped != null) {
+                table = mapped;
+            }
         }
 
         switch (eventType) {

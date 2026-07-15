@@ -132,11 +132,13 @@ public class WorkflowController {
             @RequestParam(required = false) String keyword,
             @RequestParam(required = false) String status,
             @RequestParam(required = false) String taskType,
+            @RequestParam(required = false) String sourceType,
+            @RequestParam(required = false) String targetType,
             Authentication authentication) {
         try {
             UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
             Page<Workflow> workflowPage = workflowService.getWorkflowsByUserIdAndFilters(
-                    userPrincipal.getId(), keyword, status, taskType, page, pageSize, sortBy, sortDirection
+                    userPrincipal.getId(), keyword, status, taskType, sourceType, targetType, page, pageSize, sortBy, sortDirection
             );
 
             List<Map<String, Object>> list = new ArrayList<>();

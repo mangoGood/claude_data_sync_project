@@ -55,12 +55,14 @@ public class DataValidationService {
         validation = validationRepository.save(validation);
 
         try {
-            // 解析同步对象获取表列表
+            // 解析同步对象获取表列表；表级同步可能配了表名映射，目标端按映射名取行数
             List<String> tables = parseTablesFromSyncObjects(workflow.getSyncObjects());
+            Map<String, String> tableMapping = parseTableMappingFromSyncObjects(workflow.getSyncObjects());
 
             long totalMismatched = 0;
             for (String table : tables) {
-                DataValidation tableValidation = validateTable(workflow, table, validationType);
+                DataValidation tableValidation = validateTable(workflow, table,
+                        tableMapping.getOrDefault(table, table), validationType);
                 if (tableValidation != null) {
                     tableValidation.setUserId(userId);
                     validationRepository.save(tableValidation);
@@ -88,9 +90,12 @@ public class DataValidationService {
     }
 
     /**
-     * 校验单张表
+     * 校验单张表。
+     *
+     * @param tableName       源表名
+     * @param targetTableName 目标表名（表名映射后；无映射时 = 源表名）
      */
-    private DataValidation validateTable(Workflow workflow, String tableName, String validationType) {
+    private DataValidation validateTable(Workflow workflow, String tableName, String targetTableName, String validationType) {
         DataValidation dv = new DataValidation();
         dv.setWorkflowId(workflow.getId());
         dv.setTableName(tableName);
@@ -119,7 +124,8 @@ public class DataValidationService {
                     ? getSchemaFromSyncObjects(workflow.getSyncObjects(), workflow.getSourceDbName())
                     : workflow.getSourceDbName();
             long sourceCount = getTableRowCount(sourceConn, srcSchema, tableName, srcParsed[3]);
-            long targetCount = getTableRowCount(targetConn, workflow.getTargetDbName(), tableName, tgtParsed[3]);
+            // 表名映射：目标端按映射后的表名统计行数
+            long targetCount = getTableRowCount(targetConn, workflow.getTargetDbName(), targetTableName, tgtParsed[3]);
 
             dv.setSourceCount(sourceCount);
             dv.setTargetCount(targetCount);
@@ -131,7 +137,7 @@ public class DataValidationService {
                 dv.setStatus("FAILED");
                 dv.setMismatchedCount(Math.abs(sourceCount - targetCount));
                 // 生成修复SQL
-                dv.setRepairSql(generateRepairSql(tableName, sourceCount, targetCount));
+                dv.setRepairSql(generateRepairSql(tableName, targetTableName, sourceCount, targetCount));
             }
             dv.setCompletedAt(LocalDateTime.now());
         } catch (Exception e) {
@@ -178,17 +184,21 @@ public class DataValidationService {
     /**
      * 生成差异修复SQL
      */
-    private String generateRepairSql(String tableName, long sourceCount, long targetCount) {
+    private String generateRepairSql(String tableName, String targetTableName, long sourceCount, long targetCount) {
         StringBuilder sb = new StringBuilder();
-        sb.append("-- 差异修复SQL (表: ").append(tableName).append(")\n");
+        sb.append("-- 差异修复SQL (表: ").append(tableName);
+        if (!tableName.equals(targetTableName)) {
+            sb.append(" → ").append(targetTableName);
+        }
+        sb.append(")\n");
         sb.append("-- 源库行数: ").append(sourceCount).append(", 目标库行数: ").append(targetCount).append("\n");
         if (targetCount < sourceCount) {
             sb.append("-- 目标库缺少数据，建议从源库补充:\n");
-            sb.append("-- INSERT INTO `").append(tableName).append("` SELECT * FROM source_db.`")
-              .append(tableName).append("` WHERE id NOT IN (SELECT id FROM target_db.`").append(tableName).append("`);\n");
+            sb.append("-- INSERT INTO `").append(targetTableName).append("` SELECT * FROM source_db.`")
+              .append(tableName).append("` WHERE id NOT IN (SELECT id FROM target_db.`").append(targetTableName).append("`);\n");
         } else if (targetCount > sourceCount) {
             sb.append("-- 目标库多余数据，建议删除:\n");
-            sb.append("-- DELETE FROM `").append(tableName).append("` WHERE id NOT IN (SELECT id FROM source_db.`")
+            sb.append("-- DELETE FROM `").append(targetTableName).append("` WHERE id NOT IN (SELECT id FROM source_db.`")
               .append(tableName).append("`);\n");
         }
         return sb.toString();
@@ -310,23 +320,71 @@ public class DataValidationService {
     }
 
     @SuppressWarnings("unchecked")
-    private List<String> parseTablesFromSyncObjects(String syncObjects) {
+    /**
+     * 解析 syncObjects 的表清单，兼容三种格式：
+     * 1) {"tables":["t1"]}（最老格式）
+     * 2) {"db":["t1","t2"]}（value 为 List 的旧格式）
+     * 3) {"db":{"tables":["t1"],"tableMapping":{...}}}（当前格式，value 为 Map；dbLevel entry 无表清单）
+     * 多库时合并全部表。此前只支持 1)/2)，新建任务（格式 3）会解析出 0 张表导致行数校验静默通过。
+     */
+    List<String> parseTablesFromSyncObjects(String syncObjects) {
         if (syncObjects == null || syncObjects.isEmpty()) return Collections.emptyList();
         try {
             com.google.gson.Gson gson = new com.google.gson.Gson();
             Map<String, Object> obj = gson.fromJson(syncObjects, Map.class);
-            List<String> tables = (List<String>) obj.get("tables");
-            if (tables != null) return tables;
-            // 如果是 {db: [tables]} 格式
+            if (obj == null) return Collections.emptyList();
+            Object legacyTables = obj.get("tables");
+            if (legacyTables instanceof List) {
+                return castStringList((List<?>) legacyTables);
+            }
+            List<String> result = new ArrayList<>();
             for (Object value : obj.values()) {
                 if (value instanceof List) {
-                    return (List<String>) value;
+                    result.addAll(castStringList((List<?>) value));
+                } else if (value instanceof Map) {
+                    Object tablesObj = ((Map<?, ?>) value).get("tables");
+                    if (tablesObj instanceof List) {
+                        result.addAll(castStringList((List<?>) tablesObj));
+                    }
                 }
             }
+            return result;
         } catch (Exception e) {
             logger.warn("解析同步对象失败: {}", syncObjects);
         }
         return Collections.emptyList();
+    }
+
+    /**
+     * 解析表级 entry 的表名映射（源表 → 目标表，跨库合并）：
+     * 目标端行数须按映射后的表名统计，否则映射表必报差异/表不存在。
+     */
+    Map<String, String> parseTableMappingFromSyncObjects(String syncObjects) {
+        Map<String, String> result = new HashMap<>();
+        if (syncObjects == null || syncObjects.isEmpty()) return result;
+        try {
+            com.google.gson.Gson gson = new com.google.gson.Gson();
+            Map<String, Object> obj = gson.fromJson(syncObjects, Map.class);
+            if (obj == null) return result;
+            for (Object value : obj.values()) {
+                if (!(value instanceof Map)) continue;
+                Object mappingObj = ((Map<?, ?>) value).get("tableMapping");
+                if (mappingObj instanceof Map) {
+                    ((Map<?, ?>) mappingObj).forEach((k, v) -> result.put(String.valueOf(k), String.valueOf(v)));
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("解析表名映射失败: {}", syncObjects);
+        }
+        return result;
+    }
+
+    private List<String> castStringList(List<?> list) {
+        List<String> out = new ArrayList<>();
+        for (Object o : list) {
+            if (o != null) out.add(String.valueOf(o));
+        }
+        return out;
     }
 
     /**
