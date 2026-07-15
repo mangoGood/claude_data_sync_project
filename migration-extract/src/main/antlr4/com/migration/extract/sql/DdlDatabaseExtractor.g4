@@ -28,7 +28,7 @@ alterTableStatement
     ;
 
 dropTableStatement
-    : DROP TABLE ifExists? tableName remainingSql?
+    : DROP TABLE ifExists? tableName (COMMA tableName)* remainingSql?
     ;
 
 truncateStatement

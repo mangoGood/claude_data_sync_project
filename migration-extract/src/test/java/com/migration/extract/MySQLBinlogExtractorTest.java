@@ -5,12 +5,19 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -224,5 +231,109 @@ class MySQLBinlogExtractorTest {
         assertNotNull(thl1);
         assertNotNull(thl2);
         assertTrue(thl2.getSeqno() > thl1.getSeqno(), "seqno should increment");
+    }
+
+    // ---- DDL 后列元数据缓存失效（防止 ALTER 新增列的值被静默丢弃）----
+
+    /** 按 database.table 键缓存列元数据的五个缓存字段。 */
+    private static final String[] TABLE_META_CACHES = {
+            "tableSchemaCache", "tableColumnTypeCache", "tableColumnFullTypeCache",
+            "enumSetValuesCache", "primaryKeyCache"
+    };
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> cache(String fieldName) throws Exception {
+        Field f = MySQLBinlogExtractor.class.getDeclaredField(fieldName);
+        f.setAccessible(true);
+        return (Map<String, Object>) f.get(extractor);
+    }
+
+    /** 为某个 database.table 键在全部五个缓存中植入陈旧条目，模拟 DDL 前已缓存的旧列布局。 */
+    private void seedStaleCaches(String key) throws Exception {
+        cache("tableSchemaCache").put(key, new ArrayList<>(Arrays.asList("id")));
+        cache("tableColumnTypeCache").put(key, new ArrayList<>(Arrays.asList("int")));
+        cache("tableColumnFullTypeCache").put(key, new ArrayList<>(Arrays.asList("int")));
+        cache("enumSetValuesCache").put(key, new HashMap<>());
+        cache("primaryKeyCache").put(key, new ArrayList<>(Arrays.asList("id")));
+    }
+
+    private void assertNotCached(String key) throws Exception {
+        for (String name : TABLE_META_CACHES) {
+            assertFalse(cache(name).containsKey(key), name + " 应已失效 " + key + " 的缓存");
+        }
+    }
+
+    private void assertCached(String key) throws Exception {
+        for (String name : TABLE_META_CACHES) {
+            assertTrue(cache(name).containsKey(key), name + " 不应清除 " + key + " 的缓存");
+        }
+    }
+
+    @Test
+    @DisplayName("ALTER TABLE 的 QUERY 事件应失效该表的列元数据缓存")
+    void alterTableQueryShouldInvalidateColumnCaches() throws Exception {
+        seedStaleCaches("test1.t5");
+        // QueryEventData.toString() 形如 {..., database='<会话库>', sql='<DDL>'}
+        String eventData = "QueryEventData{database='test2', "
+                + "sql='ALTER TABLE test1.t5 ADD COLUMN name VARCHAR(30)'}";
+        THLEvent thlEvent = extract(buildEvent("QUERY", "mysql-bin.000010", 100, 1700000009000L, 10, eventData));
+
+        assertNotNull(thlEvent);
+        assertEquals("QUERY", thlEvent.getMetadata().get("operation"));
+        assertNotCached("test1.t5");
+    }
+
+    @Test
+    @DisplayName("未限定库名的 ALTER 用会话库补全后失效缓存")
+    void unqualifiedAlterUsesSessionDatabase() throws Exception {
+        seedStaleCaches("test1.t5");
+        String eventData = "QueryEventData{database='test1', sql='ALTER TABLE t5 ADD COLUMN name VARCHAR(30)'}";
+        extract(buildEvent("QUERY", "mysql-bin.000011", 200, 1700000010000L, 11, eventData));
+
+        assertNotCached("test1.t5");
+    }
+
+    @Test
+    @DisplayName("RENAME TABLE 应同时失效旧表名与新表名的缓存")
+    void renameTableQueryShouldInvalidateBothNames() throws Exception {
+        seedStaleCaches("test1.t5");
+        seedStaleCaches("test1.t6");
+        String eventData = "QueryEventData{database='test1', sql='RENAME TABLE test1.t5 TO test1.t6'}";
+        extract(buildEvent("QUERY", "mysql-bin.000012", 300, 1700000011000L, 12, eventData));
+
+        assertNotCached("test1.t5");
+        assertNotCached("test1.t6");
+    }
+
+    @Test
+    @DisplayName("DROP TABLE 多表应逐个失效各自缓存")
+    void dropMultipleTablesShouldInvalidateEach() throws Exception {
+        seedStaleCaches("test1.t5");
+        seedStaleCaches("test1.t6");
+        String eventData = "QueryEventData{database='test1', sql='DROP TABLE IF EXISTS test1.t5, t6'}";
+        extract(buildEvent("QUERY", "mysql-bin.000015", 600, 1700000014000L, 15, eventData));
+
+        assertNotCached("test1.t5");
+        assertNotCached("test1.t6");
+    }
+
+    @Test
+    @DisplayName("非表级 DDL（CREATE DATABASE）不应清除列元数据缓存")
+    void databaseDdlShouldNotInvalidateColumnCaches() throws Exception {
+        seedStaleCaches("test1.t5");
+        String eventData = "QueryEventData{database='test1', sql='CREATE DATABASE newdb'}";
+        extract(buildEvent("QUERY", "mysql-bin.000013", 400, 1700000012000L, 13, eventData));
+
+        assertCached("test1.t5");
+    }
+
+    @Test
+    @DisplayName("ALTER 其它表不应误清除本表缓存")
+    void alterDifferentTableShouldNotInvalidateOtherTable() throws Exception {
+        seedStaleCaches("test1.t5");
+        String eventData = "QueryEventData{database='test1', sql='ALTER TABLE test1.t9 ADD COLUMN c INT'}";
+        extract(buildEvent("QUERY", "mysql-bin.000014", 500, 1700000013000L, 14, eventData));
+
+        assertCached("test1.t5");
     }
 }

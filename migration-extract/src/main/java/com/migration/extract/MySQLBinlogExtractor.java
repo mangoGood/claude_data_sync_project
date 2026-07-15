@@ -1057,6 +1057,27 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             if (ddlDatabase != null && !ddlDatabase.isEmpty()) {
                 thlEvent.addMetadata("ddl_database", ddlDatabase);
             }
+            // ALTER/DROP/RENAME/TRUNCATE/CREATE TABLE 会改变列布局：失效该表的列元数据缓存，
+            // 否则后续 WRITE/UPDATE_ROWS 会沿用 ALTER 前的旧列名，静默丢弃新增列的值。
+            invalidateColumnCachesForDdl(sql, database);
+        }
+    }
+
+    /**
+     * 对表级 DDL 影响的每张表，移除全部按 {@code database.table} 键缓存的列元数据，
+     * 使下一个数据事件重新查询 information_schema，拿到 DDL 后的最新列布局。
+     */
+    private void invalidateColumnCachesForDdl(String sql, String defaultDatabase) {
+        for (String cacheKey : DdlDatabaseAnltrExtractor.extractAffectedTables(sql, defaultDatabase)) {
+            boolean removed = false;
+            removed |= tableSchemaCache.remove(cacheKey) != null;
+            removed |= tableColumnTypeCache.remove(cacheKey) != null;
+            removed |= tableColumnFullTypeCache.remove(cacheKey) != null;
+            removed |= enumSetValuesCache.remove(cacheKey) != null;
+            removed |= primaryKeyCache.remove(cacheKey) != null;
+            if (removed) {
+                logger.info("DDL 变更表 {}, 失效列元数据缓存，下个数据事件将重新读取 information_schema", cacheKey);
+            }
         }
     }
 
