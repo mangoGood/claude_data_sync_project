@@ -128,7 +128,20 @@ public class MetricsPersistenceService {
     }
 
     private void checkInitialized() {
-        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword)) {
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+             Statement st = conn.createStatement()) {
+            // 时序表按需创建：任务指标点（30s/点）与子进程状态变更
+            st.execute("CREATE TABLE IF NOT EXISTS task_metrics_ts (" +
+                    "task_id VARCHAR(64) NOT NULL, ts BIGINT NOT NULL, " +
+                    "capture_rate BIGINT, e2e_latency_ms BIGINT, rpo_ms BIGINT, rto_ms BIGINT, " +
+                    "capture_q_depth BIGINT, extract_q_depth BIGINT, apply_q_depth BIGINT, " +
+                    "checkpoint_lag BIGINT, capture_events BIGINT, applied_events BIGINT)");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_metrics_task_ts ON task_metrics_ts (task_id, ts)");
+            st.execute("CREATE TABLE IF NOT EXISTS task_process_status_ts (" +
+                    "task_id VARCHAR(64) NOT NULL, ts BIGINT NOT NULL, " +
+                    "process_name VARCHAR(64), state VARCHAR(32), pid BIGINT, " +
+                    "retry_count INT, cb_state VARCHAR(32))");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_process_task_ts ON task_process_status_ts (task_id, ts)");
             initialized = true;
             logger.info("MetricsPersistenceService initialized, flushInterval={}ms, batchSize={}", flushIntervalMs, batchSize);
         } catch (SQLException e) {

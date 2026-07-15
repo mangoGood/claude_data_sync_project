@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "divider-demo",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "4173", "-d", "/private/tmp/claude-501/-Users-finn-Documents-claudecode-project-test-git/61ab4f76-110b-4ad0-8b69-b1a8294d7920/scratchpad/divider-demo"],
+      "port": 4173
+    }
+  ]
+}

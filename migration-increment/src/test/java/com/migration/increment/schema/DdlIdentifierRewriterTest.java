@@ -101,4 +101,95 @@ class DdlIdentifierRewriterTest {
         assertEquals(null, DdlIdentifierRewriter.rewriteSchema(null, map));
         assertEquals("", DdlIdentifierRewriter.rewriteSchema("", map));
     }
+
+    // ==== 表名映射（表级同步）：非限定表名走 defaultSchema 上下文 ====
+
+    /** test1 库下 t1 -> t1_new 的表映射；其它原样。 */
+    private final java.util.function.BiFunction<String, String, String> tblMap =
+            (db, t) -> Map.of("test1.t1", "t1_new").getOrDefault(db + "." + t, t);
+
+    @Test
+    @DisplayName("非限定 CREATE/ALTER/DROP/TRUNCATE 表名按 defaultSchema 映射")
+    void unqualifiedTableMapping() {
+        assertEquals("CREATE TABLE t1_new (id INT PRIMARY KEY)",
+                DdlIdentifierRewriter.rewrite("CREATE TABLE t1 (id INT PRIMARY KEY)", map, tblMap, "test1"));
+        assertEquals("CREATE TABLE IF NOT EXISTS `t1_new` (id INT)",
+                DdlIdentifierRewriter.rewrite("CREATE TABLE IF NOT EXISTS `t1` (id INT)", map, tblMap, "test1"));
+        assertEquals("ALTER TABLE t1_new ADD COLUMN c INT",
+                DdlIdentifierRewriter.rewrite("ALTER TABLE t1 ADD COLUMN c INT", map, tblMap, "test1"));
+        assertEquals("DROP TABLE IF EXISTS t1_new",
+                DdlIdentifierRewriter.rewrite("DROP TABLE IF EXISTS t1", map, tblMap, "test1"));
+        assertEquals("TRUNCATE TABLE t1_new",
+                DdlIdentifierRewriter.rewrite("TRUNCATE TABLE t1", map, tblMap, "test1"));
+        assertEquals("TRUNCATE t1_new",
+                DdlIdentifierRewriter.rewrite("TRUNCATE t1", map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("非限定表名：defaultSchema 不匹配映射库时不改")
+    void unqualifiedWrongSchemaUnchanged() {
+        assertEquals("CREATE TABLE t1 (id INT)",
+                DdlIdentifierRewriter.rewrite("CREATE TABLE t1 (id INT)", map, tblMap, "otherdb"));
+        assertEquals("ALTER TABLE t2 ADD COLUMN c INT",
+                DdlIdentifierRewriter.rewrite("ALTER TABLE t2 ADD COLUMN c INT", map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("限定名 test1.t1 同时改库名与表名（defaultSchema 版本）")
+    void qualifiedTableMappingWithDefaultSchema() {
+        assertEquals("ALTER TABLE test2.t1_new ADD COLUMN c INT",
+                DdlIdentifierRewriter.rewrite("ALTER TABLE test1.t1 ADD COLUMN c INT", map, tblMap, "test1"));
+        // 限定名的映射 key 用限定库名而非 defaultSchema：other.t1 不命中 test1.t1
+        assertEquals("ALTER TABLE other.t1 ADD COLUMN c INT",
+                DdlIdentifierRewriter.rewrite("ALTER TABLE other.t1 ADD COLUMN c INT", map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("DROP TABLE 多表清单逐个映射")
+    void dropMultipleTables() {
+        assertEquals("DROP TABLE t1_new, t2",
+                DdlIdentifierRewriter.rewrite("DROP TABLE t1, t2", map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("RENAME TABLE 非限定名两侧均按映射改写")
+    void renameUnqualified() {
+        assertEquals("RENAME TABLE t1_new TO t9",
+                DdlIdentifierRewriter.rewrite("RENAME TABLE t1 TO t9", map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("FK REFERENCES 非限定表名映射")
+    void referencesUnqualified() {
+        assertEquals("CREATE TABLE child (id INT, pid INT, FOREIGN KEY (pid) REFERENCES t1_new(id))",
+                DdlIdentifierRewriter.rewrite(
+                        "CREATE TABLE child (id INT, pid INT, FOREIGN KEY (pid) REFERENCES t1(id))",
+                        map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("字符串字面量里的表名不被误改")
+    void tableNameInStringLiteralNotTouched() {
+        assertEquals("ALTER TABLE t1_new COMMENT = 'ALTER TABLE t1 backup'",
+                DdlIdentifierRewriter.rewrite(
+                        "ALTER TABLE t1 COMMENT = 'ALTER TABLE t1 backup'",
+                        map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("列名与表名同名不误改（非表名位置的标识符不动）")
+    void columnNamedLikeTableNotTouched() {
+        assertEquals("ALTER TABLE t1_new ADD COLUMN t1 INT",
+                DdlIdentifierRewriter.rewrite("ALTER TABLE t1 ADD COLUMN t1 INT", map, tblMap, "test1"));
+    }
+
+    @Test
+    @DisplayName("客户端注释前缀 + 全小写限定名：库名与表名都改写（回归任务 9e1e602e）")
+    void leadingCommentLowercaseQualifiedAlter() {
+        String in = "/* ApplicationName=DBeaver 25.2.4 - SQLEditor <Script-4.sql> */ "
+                + "alter table test1.t1 add column name2 varchar(20)";
+        String out = DdlIdentifierRewriter.rewrite(in, map, tblMap, "test1");
+        assertEquals("/* ApplicationName=DBeaver 25.2.4 - SQLEditor <Script-4.sql> */ "
+                + "alter table test2.t1_new add column name2 varchar(20)", out);
+    }
 }

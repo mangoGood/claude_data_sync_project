@@ -21,7 +21,7 @@ public class PgToMysqlTranslator implements TypeTranslator {
     @Override
     public String generateCreateTable(TableInfo table, SqlDialect targetDialect) {
         StringBuilder sb = new StringBuilder();
-        sb.append("CREATE TABLE ").append(targetDialect.quoteIdentifier(table.getTableName())).append(" (\n");
+        sb.append("CREATE TABLE ").append(targetDialect.quoteIdentifier(table.getTargetTableName())).append(" (\n");
 
         List<String> columnDefs = new ArrayList<>();
         List<String> pkColumns = new ArrayList<>();

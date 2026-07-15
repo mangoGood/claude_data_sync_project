@@ -292,7 +292,8 @@ public class DataMigration {
         int successCount = 0;
         int failCount = 0;
         String sourceQuoteColumnList = buildSourceQuotedColumnList(table);
-        String insertSql = "INSERT INTO " + targetQuoteIdentifier(tableName) + " (" + columnList + ") VALUES (" +
+        // 表名映射：目标端 INSERT 用目标表名；源端 SELECT 与进度 key 仍用源表名
+        String insertSql = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName()) + " (" + columnList + ") VALUES (" +
                 String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
 
         Connection targetConn = shardTgt.getConnection();
@@ -413,7 +414,8 @@ public class DataMigration {
         }
         
         String sourceQuoteColumnList = buildSourceQuotedColumnList(table);
-        String insertSql = "INSERT INTO " + targetQuoteIdentifier(tableName) + " (" + columnList + ") VALUES (" +
+        // 表名映射：目标端 INSERT 用目标表名；源端 SELECT 与进度 key 仍用源表名
+        String insertSql = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName()) + " (" + columnList + ") VALUES (" +
                           String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
 
         Connection sourceConn = sourceConnection.getConnection();

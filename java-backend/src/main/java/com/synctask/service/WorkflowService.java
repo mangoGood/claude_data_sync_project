@@ -15,10 +15,13 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import jakarta.persistence.criteria.Predicate;
 import java.lang.reflect.Type;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -291,41 +294,55 @@ public class WorkflowService {
     }
 
     public Page<Workflow> getWorkflowsByUserIdAndFilters(Long userId, String keyword, String status, String taskType, int page, int pageSize, String sortBy, String sortDirection) {
-        String fieldName = mapSortField(sortBy);
+        return getWorkflowsByUserIdAndFilters(userId, keyword, status, taskType, null, null, page, pageSize, sortBy, sortDirection);
+    }
 
+    /**
+     * 列表筛选：userId 必选，其余（keyword/status/taskType/sourceType/targetType）均可选独立组合。
+     * 用 Specification 而非组合爆炸的 @Query 方法（此前 keyword×status×taskType 已有 8 个方法，
+     * 再加 sourceType/targetType 两维会变成 32 个），按需拼接 WHERE 条件，新增筛选维度零额外方法。
+     */
+    public Page<Workflow> getWorkflowsByUserIdAndFilters(Long userId, String keyword, String status, String taskType,
+                                                         String sourceType, String targetType,
+                                                         int page, int pageSize, String sortBy, String sortDirection) {
+        String fieldName = mapSortField(sortBy);
         Sort.Direction direction = sortDirection.equalsIgnoreCase("ASC") ? Sort.Direction.ASC : Sort.Direction.DESC;
         Sort sort = Sort.by(direction, fieldName);
         Pageable pageable = PageRequest.of(clampPage(page) - 1, clampPageSize(pageSize), sort);
-        
-        boolean hasKeyword = keyword != null && !keyword.trim().isEmpty();
-        boolean hasStatus = status != null && !status.trim().isEmpty();
-        boolean hasTaskType = taskType != null && !taskType.trim().isEmpty();
-        
-        if (hasTaskType) {
-            if (hasKeyword && hasStatus) {
-                WorkflowStatus workflowStatus = WorkflowStatus.valueOf(status.toUpperCase());
-                return workflowRepository.findByUserIdAndTaskTypeAndKeywordAndStatus(userId, taskType, keyword.trim(), workflowStatus, pageable);
-            } else if (hasKeyword) {
-                return workflowRepository.findByUserIdAndTaskTypeAndKeyword(userId, taskType, keyword.trim(), pageable);
-            } else if (hasStatus) {
-                WorkflowStatus workflowStatus = WorkflowStatus.valueOf(status.toUpperCase());
-                return workflowRepository.findByUserIdAndTaskTypeAndStatus(userId, taskType, workflowStatus, pageable);
-            } else {
-                return workflowRepository.findByUserIdAndTaskType(userId, taskType, pageable);
+
+        WorkflowStatus workflowStatus = (status != null && !status.trim().isEmpty())
+                ? WorkflowStatus.valueOf(status.toUpperCase()) : null;
+        String trimmedKeyword = (keyword != null && !keyword.trim().isEmpty()) ? keyword.trim() : null;
+        String trimmedTaskType = (taskType != null && !taskType.trim().isEmpty()) ? taskType : null;
+        String trimmedSourceType = (sourceType != null && !sourceType.trim().isEmpty()) ? sourceType : null;
+        String trimmedTargetType = (targetType != null && !targetType.trim().isEmpty()) ? targetType : null;
+
+        Specification<Workflow> spec = (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            predicates.add(cb.equal(root.get("userId"), userId));
+            predicates.add(cb.isFalse(root.get("isDeleted")));
+            if (trimmedTaskType != null) {
+                predicates.add(cb.equal(root.get("taskType"), trimmedTaskType));
             }
-        }
-        
-        if (hasKeyword && hasStatus) {
-            WorkflowStatus workflowStatus = WorkflowStatus.valueOf(status.toUpperCase());
-            return workflowRepository.findByUserIdAndKeywordAndStatus(userId, keyword.trim(), workflowStatus, pageable);
-        } else if (hasKeyword) {
-            return workflowRepository.findByUserIdAndKeyword(userId, keyword.trim(), pageable);
-        } else if (hasStatus) {
-            WorkflowStatus workflowStatus = WorkflowStatus.valueOf(status.toUpperCase());
-            return workflowRepository.findByUserIdAndStatus(userId, workflowStatus, pageable);
-        } else {
-            return workflowRepository.findByUserId(userId, pageable);
-        }
+            if (workflowStatus != null) {
+                predicates.add(cb.equal(root.get("status"), workflowStatus));
+            }
+            if (trimmedKeyword != null) {
+                String pattern = "%" + trimmedKeyword.toLowerCase() + "%";
+                predicates.add(cb.or(
+                        cb.like(cb.lower(root.get("name")), pattern),
+                        cb.like(cb.lower(root.get("id")), pattern)));
+            }
+            if (trimmedSourceType != null) {
+                predicates.add(cb.equal(cb.lower(root.get("sourceType")), trimmedSourceType.toLowerCase()));
+            }
+            if (trimmedTargetType != null) {
+                predicates.add(cb.equal(cb.lower(root.get("targetType")), trimmedTargetType.toLowerCase()));
+            }
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+
+        return workflowRepository.findAll(spec, pageable);
     }
     
     public List<Workflow> getFailedWorkflowsByUserId(Long userId) {

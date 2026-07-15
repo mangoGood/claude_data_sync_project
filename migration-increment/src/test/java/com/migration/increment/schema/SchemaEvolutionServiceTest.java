@@ -198,6 +198,61 @@ class SchemaEvolutionServiceTest {
         assertTrue(executedSql.contains("target_db"), "数据库名应被映射");
     }
 
+    @Test
+    @DisplayName("库名映射+表名映射并存：限定名 ALTER 两者都应改写（回归任务 9e1e602e）")
+    void databaseAndTableMappingBothAppliedOnQualifiedAlter() throws SQLException {
+        // 回归：SAME_ENGINE 曾先走 DdlTranslator 正则把 test1.t2 改成 test3.t2，
+        // 再做表名映射时用 "test3.t2" 查 "test1.t2" 的 key 落空，表名映射丢失。
+        Properties props = baseProps();
+        props.setProperty("schema.mapping.db.test1", "test3");
+        props.setProperty("schema.mapping.table.test1.t2", "test3.t23");
+        SchemaEvolutionService service = createService(props);
+
+        // 目标端先建好映射后的库表，让 ALTER 真实执行
+        try (java.sql.Statement st = connection.createStatement()) {
+            st.execute("CREATE SCHEMA IF NOT EXISTS test3");
+            st.execute("CREATE TABLE test3.t23 (id INT PRIMARY KEY)");
+        }
+
+        // 与真实故障一致：带客户端注释前缀 + 全小写
+        SchemaEvolutionService.ApplyResult result = service.applyDdl(
+                "/* ApplicationName=DBeaver 25.2.4 - SQLEditor <Script-4.sql> */ "
+                        + "alter table test1.t2 add column name2 varchar(20)",
+                "ALTER_TABLE", "test1");
+
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED, result.getStatus());
+        String executedSql = result.getExecutedSql();
+        assertTrue(executedSql.contains("test3.t23"),
+                "库名与表名都应映射，实际: " + executedSql);
+        // 列真实加到了映射后的表上
+        try (java.sql.Statement st = connection.createStatement();
+             java.sql.ResultSet rs = st.executeQuery(
+                     "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                             + "WHERE TABLE_SCHEMA = 'TEST3' AND TABLE_NAME = 'T23' AND COLUMN_NAME = 'NAME2'")) {
+            assertTrue(rs.next(), "name2 列应加在 test3.t23 上");
+        }
+    }
+
+    @Test
+    @DisplayName("仅表名映射（无库名映射）：限定名 ALTER 表名应改写")
+    void tableMappingOnlyAppliedOnQualifiedAlter() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("schema.mapping.table.test1.t9", "test1.t9_new");
+        SchemaEvolutionService service = createService(props);
+
+        try (java.sql.Statement st = connection.createStatement()) {
+            st.execute("CREATE SCHEMA IF NOT EXISTS test1");
+            st.execute("CREATE TABLE test1.t9_new (id INT PRIMARY KEY)");
+        }
+
+        SchemaEvolutionService.ApplyResult result = service.applyDdl(
+                "ALTER TABLE test1.t9 ADD COLUMN c INT", "ALTER_TABLE", "test1");
+
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED, result.getStatus());
+        assertTrue(result.getExecutedSql().contains("t9_new"),
+                "表名应映射，实际: " + result.getExecutedSql());
+    }
+
     // ==================== 同步粒度策略 ====================
 
     @Test

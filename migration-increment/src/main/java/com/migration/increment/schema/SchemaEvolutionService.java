@@ -43,6 +43,8 @@ public class SchemaEvolutionService {
     private final String manualDdlLogPath;
     private final boolean sourceIsPostgresql;
     private final boolean targetIsPostgresql;
+    /** 同引擎（mysql→mysql / pg→pg）：标识符映射全权交给 DdlIdentifierRewriter，不走 DdlTranslator 正则 */
+    private final boolean sameEngine;
     private final OnlineDdlService onlineDdlService;
 
     /** Schema 演进统计 */
@@ -88,6 +90,7 @@ public class SchemaEvolutionService {
         } else {
             direction = DdlTranslator.Direction.SAME_ENGINE;
         }
+        this.sameEngine = (direction == DdlTranslator.Direction.SAME_ENGINE);
         this.translator = new DdlTranslator(direction, mappingConfig);
         this.onlineDdlService = new OnlineDdlService(props);
 
@@ -193,9 +196,12 @@ public class SchemaEvolutionService {
             logger.info("在线 DDL 影子表转换为原表 ALTER: targetTable={}", onlineResult.getTargetTable());
         }
 
-        // 翻译 DDL
+        // 翻译 DDL。同引擎（mysql→mysql / pg→pg）不走 DdlTranslator：其 SAME_ENGINE 分支只做
+        // 正则库名替换（会先把 test1.t2 改成 test3.t2，导致下面的表名映射用 "test3.t2" 查
+        // "test1.t2" 的映射 key 落空——任务 9e1e602e 的 ALTER 即因此丢失表名映射），且正则会误伤
+        // 字符串字面量。标识符映射统一由 DdlIdentifierRewriter 词法级完成。
         String targetSql;
-        if (mappingConfig.isCrossDbTypeConvert()) {
+        if (mappingConfig.isCrossDbTypeConvert() && !sameEngine) {
             targetSql = translator.translate(sql, sourceDb);
             if (targetSql == null) {
                 totalDdlManual++;
@@ -211,7 +217,23 @@ public class SchemaEvolutionService {
         // 无论同类型还是跨类型都需要——DML 侧靠 target.db.database 强制目标库，DDL 侧则靠此改写，
         // 否则限定 DDL 会落到目标实例上的源库名（不存在则失败/或错库）。基于 ANTLR 词法 token 级改写，
         // 不会误伤字符串字面量里的 "库名."。
-        targetSql = DdlIdentifierRewriter.rewriteSchema(targetSql, mappingConfig::mapDatabase);
+        // 表名映射（仅表级同步下发 schema.mapping.table.*）：限定名（db.t）与非限定名
+        // （CREATE/ALTER/DROP/TRUNCATE/RENAME TABLE t，库名上下文 = 事件的 sourceDb）都改写。
+        // 限定名回退：若限定库名已被上游改成目标库名（跨类型 translate 的正则路径），按源库名重查。
+        final String effectiveSourceDb = sourceDb;
+        java.util.function.BiFunction<String, String, String> tableMapper = null;
+        if (mappingConfig.hasTableMappings()) {
+            tableMapper = (db, tbl) -> {
+                String mapped = mappingConfig.mapTableName(db, tbl);
+                if (mapped.equals(tbl) && effectiveSourceDb != null && db != null
+                        && !effectiveSourceDb.equalsIgnoreCase(db)
+                        && db.equalsIgnoreCase(mappingConfig.mapDatabase(effectiveSourceDb))) {
+                    mapped = mappingConfig.mapTableName(effectiveSourceDb, tbl);
+                }
+                return mapped;
+            };
+        }
+        targetSql = DdlIdentifierRewriter.rewrite(targetSql, mappingConfig::mapDatabase, tableMapper, sourceDb);
 
         // 执行 DDL
         if (targetConnection == null) {

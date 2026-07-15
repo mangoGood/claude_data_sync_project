@@ -50,6 +50,10 @@ public class THLToSqlConverter {
     // 跨库逐值转换与全量共用同一套 per-pair 实现（TypeTranslator.convertLiteral），杜绝增量/全量行为漂移
     private TypeTranslator translator;
     private String targetDatabaseName;
+    /** 表名映射（仅表级同步下发）："源库.源表" → 目标表名，来自 schema.mapping.table.* */
+    private final java.util.Map<String, String> tableNameMapping = new java.util.HashMap<>();
+    /** 小写回退索引：适配 MySQL 源 lower_case_table_names 不区分大小写（精确命中优先） */
+    private final java.util.Map<String, String> tableNameMappingLower = new java.util.HashMap<>();
 
     private SchemaEvolutionService schemaEvolutionService;
 
@@ -91,6 +95,23 @@ public class THLToSqlConverter {
                 props.getProperty("target.db.type", "mysql"));
         this.targetDatabaseName = props.getProperty("target.db.database", "");
 
+        // 表名映射：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>，DML 只需要表名部分
+        String tableMappingPrefix = "schema.mapping.table.";
+        for (String name : props.stringPropertyNames()) {
+            if (name.startsWith(tableMappingPrefix)) {
+                String key = name.substring(tableMappingPrefix.length());
+                String value = props.getProperty(name, "");
+                String targetTable = value.contains(".") ? value.substring(value.indexOf('.') + 1) : value;
+                if (!key.isEmpty() && !targetTable.isEmpty()) {
+                    tableNameMapping.put(key, targetTable);
+                    tableNameMappingLower.put(key.toLowerCase(), targetTable);
+                }
+            }
+        }
+        if (!tableNameMapping.isEmpty()) {
+            logger.info("DML 表名映射已加载: {}", tableNameMapping);
+        }
+
         this.sqlClassifier = new SqlClassifier();
         this.conflictKeyParser = new SqlConflictKeyParser();
 
@@ -98,6 +119,17 @@ public class THLToSqlConverter {
         this.executedRecordFile = inputDir + "/.executed_records";
 
         loadExecutedRecords();
+    }
+
+    /** 表名映射：按 "源库.源表" 查目标表名，未配置返回原表名。精确命中优先，小写回退（源库不区分大小写场景）。 */
+    private String mapTargetTableName(String sourceDatabase, String tableName) {
+        if (tableNameMapping.isEmpty() || sourceDatabase == null || tableName == null) {
+            return tableName;
+        }
+        String key = sourceDatabase + "." + tableName;
+        String exact = tableNameMapping.get(key);
+        if (exact != null) return exact;
+        return tableNameMappingLower.getOrDefault(key.toLowerCase(), tableName);
     }
 
     private void loadExecutedRecords() {
@@ -441,6 +473,8 @@ public class THLToSqlConverter {
             return statements;
         }
 
+        // 表名映射：key 用源库名，必须在 database 被目标库名覆盖之前查
+        table = mapTargetTableName(database, table);
         if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
             database = targetDatabaseName;
         }
@@ -931,6 +965,8 @@ public class THLToSqlConverter {
             return statements;
         }
 
+        // 表名映射：key 用源库名，必须在 database 被目标库名覆盖之前查
+        table = mapTargetTableName(database, table);
         if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
             database = targetDatabaseName;
         }
@@ -1089,6 +1125,8 @@ public class THLToSqlConverter {
             return statements;
         }
 
+        // 表名映射：key 用源库名，必须在 database 被目标库名覆盖之前查
+        table = mapTargetTableName(database, table);
         if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
             database = targetDatabaseName;
         }

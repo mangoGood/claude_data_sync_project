@@ -284,8 +284,26 @@
         }
 
         .search-box-wrapper {
-            flex: 1;
+            /* 初始紧凑，随筛选 tag 增多自适应变宽（上限一行） */
+            flex: 0 1 auto;
+            min-width: 300px;
+            max-width: 100%;
             position: relative;
+        }
+
+        /* 清空筛选：有任意筛选条件时显示 */
+        .clear-filters-btn {
+            display: none;
+            flex-shrink: 0;
+            margin-left: 6px;
+            font-size: 12px;
+            color: #999;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .clear-filters-btn:hover {
+            color: #ff4d4f;
         }
 
         .filter-dropdown, .status-dropdown {
@@ -1164,6 +1182,27 @@
             color: #ff4d4f;
         }
 
+        /* 表名映射：已选对象行内的目标表名输入框（留空 = 与源表同名，仅表级同步生效） */
+        .mapping-name-input {
+            width: 110px;
+            margin: 0 8px;
+            padding: 2px 6px;
+            font-size: 12px;
+            border: 1px solid #d9d9d9;
+            border-radius: 4px;
+            color: #333;
+            flex-shrink: 0;
+        }
+
+        .mapping-name-input::placeholder {
+            color: #ccc;
+        }
+
+        .mapping-name-input:focus {
+            border-color: #1890ff;
+            outline: none;
+        }
+
         .remove-btn:hover {
             background-color: #fff1f0;
         }
@@ -1958,15 +1997,7 @@
                 <!-- 操作栏 -->
                 <div class="toolbar">
                     <div class="toolbar-row">
-                        <button class="btn btn-default">
-                            批量操作
-                            <span>▼</span>
-                        </button>
                         <button class="btn btn-default" id="viewFailedTasksBtn">查看异常任务</button>
-                        <button class="btn btn-default">批量导入任务</button>
-                        <button class="btn btn-default">导出</button>
-                        <button class="btn btn-default">导出创建模板</button>
-                        <button class="btn btn-default">下载创建模板</button>
                     </div>
                     <div class="toolbar-row">
                         <div class="search-box-wrapper">
@@ -1974,6 +2005,7 @@
                                 <span class="search-icon">🔍</span>
                                 <div class="filter-tags" id="filterTags"></div>
                                 <input type="text" class="search-input" id="searchInput" placeholder="添加筛选条件">
+                                <span class="clear-filters-btn" id="clearFiltersBtn" title="还原筛选条件" onclick="clearAllFiltersAndRefetch(event)">清空</span>
                             </div>
                             <div class="filter-dropdown" id="filterDropdown">
                                 <div class="filter-option" data-filter="keyword">
@@ -1983,6 +2015,14 @@
                                 <div class="filter-option" data-filter="status">
                                     <span class="filter-icon">📊</span>
                                     <span>状态</span>
+                                </div>
+                                <div class="filter-option" data-filter="sourceType">
+                                    <span class="filter-icon">🗄️</span>
+                                    <span>源库类型</span>
+                                </div>
+                                <div class="filter-option" data-filter="targetType">
+                                    <span class="filter-icon">🗄️</span>
+                                    <span>目标库类型</span>
                                 </div>
                             </div>
                             <div class="status-dropdown" id="statusDropdown">
@@ -1994,6 +2034,18 @@
                                 <div class="status-option" data-status="COMPLETED">已完成</div>
                                 <div class="status-option" data-status="FAILED">失败</div>
                                 <div class="status-option" data-status="PAUSED">已暂停</div>
+                            </div>
+                            <div class="status-dropdown" id="sourceTypeDropdown">
+                                <div class="status-option type-option" data-source-type="mysql">MySQL</div>
+                                <div class="status-option type-option" data-source-type="postgresql">PostgreSQL</div>
+                                <div class="status-option type-option" data-source-type="oracle">Oracle</div>
+                                <div class="status-option type-option" data-source-type="mongodb">MongoDB</div>
+                            </div>
+                            <div class="status-dropdown" id="targetTypeFilterDropdown">
+                                <div class="status-option type-option" data-target-type="mysql">MySQL</div>
+                                <div class="status-option type-option" data-target-type="postgresql">PostgreSQL</div>
+                                <div class="status-option type-option" data-target-type="mongodb">MongoDB</div>
+                                <div class="status-option type-option" data-target-type="elasticsearch">Elasticsearch</div>
                             </div>
                         </div>
                         <div class="toolbar-actions">
@@ -2141,7 +2193,6 @@
                     <div class="toolbar">
                         <div class="toolbar-row">
                             <button class="btn btn-default" id="subscribeViewFailedBtn">查看异常任务</button>
-                            <button class="btn btn-default">导出</button>
                         </div>
                         <div class="toolbar-row">
                             <div class="search-box-wrapper">
@@ -2159,6 +2210,14 @@
                                         <span class="filter-icon">📊</span>
                                         <span>状态</span>
                                     </div>
+                                    <div class="filter-option" data-filter="sourceType">
+                                        <span class="filter-icon">🗄️</span>
+                                        <span>源库类型</span>
+                                    </div>
+                                    <div class="filter-option" data-filter="targetType">
+                                        <span class="filter-icon">🗄️</span>
+                                        <span>目标库类型</span>
+                                    </div>
                                 </div>
                                 <div class="status-dropdown" id="subscribeStatusDropdown">
                                     <div class="status-option" data-status="CONFIGURING">配置中</div>
@@ -2168,6 +2227,16 @@
                                     <div class="status-option" data-status="PAUSED">已暂停</div>
                                     <div class="status-option" data-status="FAILED">异常</div>
                                     <div class="status-option" data-status="COMPLETED">已完成</div>
+                                </div>
+                                <div class="status-dropdown" id="subscribeSourceTypeDropdown">
+                                    <div class="status-option type-option" data-source-type="mysql">MySQL</div>
+                                    <div class="status-option type-option" data-source-type="postgresql">PostgreSQL</div>
+                                    <div class="status-option type-option" data-source-type="oracle">Oracle</div>
+                                </div>
+                                <div class="status-dropdown" id="subscribeTargetTypeDropdown">
+                                    <div class="status-option type-option" data-target-type="mysql">MySQL</div>
+                                    <div class="status-option type-option" data-target-type="postgresql">PostgreSQL</div>
+                                    <div class="status-option type-option" data-target-type="oracle">Oracle</div>
                                 </div>
                             </div>
                             <div class="toolbar-actions">
@@ -2249,7 +2318,6 @@
                     <div class="toolbar">
                         <div class="toolbar-row">
                             <button class="btn btn-default" id="drViewFailedBtn">查看异常任务</button>
-                            <button class="btn btn-default">导出</button>
                         </div>
                         <div class="toolbar-row">
                             <div class="search-box-wrapper">
@@ -2257,6 +2325,16 @@
                                     <span class="search-icon">🔍</span>
                                     <input type="text" class="search-input" id="drSearchInput" placeholder="搜索灾备任务名称/ID">
                                 </div>
+                                <select class="page-size" id="drSourceTypeFilterSelect" title="源库类型" style="margin-left: 8px;">
+                                    <option value="">源库类型：全部</option>
+                                    <option value="mysql">MySQL</option>
+                                    <option value="postgresql">PostgreSQL</option>
+                                </select>
+                                <select class="page-size" id="drTargetTypeFilterSelect" title="目标库类型" style="margin-left: 8px;">
+                                    <option value="">目标库类型：全部</option>
+                                    <option value="mysql">MySQL</option>
+                                    <option value="postgresql">PostgreSQL</option>
+                                </select>
                                 <div class="toolbar-actions">
                                     <button class="icon-btn" id="drRefreshBtn" title="刷新">↻</button>
                                 </div>
@@ -2606,11 +2684,6 @@
                 </div>
 
                 <div class="step-content" id="cfgStep2Content">
-                    <div class="form-group" style="margin-bottom: 12px;" id="cfgTargetDbNameGroup">
-                        <label class="form-label">目标数据库名称</label>
-                        <input type="text" class="form-input" id="cfgTargetDbName" placeholder="请输入同步到目标库的数据库名称" style="max-width: 400px;">
-                        <div id="cfgTargetDbNameHint" style="font-size: 11px; color: #999; margin-top: 4px;">MySQL中每个数据库对应一个同步目标库</div>
-                    </div>
                     <div class="form-group" style="margin-bottom: 12px;" id="cfgGranularityGroup">
                         <label class="form-label">同步粒度</label>
                         <div style="display: flex; gap: 16px; align-items: center;">
@@ -3162,6 +3235,8 @@
         
         let filterKeyword = null;
         let filterStatus = null;
+        let filterSourceType = null;
+        let filterTargetType = null;
         let activeFilterType = null;
         let isViewingFailedTasks = false;
         
@@ -3617,9 +3692,15 @@
                 if (filterStatus) {
                     url += `&status=${filterStatus}`;
                 }
-                
+                if (filterSourceType) {
+                    url += `&sourceType=${filterSourceType}`;
+                }
+                if (filterTargetType) {
+                    url += `&targetType=${filterTargetType}`;
+                }
+
                 const response = await fetchWithAuth(url);
-                
+
                 const result = await response.json();
                 console.log('API 返回结果:', result);
                 
@@ -5005,8 +5086,12 @@
                                 const dbList = [];
                                 const tableList = [];
                                 for (const [db, dbValue] of Object.entries(syncObjects)) {
+                                    // 库名映射展示：entry 的 targetDb（库级/表级均可携带）
+                                    const tgtDb = (dbValue && dbValue.targetDb && dbValue.targetDb !== db) ? dbValue.targetDb : null;
                                     if (dbValue && dbValue.dbLevel === true) {
-                                        dbList.push(db);
+                                        dbList.push(tgtDb
+                                            ? `${db} <span style="color:#1890ff;">→ ${tgtDb}</span>（整库）`
+                                            : `${db}（整库）`);
                                         continue;
                                     }
                                     let tables = null;
@@ -5016,15 +5101,22 @@
                                         tables = dbValue.tables;
                                     }
                                     if (tables) {
+                                        const mapping = (dbValue && dbValue.tableMapping) || {};
                                         tables.forEach(table => {
-                                            tableList.push(`${db}.${table}`);
+                                            const tgtTable = mapping[table];
+                                            // 库名/表名映射展示：源库.源表 → 目标库.目标表（无任何映射只显示源）
+                                            if (tgtDb || (tgtTable && tgtTable !== table)) {
+                                                tableList.push(`${db}.${table} <span style="color:#1890ff;">→ ${tgtDb || db}.${tgtTable || table}</span>`);
+                                            } else {
+                                                tableList.push(`${db}.${table}`);
+                                            }
                                         });
                                     }
                                 }
                                 if (dbList.length > 0) {
                                     syncGranularity = '库级';
                                     syncObjectsHtml = `<div style="max-height: 120px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 4px; padding: 8px;">
-                                        ${dbList.map(d => `<div style="font-size: 12px; padding: 2px 0;">${d}（整库）</div>`).join('')}
+                                        ${dbList.map(d => `<div style="font-size: 12px; padding: 2px 0;">${d}</div>`).join('')}
                                     </div>`;
                                 } else if (tableList.length > 0) {
                                     syncObjectsHtml = `<div style="max-height: 120px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 4px; padding: 8px;">
@@ -5733,11 +5825,36 @@
         // 库级选中的库在 cfgSelectedSyncObjects 里以哨兵字符串 '__DB_LEVEL__' 表示（表级为表名数组）。
         let cfgSyncGranularity = 'table';
         const DB_LEVEL_SENTINEL = '__DB_LEVEL__';
+        // 表名映射（仅表级同步生效）：key = "db.table"，value = 目标表名。
+        // 未配置/与源表同名 = 不映射；库级同步（dbLevel）不支持表名映射。
+        let cfgTableNameMapping = {};
+        // 库名映射：key = 源库名，value = 目标库名（表级/库级同步均支持）。
+        // 未配置/与源库同名 = 不映射。取代原"目标数据库名称"输入框（PG 目标的库名走连接区输入）。
+        let cfgDbNameMapping = {};
+
+        // 目标库名输入变更：空值/与源库同名 = 取消映射
+        window.cfgSetDbNameMapping = function(db, value) {
+            const v = (value || '').trim();
+            if (!v || v === db) {
+                delete cfgDbNameMapping[db];
+                cfgRenderSelectedObjects();
+                return;
+            }
+            if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(v)) {
+                showNotification('目标库名仅支持字母、数字、下划线和$，且不能以数字开头', 'error');
+                cfgRenderSelectedObjects();
+                return;
+            }
+            cfgDbNameMapping[db] = v;
+            cfgRenderSelectedObjects();
+        }
 
         window.cfgSetGranularity = function(mode) {
             if (cfgSyncGranularity === mode) return;
             cfgSyncGranularity = mode;
             cfgSelectedSyncObjects = {};
+            cfgTableNameMapping = {};
+            cfgDbNameMapping = {};
             const radio = document.querySelector(`input[name="cfgSyncGranularity"][value="${mode}"]`);
             if (radio) radio.checked = true;
             cfgRenderDatabases();
@@ -5749,8 +5866,34 @@
                 cfgSelectedSyncObjects[db] = DB_LEVEL_SENTINEL;
             } else {
                 delete cfgSelectedSyncObjects[db];
+                delete cfgDbNameMapping[db];
             }
+            cfgClearTableMappingForDb(db);
             cfgRenderDatabases();
+            cfgRenderSelectedObjects();
+        }
+
+        function cfgClearTableMappingForDb(db) {
+            Object.keys(cfgTableNameMapping).forEach(key => {
+                if (key.startsWith(db + '.')) delete cfgTableNameMapping[key];
+            });
+        }
+
+        // 目标表名输入变更：空值/与源表同名 = 取消映射；仅允许常规标识符字符，防注入且与引擎改写规则一致
+        window.cfgSetTableMapping = function(db, tableName, value) {
+            const key = db + '.' + tableName;
+            const v = (value || '').trim();
+            if (!v || v === tableName) {
+                delete cfgTableNameMapping[key];
+                cfgRenderSelectedObjects();
+                return;
+            }
+            if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(v)) {
+                showNotification('目标表名仅支持字母、数字、下划线和$，且不能以数字开头', 'error');
+                cfgRenderSelectedObjects();
+                return;
+            }
+            cfgTableNameMapping[key] = v;
             cfgRenderSelectedObjects();
         }
         let cfgTablesCache = {};
@@ -5823,6 +5966,7 @@
                 cfgCurrentStep = 1;
                 cfgConnectionTestStatus = { source: null, target: null };
                 cfgSelectedSyncObjects = {};
+                cfgTableNameMapping = {};
                 cfgTablesCache = {};
                 cfgDatabasesCache = [];
                 cfgSchemasCache = [];
@@ -5856,6 +6000,10 @@
                         cfgSelectedSyncObjects = {};
                         let hasDbLevel = false;
                         for (const [db, dbValue] of Object.entries(syncObjects)) {
+                            // 恢复库名映射（entry 的 targetDb，表级/库级均可携带）
+                            if (dbValue && dbValue.targetDb && dbValue.targetDb !== db) {
+                                cfgDbNameMapping[db] = dbValue.targetDb;
+                            }
                             if (dbValue && dbValue.dbLevel === true) {
                                 cfgSelectedSyncObjects[db] = DB_LEVEL_SENTINEL;
                                 hasDbLevel = true;
@@ -5863,6 +6011,19 @@
                             }
                             let tables = Array.isArray(dbValue) ? dbValue : (dbValue.tables || []);
                             cfgSelectedSyncObjects[db] = tables;
+                            // 恢复表名映射（表级 entry 的 tableMapping: {源表: 目标表}）
+                            if (dbValue && dbValue.tableMapping && typeof dbValue.tableMapping === 'object') {
+                                Object.entries(dbValue.tableMapping).forEach(([src, tgt]) => {
+                                    if (tgt && tgt !== src) cfgTableNameMapping[db + '.' + src] = tgt;
+                                });
+                            }
+                        }
+                        // 旧任务兼容：syncObjects 未带 targetDb，但 target_db_name 与唯一源库不同 → 视作库名映射
+                        const dbKeys = Object.keys(cfgSelectedSyncObjects);
+                        if (Object.keys(cfgDbNameMapping).length === 0 && dbKeys.length === 1
+                                && task.target_db_name && task.target_db_name !== dbKeys[0]
+                                && cfgSourceType === 'mysql' && cfgTargetType === 'mysql') {
+                            cfgDbNameMapping[dbKeys[0]] = task.target_db_name;
                         }
                         cfgSyncGranularity = hasDbLevel ? 'database' : 'table';
                         const gRadio = document.querySelector(`input[name="cfgSyncGranularity"][value="${cfgSyncGranularity}"]`);
@@ -5878,12 +6039,7 @@
                     }
                 }
                 
-                if (task.target_db_name) {
-                    document.getElementById('cfgTargetDbName').value = task.target_db_name;
-                }
-                
                 cfgUpdateDbNameRows();
-                cfgUpdateTargetDbNameHint();
                 cfgUpdateStepUI();
                 
                 document.getElementById('cfgValidationResult').innerHTML = '<div class="validation-empty">请点击"开始校验"按钮进行数据库同步条件检查</div>';
@@ -6151,19 +6307,19 @@
                     } else {
                         cfgLoadDatabases(sourceConnection);
                     }
-                    cfgUpdateTargetDbNameHint();
                 });
             }
-            
+
             if (step === 3 && cfgCurrentStep === 2) {
                 if (Object.keys(cfgSelectedSyncObjects).length === 0) {
                     showNotification('请至少选择一个同步对象', 'error');
                     return;
                 }
                 if (cfgTargetType === 'postgresql') {
-                    const targetDbName = document.getElementById('cfgTargetDbName').value.trim();
-                    if (!targetDbName) {
-                        showNotification('请填写目标PostgreSQL数据库名称', 'error');
+                    // PG 目标库名取第 1 步目标连接区的数据库名称输入（原步骤 2 的目标数据库名称输入框已移除）
+                    const tgtDbInput = document.getElementById('cfgTargetDbNameInput');
+                    if (!tgtDbInput || !tgtDbInput.value.trim()) {
+                        showNotification('请在连接信息中填写目标PostgreSQL数据库名称', 'error');
                         return;
                     }
                 }
@@ -6192,40 +6348,6 @@
             document.getElementById('cfgLaunchBtn').style.display = cfgCurrentStep === 3 ? 'inline-block' : 'none';
         }
 
-        function cfgUpdateTargetDbNameHint() {
-            const hintDiv = document.getElementById('cfgTargetDbNameHint');
-            const targetDbNameInput = document.getElementById('cfgTargetDbName');
-            const targetDbNameGroup = document.getElementById('cfgTargetDbNameGroup');
-            
-            if (cfgSourceType === 'postgresql' && cfgTargetType === 'mysql') {
-                hintDiv.textContent = 'PostgreSQL的schema对应MySQL的数据库，每个选中的schema将同步到目标MySQL的同名数据库';
-                targetDbNameInput.placeholder = '默认使用源schema名称作为目标数据库名';
-                targetDbNameGroup.style.display = 'none';
-            } else if (cfgSourceType === 'postgresql' && cfgTargetType === 'postgresql') {
-                hintDiv.textContent = 'PostgreSQL的schema将同步到目标PostgreSQL的同名schema，需指定目标数据库名称';
-                targetDbNameInput.placeholder = '请输入目标PostgreSQL数据库名称（PG三层结构中的db层）';
-                targetDbNameGroup.style.display = 'block';
-            } else if (cfgSourceType === 'mysql' && cfgTargetType === 'postgresql') {
-                hintDiv.textContent = 'MySQL的数据库对应PostgreSQL的schema，需指定同步到目标PostgreSQL的哪个数据库';
-                targetDbNameInput.placeholder = '请输入目标PostgreSQL数据库名称（如 myapp_db）';
-                targetDbNameGroup.style.display = 'block';
-            } else if (cfgSourceType === 'oracle' && cfgTargetType === 'postgresql') {
-                hintDiv.textContent = 'Oracle的schema对应PostgreSQL的schema，需指定同步到目标PostgreSQL的哪个数据库';
-                targetDbNameInput.placeholder = '请输入目标PostgreSQL数据库名称（如 myapp_db）';
-                targetDbNameGroup.style.display = 'block';
-            } else if (cfgSourceType === 'mongodb') {
-                hintDiv.textContent = 'MongoDB 按库/集合镜像同步到目标端同名库和集合；分片集群请直接填写 mongos 地址（无需逐个 shard 填写）';
-                targetDbNameGroup.style.display = 'none';
-            } else if (cfgTargetType === 'elasticsearch') {
-                hintDiv.textContent = '每个选中的表将同步到目标 Elasticsearch 的同名索引（索引名 = 库名_表名 小写，文档 _id = 主键）';
-                targetDbNameGroup.style.display = 'none';
-            } else {
-                hintDiv.textContent = 'MySQL中每个数据库对应一个同步目标库';
-                targetDbNameInput.placeholder = '请输入同步到目标库的数据库名称';
-                targetDbNameGroup.style.display = 'block';
-            }
-        }
-
         async function cfgSaveConfig() {
             const sourceConnection = cfgBuildConnectionString('source');
             const targetConnection = cfgBuildConnectionString('target');
@@ -6239,12 +6361,28 @@
                 const syncObjectsData = {};
                 Object.keys(cfgSelectedSyncObjects).forEach(db => {
                     // 库级同步：{"db":{"dbLevel":true}}，不枚举表（增量期新对象自动纳入同步范围）
-                    syncObjectsData[db] = cfgSelectedSyncObjects[db] === DB_LEVEL_SENTINEL
-                        ? { dbLevel: true }
-                        : { tables: cfgSelectedSyncObjects[db] };
+                    if (cfgSelectedSyncObjects[db] === DB_LEVEL_SENTINEL) {
+                        syncObjectsData[db] = { dbLevel: true };
+                    } else {
+                        syncObjectsData[db] = { tables: cfgSelectedSyncObjects[db] };
+                        // 表名映射（仅表级）：只写与源表名不同的有效映射
+                        const mapping = {};
+                        cfgSelectedSyncObjects[db].forEach(t => {
+                            const tgt = cfgTableNameMapping[db + '.' + t];
+                            if (tgt && tgt !== t) mapping[t] = tgt;
+                        });
+                        if (Object.keys(mapping).length > 0) {
+                            syncObjectsData[db].tableMapping = mapping;
+                        }
+                    }
+                    // 库名映射：只写与源库名不同的有效映射（表级/库级均支持）
+                    const tgtDb = cfgDbNameMapping[db];
+                    if (tgtDb && tgtDb !== db) {
+                        syncObjectsData[db].targetDb = tgtDb;
+                    }
                 });
                 syncObjectsJson = JSON.stringify(syncObjectsData);
-                
+
                 if (cfgSourceType === 'postgresql' || cfgSourceType === 'oracle') {
                     const prefix = 'cfg' + capitalize('source');
                     const dbNameInput = document.getElementById(prefix + 'DbNameInput');
@@ -6254,20 +6392,21 @@
                     if (dbNames.length === 1) sourceDbName = dbNames[0];
                 }
             }
-            
-            let targetDbName = document.getElementById('cfgTargetDbName').value.trim();
-            if (!targetDbName) {
-                if (cfgSourceType === 'postgresql' && cfgTargetType === 'mysql') {
-                    targetDbName = Object.keys(cfgSelectedSyncObjects)[0] || '';
-                } else if (cfgSourceType === 'mysql' && cfgTargetType === 'mysql') {
-                    targetDbName = sourceDbName || Object.keys(cfgSelectedSyncObjects)[0] || '';
-                } else if (cfgSourceType === 'mongodb') {
-                    // MongoDB 镜像同步：目标库名与源库名一致（仅用于详情展示）
-                    targetDbName = sourceDbName || Object.keys(cfgSelectedSyncObjects)[0] || '';
-                } else if (cfgTargetType === 'elasticsearch') {
-                    // ES 索引名自动映射（库名_表名），目标库名仅用于详情展示
-                    targetDbName = sourceDbName || Object.keys(cfgSelectedSyncObjects)[0] || '';
-                }
+
+            // 目标库名派生（原"目标数据库名称"输入框已移除）：
+            // - PG 目标：库名是连接层概念，取第 1 步目标连接区的数据库名称输入（PG 必填）
+            // - MySQL 目标：取"已选对象"栏的库名映射（未映射 = 与源库同名）
+            // - mongo/ES：镜像/索引自动命名，仅用于详情展示
+            let targetDbName = '';
+            const firstDb = Object.keys(cfgSelectedSyncObjects)[0] || '';
+            if (cfgTargetType === 'postgresql') {
+                const tgtDbInput = document.getElementById('cfgTargetDbNameInput');
+                targetDbName = tgtDbInput ? tgtDbInput.value.trim() : '';
+            } else if (cfgSourceType === 'mysql' && cfgTargetType === 'mysql') {
+                targetDbName = (sourceDbName && cfgDbNameMapping[sourceDbName]) || sourceDbName || firstDb;
+            } else {
+                // pg→mysql（同名库）、mongodb 镜像、elasticsearch 索引自动命名
+                targetDbName = sourceDbName || firstDb;
             }
             
             try {
@@ -6547,6 +6686,7 @@
                 });
             } else {
                 delete cfgSelectedSyncObjects[db];
+                cfgClearTableMappingForDb(db);
             }
             cfgRenderTables(db);
             cfgRenderSelectedObjects();
@@ -6565,6 +6705,7 @@
                 if (index > -1) cfgSelectedSyncObjects[db].splice(index, 1);
                 if (cfgSelectedSyncObjects[db].length === 0) delete cfgSelectedSyncObjects[db];
             }
+            delete cfgTableNameMapping[db + '.' + tableName];
             cfgRenderSelectedObjects();
             if (cfgTablesCache[db]) cfgRenderTables(db);
             else if (cfgTablesCache[`pg-${db}`]) {
@@ -6584,23 +6725,47 @@
             }
             let html = '';
             const isPgSource = cfgSourceType === 'postgresql';
+            // 库名映射仅 MySQL 源→MySQL 目标有意义（PG 目标库名走连接区；mongo/ES 镜像/索引自动命名）
+            const dbMappingEnabled = cfgSourceType === 'mysql' && cfgTargetType === 'mysql';
             dbNames.forEach(db => {
+                const mappedDb = cfgDbNameMapping[db] || '';
+                // 库头行：库名 + 目标库名映射输入（取代原"目标数据库名称"输入框，按库配置）
+                const dbMappingInput = dbMappingEnabled ? `
+                            <span style="color: #bbb; flex-shrink: 0;">→</span>
+                            <input type="text" class="mapping-name-input" value="${mappedDb}" placeholder="${db}"
+                                   title="目标库名（留空 = 与源库同名）"
+                                   onchange="cfgSetDbNameMapping('${db}', this.value)"
+                                   onclick="event.stopPropagation()">` : '';
                 if (cfgSelectedSyncObjects[db] === DB_LEVEL_SENTINEL) {
                     html += `
-                        <div class="selected-item">
-                            <span class="selected-db-name">${db}</span>
-                            <span class="selected-table-name" style="color: #52c41a;">（整库：全部表+存储过程/函数，增量期新对象自动同步）</span>
+                        <div class="selected-item" style="background: #fafafa;">
+                            <span class="selected-table-name" style="font-weight: 600;">${db}</span>
+                            ${dbMappingInput}
                             <button class="remove-btn" onclick="cfgToggleDbLevel('${db}', false)">移除</button>
+                        </div>
+                        <div class="selected-item">
+                            <span class="selected-table-name" style="color: #52c41a; font-size: 12px;">（整库：全部表+存储过程/函数，增量期新对象自动同步）</span>
                         </div>
                     `;
                     return;
                 }
+                const label = isPgSource ? `${db} (schema)` : db;
+                html += `
+                    <div class="selected-item" style="background: #fafafa;">
+                        <span class="selected-table-name" style="font-weight: 600;">${label}</span>
+                        ${dbMappingInput}
+                    </div>
+                `;
                 cfgSelectedSyncObjects[db].forEach(tableName => {
-                    const label = isPgSource ? `${db} (schema)` : db;
+                    const mapped = cfgTableNameMapping[db + '.' + tableName] || '';
                     html += `
-                        <div class="selected-item">
-                            <span class="selected-db-name">${label}.</span>
+                        <div class="selected-item" style="padding-left: 28px;">
                             <span class="selected-table-name">${tableName}</span>
+                            <span style="color: #bbb; flex-shrink: 0;">→</span>
+                            <input type="text" class="mapping-name-input" value="${mapped}" placeholder="${tableName}"
+                                   title="目标表名（留空 = 与源表同名）"
+                                   onchange="cfgSetTableMapping('${db}', '${tableName}', this.value)"
+                                   onclick="event.stopPropagation()">
                             <button class="remove-btn" onclick="cfgRemoveTable('${db}', '${tableName}')">移除</button>
                         </div>
                     `;
@@ -7629,8 +7794,9 @@
         document.getElementById('closeModal').addEventListener('click', closeModal);
         document.getElementById('cancelBtn').addEventListener('click', closeModal);
         document.getElementById('closeConfigModal').addEventListener('click', closeConfigModal);
-        document.getElementById('refreshBtn').addEventListener('click', fetchWorkflows);
-        
+        // 刷新按钮的点击处理在 DOMContentLoaded 里按当前视图（正常/异常任务）分派，
+        // 此处不再重复绑定——重复绑定会让异常任务视图下的刷新被普通列表数据覆盖。
+
         // 分页控件事件
         document.getElementById('pageSizeSelect').addEventListener('change', (e) => {
             changePageSize(e.target.value);
@@ -7691,61 +7857,116 @@
             const searchInput = document.getElementById('searchInput');
             const filterDropdown = document.getElementById('filterDropdown');
             const statusDropdown = document.getElementById('statusDropdown');
+            const sourceTypeDropdown = document.getElementById('sourceTypeDropdown');
+            const targetTypeFilterDropdown = document.getElementById('targetTypeFilterDropdown');
             const filterTags = document.getElementById('filterTags');
-            
+
+            const closeAllTypeDropdowns = () => {
+                statusDropdown.classList.remove('show');
+                sourceTypeDropdown.classList.remove('show');
+                targetTypeFilterDropdown.classList.remove('show');
+            };
+
             searchInput.addEventListener('focus', () => {
                 if (!activeFilterType) {
                     filterDropdown.classList.add('show');
                 }
             });
-            
+
             searchInput.addEventListener('click', (e) => {
                 e.stopPropagation();
+                // 关键字模式下输入框为空再点一次 = 放弃关键字输入，回到条件选择
+                // （否则 activeFilterType 卡在 keyword，下拉打不开，无法叠加其它条件）
+                if (activeFilterType === 'keyword' && !searchInput.value.trim()) {
+                    activeFilterType = null;
+                    searchInput.placeholder = '添加筛选条件';
+                }
                 if (!activeFilterType) {
                     filterDropdown.classList.add('show');
                 }
             });
-            
+
             document.addEventListener('click', (e) => {
                 if (!e.target.closest('.search-box-wrapper')) {
                     filterDropdown.classList.remove('show');
-                    statusDropdown.classList.remove('show');
+                    closeAllTypeDropdowns();
+                    // 点击外部退出关键字输入模式，避免状态卡住
+                    if (activeFilterType === 'keyword' && !searchInput.value.trim()) {
+                        activeFilterType = null;
+                        searchInput.placeholder = '添加筛选条件';
+                    }
                 }
             });
-            
+
             document.querySelectorAll('.filter-option').forEach(option => {
                 option.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const filterType = option.dataset.filter;
-                    
+
                     filterDropdown.classList.remove('show');
-                    
+
                     if (filterType === 'keyword') {
                         activeFilterType = 'keyword';
-                        searchInput.placeholder = '输入任务名称或ID...';
+                        searchInput.placeholder = '输入任务名称或ID，回车确认...';
                         searchInput.focus();
                     } else if (filterType === 'status') {
+                        activeFilterType = null;
+                        closeAllTypeDropdowns();
                         statusDropdown.classList.add('show');
+                    } else if (filterType === 'sourceType') {
+                        activeFilterType = null;
+                        closeAllTypeDropdowns();
+                        sourceTypeDropdown.classList.add('show');
+                    } else if (filterType === 'targetType') {
+                        activeFilterType = null;
+                        closeAllTypeDropdowns();
+                        targetTypeFilterDropdown.classList.add('show');
                     }
                 });
             });
-            
-            document.querySelectorAll('.status-option').forEach(option => {
+
+            document.querySelectorAll('.status-option:not(.type-option)').forEach(option => {
                 option.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const status = option.dataset.status;
                     const statusText = option.textContent;
-                    
+
                     filterStatus = status;
                     addFilterTag('状态', statusText, 'status');
                     statusDropdown.classList.remove('show');
                     searchInput.placeholder = '添加筛选条件';
-                    
+
                     currentPage = 1;
                     fetchWorkflows();
                 });
             });
-            
+
+            sourceTypeDropdown.querySelectorAll('.type-option').forEach(option => {
+                option.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    filterSourceType = option.dataset.sourceType;
+                    addFilterTag('源库类型', formatDbTypeLabel(filterSourceType), 'sourceType');
+                    sourceTypeDropdown.classList.remove('show');
+                    searchInput.placeholder = '添加筛选条件';
+
+                    currentPage = 1;
+                    fetchWorkflows();
+                });
+            });
+
+            targetTypeFilterDropdown.querySelectorAll('.type-option').forEach(option => {
+                option.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    filterTargetType = option.dataset.targetType;
+                    addFilterTag('目标库类型', formatDbTypeLabel(filterTargetType), 'targetType');
+                    targetTypeFilterDropdown.classList.remove('show');
+                    searchInput.placeholder = '添加筛选条件';
+
+                    currentPage = 1;
+                    fetchWorkflows();
+                });
+            });
+
             searchInput.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter' && activeFilterType === 'keyword') {
                     const value = searchInput.value.trim();
@@ -7769,43 +7990,70 @@
         
         function addFilterTag(label, value, type) {
             const filterTags = document.getElementById('filterTags');
+            // 同类型条件去重：重复添加时替换旧 tag（否则旧 tag 删不掉且状态不一致）
+            const existing = filterTags.querySelector(`[data-type="${type}"]`);
+            if (existing) {
+                existing.remove();
+            }
             const tag = document.createElement('span');
             tag.className = 'filter-tag';
             tag.dataset.type = type;
             tag.innerHTML = `${label}：${value}<span class="tag-remove" onclick="removeFilterTag('${type}')">×</span>`;
             filterTags.appendChild(tag);
+            updateClearFiltersVisibility();
         }
-        
+
         function removeFilterTag(type) {
             const filterTags = document.getElementById('filterTags');
-            const tag = filterTags.querySelector(`[data-type="${type}"]`);
-            if (tag) {
-                tag.remove();
-            }
-            
+            // 同类型可能残留多个（历史数据），全部移除
+            filterTags.querySelectorAll(`[data-type="${type}"]`).forEach(t => t.remove());
+
             if (type === 'keyword') {
                 filterKeyword = null;
             } else if (type === 'status') {
                 filterStatus = null;
+            } else if (type === 'sourceType') {
+                filterSourceType = null;
+            } else if (type === 'targetType') {
+                filterTargetType = null;
             }
-            
+            updateClearFiltersVisibility();
+
             currentPage = 1;
             fetchWorkflows();
         }
-        
+
+        function updateClearFiltersVisibility() {
+            const btn = document.getElementById('clearFiltersBtn');
+            if (!btn) return;
+            const hasTags = document.getElementById('filterTags').children.length > 0;
+            btn.style.display = hasTags ? 'inline' : 'none';
+        }
+
+        // "清空"按钮：还原所有筛选条件并重查列表
+        window.clearAllFiltersAndRefetch = function(e) {
+            if (e) e.stopPropagation();
+            clearAllFilters();
+            currentPage = 1;
+            fetchWorkflows();
+        }
+
         function clearAllFilters() {
             filterKeyword = null;
             filterStatus = null;
+            filterSourceType = null;
+            filterTargetType = null;
             activeFilterType = null;
             isViewingFailedTasks = false;
-            
+
             const filterTags = document.getElementById('filterTags');
             filterTags.innerHTML = '';
-            
+
             const searchInput = document.getElementById('searchInput');
             searchInput.value = '';
             searchInput.placeholder = '添加筛选条件';
-            
+            updateClearFiltersVisibility();
+
             document.getElementById('viewFailedTasksBtn').textContent = '查看异常任务';
         }
         
@@ -7870,6 +8118,8 @@
         let drAllTasks = [];
         let drPageSize = 10;
         let drTotalCount = 0;
+        let drFilterSourceType = null;
+        let drFilterTargetType = null;
         let currentDrTaskId = null;
         let drConnectionTestStatus = { source: false, target: false };
 
@@ -7945,7 +8195,9 @@
                 const keyword = document.getElementById('drSearchInput').value.trim();
                 let url = `${API_BASE_URL}/workflows?page=${page}&pageSize=${drPageSize}&taskType=DR`;
                 if (keyword) url += `&keyword=${encodeURIComponent(keyword)}`;
-                
+                if (drFilterSourceType) url += `&sourceType=${drFilterSourceType}`;
+                if (drFilterTargetType) url += `&targetType=${drFilterTargetType}`;
+
                 const response = await fetchWithAuth(url);
                 const result = await response.json();
                 
@@ -8434,6 +8686,14 @@
         });
         document.getElementById('drPageSizeSelect').addEventListener('change', (e) => {
             drPageSize = parseInt(e.target.value);
+            fetchDrTasks(1);
+        });
+        document.getElementById('drSourceTypeFilterSelect').addEventListener('change', (e) => {
+            drFilterSourceType = e.target.value || null;
+            fetchDrTasks(1);
+        });
+        document.getElementById('drTargetTypeFilterSelect').addEventListener('change', (e) => {
+            drFilterTargetType = e.target.value || null;
             fetchDrTasks(1);
         });
         document.getElementById('drViewFailedBtn').addEventListener('click', () => {
@@ -9079,6 +9339,8 @@
         let subscribeCurrentPage = 1;
         let subscribeFilterKeyword = null;
         let subscribeFilterStatus = null;
+        let subscribeFilterSourceType = null;
+        let subscribeFilterTargetType = null;
         let subscribeActiveFilterType = null;
 
         const subscribeStatusMap = {
@@ -9099,6 +9361,8 @@
             let url = `${API_BASE_URL}/workflows?page=${page}&pageSize=${subscribePageSize}&taskType=SUBSCRIBE`;
             if (subscribeFilterStatus) url += `&status=${subscribeFilterStatus}`;
             if (subscribeFilterKeyword) url += `&keyword=${encodeURIComponent(subscribeFilterKeyword)}`;
+            if (subscribeFilterSourceType) url += `&sourceType=${subscribeFilterSourceType}`;
+            if (subscribeFilterTargetType) url += `&targetType=${subscribeFilterTargetType}`;
 
             try {
                 const response = await fetchWithAuth(url);
@@ -10236,7 +10500,15 @@
             const searchInput = document.getElementById('subscribeSearchInput');
             const filterDropdown = document.getElementById('subscribeFilterDropdown');
             const statusDropdown = document.getElementById('subscribeStatusDropdown');
+            const sourceTypeDropdown = document.getElementById('subscribeSourceTypeDropdown');
+            const targetTypeDropdown = document.getElementById('subscribeTargetTypeDropdown');
             const filterTags = document.getElementById('subscribeFilterTags');
+
+            const closeAllTypeDropdowns = () => {
+                statusDropdown.classList.remove('show');
+                sourceTypeDropdown.classList.remove('show');
+                targetTypeDropdown.classList.remove('show');
+            };
 
             searchInput.addEventListener('focus', () => {
                 if (!subscribeActiveFilterType) {
@@ -10252,9 +10524,11 @@
             });
 
             document.addEventListener('click', (e) => {
-                if (!e.target.closest('#subscribeSearchBox') && !e.target.closest('#subscribeFilterDropdown') && !e.target.closest('#subscribeStatusDropdown')) {
+                if (!e.target.closest('#subscribeSearchBox') && !e.target.closest('#subscribeFilterDropdown')
+                        && !e.target.closest('#subscribeStatusDropdown') && !e.target.closest('#subscribeSourceTypeDropdown')
+                        && !e.target.closest('#subscribeTargetTypeDropdown')) {
                     filterDropdown.classList.remove('show');
-                    statusDropdown.classList.remove('show');
+                    closeAllTypeDropdowns();
                 }
             });
 
@@ -10269,7 +10543,14 @@
                         searchInput.placeholder = '输入任务名称或ID...';
                         searchInput.focus();
                     } else if (filterType === 'status') {
+                        closeAllTypeDropdowns();
                         statusDropdown.classList.add('show');
+                    } else if (filterType === 'sourceType') {
+                        closeAllTypeDropdowns();
+                        sourceTypeDropdown.classList.add('show');
+                    } else if (filterType === 'targetType') {
+                        closeAllTypeDropdowns();
+                        targetTypeDropdown.classList.add('show');
                     }
                 });
             });
@@ -10283,6 +10564,32 @@
                     subscribeFilterStatus = status;
                     addSubscribeFilterTag('状态', statusText, 'status');
                     statusDropdown.classList.remove('show');
+                    searchInput.placeholder = '添加筛选条件';
+                    subscribeActiveFilterType = null;
+
+                    fetchSubscribeTasks(1);
+                });
+            });
+
+            sourceTypeDropdown.querySelectorAll('.type-option').forEach(option => {
+                option.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    subscribeFilterSourceType = option.dataset.sourceType;
+                    addSubscribeFilterTag('源库类型', formatDbTypeLabel(subscribeFilterSourceType), 'sourceType');
+                    sourceTypeDropdown.classList.remove('show');
+                    searchInput.placeholder = '添加筛选条件';
+                    subscribeActiveFilterType = null;
+
+                    fetchSubscribeTasks(1);
+                });
+            });
+
+            targetTypeDropdown.querySelectorAll('.type-option').forEach(option => {
+                option.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    subscribeFilterTargetType = option.dataset.targetType;
+                    addSubscribeFilterTag('目标库类型', formatDbTypeLabel(subscribeFilterTargetType), 'targetType');
+                    targetTypeDropdown.classList.remove('show');
                     searchInput.placeholder = '添加筛选条件';
                     subscribeActiveFilterType = null;
 
@@ -10328,6 +10635,10 @@
                 subscribeFilterKeyword = null;
             } else if (type === 'status') {
                 subscribeFilterStatus = null;
+            } else if (type === 'sourceType') {
+                subscribeFilterSourceType = null;
+            } else if (type === 'targetType') {
+                subscribeFilterTargetType = null;
             }
 
             fetchSubscribeTasks(1);

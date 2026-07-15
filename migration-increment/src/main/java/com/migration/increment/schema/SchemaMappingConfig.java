@@ -43,6 +43,13 @@ public class SchemaMappingConfig {
     private final Map<String, String> databaseMapping = new LinkedHashMap<>();
     /** sourceDb.sourceTable → targetDb.targetTable */
     private final Map<String, String> tableMapping = new LinkedHashMap<>();
+    /**
+     * 小写回退索引：MySQL 源 lower_case_table_names 不区分大小写时，binlog/DDL 里的库表名
+     * 大小写可能与映射配置不一致（如配置 test1.t2、语句写 Test1.T2）。查找规则：精确命中优先，
+     * 未命中再按小写回退——区分大小写的源（仅大小写不同的两张表）不受影响。
+     */
+    private final Map<String, String> databaseMappingLower = new LinkedHashMap<>();
+    private final Map<String, String> tableMappingLower = new LinkedHashMap<>();
     /** 需跳过的 DDL 子类型（大写），如 CREATE_DATABASE */
     private final java.util.Set<String> skippedDdlSubtypes = new java.util.HashSet<>();
 
@@ -73,6 +80,7 @@ public class SchemaMappingConfig {
                 String targetDb = props.getProperty(name);
                 if (sourceDb != null && targetDb != null && !sourceDb.isEmpty() && !targetDb.isEmpty()) {
                     config.databaseMapping.put(sourceDb, targetDb);
+                    config.databaseMappingLower.put(sourceDb.toLowerCase(), targetDb);
                 }
             }
         }
@@ -85,6 +93,7 @@ public class SchemaMappingConfig {
                 String value = props.getProperty(name);
                 if (key != null && value != null && !key.isEmpty() && !value.isEmpty()) {
                     config.tableMapping.put(key, value);
+                    config.tableMappingLower.put(key.toLowerCase(), value);
                 }
             }
         }
@@ -124,11 +133,14 @@ public class SchemaMappingConfig {
     }
 
     /**
-     * 映射数据库名，未配置则返回原值。
+     * 映射数据库名，未配置则返回原值。精确命中优先，未命中按小写回退
+     * （适配 MySQL 源 lower_case_table_names 不区分大小写的场景）。
      */
     public String mapDatabase(String sourceDb) {
         if (sourceDb == null) return null;
-        return databaseMapping.getOrDefault(sourceDb, sourceDb);
+        String exact = databaseMapping.get(sourceDb);
+        if (exact != null) return exact;
+        return databaseMappingLower.getOrDefault(sourceDb.toLowerCase(), sourceDb);
     }
 
     /**
@@ -146,8 +158,45 @@ public class SchemaMappingConfig {
         if (tableMapping.containsKey(key)) {
             return tableMapping.get(key);
         }
+        String lowerHit = tableMappingLower.get(key.toLowerCase());
+        if (lowerHit != null) {
+            return lowerHit;
+        }
         String targetDb = mapDatabase(sourceDb);
         return targetDb + "." + sourceTable;
+    }
+
+    /**
+     * 是否配置了任何表名映射（无映射时 DDL/DML 改写可整体短路）。
+     */
+    public boolean hasTableMappings() {
+        return !tableMapping.isEmpty();
+    }
+
+    /**
+     * 仅映射表名部分（不带库名前缀），未配置则返回原表名。
+     * 供 DDL 词法改写与 DML 目标表名替换使用——目标库名由 target.db.database /
+     * schema.mapping.db.* 决定，这里只关心表名。
+     *
+     * @param sourceDb    源库（映射 key 的库名部分）
+     * @param sourceTable 源表
+     * @return 目标表名（无映射时 = 源表名）
+     */
+    public String mapTableName(String sourceDb, String sourceTable) {
+        if (sourceDb == null || sourceTable == null) {
+            return sourceTable;
+        }
+        String key = sourceDb + "." + sourceTable;
+        String value = tableMapping.get(key);
+        if (value == null || value.isEmpty()) {
+            // 小写回退：源库不区分大小写时语句里的大小写可能与配置不一致
+            value = tableMappingLower.get(key.toLowerCase());
+        }
+        if (value == null || value.isEmpty()) {
+            return sourceTable;
+        }
+        int dot = value.indexOf('.');
+        return dot >= 0 ? value.substring(dot + 1) : value;
     }
 
     /**

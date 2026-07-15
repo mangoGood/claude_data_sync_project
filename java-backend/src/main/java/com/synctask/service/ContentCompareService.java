@@ -28,6 +28,18 @@ public class ContentCompareService {
     public ContentCompareSession startCompare(String sourceConnection, String targetConnection,
                                                String sourceType, String targetType,
                                                Map<String, List<String>> syncObjects) {
+        return startCompare(sourceConnection, targetConnection, sourceType, targetType, syncObjects, null);
+    }
+
+    /**
+     * @param explicitTableMappings 表名映射（db → {源表: 目标表}），来自任务 syncObjects 的 tableMapping。
+     *                              ValidationTaskService 传入压平后的表清单时映射已丢失，需在此显式补传；
+     *                              为 null 时退回从 syncObjects 原始 value 里解析（MetadataController 直传路径）。
+     */
+    public ContentCompareSession startCompare(String sourceConnection, String targetConnection,
+                                               String sourceType, String targetType,
+                                               Map<String, List<String>> syncObjects,
+                                               Map<String, Map<String, String>> explicitTableMappings) {
         if (!sourceType.equalsIgnoreCase(targetType)) {
             throw new IllegalArgumentException("内容对比仅支持源库和目标库为相同类型的数据库");
         }
@@ -59,6 +71,11 @@ public class ContentCompareService {
                 String dbName = entry.getKey();
                 List<String> tables = entry.getValue();
                 List<String> actualTables = tables;
+                // 表名映射（表级同步）：对比时目标端按映射后的表名取数，否则映射表必报差异
+                Map<String, String> tableMapping = java.util.Collections.emptyMap();
+                if (explicitTableMappings != null && explicitTableMappings.containsKey(dbName)) {
+                    tableMapping = explicitTableMappings.get(dbName);
+                }
 
                 if (tables != null && !tables.isEmpty()) {
                     try {
@@ -69,6 +86,12 @@ public class ContentCompareService {
                             if (tablesObj instanceof List) {
                                 actualTables = (List<String>) tablesObj;
                             }
+                            Object mappingObj = map.get("tableMapping");
+                            if (mappingObj instanceof Map && tableMapping.isEmpty()) {
+                                Map<String, String> m = new java.util.HashMap<>();
+                                ((Map<?, ?>) mappingObj).forEach((k, v) -> m.put(String.valueOf(k), String.valueOf(v)));
+                                tableMapping = m;
+                            }
                         }
                     } catch (Exception e) {
                         logger.debug("Using tables as-is for db={}", dbName);
@@ -78,16 +101,17 @@ public class ContentCompareService {
                 if (actualTables == null || actualTables.isEmpty()) continue;
 
                 for (String tableName : actualTables) {
+                    String targetTableName = tableMapping.getOrDefault(tableName, tableName);
                     TableCompareTask task = new TableCompareTask();
                     task.setSourceDb(isPg ? sourceConn.database : dbName);
                     // mysql 目标库名可能与源库名不同（如 prod -> prod_replica）：targetConn.database
                     // 在上面已从连接串或 syncObjects 兜底解析好，不能像源库那样直接用 dbName（源库名）
                     task.setTargetDb(isPg ? targetConn.database : targetConn.database);
                     task.setSourceTable(tableName);
-                    task.setTargetTable(tableName);
+                    task.setTargetTable(targetTableName);
 
                     String qualifiedSource = isPg ? tableName : dbName + "." + tableName;
-                    String qualifiedTarget = isPg ? tableName : targetConn.database + "." + tableName;
+                    String qualifiedTarget = isPg ? targetTableName : targetConn.database + "." + targetTableName;
 
                     task.setPrimaryKeyColumn(detectPrimaryKey(sourceDb, qualifiedSource, isPg, sourceConn.database));
                     task.setColumns(getColumnMeta(sourceDb, qualifiedSource, isPg, sourceConn.database));

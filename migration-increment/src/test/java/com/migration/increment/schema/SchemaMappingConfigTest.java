@@ -96,4 +96,48 @@ class SchemaMappingConfigTest {
         SchemaMappingConfig config = SchemaMappingConfig.loadFromProperties(props);
         assertFalse(config.isCrossDbTypeConvert());
     }
+
+    // ==== 大小写：MySQL 源 lower_case_table_names 不区分大小写时，语句/元数据里的
+    //      库表名大小写可能与映射配置不一致；精确命中优先，未命中按小写回退 ====
+
+    @Test
+    @DisplayName("库名映射大小写回退：Test1/TEST1 命中 test1 的映射")
+    void databaseMappingCaseInsensitiveFallback() {
+        Properties props = new Properties();
+        props.setProperty("schema.mapping.db.test1", "test3");
+        SchemaMappingConfig config = SchemaMappingConfig.loadFromProperties(props);
+
+        assertEquals("test3", config.mapDatabase("test1"));
+        assertEquals("test3", config.mapDatabase("Test1"));
+        assertEquals("test3", config.mapDatabase("TEST1"));
+        assertEquals("other", config.mapDatabase("other"));
+    }
+
+    @Test
+    @DisplayName("表名映射大小写回退：Test1.T2 命中 test1.t2 的映射")
+    void tableMappingCaseInsensitiveFallback() {
+        Properties props = new Properties();
+        props.setProperty("schema.mapping.table.test1.t2", "test3.t23");
+        SchemaMappingConfig config = SchemaMappingConfig.loadFromProperties(props);
+
+        assertEquals("t23", config.mapTableName("test1", "t2"));
+        assertEquals("t23", config.mapTableName("Test1", "T2"));
+        assertEquals("t23", config.mapTableName("TEST1", "t2"));
+        assertEquals("test3.t23", config.mapTable("Test1", "T2"));
+        // 未映射表不受影响
+        assertEquals("t9", config.mapTableName("test1", "t9"));
+    }
+
+    @Test
+    @DisplayName("大小写敏感源：精确命中优先于小写回退（仅大小写不同的两张表各自映射）")
+    void exactMatchWinsOverLowercaseFallback() {
+        Properties props = new Properties();
+        props.setProperty("schema.mapping.table.test1.T2", "test3.T2_upper");
+        props.setProperty("schema.mapping.table.test1.t2", "test3.t2_lower");
+        SchemaMappingConfig config = SchemaMappingConfig.loadFromProperties(props);
+
+        // 精确命中：各查各的
+        assertEquals("T2_upper", config.mapTableName("test1", "T2"));
+        assertEquals("t2_lower", config.mapTableName("test1", "t2"));
+    }
 }

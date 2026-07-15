@@ -23,7 +23,7 @@ public class OracleToPgTranslator implements TypeTranslator {
     @Override
     public String generateCreateTable(TableInfo table, SqlDialect targetDialect) {
         StringBuilder sb = new StringBuilder();
-        String pgTableName = table.getTableName().toLowerCase();
+        String pgTableName = table.getTargetTableName().toLowerCase();
         sb.append("CREATE TABLE ").append(targetDialect.quoteIdentifier(pgTableName)).append(" (\n");
 
         List<String> columnDefs = new ArrayList<>();
