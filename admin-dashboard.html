@@ -234,33 +234,51 @@
             border-color: #1890ff;
         }
 
+        /* 筛选条件标签行：位于查询框下方，各条件以小标签展示 */
+        .filter-tags-row {
+            margin-top: 8px;
+        }
+
         .filter-tags {
             display: flex;
             flex-wrap: wrap;
-            gap: 4px;
+            gap: 10px;
             align-items: center;
         }
 
         .filter-tag {
+            position: relative;
             display: inline-flex;
             align-items: center;
             background-color: #e6f7ff;
             border: 1px solid #91d5ff;
             border-radius: 4px;
-            padding: 0 8px;
+            padding: 0 10px;
             font-size: 12px;
-            height: 22px;
+            height: 24px;
             color: #1890ff;
         }
 
+        /* 标签右上角的红✕（角标样式），点击移除该筛选条件 */
         .filter-tag .tag-remove {
-            margin-left: 4px;
+            position: absolute;
+            top: -7px;
+            right: -7px;
+            width: 15px;
+            height: 15px;
+            line-height: 13px;
+            text-align: center;
+            border-radius: 50%;
+            background: #fff;
+            border: 1px solid #ff4d4f;
+            color: #ff4d4f;
+            font-size: 11px;
             cursor: pointer;
-            font-size: 14px;
         }
 
         .filter-tag .tag-remove:hover {
-            color: #ff4d4f;
+            background: #ff4d4f;
+            color: #fff;
         }
 
         .search-box .search-input {
@@ -2045,15 +2063,10 @@
                         <div class="search-box-wrapper">
                             <div class="search-box" id="searchBox">
                                 <span class="search-icon">🔍</span>
-                                <div class="filter-tags" id="filterTags"></div>
-                                <input type="text" class="search-input" id="searchInput" placeholder="添加筛选条件">
+                                <input type="text" class="search-input" id="searchInput" placeholder="任务名称/ID（回车或点刷新查询）">
                                 <span class="clear-filters-btn" id="clearFiltersBtn" title="还原筛选条件" onclick="clearAllFiltersAndRefetch(event)">清空</span>
                             </div>
                             <div class="filter-dropdown" id="filterDropdown">
-                                <div class="filter-option" data-filter="keyword">
-                                    <span class="filter-icon">📝</span>
-                                    <span>任务名称/ID</span>
-                                </div>
                                 <div class="filter-option" data-filter="status">
                                     <span class="filter-icon">📊</span>
                                     <span>状态</span>
@@ -2093,6 +2106,10 @@
                         <div class="toolbar-actions">
                             <button class="icon-btn" id="refreshBtn" title="刷新">↻</button>
                         </div>
+                    </div>
+                    <!-- 已选筛选条件：小标签展示在查询框下方，右上角红✕移除 -->
+                    <div class="toolbar-row filter-tags-row">
+                        <div class="filter-tags" id="filterTags"></div>
                     </div>
                 </div>
 
@@ -2240,14 +2257,10 @@
                             <div class="search-box-wrapper">
                                 <div class="search-box" id="subscribeSearchBox">
                                     <span class="search-icon">🔍</span>
-                                    <div class="filter-tags" id="subscribeFilterTags"></div>
-                                    <input type="text" class="search-input" id="subscribeSearchInput" placeholder="添加筛选条件">
+                                    <input type="text" class="search-input" id="subscribeSearchInput" placeholder="任务名称/ID（回车或点刷新查询）">
                                 </div>
+                                <!-- 订阅目标固定为 Kafka，筛选只保留 状态 + 源库类型 -->
                                 <div class="filter-dropdown" id="subscribeFilterDropdown">
-                                    <div class="filter-option" data-filter="keyword">
-                                        <span class="filter-icon">📝</span>
-                                        <span>任务名称/ID</span>
-                                    </div>
                                     <div class="filter-option" data-filter="status">
                                         <span class="filter-icon">📊</span>
                                         <span>状态</span>
@@ -2255,10 +2268,6 @@
                                     <div class="filter-option" data-filter="sourceType">
                                         <span class="filter-icon">🗄️</span>
                                         <span>源库类型</span>
-                                    </div>
-                                    <div class="filter-option" data-filter="targetType">
-                                        <span class="filter-icon">🗄️</span>
-                                        <span>目标库类型</span>
                                     </div>
                                 </div>
                                 <div class="status-dropdown" id="subscribeStatusDropdown">
@@ -2275,15 +2284,14 @@
                                     <div class="status-option type-option" data-source-type="postgresql">PostgreSQL</div>
                                     <div class="status-option type-option" data-source-type="oracle">Oracle</div>
                                 </div>
-                                <div class="status-dropdown" id="subscribeTargetTypeDropdown">
-                                    <div class="status-option type-option" data-target-type="mysql">MySQL</div>
-                                    <div class="status-option type-option" data-target-type="postgresql">PostgreSQL</div>
-                                    <div class="status-option type-option" data-target-type="oracle">Oracle</div>
-                                </div>
                             </div>
                             <div class="toolbar-actions">
-                                <button class="icon-btn" id="subscribeRefreshBtn" title="刷新" onclick="fetchSubscribeTasks()">↻</button>
+                                <button class="icon-btn" id="subscribeRefreshBtn" title="刷新" onclick="subscribeApplyKeywordAndRefresh()">↻</button>
                             </div>
+                        </div>
+                        <!-- 已选筛选条件：小标签展示在查询框下方，右上角红✕移除 -->
+                        <div class="toolbar-row filter-tags-row">
+                            <div class="filter-tags" id="subscribeFilterTags"></div>
                         </div>
                     </div>
 
@@ -2367,13 +2375,9 @@
                                     <span class="search-icon">🔍</span>
                                     <input type="text" class="search-input" id="drSearchInput" placeholder="搜索灾备任务名称/ID">
                                 </div>
-                                <select class="page-size" id="drSourceTypeFilterSelect" title="源库类型" style="margin-left: 8px;">
-                                    <option value="">源库类型：全部</option>
-                                    <option value="mysql">MySQL</option>
-                                    <option value="postgresql">PostgreSQL</option>
-                                </select>
-                                <select class="page-size" id="drTargetTypeFilterSelect" title="目标库类型" style="margin-left: 8px;">
-                                    <option value="">目标库类型：全部</option>
+                                <!-- 灾备任务源库与目标库类型一致，只需一个数据库类型筛选 -->
+                                <select class="page-size" id="drDbTypeFilterSelect" title="数据库类型" style="margin-left: 8px;">
+                                    <option value="">数据库类型：全部</option>
                                     <option value="mysql">MySQL</option>
                                     <option value="postgresql">PostgreSQL</option>
                                 </select>
@@ -3356,7 +3360,6 @@
         let filterStatus = null;
         let filterSourceType = null;
         let filterTargetType = null;
-        let activeFilterType = null;
         let isViewingFailedTasks = false;
         
         // 已选择的同步对象
@@ -8426,7 +8429,9 @@
             }
         });
         
-        // 页面加载时获取任务列表
+        // 页面加载时获取任务列表。
+        // 筛选交互：查询框只承载任务名称/ID（回车或点刷新按钮生效）；
+        // 状态/源库类型/目标库类型经下拉选择后以小标签形式展示在查询框下方，标签右上角红✕移除。
         function initFilterDropdown() {
             const searchBox = document.getElementById('searchBox');
             const searchInput = document.getElementById('searchInput');
@@ -8434,7 +8439,6 @@
             const statusDropdown = document.getElementById('statusDropdown');
             const sourceTypeDropdown = document.getElementById('sourceTypeDropdown');
             const targetTypeFilterDropdown = document.getElementById('targetTypeFilterDropdown');
-            const filterTags = document.getElementById('filterTags');
 
             const closeAllTypeDropdowns = () => {
                 statusDropdown.classList.remove('show');
@@ -8442,65 +8446,48 @@
                 targetTypeFilterDropdown.classList.remove('show');
             };
 
+            // 聚焦/点击均展开条件下拉——查询框里已输入关键字时也保持可选，
+            // 保证"名称/ID + 状态/库类型"可叠加筛选（输入过程不收起，回车确认时才收起）
             searchInput.addEventListener('focus', () => {
-                if (!activeFilterType) {
-                    filterDropdown.classList.add('show');
-                }
+                filterDropdown.classList.add('show');
             });
 
             searchInput.addEventListener('click', (e) => {
                 e.stopPropagation();
-                // 关键字模式下输入框为空再点一次 = 放弃关键字输入，回到条件选择
-                // （否则 activeFilterType 卡在 keyword，下拉打不开，无法叠加其它条件）
-                if (activeFilterType === 'keyword' && !searchInput.value.trim()) {
-                    activeFilterType = null;
-                    searchInput.placeholder = '添加筛选条件';
-                }
-                if (!activeFilterType) {
-                    filterDropdown.classList.add('show');
-                }
+                filterDropdown.classList.add('show');
             });
 
             document.addEventListener('click', (e) => {
                 if (!e.target.closest('.search-box-wrapper')) {
                     filterDropdown.classList.remove('show');
                     closeAllTypeDropdowns();
-                    // 点击外部退出关键字输入模式，避免状态卡住
-                    if (activeFilterType === 'keyword' && !searchInput.value.trim()) {
-                        activeFilterType = null;
-                        searchInput.placeholder = '添加筛选条件';
-                    }
                 }
             });
 
-            document.querySelectorAll('.filter-option').forEach(option => {
+            // 绑定范围收窄到本页自己的下拉容器：document 级全局选择器会把订阅页的
+            // 同类选项一并绑上本页 handler，造成跨页筛选状态污染（点订阅页"状态"
+            // 会同时设置同步页的 filterStatus 并加标签）
+            filterDropdown.querySelectorAll('.filter-option').forEach(option => {
                 option.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const filterType = option.dataset.filter;
 
                     filterDropdown.classList.remove('show');
 
-                    if (filterType === 'keyword') {
-                        activeFilterType = 'keyword';
-                        searchInput.placeholder = '输入任务名称或ID，回车确认...';
-                        searchInput.focus();
-                    } else if (filterType === 'status') {
-                        activeFilterType = null;
+                    if (filterType === 'status') {
                         closeAllTypeDropdowns();
                         statusDropdown.classList.add('show');
                     } else if (filterType === 'sourceType') {
-                        activeFilterType = null;
                         closeAllTypeDropdowns();
                         sourceTypeDropdown.classList.add('show');
                     } else if (filterType === 'targetType') {
-                        activeFilterType = null;
                         closeAllTypeDropdowns();
                         targetTypeFilterDropdown.classList.add('show');
                     }
                 });
             });
 
-            document.querySelectorAll('.status-option:not(.type-option)').forEach(option => {
+            statusDropdown.querySelectorAll('.status-option').forEach(option => {
                 option.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const status = option.dataset.status;
@@ -8509,7 +8496,6 @@
                     filterStatus = status;
                     addFilterTag('状态', statusText, 'status');
                     statusDropdown.classList.remove('show');
-                    searchInput.placeholder = '添加筛选条件';
 
                     currentPage = 1;
                     fetchWorkflows();
@@ -8522,7 +8508,6 @@
                     filterSourceType = option.dataset.sourceType;
                     addFilterTag('源库类型', formatDbTypeLabel(filterSourceType), 'sourceType');
                     sourceTypeDropdown.classList.remove('show');
-                    searchInput.placeholder = '添加筛选条件';
 
                     currentPage = 1;
                     fetchWorkflows();
@@ -8535,7 +8520,6 @@
                     filterTargetType = option.dataset.targetType;
                     addFilterTag('目标库类型', formatDbTypeLabel(filterTargetType), 'targetType');
                     targetTypeFilterDropdown.classList.remove('show');
-                    searchInput.placeholder = '添加筛选条件';
 
                     currentPage = 1;
                     fetchWorkflows();
@@ -8543,24 +8527,22 @@
             });
 
             searchInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' && activeFilterType === 'keyword') {
-                    const value = searchInput.value.trim();
-                    if (value) {
-                        filterKeyword = value;
-                        addFilterTag('任务名称/ID', value, 'keyword');
-                        searchInput.value = '';
-                        searchInput.placeholder = '添加筛选条件';
-                        activeFilterType = null;
-                        
-                        currentPage = 1;
-                        fetchWorkflows();
-                    }
+                if (e.key === 'Enter') {
+                    applyKeywordFromSearchInput();
+                    filterDropdown.classList.remove('show');
+                    currentPage = 1;
+                    fetchWorkflows();
                 } else if (e.key === 'Escape') {
-                    activeFilterType = null;
-                    searchInput.placeholder = '添加筛选条件';
                     filterDropdown.classList.remove('show');
                 }
             });
+        }
+
+        // 关键字直接取自查询框（回车与刷新按钮共用）：空 = 不按名称/ID 过滤
+        function applyKeywordFromSearchInput() {
+            const value = document.getElementById('searchInput').value.trim();
+            filterKeyword = value || null;
+            updateClearFiltersVisibility();
         }
         
         function addFilterTag(label, value, type) {
@@ -8583,9 +8565,7 @@
             // 同类型可能残留多个（历史数据），全部移除
             filterTags.querySelectorAll(`[data-type="${type}"]`).forEach(t => t.remove());
 
-            if (type === 'keyword') {
-                filterKeyword = null;
-            } else if (type === 'status') {
+            if (type === 'status') {
                 filterStatus = null;
             } else if (type === 'sourceType') {
                 filterSourceType = null;
@@ -8602,7 +8582,8 @@
             const btn = document.getElementById('clearFiltersBtn');
             if (!btn) return;
             const hasTags = document.getElementById('filterTags').children.length > 0;
-            btn.style.display = hasTags ? 'inline' : 'none';
+            const hasKeyword = !!document.getElementById('searchInput').value.trim();
+            btn.style.display = (hasTags || hasKeyword) ? 'inline' : 'none';
         }
 
         // "清空"按钮：还原所有筛选条件并重查列表
@@ -8618,15 +8599,12 @@
             filterStatus = null;
             filterSourceType = null;
             filterTargetType = null;
-            activeFilterType = null;
             isViewingFailedTasks = false;
 
             const filterTags = document.getElementById('filterTags');
             filterTags.innerHTML = '';
 
-            const searchInput = document.getElementById('searchInput');
-            searchInput.value = '';
-            searchInput.placeholder = '添加筛选条件';
+            document.getElementById('searchInput').value = '';
             updateClearFiltersVisibility();
 
             document.getElementById('viewFailedTasksBtn').textContent = '查看异常任务';
@@ -8666,9 +8644,12 @@
             });
             
             document.getElementById('refreshBtn').addEventListener('click', () => {
+                // 刷新按钮同时生效查询框中的名称/ID 关键字
+                applyKeywordFromSearchInput();
                 if (isViewingFailedTasks) {
                     fetchFailedWorkflows();
                 } else {
+                    currentPage = 1;
                     fetchWorkflows();
                 }
             });
@@ -9263,12 +9244,11 @@
             drPageSize = parseInt(e.target.value);
             fetchDrTasks(1);
         });
-        document.getElementById('drSourceTypeFilterSelect').addEventListener('change', (e) => {
-            drFilterSourceType = e.target.value || null;
-            fetchDrTasks(1);
-        });
-        document.getElementById('drTargetTypeFilterSelect').addEventListener('change', (e) => {
-            drFilterTargetType = e.target.value || null;
+        // 灾备任务两端类型一致：单个"数据库类型"筛选同时下发 sourceType 与 targetType
+        document.getElementById('drDbTypeFilterSelect').addEventListener('change', (e) => {
+            const dbType = e.target.value || null;
+            drFilterSourceType = dbType;
+            drFilterTargetType = dbType;
             fetchDrTasks(1);
         });
         document.getElementById('drViewFailedBtn').addEventListener('click', () => {
@@ -9915,8 +9895,6 @@
         let subscribeFilterKeyword = null;
         let subscribeFilterStatus = null;
         let subscribeFilterSourceType = null;
-        let subscribeFilterTargetType = null;
-        let subscribeActiveFilterType = null;
 
         const subscribeStatusMap = {
             'CONFIGURING': { text: '配置中', class: 'status-configuring', icon: '⚙' },
@@ -9937,7 +9915,6 @@
             if (subscribeFilterStatus) url += `&status=${subscribeFilterStatus}`;
             if (subscribeFilterKeyword) url += `&keyword=${encodeURIComponent(subscribeFilterKeyword)}`;
             if (subscribeFilterSourceType) url += `&sourceType=${subscribeFilterSourceType}`;
-            if (subscribeFilterTargetType) url += `&targetType=${subscribeFilterTargetType}`;
 
             try {
                 const response = await fetchWithAuth(url);
@@ -11069,39 +11046,32 @@
             if (e.target.id === 'createSubscribeEntryModal') closeSubscribeEntryModal();
         });
 
-        // 订阅任务筛选交互
+        // 订阅任务筛选交互：查询框只承载任务名称/ID（回车或点刷新生效）；
+        // 状态/源库类型经下拉选择后以小标签展示在查询框下方（订阅目标固定 Kafka，无目标库类型筛选）。
         (function initSubscribeFilter() {
-            const searchBox = document.getElementById('subscribeSearchBox');
             const searchInput = document.getElementById('subscribeSearchInput');
             const filterDropdown = document.getElementById('subscribeFilterDropdown');
             const statusDropdown = document.getElementById('subscribeStatusDropdown');
             const sourceTypeDropdown = document.getElementById('subscribeSourceTypeDropdown');
-            const targetTypeDropdown = document.getElementById('subscribeTargetTypeDropdown');
-            const filterTags = document.getElementById('subscribeFilterTags');
 
             const closeAllTypeDropdowns = () => {
                 statusDropdown.classList.remove('show');
                 sourceTypeDropdown.classList.remove('show');
-                targetTypeDropdown.classList.remove('show');
             };
 
+            // 聚焦/点击均展开条件下拉——查询框里已输入关键字时也保持可选（与实时同步页一致）
             searchInput.addEventListener('focus', () => {
-                if (!subscribeActiveFilterType) {
-                    filterDropdown.classList.add('show');
-                }
+                filterDropdown.classList.add('show');
             });
 
             searchInput.addEventListener('click', (e) => {
                 e.stopPropagation();
-                if (!subscribeActiveFilterType) {
-                    filterDropdown.classList.add('show');
-                }
+                filterDropdown.classList.add('show');
             });
 
             document.addEventListener('click', (e) => {
                 if (!e.target.closest('#subscribeSearchBox') && !e.target.closest('#subscribeFilterDropdown')
-                        && !e.target.closest('#subscribeStatusDropdown') && !e.target.closest('#subscribeSourceTypeDropdown')
-                        && !e.target.closest('#subscribeTargetTypeDropdown')) {
+                        && !e.target.closest('#subscribeStatusDropdown') && !e.target.closest('#subscribeSourceTypeDropdown')) {
                     filterDropdown.classList.remove('show');
                     closeAllTypeDropdowns();
                 }
@@ -11113,19 +11083,12 @@
                     const filterType = option.dataset.filter;
                     filterDropdown.classList.remove('show');
 
-                    if (filterType === 'keyword') {
-                        subscribeActiveFilterType = 'keyword';
-                        searchInput.placeholder = '输入任务名称或ID...';
-                        searchInput.focus();
-                    } else if (filterType === 'status') {
+                    if (filterType === 'status') {
                         closeAllTypeDropdowns();
                         statusDropdown.classList.add('show');
                     } else if (filterType === 'sourceType') {
                         closeAllTypeDropdowns();
                         sourceTypeDropdown.classList.add('show');
-                    } else if (filterType === 'targetType') {
-                        closeAllTypeDropdowns();
-                        targetTypeDropdown.classList.add('show');
                     }
                 });
             });
@@ -11139,8 +11102,6 @@
                     subscribeFilterStatus = status;
                     addSubscribeFilterTag('状态', statusText, 'status');
                     statusDropdown.classList.remove('show');
-                    searchInput.placeholder = '添加筛选条件';
-                    subscribeActiveFilterType = null;
 
                     fetchSubscribeTasks(1);
                 });
@@ -11152,48 +11113,35 @@
                     subscribeFilterSourceType = option.dataset.sourceType;
                     addSubscribeFilterTag('源库类型', formatDbTypeLabel(subscribeFilterSourceType), 'sourceType');
                     sourceTypeDropdown.classList.remove('show');
-                    searchInput.placeholder = '添加筛选条件';
-                    subscribeActiveFilterType = null;
-
-                    fetchSubscribeTasks(1);
-                });
-            });
-
-            targetTypeDropdown.querySelectorAll('.type-option').forEach(option => {
-                option.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    subscribeFilterTargetType = option.dataset.targetType;
-                    addSubscribeFilterTag('目标库类型', formatDbTypeLabel(subscribeFilterTargetType), 'targetType');
-                    targetTypeDropdown.classList.remove('show');
-                    searchInput.placeholder = '添加筛选条件';
-                    subscribeActiveFilterType = null;
 
                     fetchSubscribeTasks(1);
                 });
             });
 
             searchInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' && subscribeActiveFilterType === 'keyword') {
-                    const value = searchInput.value.trim();
-                    if (value) {
-                        subscribeFilterKeyword = value;
-                        addSubscribeFilterTag('任务名称/ID', value, 'keyword');
-                        searchInput.value = '';
-                        searchInput.placeholder = '添加筛选条件';
-                        subscribeActiveFilterType = null;
-
-                        fetchSubscribeTasks(1);
-                    }
+                if (e.key === 'Enter') {
+                    filterDropdown.classList.remove('show');
+                    subscribeApplyKeywordAndRefresh();
                 } else if (e.key === 'Escape') {
-                    subscribeActiveFilterType = null;
-                    searchInput.placeholder = '添加筛选条件';
                     filterDropdown.classList.remove('show');
                 }
             });
         })();
 
+        // 关键字直接取自查询框（回车与刷新按钮共用）：空 = 不按名称/ID 过滤
+        window.subscribeApplyKeywordAndRefresh = function() {
+            const value = document.getElementById('subscribeSearchInput').value.trim();
+            subscribeFilterKeyword = value || null;
+            fetchSubscribeTasks(1);
+        }
+
         function addSubscribeFilterTag(label, value, type) {
             const filterTags = document.getElementById('subscribeFilterTags');
+            // 同类型条件去重：重复添加时替换旧 tag
+            const existing = filterTags.querySelector(`[data-type="${type}"]`);
+            if (existing) {
+                existing.remove();
+            }
             const tag = document.createElement('span');
             tag.className = 'filter-tag';
             tag.dataset.type = type;
@@ -11203,17 +11151,12 @@
 
         function removeSubscribeFilterTag(type) {
             const filterTags = document.getElementById('subscribeFilterTags');
-            const tag = filterTags.querySelector(`[data-type="${type}"]`);
-            if (tag) tag.remove();
+            filterTags.querySelectorAll(`[data-type="${type}"]`).forEach(t => t.remove());
 
-            if (type === 'keyword') {
-                subscribeFilterKeyword = null;
-            } else if (type === 'status') {
+            if (type === 'status') {
                 subscribeFilterStatus = null;
             } else if (type === 'sourceType') {
                 subscribeFilterSourceType = null;
-            } else if (type === 'targetType') {
-                subscribeFilterTargetType = null;
             }
 
             fetchSubscribeTasks(1);
