@@ -57,6 +57,34 @@ class SchemaEvolutionServiceTest {
     }
 
     @Test
+    @DisplayName("表级同步：范围外库的 DDL（含 DROP DATABASE）一律跳过，范围内正常应用")
+    void tableLevelSkipsOutOfScopeDatabaseDdl() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("migration.included.databases", "dbm1,dbm2");
+        props.setProperty("migration.included.tables", "dbm1.ta,dbm2.tb");
+        SchemaEvolutionService service = createService(props);
+
+        // 共享实例上其他库的建删库语句：曾被重放到目标端把无关库整删（跨任务破坏），必须跳过
+        SchemaEvolutionService.ApplyResult dropOther = service.applyDdl(
+                "DROP DATABASE IF EXISTS p02src", "DROP_DATABASE", "p02src");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, dropOther.getStatus());
+
+        SchemaEvolutionService.ApplyResult createOther = service.applyDdl(
+                "CREATE DATABASE other_db", "CREATE_DATABASE", "other_db");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, createOther.getStatus());
+
+        // 范围外库的表级 DDL 同样跳过
+        SchemaEvolutionService.ApplyResult alterOther = service.applyDdl(
+                "ALTER TABLE p02src.t ADD COLUMN c INT", "ALTER_TABLE", "p02src");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, alterOther.getStatus());
+
+        // 范围内库的清单内表 DDL 正常应用
+        SchemaEvolutionService.ApplyResult inScope = service.applyDdl(
+                "CREATE TABLE ta (id INT PRIMARY KEY)", "CREATE_TABLE", "dbm1");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED, inScope.getStatus());
+    }
+
+    @Test
     @DisplayName("AUTO_APPLY 策略：同源同目标应直接执行 DDL")
     void autoApplySameEngineShouldExecuteDdl() throws SQLException {
         SchemaEvolutionService service = createService(baseProps());

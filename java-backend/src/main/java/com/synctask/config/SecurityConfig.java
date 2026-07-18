@@ -91,6 +91,15 @@ public class SecurityConfig {
                 .anyRequest().authenticated()
         );
 
+        // 未认证/无效 token 统一返回 401：Spring Security 默认对匿名请求返回 403，
+        // 前端无法与"权限不足"区分，导致 token 失效（如后端重启换 JWT 密钥）后
+        // 页面静默空白而不是引导重新登录。本应用无角色级授权，401 语义准确。
+        http.exceptionHandling(ex -> ex.authenticationEntryPoint((request, response, authException) -> {
+            response.setStatus(401);
+            response.setContentType("application/json;charset=UTF-8");
+            response.getWriter().write("{\"success\":false,\"message\":\"未认证或登录已失效，请重新登录\"}");
+        }));
+
         http.authenticationProvider(authenticationProvider());
         http.addFilterBefore(jwtAuthenticationFilter(), UsernamePasswordAuthenticationFilter.class);
         http.addFilterAfter(apiRateLimitFilter, JwtAuthenticationFilter.class);

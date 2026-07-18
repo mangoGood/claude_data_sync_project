@@ -44,17 +44,26 @@ public final class StoredObjectSyncUtil {
     }
 
     /**
-     * 把源库 database 下的全部存储过程与函数复制到目标库（先 DROP IF EXISTS 再建，幂等）。
+     * 把源库 database 下的全部存储过程与函数复制到目标库同名库（先 DROP IF EXISTS 再建，幂等）。
      * 单个对象失败只记日志继续，返回成功复制的数量。
      */
     public static int copyProceduresAndFunctions(Connection source, Connection target, String database) {
+        return copyProceduresAndFunctions(source, target, database, database);
+    }
+
+    /**
+     * 同上，但目标端应用到 targetDatabase（库名映射场景：源库 db1 的存储程序落到目标端映射库）。
+     */
+    public static int copyProceduresAndFunctions(Connection source, Connection target,
+                                                 String sourceDatabase, String targetDatabase) {
         int copied = 0;
-        copied += copyRoutines(source, target, database, "PROCEDURE");
-        copied += copyRoutines(source, target, database, "FUNCTION");
+        copied += copyRoutines(source, target, sourceDatabase, targetDatabase, "PROCEDURE");
+        copied += copyRoutines(source, target, sourceDatabase, targetDatabase, "FUNCTION");
         return copied;
     }
 
-    private static int copyRoutines(Connection source, Connection target, String database, String routineType) {
+    private static int copyRoutines(Connection source, Connection target, String database,
+                                    String targetDatabase, String routineType) {
         int copied = 0;
         List<String> names = new ArrayList<>();
         String listSql = "SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = ?";
@@ -80,10 +89,10 @@ public final class StoredObjectSyncUtil {
                     logger.warn("[{}] SHOW CREATE {} {} 返回空（可能缺少权限），跳过", database, routineType, name);
                     continue;
                 }
-                applyInDatabase(target, database,
+                applyInDatabase(target, targetDatabase,
                         "DROP " + routineType + " IF EXISTS `" + name + "`", stripDefiner(createSql));
                 copied++;
-                logger.info("[{}] {} {} 已同步到目标库", database, routineType, name);
+                logger.info("[{}] {} {} 已同步到目标库 {}", database, routineType, name, targetDatabase);
             } catch (SQLException e) {
                 logger.warn("[{}] 同步 {} {} 失败: {}", database, routineType, name, e.getMessage());
             }
@@ -99,10 +108,18 @@ public final class StoredObjectSyncUtil {
     }
 
     /**
-     * 把源库 database 下的全部触发器与事件复制到目标库（任务结束时调用），返回逐对象明细。
+     * 把源库 database 下的全部触发器与事件复制到目标库同名库（任务结束时调用），返回逐对象明细。
      * 复制出的 event 保留源库定义原样（含 ENABLE 状态）；单个失败记入报告继续。
      */
     public static SyncReport copyTriggersAndEventsDetailed(Connection source, Connection target, String database) {
+        return copyTriggersAndEventsDetailed(source, target, database, database);
+    }
+
+    /**
+     * 同上，但目标端应用到 targetDatabase（库名映射场景）。
+     */
+    public static SyncReport copyTriggersAndEventsDetailed(Connection source, Connection target,
+                                                           String database, String targetDatabase) {
         SyncReport report = new SyncReport();
 
         List<String> triggers = new ArrayList<>();
@@ -126,7 +143,7 @@ public final class StoredObjectSyncUtil {
                     report.failed.add("TRIGGER " + database + "." + name + ": SHOW CREATE 返回空（可能缺少权限）");
                     continue;
                 }
-                applyInDatabase(target, database,
+                applyInDatabase(target, targetDatabase,
                         "DROP TRIGGER IF EXISTS `" + name + "`", stripDefiner(createSql));
                 report.succeeded.add("TRIGGER " + database + "." + name);
                 logger.info("[{}] TRIGGER {} 已同步到目标库", database, name);
@@ -157,7 +174,7 @@ public final class StoredObjectSyncUtil {
                     report.failed.add("EVENT " + database + "." + name + ": SHOW CREATE 返回空（可能缺少权限）");
                     continue;
                 }
-                applyInDatabase(target, database,
+                applyInDatabase(target, targetDatabase,
                         "DROP EVENT IF EXISTS `" + name + "`", stripDefiner(createSql));
                 report.succeeded.add("EVENT " + database + "." + name);
                 logger.info("[{}] EVENT {} 已同步到目标库", database, name);

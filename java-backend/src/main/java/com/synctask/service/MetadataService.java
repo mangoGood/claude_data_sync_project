@@ -400,13 +400,15 @@ public class MetadataService {
                 String jdbcUrl = buildJdbcUrl(conn, database);
                 try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
                     String effectiveSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
-                    try (Statement stmt = connection.createStatement();
-                         ResultSet rs = stmt.executeQuery(
-                             "SELECT tablename FROM pg_tables WHERE schemaname = '" + effectiveSchema + "'")) {
-                        while (rs.next()) {
-                            String tableName = rs.getString(1);
-                            long rows = getPgRowCount(connection, tableName);
-                            tables.add(new TableInfo(tableName, rows, "", "TABLE"));
+                    try (PreparedStatement stmt = connection.prepareStatement(
+                             "SELECT tablename FROM pg_tables WHERE schemaname = ?")) {
+                        stmt.setString(1, effectiveSchema);
+                        try (ResultSet rs = stmt.executeQuery()) {
+                            while (rs.next()) {
+                                String tableName = rs.getString(1);
+                                long rows = getPgRowCount(connection, tableName);
+                                tables.add(new TableInfo(tableName, rows, "", "TABLE"));
+                            }
                         }
                     }
                 }
@@ -423,12 +425,14 @@ public class MetadataService {
                 String jdbcUrl = buildJdbcUrl(conn, database);
                 try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
                     String owner = (schema != null && !schema.isEmpty()) ? schema.toUpperCase() : conn.username.toUpperCase();
-                    try (Statement stmt = connection.createStatement();
-                         ResultSet rs = stmt.executeQuery(
-                             "SELECT table_name FROM all_tables WHERE owner = '" + owner + "' ORDER BY table_name")) {
-                        while (rs.next()) {
-                            String tableName = rs.getString(1);
-                            tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                    try (PreparedStatement stmt = connection.prepareStatement(
+                             "SELECT table_name FROM all_tables WHERE owner = ? ORDER BY table_name")) {
+                        stmt.setString(1, owner);
+                        try (ResultSet rs = stmt.executeQuery()) {
+                            while (rs.next()) {
+                                String tableName = rs.getString(1);
+                                tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                            }
                         }
                     }
                 }
@@ -591,6 +595,56 @@ public class MetadataService {
                "config".equalsIgnoreCase(dbName);
     }
 
+    /** 列过滤支持的类型（整数/bit/浮点定点/日期时间），供前端“列名过滤”页签按类型放行 */
+    private static final Set<String> FILTERABLE_COLUMN_TYPES = new HashSet<>(Arrays.asList(
+        "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "bit",
+        "decimal", "numeric", "float", "double",
+        "date", "datetime", "timestamp", "time", "year"
+    ));
+
+    /**
+     * 查询表的列信息（列处理页面用，目前仅支持 MySQL 源）。
+     * 返回每列的 name/dataType/columnType/primaryKey/filterable。
+     */
+    public List<java.util.Map<String, Object>> listColumns(String connectionStr, String database, String table) {
+        ParsedConnection conn = parseConnection(connectionStr);
+        if (conn.isMongo() || conn.isPostgresql() || conn.isOracle() || conn.isElastic()) {
+            throw new RuntimeException("列处理目前仅支持 MySQL 数据源");
+        }
+        List<java.util.Map<String, Object>> columns = new ArrayList<>();
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+            try (Connection connection = DataSourcePoolManager.getConnection(
+                    buildJdbcUrl(conn, database), conn.username, conn.password);
+                 PreparedStatement stmt = connection.prepareStatement(
+                     "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLUMN_KEY FROM information_schema.COLUMNS " +
+                     "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION")) {
+                stmt.setString(1, database);
+                stmt.setString(2, table);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        java.util.Map<String, Object> col = new java.util.LinkedHashMap<>();
+                        String dataType = rs.getString("DATA_TYPE");
+                        col.put("name", rs.getString("COLUMN_NAME"));
+                        col.put("dataType", dataType);
+                        col.put("columnType", rs.getString("COLUMN_TYPE"));
+                        col.put("primaryKey", "PRI".equalsIgnoreCase(rs.getString("COLUMN_KEY")));
+                        col.put("filterable", dataType != null
+                                && FILTERABLE_COLUMN_TYPES.contains(dataType.toLowerCase()));
+                        columns.add(col);
+                    }
+                }
+            }
+            logger.info("表 {}.{} 查询到 {} 个列", database, table, columns.size());
+        } catch (SQLException e) {
+            logger.error("查询列信息失败: {}", e.getMessage());
+            throw new RuntimeException("查询列信息失败: " + e.getMessage());
+        } catch (ClassNotFoundException e) {
+            throw new RuntimeException("数据库驱动未找到: " + e.getMessage());
+        }
+        return columns;
+    }
+
     public List<TableInfo> listTables(String connectionStr, String database) {
         ParsedConnection conn = parseConnection(connectionStr);
 
@@ -639,12 +693,14 @@ public class MetadataService {
                     }
                 } else if (conn.isOracle()) {
                     String owner = (database != null && !database.isEmpty()) ? database.toUpperCase() : conn.username.toUpperCase();
-                    try (Statement stmt = connection.createStatement();
-                         ResultSet rs = stmt.executeQuery(
-                             "SELECT table_name FROM all_tables WHERE owner = '" + owner + "' ORDER BY table_name")) {
-                        while (rs.next()) {
-                            String tableName = rs.getString(1);
-                            tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                    try (PreparedStatement stmt = connection.prepareStatement(
+                             "SELECT table_name FROM all_tables WHERE owner = ? ORDER BY table_name")) {
+                        stmt.setString(1, owner);
+                        try (ResultSet rs = stmt.executeQuery()) {
+                            while (rs.next()) {
+                                String tableName = rs.getString(1);
+                                tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                            }
                         }
                     }
                 } else {
@@ -675,8 +731,10 @@ public class MetadataService {
     }
     
     private long getPgRowCount(Connection connection, String tableName) {
+        // 表名是标识符无法参数化：对引号转义（表名来自服务端元数据枚举，转义防御异常命名）
         try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM \"" + tableName + "\"")) {
+             ResultSet rs = stmt.executeQuery(
+                 "SELECT COUNT(*) FROM \"" + tableName.replace("\"", "\"\"") + "\"")) {
             if (rs.next()) {
                 return rs.getLong(1);
             }
@@ -687,8 +745,10 @@ public class MetadataService {
     }
 
     private long getRowCount(Connection connection, String database, String tableName) {
+        // 表名是标识符无法参数化：对反引号转义（表名来自服务端元数据枚举，转义防御异常命名）
         try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM `" + tableName + "`")) {
+             ResultSet rs = stmt.executeQuery(
+                 "SELECT COUNT(*) FROM `" + tableName.replace("`", "``") + "`")) {
             if (rs.next()) {
                 return rs.getLong(1);
             }
@@ -699,14 +759,17 @@ public class MetadataService {
     }
 
     private String getTableSize(Connection connection, String database, String tableName) {
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery(
+        try (PreparedStatement stmt = connection.prepareStatement(
                  "SELECT ROUND(data_length + index_length) as size_bytes " +
                  "FROM information_schema.tables " +
-                 "WHERE table_schema = '" + database + "' AND table_name = '" + tableName + "'")) {
-            if (rs.next()) {
-                long bytes = rs.getLong("size_bytes");
-                return formatSize(bytes);
+                 "WHERE table_schema = ? AND table_name = ?")) {
+            stmt.setString(1, database);
+            stmt.setString(2, tableName);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    long bytes = rs.getLong("size_bytes");
+                    return formatSize(bytes);
+                }
             }
         } catch (SQLException e) {
             logger.warn("获取表 {} 大小失败: {}", tableName, e.getMessage());

@@ -159,6 +159,13 @@ public class ValidationTaskService {
             throw new RuntimeException("该任务已有对比任务正在执行中，请等待完成后再创建");
         }
 
+        // 列处理任务（列过滤/列名映射/附加列）：源表与目标表的行集/列集不再一一对应，
+        // 行数对比与内容对比均无意义，直接拒绝创建
+        if (hasColumnProcessing(workflow.getSyncObjects())) {
+            throw new RuntimeException("该任务配置了列处理（列名过滤/列名映射/附加列），" +
+                    "源端与目标端数据不再一一对应，无法进行内容对比和行数对比");
+        }
+
         if ("CONTENT".equals(compareType)) {
             if (workflow.getTargetConnection().startsWith("elastic")) {
                 throw new RuntimeException("Elasticsearch 任务暂不支持内容对比，请使用行数对比（按索引文档数）");
@@ -635,6 +642,34 @@ public class ValidationTaskService {
 
     private String quoteId(String id, boolean isPg) {
         return isPg ? "\"" + id + "\"" : "`" + id + "`";
+    }
+
+    /**
+     * 任务是否配置了列处理（syncObjects 任一库 entry 携带非空的
+     * columnFilter/columnMapping/extraColumns）。列处理任务不支持行数/内容对比。
+     */
+    @SuppressWarnings("unchecked")
+    public boolean hasColumnProcessing(String syncObjectsJson) {
+        if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
+            return false;
+        }
+        try {
+            Map<String, Object> raw = gson.fromJson(syncObjectsJson, Map.class);
+            if (raw == null) return false;
+            for (Object value : raw.values()) {
+                if (!(value instanceof Map)) continue;
+                Map<?, ?> entry = (Map<?, ?>) value;
+                for (String key : new String[]{"columnFilter", "columnMapping", "extraColumns"}) {
+                    Object cp = entry.get(key);
+                    if (cp instanceof Map && !((Map<?, ?>) cp).isEmpty()) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("解析列处理配置失败: {}", e.getMessage());
+        }
+        return false;
     }
 
     @SuppressWarnings("unchecked")

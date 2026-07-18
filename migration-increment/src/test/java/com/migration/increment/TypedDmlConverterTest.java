@@ -230,6 +230,9 @@ class TypedDmlConverterTest {
         p.setProperty("source.db.type", "mysql");
         p.setProperty("target.db.type", "mysql");
         p.setProperty("target.db.database", "tgt_db");
+        // mysql→mysql 的库改名靠 schema.mapping.db.*（ConfigService 对 src≠tgt 必然写入）；
+        // 不再用 target.db.database 覆盖一切——多库任务各库按事件源库独立路由
+        p.setProperty("schema.mapping.db.src_db", "tgt_db");
         TypedDmlConverter c = new TypedDmlConverter(p);
 
         THLEvent e = new THLEvent();

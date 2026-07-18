@@ -197,6 +197,16 @@ public class ContinuousIncrementMain {
         targetConnection = ConnectionPoolManager.getConnection(url, targetUser, targetPassword);
         logger.info("已连接目标数据库: {}:{}/{} (类型: {})", targetHost, targetPort, targetDatabase,
                 isPostgresql ? "postgresql" : "mysql");
+        // MySQL 目标关闭本会话外键检查：增量按 binlog 顺序应用本身满足约束，但部分表同步/
+        // 列过滤会破坏引用完整性（父行被过滤而子行保留），幂等重放（重试续传）也可能暂时乱序。
+        // 与全量搬数会话保持一致语义；重连走同一入口，新会话自动重设。
+        if (!isPostgresql) {
+            try (Statement st = targetConnection.createStatement()) {
+                st.execute("SET FOREIGN_KEY_CHECKS=0");
+            } catch (SQLException e) {
+                logger.warn("设置 FOREIGN_KEY_CHECKS=0 失败（继续执行）: {}", e.getMessage());
+            }
+        }
         if (bidirectionalEnabled) {
             ensureMarkerTable();
         }
@@ -387,13 +397,16 @@ public class ContinuousIncrementMain {
 
         logger.info("处理THL文件: {}", fileName);
         int eventCount = 0;
+        // 本文件是否被中途打断（优雅停止 / 不可恢复错误 fail-stop）：
+        // 打断时绝不能把文件标记为“已处理完(-1)”，否则重启后整个文件被跳过造成数据丢失
+        boolean aborted = false;
 
         try (THLFileReader reader = createThlReader(thlFile.getAbsolutePath())) {
             THLEvent event;
             // readEventAfter 只返回 seqno > 已执行seqno 的事件：分帧格式下对已应用事件按字节跳过、
             // 不反序列化，大幅加快增量进程重启时“从 seqno 跳到当前位点”；旧格式自动回退为逐条反序列化跳过。
             while ((event = reader.readEventAfter(lastExecutedSeqno)) != null) {
-                if (!running.get()) break;
+                if (!running.get()) { aborted = true; break; }
 
                 if (event.getType() == THLEvent.HEARTBEAT_EVENT) {
                     lastExecutedSeqno = event.getSeqno();
@@ -543,6 +556,19 @@ public class ContinuousIncrementMain {
                     logger.error("事务管理异常 (seqno={}): {}", event.getSeqno(), txEx.getMessage());
                     try { targetConnection.rollback(); } catch (SQLException ignored) {}
                     try { targetConnection.setAutoCommit(true); } catch (SQLException ignored) {}
+                    txFailed = true;
+                }
+
+                // fail-stop：事务失败（已回滚）时绝不推进 lastExecutedSeqno/checkpoint，
+                // 并停止整个增量处理——否则该事件在重试后被跳过（静默丢数），且失败点之后
+                // 继续应用会造成乱序偏差（后续对同一行的 UPDATE 因"未影响任何行"被吞掉）。
+                // 修复问题后重试/恢复将从本事件精确续传（应用侧幂等语义保证重放安全）。
+                if (txFailed) {
+                    logger.error("增量应用 fail-stop：seqno={} 未计入位点，停止处理；修复目标端问题后重试将从该事件继续",
+                            event.getSeqno());
+                    aborted = true;
+                    running.set(false);
+                    break;
                 }
 
                 // 限速：按本事件实际处理的行数计入配额窗口（typedDmls 与 sqlStatements 二选一，
@@ -603,6 +629,14 @@ public class ContinuousIncrementMain {
 
         if (eventCount > 0) {
             logger.info("处理THL文件完成: {} -> 执行了{}个事件, 最后seqno: {}", fileName, eventCount, lastExecutedSeqno);
+        }
+
+        // 中途打断（fail-stop / 优雅停止）：只记录已应用到的 seqno，绝不标记 -1（已处理完）。
+        // 否则重启后该文件被整体跳过，未应用的事件全部丢失。
+        if (aborted) {
+            processedFiles.put(fileName, lastExecutedSeqno);
+            saveProgress();
+            return;
         }
 
         if (isLatestFile) {

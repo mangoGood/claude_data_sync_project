@@ -62,6 +62,12 @@ public class SchemaEvolutionService {
     /** 表级同步的同步对象清单（db.table，小写）。非空时表级 DDL 仅对清单内的表应用——
      *  新表/未选表的 CREATE/ALTER/DROP 等一律屏蔽，与"表级不同步增量期新表"的数据面语义对齐。 */
     private final java.util.Set<String> includedTables = new java.util.HashSet<>();
+    /** 表级同步的范围库集合（migration.included.databases，小写）。非空时范围外库的一切 DDL
+     *  （尤其 CREATE/DROP DATABASE 这类库级 DDL，表级清单守卫覆盖不到）一律不应用——
+     *  共享实例上其他库的建删库语句若放行重放到目标端，会造成跨任务破坏。 */
+    private final java.util.Set<String> includedDatabases = new java.util.HashSet<>();
+    /** 列处理配置：仅用于对列处理表的 DDL 告警（DDL 不做列级改写，需人工核对） */
+    private final com.migration.config.ColumnProcessingConfig columnProcessing;
 
     public SchemaEvolutionService(Properties props, Connection targetConnection) {
         this.mappingConfig = SchemaMappingConfig.loadFromProperties(props);
@@ -81,6 +87,12 @@ public class SchemaEvolutionService {
                 includedTables.add(t.trim().toLowerCase());
             }
         }
+        for (String db : props.getProperty("migration.included.databases", "").split(",")) {
+            if (!db.trim().isEmpty()) {
+                includedDatabases.add(db.trim().toLowerCase());
+            }
+        }
+        this.columnProcessing = com.migration.config.ColumnProcessingConfig.loadFromProperties(props);
 
         DdlTranslator.Direction direction;
         if (sourceIsPostgresql && !targetIsPostgresql) {
@@ -158,6 +170,15 @@ public class SchemaEvolutionService {
                 // 存储过程/函数：剥掉 DEFINER 子句（目标库通常无对应账号/权限，保留会执行失败）
                 sql = com.migration.common.sqlobj.StoredObjectSyncUtil.stripDefiner(sql);
             }
+        } else if (sourceDb != null && !sourceDb.isEmpty() && !includedDatabases.isEmpty()
+                && !includedDatabases.contains(sourceDb.toLowerCase())) {
+            // 表级同步：范围外库的一切 DDL 不应用。表级清单守卫只覆盖表级 DDL，
+            // CREATE/DROP DATABASE 这类库级 DDL 此前会漏网——共享实例上其他任务/其他库的
+            // 建删库语句被重放到目标端，实测曾把无关库整个删掉（跨任务破坏）。
+            totalDdlSkipped++;
+            logger.info("表级同步：库 {} 不在同步范围，DDL 跳过: subtype={} | sql={}",
+                    sourceDb, ddlSubType, truncate(sql));
+            return ApplyResult.skipped("库 " + sourceDb + " 不在表级同步范围，DDL 不应用");
         } else if (isRoutineDdl) {
             // 表级同步：不复制存储程序（与"表级不同步增量期新对象"的语义一致）
             totalDdlSkipped++;
@@ -173,6 +194,21 @@ public class SchemaEvolutionService {
                 logger.info("表级同步：表 {} 不在同步对象清单，DDL 跳过: subtype={} | sql={}",
                         fullTable, ddlSubType, truncate(sql));
                 return ApplyResult.skipped("表 " + fullTable + " 不在表级同步对象清单，DDL 不应用");
+            }
+        }
+
+        // 列处理表的 DDL 告警：DDL 只做库/表名映射，不改写列名、不感知过滤/附加列——
+        // 对已改名列的 ALTER 可能在目标端失败或产生结构漂移，留痕提示人工核对。
+        if (!columnProcessing.isEmpty() && isTableScopedDdl(subtypeUpper)) {
+            String cpTable = resolveDdlTargetTable(sql, subtypeUpper, sourceDb);
+            if (cpTable != null) {
+                int dot = cpTable.indexOf('.');
+                String cpDb = dot > 0 ? cpTable.substring(0, dot) : sourceDb;
+                String cpTbl = dot > 0 ? cpTable.substring(dot + 1) : cpTable;
+                if (cpDb != null && columnProcessing.hasProcessing(cpDb, cpTbl)) {
+                    logger.warn("表 {} 配置了列处理（列过滤/列名映射/附加列），DDL 不做列级改写，请人工核对目标表结构: {}",
+                            cpTable, truncate(sql));
+                }
             }
         }
 

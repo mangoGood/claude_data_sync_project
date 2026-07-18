@@ -40,11 +40,19 @@ public class TypedDmlConverter {
 
     private final boolean enabled;
     private final boolean targetIsMysql;
+    private final boolean sourceIsMysql;
     private final String targetDatabaseName;
     /** 表名映射（仅表级同步下发）："源库.源表" → 目标表名，来自 schema.mapping.table.* */
     private final Map<String, String> tableNameMapping = new java.util.HashMap<>();
     /** 小写回退索引：适配 MySQL 源 lower_case_table_names 不区分大小写（精确命中优先） */
     private final Map<String, String> tableNameMappingLower = new java.util.HashMap<>();
+    /** 库名映射（schema.mapping.db.*）：源库 → 目标库。多库任务每个事件按自己的源库路由目标库 */
+    private final Map<String, String> databaseMapping = new java.util.HashMap<>();
+    private final Map<String, String> databaseMappingLower = new java.util.HashMap<>();
+    /** 列处理（仅表级同步下发、mysql→mysql）：行过滤 + 列名映射；附加列由建表 DEFAULT 承载，DML 无需注值 */
+    private final com.migration.config.ColumnProcessingConfig columnProcessing;
+    /** 列处理是否生效（有配置且源/目标均为 MySQL） */
+    private final boolean columnProcessingActive;
 
     public TypedDmlConverter(Properties props) {
         String source = props.getProperty("source.db.type", "mysql").toLowerCase();
@@ -58,10 +66,13 @@ public class TypedDmlConverter {
                         || ("postgresql".equals(source) && "postgresql".equals(target));
         this.enabled = switchOn && pairSupported;
         this.targetIsMysql = "mysql".equals(target);
+        this.sourceIsMysql = "mysql".equals(source);
         this.targetDatabaseName = props.getProperty("target.db.database", "");
 
         // 表名映射：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>，DML 只需要表名部分
         String tableMappingPrefix = "schema.mapping.table.";
+        // 库名映射：schema.mapping.db.<源库>=<目标库>（未映射的库按源库名原样路由）
+        String dbMappingPrefix = "schema.mapping.db.";
         for (String name : props.stringPropertyNames()) {
             if (name.startsWith(tableMappingPrefix)) {
                 String key = name.substring(tableMappingPrefix.length());
@@ -71,10 +82,21 @@ public class TypedDmlConverter {
                     tableNameMapping.put(key, targetTable);
                     tableNameMappingLower.put(key.toLowerCase(), targetTable);
                 }
+            } else if (name.startsWith(dbMappingPrefix)) {
+                String srcDb = name.substring(dbMappingPrefix.length());
+                String tgtDb = props.getProperty(name, "");
+                if (!srcDb.isEmpty() && !tgtDb.isEmpty()) {
+                    databaseMapping.put(srcDb, tgtDb);
+                    databaseMappingLower.put(srcDb.toLowerCase(), tgtDb);
+                }
             }
         }
-        logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={}, tableMappings={})",
-                enabled, source, target, switchOn, tableNameMapping.size());
+        this.columnProcessing = com.migration.config.ColumnProcessingConfig.loadFromProperties(props);
+        this.columnProcessingActive = !columnProcessing.isEmpty()
+                && "mysql".equals(source) && "mysql".equals(target);
+
+        logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={}, tableMappings={}, columnProcessing={})",
+                enabled, source, target, switchOn, tableNameMapping.size(), columnProcessingActive);
     }
 
     public boolean isEnabled() {
@@ -98,15 +120,16 @@ public class TypedDmlConverter {
         if (rowsTyped == null || rowsTyped.isEmpty()) {
             return null;
         }
-        String table = (String) metadata.getOrDefault("table_name", "");
-        if (table.isEmpty()) {
+        String srcTable = (String) metadata.getOrDefault("table_name", "");
+        if (srcTable.isEmpty()) {
             return null;
         }
+        String srcDb = (String) metadata.getOrDefault("database_name", "");
+        String table = srcTable;
         // 表名映射：key 用源库名（metadata 的 database_name 是源库），仅表级同步配置。
         // 精确命中优先，小写回退（适配 MySQL 源 lower_case_table_names 不区分大小写）。
         if (!tableNameMapping.isEmpty()) {
-            String srcDb = (String) metadata.getOrDefault("database_name", "");
-            String key = srcDb + "." + table;
+            String key = srcDb + "." + srcTable;
             String mapped = tableNameMapping.get(key);
             if (mapped == null) {
                 mapped = tableNameMappingLower.get(key.toLowerCase());
@@ -120,7 +143,7 @@ public class TypedDmlConverter {
             case "INSERT":
             case "WRITE_ROWS":
             case "EXT_WRITE_ROWS":
-                return convertInsert(metadata, table, rowsTyped);
+                return convertInsert(metadata, srcDb, srcTable, table, rowsTyped);
             case "UPDATE":
             case "UPDATE_ROWS":
             case "EXT_UPDATE_ROWS":
@@ -133,14 +156,35 @@ public class TypedDmlConverter {
                 } else if (beforeTyped.size() != rowsTyped.size()) {
                     return null;
                 }
-                return convertUpdate(metadata, table, rowsTyped, beforeTyped);
+                return convertUpdate(metadata, srcDb, srcTable, table, rowsTyped, beforeTyped);
             case "DELETE":
             case "DELETE_ROWS":
             case "EXT_DELETE_ROWS":
-                return convertDelete(metadata, table, rowsTyped);
+                return convertDelete(metadata, srcDb, srcTable, table, rowsTyped);
             default:
                 return null; // DDL/QUERY/心跳等走文本路径
         }
+    }
+
+    /** 列过滤是否将该行排除（列处理未生效时恒 false）。 */
+    private boolean rowExcluded(String srcDb, String srcTable, String[] cols, List<Object> values) {
+        return columnProcessingActive && columnProcessing.rowExcluded(srcDb, srcTable, cols, values);
+    }
+
+    /** 列名映射：生成 SQL 用的目标列名数组（无映射时返回原数组）。 */
+    private String[] mapColumns(String srcDb, String srcTable, String[] cols) {
+        if (!columnProcessingActive || cols == null) {
+            return cols;
+        }
+        Map<String, String> mapping = columnProcessing.getColumnMapping(srcDb, srcTable);
+        if (mapping.isEmpty()) {
+            return cols;
+        }
+        String[] mapped = new String[cols.length];
+        for (int i = 0; i < cols.length; i++) {
+            mapped[i] = columnProcessing.mapColumn(srcDb, srcTable, cols[i].trim());
+        }
+        return mapped;
     }
 
     @SuppressWarnings("unchecked")
@@ -165,28 +209,74 @@ public class TypedDmlConverter {
         return "\"" + identifier.toLowerCase() + "\"";
     }
 
-    /** 目标表引用：MySQL 目标带库名限定（目标库名优先），PG 目标裸表名（schema 由连接串决定）。 */
+    /** 目标表引用：MySQL 目标带库名限定（按事件源库做 per-db 解析），PG 目标裸表名（schema 由连接串决定）。 */
     private String tableRef(Map<String, Object> metadata, String table) {
         if (targetIsMysql) {
-            String db = (targetDatabaseName != null && !targetDatabaseName.isEmpty())
-                    ? targetDatabaseName
-                    : (String) metadata.getOrDefault("database_name", "");
+            String srcDb = (String) metadata.getOrDefault("database_name", "");
+            String db = mapTargetDatabase(srcDb);
             return db.isEmpty() ? quote(table) : quote(db) + "." + quote(table);
         }
         return quote(table);
     }
 
-    private List<ParameterizedDml> convertInsert(Map<String, Object> metadata, String table,
-                                                 List<ArrayList<Object>> rows) {
+    /**
+     * 目标库解析（仅 mysql 目标调用）：
+     * <ul>
+     *   <li>mysql→mysql（同名字空间）：库名映射命中用映射值，未命中保留事件源库名——
+     *       多库任务各库独立路由，修复此前用单一 target.db.database 覆盖一切导致的多库串写；
+     *       单库改名场景由 ConfigService 保证 schema.mapping.db.* 必然写入，映射照常命中。</li>
+     *   <li>异构源（pg/oracle→mysql）：事件的 database_name 是源端 schema（如 pg 的 "public"），
+     *       不是可路由的库名，保持旧行为整体落到 target.db.database。</li>
+     * </ul>
+     * 事件缺源库名时回退 target.db.database 兜底。精确命中优先，小写回退。
+     */
+    private String mapTargetDatabase(String srcDb) {
+        String fallback = targetDatabaseName != null ? targetDatabaseName : "";
+        if (srcDb == null || srcDb.isEmpty()) {
+            return fallback;
+        }
+        if (!sourceIsMysql) {
+            return fallback.isEmpty() ? srcDb : fallback;
+        }
+        String mapped = databaseMapping.get(srcDb);
+        if (mapped == null) {
+            mapped = databaseMappingLower.get(srcDb.toLowerCase());
+        }
+        return mapped != null ? mapped : srcDb;
+    }
+
+    private List<ParameterizedDml> convertInsert(Map<String, Object> metadata, String srcDb, String srcTable,
+                                                 String table, List<ArrayList<Object>> rows) {
         String[] cols = columns(metadata, "insert_column_names");
         if (cols == null) {
             return null;
         }
+        String insertSql = buildInsertSql(metadata, srcDb, srcTable, table, cols);
+
+        List<ParameterizedDml> out = new ArrayList<>();
+        for (ArrayList<Object> row : rows) {
+            if (row.size() != cols.length) {
+                return null; // 列/值数量不齐：整事件回退
+            }
+            // 列过滤：命中条件的行不同步（返回空列表 = 事件已处理、无 DML，不回退文本路径）
+            if (rowExcluded(srcDb, srcTable, cols, row)) {
+                logger.debug("列过滤跳过 INSERT 行: {}.{}", srcDb, srcTable);
+                continue;
+            }
+            out.add(new ParameterizedDml(insertSql, row));
+        }
+        return out;
+    }
+
+    /** 生成 INSERT（含幂等子句）SQL：列名经列名映射改写；供 INSERT 与 UPDATE 升级插入共用。 */
+    private String buildInsertSql(Map<String, Object> metadata, String srcDb, String srcTable,
+                                  String table, String[] cols) {
+        String[] sqlCols = mapColumns(srcDb, srcTable, cols);
         StringBuilder sql = new StringBuilder("INSERT INTO ").append(tableRef(metadata, table)).append(" (");
         StringBuilder ph = new StringBuilder();
-        for (int i = 0; i < cols.length; i++) {
+        for (int i = 0; i < sqlCols.length; i++) {
             if (i > 0) { sql.append(", "); ph.append(", "); }
-            sql.append(quote(cols[i]));
+            sql.append(quote(sqlCols[i]));
             ph.append("?");
         }
         sql.append(") VALUES (").append(ph).append(")");
@@ -194,9 +284,9 @@ public class TypedDmlConverter {
         if (targetIsMysql) {
             // 与文本路径一致的幂等语义：重复主键按新值覆盖
             sql.append(" ON DUPLICATE KEY UPDATE ");
-            for (int i = 0; i < cols.length; i++) {
+            for (int i = 0; i < sqlCols.length; i++) {
                 if (i > 0) sql.append(", ");
-                sql.append(quote(cols[i])).append(" = VALUES(").append(quote(cols[i])).append(")");
+                sql.append(quote(sqlCols[i])).append(" = VALUES(").append(quote(sqlCols[i])).append(")");
             }
         } else {
             String pkStr = (String) metadata.get("primary_keys");
@@ -210,18 +300,11 @@ public class TypedDmlConverter {
                 sql.append(") DO NOTHING");
             }
         }
-
-        List<ParameterizedDml> out = new ArrayList<>();
-        for (ArrayList<Object> row : rows) {
-            if (row.size() != cols.length) {
-                return null; // 列/值数量不齐：整事件回退
-            }
-            out.add(new ParameterizedDml(sql.toString(), row));
-        }
-        return out;
+        return sql.toString();
     }
 
-    private List<ParameterizedDml> convertUpdate(Map<String, Object> metadata, String table,
+    private List<ParameterizedDml> convertUpdate(Map<String, Object> metadata, String srcDb, String srcTable,
+                                                 String table,
                                                  List<ArrayList<Object>> afterRows,
                                                  List<ArrayList<Object>> beforeRows) {
         String[] setCols = columns(metadata, "update_column_names");
@@ -230,6 +313,8 @@ public class TypedDmlConverter {
             return null;
         }
         java.util.Set<String> pks = pkSet(metadata);
+        String[] sqlSetCols = mapColumns(srcDb, srcTable, setCols);
+        String[] sqlWhereCols = mapColumns(srcDb, srcTable, whereCols);
 
         List<ParameterizedDml> out = new ArrayList<>();
         for (int r = 0; r < afterRows.size(); r++) {
@@ -238,14 +323,42 @@ public class TypedDmlConverter {
             if (after.size() != setCols.length || before.size() != whereCols.length) {
                 return null;
             }
+
+            // 列过滤下的 UPDATE 语义：按前/后镜像分别判定，保证目标端与"过滤后的源"一致。
+            // 后镜像命中过滤 → 该行不应再存在于目标端 → 转 DELETE；
+            // 前镜像命中而后镜像未命中 → 该行此前未同步到目标端 → 升级为幂等 INSERT；
+            // 两侧均命中 → 目标端本就没有该行 → 跳过。
+            if (columnProcessingActive) {
+                boolean beforeExcluded = rowExcluded(srcDb, srcTable, whereCols, before);
+                boolean afterExcluded = rowExcluded(srcDb, srcTable, setCols, after);
+                if (afterExcluded) {
+                    if (!beforeExcluded) {
+                        StringBuilder del = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table));
+                        List<Object> delParams = new ArrayList<>();
+                        if (!appendWhere(del, delParams, whereCols, sqlWhereCols, before, pks)) {
+                            return null;
+                        }
+                        out.add(new ParameterizedDml(del.toString(), delParams));
+                        logger.debug("列过滤将 UPDATE 转为 DELETE: {}.{}", srcDb, srcTable);
+                    }
+                    continue;
+                }
+                if (beforeExcluded) {
+                    String insertSql = buildInsertSql(metadata, srcDb, srcTable, table, setCols);
+                    out.add(new ParameterizedDml(insertSql, after));
+                    logger.debug("列过滤将 UPDATE 转为 INSERT: {}.{}", srcDb, srcTable);
+                    continue;
+                }
+            }
+
             StringBuilder sql = new StringBuilder("UPDATE ").append(tableRef(metadata, table)).append(" SET ");
             List<Object> params = new ArrayList<>(after.size() + before.size());
-            for (int i = 0; i < setCols.length; i++) {
+            for (int i = 0; i < sqlSetCols.length; i++) {
                 if (i > 0) sql.append(", ");
-                sql.append(quote(setCols[i])).append("=?");
+                sql.append(quote(sqlSetCols[i])).append("=?");
                 params.add(after.get(i));
             }
-            if (!appendWhere(sql, params, whereCols, before, pks)) {
+            if (!appendWhere(sql, params, whereCols, sqlWhereCols, before, pks)) {
                 return null;
             }
             out.add(new ParameterizedDml(sql.toString(), params));
@@ -253,22 +366,28 @@ public class TypedDmlConverter {
         return out;
     }
 
-    private List<ParameterizedDml> convertDelete(Map<String, Object> metadata, String table,
-                                                 List<ArrayList<Object>> rows) {
+    private List<ParameterizedDml> convertDelete(Map<String, Object> metadata, String srcDb, String srcTable,
+                                                 String table, List<ArrayList<Object>> rows) {
         String[] cols = columns(metadata, null);
         if (cols == null) {
             return null;
         }
         java.util.Set<String> pks = pkSet(metadata);
+        String[] sqlCols = mapColumns(srcDb, srcTable, cols);
 
         List<ParameterizedDml> out = new ArrayList<>();
         for (ArrayList<Object> row : rows) {
             if (row.size() != cols.length) {
                 return null;
             }
+            // 列过滤：命中条件的行本就未同步到目标端，DELETE 直接跳过
+            if (rowExcluded(srcDb, srcTable, cols, row)) {
+                logger.debug("列过滤跳过 DELETE 行: {}.{}", srcDb, srcTable);
+                continue;
+            }
             StringBuilder sql = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table));
             List<Object> params = new ArrayList<>();
-            if (!appendWhere(sql, params, cols, row, pks)) {
+            if (!appendWhere(sql, params, cols, sqlCols, row, pks)) {
                 return null;
             }
             out.add(new ParameterizedDml(sql.toString(), params));
@@ -290,23 +409,26 @@ public class TypedDmlConverter {
     /**
      * 生成 WHERE 子句：有主键时按主键列（参数绑定），无主键时按整行前镜像；
      * NULL 值输出 IS NULL。返回 false 表示无法生成有效条件（回退文本路径）。
+     *
+     * @param cols    源列名（用于主键匹配——metadata 的 primary_keys 是源列名）
+     * @param sqlCols SQL 输出用列名（列名映射后的目标列名；无映射时与 cols 相同）
      */
     private boolean appendWhere(StringBuilder sql, List<Object> params,
-                                String[] cols, List<Object> values, java.util.Set<String> pks) {
+                                String[] cols, String[] sqlCols, List<Object> values, java.util.Set<String> pks) {
         sql.append(" WHERE ");
         boolean first = true;
         boolean usePk = !pks.isEmpty();
         for (int i = 0; i < cols.length; i++) {
-            if (usePk && !pks.contains(cols[i].toLowerCase())) {
+            if (usePk && !pks.contains(cols[i].trim().toLowerCase())) {
                 continue;
             }
             if (!first) sql.append(" AND ");
             first = false;
             Object v = values.get(i);
             if (v == null) {
-                sql.append(quote(cols[i])).append(" IS NULL");
+                sql.append(quote(sqlCols[i])).append(" IS NULL");
             } else {
-                sql.append(quote(cols[i])).append("=?");
+                sql.append(quote(sqlCols[i])).append("=?");
                 params.add(v);
             }
         }

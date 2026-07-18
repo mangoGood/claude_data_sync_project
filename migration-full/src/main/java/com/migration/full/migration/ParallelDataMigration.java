@@ -42,10 +42,18 @@ public class ParallelDataMigration {
     private static final Logger logger = LoggerFactory.getLogger(ParallelDataMigration.class);
 
     private final MigrationConfig config;
+    /** 本次迁移的连接配置（多库模式下为 per-db 配置；全局 config 的 database 在多库时为空/无映射） */
+    private final com.migration.config.DatabaseConfig sourceCfg;
+    private final com.migration.config.DatabaseConfig targetCfg;
     private final ProgressManager progressManager;
 
-    public ParallelDataMigration(MigrationConfig config, ProgressManager progressManager) {
+    public ParallelDataMigration(MigrationConfig config,
+                                 com.migration.config.DatabaseConfig sourceCfg,
+                                 com.migration.config.DatabaseConfig targetCfg,
+                                 ProgressManager progressManager) {
         this.config = config;
+        this.sourceCfg = sourceCfg;
+        this.targetCfg = targetCfg;
         this.progressManager = progressManager;
     }
 
@@ -64,13 +72,14 @@ public class ParallelDataMigration {
 
         for (int i = 0; i < workers; i++) {
             Thread worker = new Thread(() -> {
-                DatabaseConnection src = new DatabaseConnection(config.getSourceConfig());
-                DatabaseConnection tgt = new DatabaseConnection(config.getTargetConfig());
+                DatabaseConnection src = new DatabaseConnection(sourceCfg);
+                DatabaseConnection tgt = new DatabaseConnection(targetCfg);
                 try {
                     prepareTargetSession(tgt);
                     DataMigration dataMigration = new DataMigration(
                             src, tgt, config.getBatchSize(), config.isContinueOnError(), progressManager,
                             config.isShardEnabled(), config.getShardMinRows(), config.getShardCount());
+                    dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
 
                     TableInfo table;
                     while ((table = queue.poll()) != null) {

@@ -264,6 +264,32 @@ public class MetadataController {
         }
     }
 
+    /** 列处理页面：查询表的列信息（名称/类型/是否主键/是否可做列过滤），目前仅支持 MySQL 源 */
+    @PostMapping("/columns")
+    public ResponseEntity<?> listColumns(@RequestBody Map<String, String> request) {
+        try {
+            String connectionStr = request.get("sourceConnection");
+            String database = request.get("database");
+            String table = request.get("table");
+
+            logger.info("查询列信息: database={}, table={}", database, table);
+
+            List<Map<String, Object>> columns = metadataService.listColumns(connectionStr, database, table);
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("success", true);
+            response.put("data", Map.of("database", database, "table", table, "columns", columns));
+
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            logger.error("查询列信息失败: {}", e.getMessage());
+            return ResponseEntity.ok(Map.of(
+                "success", false,
+                "message", e.getMessage()
+            ));
+        }
+    }
+
     @PostMapping("/schemas")
     public ResponseEntity<?> listSchemas(@RequestBody Map<String, String> request) {
         try {

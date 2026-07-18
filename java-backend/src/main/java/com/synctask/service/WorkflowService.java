@@ -310,8 +310,16 @@ public class WorkflowService {
         Sort sort = Sort.by(direction, fieldName);
         Pageable pageable = PageRequest.of(clampPage(page) - 1, clampPageSize(pageSize), sort);
 
-        WorkflowStatus workflowStatus = (status != null && !status.trim().isEmpty())
-                ? WorkflowStatus.valueOf(status.toUpperCase()) : null;
+        // 非法状态值给出明确报错而非 IllegalArgumentException 冒泡成 500
+        WorkflowStatus parsedStatus = null;
+        if (status != null && !status.trim().isEmpty()) {
+            try {
+                parsedStatus = WorkflowStatus.valueOf(status.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                throw new RuntimeException("无效的状态筛选值: " + status);
+            }
+        }
+        final WorkflowStatus workflowStatus = parsedStatus;
         String trimmedKeyword = (keyword != null && !keyword.trim().isEmpty()) ? keyword.trim() : null;
         String trimmedTaskType = (taskType != null && !taskType.trim().isEmpty()) ? taskType : null;
         String trimmedSourceType = (sourceType != null && !sourceType.trim().isEmpty()) ? sourceType : null;
@@ -473,9 +481,20 @@ public class WorkflowService {
         }
     }
 
+    /** 可暂停的运行中状态（与 cascadeBidiShadow 的 shadowActive 判定一致） */
+    private static final java.util.Set<WorkflowStatus> PAUSABLE_STATUSES = java.util.Set.of(
+            WorkflowStatus.PENDING, WorkflowStatus.RECEIVED, WorkflowStatus.STARTING,
+            WorkflowStatus.FULL_MIGRATING, WorkflowStatus.FULL_COMPLETED, WorkflowStatus.INCREMENT_RUNNING);
+
     @Transactional
     public void pauseWorkflow(String id, Long userId) {
         Workflow workflow = getWorkflowById(id, userId);
+
+        // 状态守卫：只有运行中的任务才能暂停。此前无校验，配置中/已完成/失败的任务
+        // 也会被强制改成 PAUSED 并发出无意义的停止消息，状态机随之错乱。
+        if (!PAUSABLE_STATUSES.contains(workflow.getStatus())) {
+            throw new RuntimeException("只能暂停运行中的任务，当前状态: " + workflow.getStatus().name());
+        }
 
         String currentStatus = workflow.getStatus().name();
 
@@ -507,6 +526,12 @@ public class WorkflowService {
     @Transactional
     public void resumeWorkflow(String id, Long userId) {
         Workflow workflow = getWorkflowById(id, userId);
+
+        // 状态守卫：只有已暂停的任务才能恢复（失败任务走 retry 接口）。
+        if (workflow.getStatus() != WorkflowStatus.PAUSED) {
+            throw new RuntimeException("只能恢复已暂停的任务，当前状态: " + workflow.getStatus().name());
+        }
+
         String previousStatus = workflow.getStatus().name();
         workflow.setStatus(WorkflowStatus.STARTING);
         workflowRepository.save(workflow);
@@ -641,21 +666,10 @@ public class WorkflowService {
             workflowRepository.save(workflow);
             
             addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务重试中，状态重置为 PENDING");
-            
-            TaskCreatedMessage message = new TaskCreatedMessage();
-            message.setTaskId(workflow.getId());
-            message.setTaskName(workflow.getName());
-            message.setUserId(workflow.getUserId());
-            message.setSourceConnection(workflow.getSourceConnection());
-            message.setTargetConnection(workflow.getTargetConnection());
-            message.setMigrationMode(workflow.getMigrationMode());
-            message.setSyncObjects(parseSyncObjects(workflow.getSyncObjects()));
-            message.setSourceDbName(workflow.getSourceDbName());
-            message.setCreatedAt(workflow.getCreatedAt());
-            message.setMessageType("TASK_CREATED");
-            message.setSourceType(workflow.getSourceType());
-            message.setTargetType(workflow.getTargetType());
-            
+
+            // 消息体由 sendTaskCreatedMessage(workflow) 内部构建（与首次启动同一条路径），
+            // 此处不再手工拼装 TaskCreatedMessage——曾有一份拼装后从未发送的死代码，
+            // 改字段只改到死代码上不会生效，故删除。
             try {
                 kafkaProducerService.sendTaskCreatedMessage(workflow);
                 addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务重试消息已发送到 Kafka，等待任务执行服务处理");
@@ -690,17 +704,21 @@ public class WorkflowService {
         workflowLogRepository.save(log);
     }
 
-    /** 统计 targetConnections JSON 数组中的目标库数量 */
+    /** 统计 targetConnections JSON 数组中的目标库数量（真解析 JSON，解析失败回退 1）。 */
     private int countTargetConnections(String targetConnectionsJson) {
         if (targetConnectionsJson == null || targetConnectionsJson.trim().isEmpty()) return 0;
-        // 简单统计：通过 "host" 字段出现次数估算
-        int count = 0;
-        int idx = 0;
-        while ((idx = targetConnectionsJson.indexOf("\"host\"", idx)) != -1) {
-            count++;
-            idx += 6;
+        try {
+            com.google.gson.JsonElement el = com.google.gson.JsonParser.parseString(targetConnectionsJson);
+            if (el.isJsonArray()) {
+                return Math.max(1, el.getAsJsonArray().size());
+            }
+            if (el.isJsonObject()) {
+                return 1;
+            }
+        } catch (Exception e) {
+            logger.warn("解析 targetConnections 失败，按 1 个目标计: {}", e.getMessage());
         }
-        return Math.max(1, count);
+        return 1;
     }
 
     @Transactional
