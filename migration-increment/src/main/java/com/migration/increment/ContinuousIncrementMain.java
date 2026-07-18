@@ -197,6 +197,16 @@ public class ContinuousIncrementMain {
         targetConnection = ConnectionPoolManager.getConnection(url, targetUser, targetPassword);
         logger.info("已连接目标数据库: {}:{}/{} (类型: {})", targetHost, targetPort, targetDatabase,
                 isPostgresql ? "postgresql" : "mysql");
+        // MySQL 目标关闭本会话外键检查：增量按 binlog 顺序应用本身满足约束，但部分表同步/
+        // 列过滤会破坏引用完整性（父行被过滤而子行保留），幂等重放（重试续传）也可能暂时乱序。
+        // 与全量搬数会话保持一致语义；重连走同一入口，新会话自动重设。
+        if (!isPostgresql) {
+            try (Statement st = targetConnection.createStatement()) {
+                st.execute("SET FOREIGN_KEY_CHECKS=0");
+            } catch (SQLException e) {
+                logger.warn("设置 FOREIGN_KEY_CHECKS=0 失败（继续执行）: {}", e.getMessage());
+            }
+        }
         if (bidirectionalEnabled) {
             ensureMarkerTable();
         }

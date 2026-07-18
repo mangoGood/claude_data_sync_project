@@ -92,7 +92,13 @@ public class Main {
             logger.info("========================================");
 
             DatabaseConfig sourceDbConfig = createDbConfig(config.getSourceConfig(), dbName);
-            DatabaseConfig targetDbConfig = createDbConfig(config.getTargetConfig(), dbName);
+            // 库名映射（schema.mapping.db.*）：每个源库按映射解析目标库，未映射与源库同名。
+            // 此前固定用源库名建目标连接，配置了 per-db 映射的多库任务全量会写错库。
+            String targetDbName = config.getTargetDatabaseFor(dbName);
+            if (!targetDbName.equals(dbName)) {
+                logger.info("库名映射: {} -> {}", dbName, targetDbName);
+            }
+            DatabaseConfig targetDbConfig = createDbConfig(config.getTargetConfig(), targetDbName);
 
             DatabaseConnection sourceConn = new DatabaseConnection(sourceDbConfig);
             DatabaseConnection targetConn = new DatabaseConnection(targetDbConfig);
@@ -182,8 +188,10 @@ public class Main {
             return;
         }
         try {
+            // 库名映射：存储程序落到目标端映射库（未映射与源库同名）
             int copied = com.migration.common.sqlobj.StoredObjectSyncUtil.copyProceduresAndFunctions(
-                    sourceConn.getConnection(), targetConn.getConnection(), dbName);
+                    sourceConn.getConnection(), targetConn.getConnection(), dbName,
+                    config.getTargetDatabaseFor(dbName));
             logger.info("数据库 {} 库级同步：已复制 {} 个存储过程/函数", dbName, copied);
         } catch (Exception e) {
             logger.warn("数据库 {} 存储过程/函数复制失败（表数据不受影响）: {}", dbName, e.getMessage());
@@ -272,8 +280,11 @@ public class Main {
 
             int parallelism = Math.min(config.getFullParallelism(), tables.size());
             if (parallelism > 1) {
-                // 表级并行：每个 worker 独立连接对，从共享队列领表（详见 ParallelDataMigration）
-                new com.migration.full.migration.ParallelDataMigration(config, progressManager)
+                // 表级并行：每个 worker 独立连接对，从共享队列领表（详见 ParallelDataMigration）。
+                // 连接配置必须用本次调用的 per-db 连接对——多库模式下全局配置的 database 为空/
+                // 无映射，worker 用它建连会连错库
+                new com.migration.full.migration.ParallelDataMigration(
+                        config, sourceConn.getConfig(), targetConn.getConfig(), progressManager)
                         .migrateAllData(tables, parallelism);
             } else {
                 DataMigration dataMigration = new DataMigration(

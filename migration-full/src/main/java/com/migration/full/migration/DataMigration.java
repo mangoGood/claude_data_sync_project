@@ -79,6 +79,24 @@ public class DataMigration {
         this.columnProcessing = columnProcessing;
     }
 
+    /**
+     * 获取目标连接并确保该会话已关闭外键检查（MySQL 目标）。
+     * 此前只有并行 worker 的主连接关了 FK 检查——串行路径、PK 分片 worker、错误重连
+     * 产生的新会话都带着 FK 检查跑，带外键的库在这些路径下会因表间顺序插入失败。
+     * SET 是会话级的且重连后不继承，故每个获取点统一走这里。
+     */
+    private Connection acquireTargetConnection(DatabaseConnection tgt) throws SQLException {
+        Connection conn = tgt.getConnection();
+        if ("mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType())) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("SET FOREIGN_KEY_CHECKS=0");
+            } catch (SQLException e) {
+                logger.warn("设置 FOREIGN_KEY_CHECKS=0 失败（继续执行）: {}", e.getMessage());
+            }
+        }
+        return conn;
+    }
+
     /** 列处理仅在 mysql→mysql 同构链路生效。 */
     private boolean columnProcessingApplicable() {
         return columnProcessing != null && !columnProcessing.isEmpty()
@@ -322,7 +340,7 @@ public class DataMigration {
         String insertSql = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName()) + " (" + columnList + ") VALUES (" +
                 String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
 
-        Connection targetConn = shardTgt.getConnection();
+        Connection targetConn = acquireTargetConnection(shardTgt);
         PreparedStatement insertStmt = targetConn.prepareStatement(insertSql);
         final int pageSize = 1000;
         long currentLastId = lowerExclusive;
@@ -349,7 +367,7 @@ public class DataMigration {
                 while (rs.next()) {
                     try {
                         if (targetConn.isClosed()) {
-                            targetConn = shardTgt.getConnection();
+                            targetConn = acquireTargetConnection(shardTgt);
                             insertStmt = targetConn.prepareStatement(insertSql);
                         }
                         for (int i = 1; i <= columnCount; i++) {
@@ -383,7 +401,7 @@ public class DataMigration {
                             logger.error("插入数据失败，表: {}", tableName, e);
                             if (!continueOnError) { throw e; }
                             try {
-                                if (targetConn.isClosed()) { targetConn = shardTgt.getConnection(); }
+                                if (targetConn.isClosed()) { targetConn = acquireTargetConnection(shardTgt); }
                                 insertStmt = targetConn.prepareStatement(insertSql);
                             } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
                         }
@@ -448,7 +466,7 @@ public class DataMigration {
                           String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
 
         Connection sourceConn = sourceConnection.getConnection();
-        Connection targetConn = targetConnection.getConnection();
+        Connection targetConn = acquireTargetConnection(targetConnection);
         PreparedStatement insertStmt = targetConn.prepareStatement(insertSql);
 
         // 分页大小：有主键时启用分页查询，避免大结果集（尤其含 LOB）占用源端 PGA 导致 ORA-04036
@@ -484,7 +502,7 @@ public class DataMigration {
                         try {
                             if (targetConn.isClosed()) {
                                 logger.warn("目标数据库连接已关闭，重新建立连接");
-                                targetConn = targetConnection.getConnection();
+                                targetConn = acquireTargetConnection(targetConnection);
                                 insertStmt = targetConn.prepareStatement(insertSql);
                             }
                             for (int i = 1; i <= columnCount; i++) {
@@ -525,7 +543,7 @@ public class DataMigration {
                                 }
                                 if (!continueOnError) { throw e; }
                                 try {
-                                    if (targetConn.isClosed()) { targetConn = targetConnection.getConnection(); }
+                                    if (targetConn.isClosed()) { targetConn = acquireTargetConnection(targetConnection); }
                                     insertStmt = targetConn.prepareStatement(insertSql);
                                 } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
                             }
@@ -568,7 +586,7 @@ public class DataMigration {
                 while (rs.next()) {
                     try {
                         if (targetConn.isClosed()) {
-                            targetConn = targetConnection.getConnection();
+                            targetConn = acquireTargetConnection(targetConnection);
                             insertStmt = targetConn.prepareStatement(insertSql);
                         }
                         for (int i = 1; i <= columnCount; i++) {

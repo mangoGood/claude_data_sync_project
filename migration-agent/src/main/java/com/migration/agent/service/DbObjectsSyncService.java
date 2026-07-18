@@ -67,8 +67,10 @@ public class DbObjectsSyncService {
                     if (dbName.isEmpty()) {
                         continue;
                     }
+                    // 库名映射：trigger/event 落到目标端映射库（未映射与源库同名）
+                    String targetDbName = props.getProperty("schema.mapping.db." + dbName, dbName);
                     StoredObjectSyncUtil.SyncReport r =
-                            StoredObjectSyncUtil.copyTriggersAndEventsDetailed(source, target, dbName);
+                            StoredObjectSyncUtil.copyTriggersAndEventsDetailed(source, target, dbName, targetDbName);
                     total.succeeded.addAll(r.succeeded);
                     total.failed.addAll(r.failed);
                 }

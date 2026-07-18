@@ -25,6 +25,8 @@ public class MigrationConfig {
     private Set<String> dbLevelDatabases;
     /** 表名映射："源库.源表" → 目标表名（仅表级同步配置，空 map = 无映射） */
     private Map<String, String> tableNameMapping;
+    /** 库名映射（schema.mapping.db.*）：源库 → 目标库；多库全量按此把每个源库路由到目标库 */
+    private Map<String, String> databaseMapping;
     /** 列处理配置（列过滤/列名映射/附加列，仅表级同步下发；无配置时为空实例） */
     private ColumnProcessingConfig columnProcessingConfig;
     private String checkpointDbPath;
@@ -109,9 +111,12 @@ public class MigrationConfig {
         dbLevelDatabases = parseStringSet(props.getProperty("sync.db.level.databases", ""));
 
         // 表名映射（仅表级同步下发）：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>。
-        // 全量侧目标库已由 target.db.database 决定，这里只取目标表名部分；key 保留 "源库.源表"。
+        // 单库全量目标库已由 target.db.database 决定，这里只取目标表名部分；key 保留 "源库.源表"。
         tableNameMapping = new HashMap<>();
+        // 库名映射：schema.mapping.db.<源库>=<目标库>——多库全量按每个源库解析目标库
+        databaseMapping = new HashMap<>();
         String tableMappingPrefix = "schema.mapping.table.";
+        String dbMappingPrefix = "schema.mapping.db.";
         for (String name : props.stringPropertyNames()) {
             if (name.startsWith(tableMappingPrefix)) {
                 String key = name.substring(tableMappingPrefix.length());
@@ -119,6 +124,12 @@ public class MigrationConfig {
                 String targetTable = value.contains(".") ? value.substring(value.indexOf('.') + 1) : value;
                 if (!key.isEmpty() && !targetTable.isEmpty()) {
                     tableNameMapping.put(key, targetTable);
+                }
+            } else if (name.startsWith(dbMappingPrefix)) {
+                String srcDb = name.substring(dbMappingPrefix.length());
+                String tgtDb = props.getProperty(name, "");
+                if (!srcDb.isEmpty() && !tgtDb.isEmpty()) {
+                    databaseMapping.put(srcDb, tgtDb);
                 }
             }
         }
@@ -228,6 +239,26 @@ public class MigrationConfig {
         return columnProcessingConfig != null ? columnProcessingConfig : new ColumnProcessingConfig();
     }
 
+    /**
+     * 目标库解析（多库全量用）：库名映射命中返回映射值，未命中返回源库名。
+     * 精确命中优先，小写回退（适配 MySQL 源 lower_case_table_names 不区分大小写）。
+     */
+    public String getTargetDatabaseFor(String sourceDb) {
+        if (sourceDb == null || databaseMapping == null || databaseMapping.isEmpty()) {
+            return sourceDb;
+        }
+        String mapped = databaseMapping.get(sourceDb);
+        if (mapped != null) {
+            return mapped;
+        }
+        for (Map.Entry<String, String> e : databaseMapping.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(sourceDb)) {
+                return e.getValue();
+            }
+        }
+        return sourceDb;
+    }
+    
     public String getCheckpointDbPath() {
         return checkpointDbPath;
     }

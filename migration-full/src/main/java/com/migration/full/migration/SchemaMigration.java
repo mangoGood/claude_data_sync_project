@@ -56,6 +56,16 @@ public class SchemaMigration {
     public void migrateAllTables(List<TableInfo> tables) throws SQLException {
         logger.info("开始迁移表结构，共 {} 个表", tables.size());
 
+        // MySQL 目标关闭本会话外键检查：带 FK 的建表语句若父表尚未创建会直接失败导致表缺失
+        // （建表顺序不保证父先子后）。DatabaseConnection 缓存单连接，一次设置覆盖整个建表阶段。
+        if ("mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType())) {
+            try {
+                targetConnection.execute("SET FOREIGN_KEY_CHECKS=0");
+            } catch (SQLException e) {
+                logger.warn("设置 FOREIGN_KEY_CHECKS=0 失败（继续执行）: {}", e.getMessage());
+            }
+        }
+
         int successCount = 0;
         int failCount = 0;
 
