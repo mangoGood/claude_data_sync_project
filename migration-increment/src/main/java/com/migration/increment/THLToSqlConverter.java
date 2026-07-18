@@ -54,6 +54,9 @@ public class THLToSqlConverter {
     private final java.util.Map<String, String> tableNameMapping = new java.util.HashMap<>();
     /** 小写回退索引：适配 MySQL 源 lower_case_table_names 不区分大小写（精确命中优先） */
     private final java.util.Map<String, String> tableNameMappingLower = new java.util.HashMap<>();
+    /** 库名映射（schema.mapping.db.*）：源库 → 目标库，多库任务每个事件按自己的源库路由 */
+    private final java.util.Map<String, String> databaseMapping = new java.util.HashMap<>();
+    private final java.util.Map<String, String> databaseMappingLower = new java.util.HashMap<>();
     /** 列处理（仅表级同步下发、mysql→mysql）：文本回退路径只做列名映射 */
     private com.migration.config.ColumnProcessingConfig columnProcessing;
     private boolean columnProcessingActive;
@@ -100,6 +103,8 @@ public class THLToSqlConverter {
 
         // 表名映射：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>，DML 只需要表名部分
         String tableMappingPrefix = "schema.mapping.table.";
+        // 库名映射：schema.mapping.db.<源库>=<目标库>（未映射的库按源库名原样路由）
+        String dbMappingPrefix = "schema.mapping.db.";
         for (String name : props.stringPropertyNames()) {
             if (name.startsWith(tableMappingPrefix)) {
                 String key = name.substring(tableMappingPrefix.length());
@@ -109,10 +114,20 @@ public class THLToSqlConverter {
                     tableNameMapping.put(key, targetTable);
                     tableNameMappingLower.put(key.toLowerCase(), targetTable);
                 }
+            } else if (name.startsWith(dbMappingPrefix)) {
+                String srcDb = name.substring(dbMappingPrefix.length());
+                String tgtDb = props.getProperty(name, "");
+                if (!srcDb.isEmpty() && !tgtDb.isEmpty()) {
+                    databaseMapping.put(srcDb, tgtDb);
+                    databaseMappingLower.put(srcDb.toLowerCase(), tgtDb);
+                }
             }
         }
         if (!tableNameMapping.isEmpty()) {
             logger.info("DML 表名映射已加载: {}", tableNameMapping);
+        }
+        if (!databaseMapping.isEmpty()) {
+            logger.info("DML 库名映射已加载: {}", databaseMapping);
         }
 
         // 列处理（mysql→mysql）：文本回退路径只做列名映射（保证 SQL 与已改名的目标表结构一致，
@@ -162,6 +177,28 @@ public class THLToSqlConverter {
         String exact = tableNameMapping.get(key);
         if (exact != null) return exact;
         return tableNameMappingLower.getOrDefault(key.toLowerCase(), tableName);
+    }
+
+    /**
+     * 目标库解析（仅非 PG 目标调用）：
+     * mysql 源（同名字空间）——库名映射（schema.mapping.db.*）命中用映射值，未命中保留事件
+     * 源库名（多库任务各库独立路由，修复此前用单一 target.db.database 覆盖一切导致的多库串写；
+     * 单库改名场景由 ConfigService 保证映射必然写入）；
+     * 异构源（pg/oracle）——事件的 database_name 是源端 schema，保持旧行为整体落到
+     * target.db.database。事件缺源库名时回退 target.db.database 兜底。
+     */
+    private String mapTargetDatabaseName(String sourceDatabase) {
+        if (sourceDatabase == null || sourceDatabase.isEmpty()) {
+            return targetDatabaseName;
+        }
+        if (!sourceIsMysql) {
+            return targetDatabaseName.isEmpty() ? sourceDatabase : targetDatabaseName;
+        }
+        String mapped = databaseMapping.get(sourceDatabase);
+        if (mapped == null) {
+            mapped = databaseMappingLower.get(sourceDatabase.toLowerCase());
+        }
+        return mapped != null ? mapped : sourceDatabase;
     }
 
     private void loadExecutedRecords() {
@@ -509,8 +546,9 @@ public class THLToSqlConverter {
         String sourceDb = database;
         String sourceTable = table;
         table = mapTargetTableName(database, table);
-        if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
-            database = targetDatabaseName;
+        if (!targetIsPostgresql) {
+            // per-db 目标库解析（多库任务各库独立路由；映射命中用映射值，未命中保留源库名）
+            database = mapTargetDatabaseName(database);
         }
 
         String rowDataStr = (String) metadata.get("row_data");
@@ -1006,8 +1044,9 @@ public class THLToSqlConverter {
         String sourceDb = database;
         String sourceTable = table;
         table = mapTargetTableName(database, table);
-        if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
-            database = targetDatabaseName;
+        if (!targetIsPostgresql) {
+            // per-db 目标库解析（多库任务各库独立路由；映射命中用映射值，未命中保留源库名）
+            database = mapTargetDatabaseName(database);
         }
 
         String rowDataStr = (String) metadata.get("row_data");
@@ -1174,8 +1213,9 @@ public class THLToSqlConverter {
         String sourceDb = database;
         String sourceTable = table;
         table = mapTargetTableName(database, table);
-        if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
-            database = targetDatabaseName;
+        if (!targetIsPostgresql) {
+            // per-db 目标库解析（多库任务各库独立路由；映射命中用映射值，未命中保留源库名）
+            database = mapTargetDatabaseName(database);
         }
 
         String rowDataStr = (String) metadata.get("row_data");
