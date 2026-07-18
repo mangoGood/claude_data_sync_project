@@ -400,13 +400,15 @@ public class MetadataService {
                 String jdbcUrl = buildJdbcUrl(conn, database);
                 try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
                     String effectiveSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
-                    try (Statement stmt = connection.createStatement();
-                         ResultSet rs = stmt.executeQuery(
-                             "SELECT tablename FROM pg_tables WHERE schemaname = '" + effectiveSchema + "'")) {
-                        while (rs.next()) {
-                            String tableName = rs.getString(1);
-                            long rows = getPgRowCount(connection, tableName);
-                            tables.add(new TableInfo(tableName, rows, "", "TABLE"));
+                    try (PreparedStatement stmt = connection.prepareStatement(
+                             "SELECT tablename FROM pg_tables WHERE schemaname = ?")) {
+                        stmt.setString(1, effectiveSchema);
+                        try (ResultSet rs = stmt.executeQuery()) {
+                            while (rs.next()) {
+                                String tableName = rs.getString(1);
+                                long rows = getPgRowCount(connection, tableName);
+                                tables.add(new TableInfo(tableName, rows, "", "TABLE"));
+                            }
                         }
                     }
                 }
@@ -423,12 +425,14 @@ public class MetadataService {
                 String jdbcUrl = buildJdbcUrl(conn, database);
                 try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
                     String owner = (schema != null && !schema.isEmpty()) ? schema.toUpperCase() : conn.username.toUpperCase();
-                    try (Statement stmt = connection.createStatement();
-                         ResultSet rs = stmt.executeQuery(
-                             "SELECT table_name FROM all_tables WHERE owner = '" + owner + "' ORDER BY table_name")) {
-                        while (rs.next()) {
-                            String tableName = rs.getString(1);
-                            tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                    try (PreparedStatement stmt = connection.prepareStatement(
+                             "SELECT table_name FROM all_tables WHERE owner = ? ORDER BY table_name")) {
+                        stmt.setString(1, owner);
+                        try (ResultSet rs = stmt.executeQuery()) {
+                            while (rs.next()) {
+                                String tableName = rs.getString(1);
+                                tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                            }
                         }
                     }
                 }
@@ -689,12 +693,14 @@ public class MetadataService {
                     }
                 } else if (conn.isOracle()) {
                     String owner = (database != null && !database.isEmpty()) ? database.toUpperCase() : conn.username.toUpperCase();
-                    try (Statement stmt = connection.createStatement();
-                         ResultSet rs = stmt.executeQuery(
-                             "SELECT table_name FROM all_tables WHERE owner = '" + owner + "' ORDER BY table_name")) {
-                        while (rs.next()) {
-                            String tableName = rs.getString(1);
-                            tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                    try (PreparedStatement stmt = connection.prepareStatement(
+                             "SELECT table_name FROM all_tables WHERE owner = ? ORDER BY table_name")) {
+                        stmt.setString(1, owner);
+                        try (ResultSet rs = stmt.executeQuery()) {
+                            while (rs.next()) {
+                                String tableName = rs.getString(1);
+                                tables.add(new TableInfo(tableName, 0, "", "TABLE"));
+                            }
                         }
                     }
                 } else {
@@ -725,8 +731,10 @@ public class MetadataService {
     }
     
     private long getPgRowCount(Connection connection, String tableName) {
+        // 表名是标识符无法参数化：对引号转义（表名来自服务端元数据枚举，转义防御异常命名）
         try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM \"" + tableName + "\"")) {
+             ResultSet rs = stmt.executeQuery(
+                 "SELECT COUNT(*) FROM \"" + tableName.replace("\"", "\"\"") + "\"")) {
             if (rs.next()) {
                 return rs.getLong(1);
             }
@@ -737,8 +745,10 @@ public class MetadataService {
     }
 
     private long getRowCount(Connection connection, String database, String tableName) {
+        // 表名是标识符无法参数化：对反引号转义（表名来自服务端元数据枚举，转义防御异常命名）
         try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM `" + tableName + "`")) {
+             ResultSet rs = stmt.executeQuery(
+                 "SELECT COUNT(*) FROM `" + tableName.replace("`", "``") + "`")) {
             if (rs.next()) {
                 return rs.getLong(1);
             }
@@ -749,14 +759,17 @@ public class MetadataService {
     }
 
     private String getTableSize(Connection connection, String database, String tableName) {
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery(
+        try (PreparedStatement stmt = connection.prepareStatement(
                  "SELECT ROUND(data_length + index_length) as size_bytes " +
                  "FROM information_schema.tables " +
-                 "WHERE table_schema = '" + database + "' AND table_name = '" + tableName + "'")) {
-            if (rs.next()) {
-                long bytes = rs.getLong("size_bytes");
-                return formatSize(bytes);
+                 "WHERE table_schema = ? AND table_name = ?")) {
+            stmt.setString(1, database);
+            stmt.setString(2, tableName);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    long bytes = rs.getLong("size_bytes");
+                    return formatSize(bytes);
+                }
             }
         } catch (SQLException e) {
             logger.warn("获取表 {} 大小失败: {}", tableName, e.getMessage());

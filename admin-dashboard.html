@@ -8657,6 +8657,11 @@
             });
             
             setInterval(() => {
+                // 仅在浏览器标签可见且当前处于"实时同步管理"页时轮询——
+                // 停留在灾备/订阅等其他页面或标签切后台时不再每 5 秒空刷同步列表
+                if (document.hidden) return;
+                const syncPage = document.getElementById('syncPage');
+                if (!syncPage || syncPage.style.display === 'none') return;
                 if (isViewingFailedTasks) {
                     fetchFailedWorkflows();
                 } else {

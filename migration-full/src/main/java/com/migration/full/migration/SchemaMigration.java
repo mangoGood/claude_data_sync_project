@@ -243,17 +243,24 @@ public class SchemaMigration {
             if (schema == null || schema.isEmpty()) {
                 schema = "public";
             }
-            String sql = "SELECT COUNT(*) FROM pg_tables WHERE schemaname = '" + schema + "' AND tablename = '" + tableName + "'";
-            try (var stmt = targetConnection.getConnection().createStatement();
-                 var rs = stmt.executeQuery(sql)) {
-                return rs.next() && rs.getInt(1) > 0;
+            try (var stmt = targetConnection.getConnection().prepareStatement(
+                    "SELECT COUNT(*) FROM pg_tables WHERE schemaname = ? AND tablename = ?")) {
+                stmt.setString(1, schema);
+                stmt.setString(2, tableName);
+                try (var rs = stmt.executeQuery()) {
+                    return rs.next() && rs.getInt(1) > 0;
+                }
             }
         }
 
-        String sql = "SHOW TABLES LIKE '" + tableName + "'";
-        try (var stmt = targetConnection.getConnection().createStatement();
-                 var rs = stmt.executeQuery(sql)) {
-            return rs.next();
+        // information_schema 等值匹配取代 SHOW TABLES LIKE：LIKE 会把表名里的 _/% 当通配符，
+        // 且拼接无法参数化
+        try (var stmt = targetConnection.getConnection().prepareStatement(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?")) {
+            stmt.setString(1, tableName);
+            try (var rs = stmt.executeQuery()) {
+                return rs.next() && rs.getInt(1) > 0;
+            }
         }
     }
 
