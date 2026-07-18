@@ -3706,7 +3706,9 @@
             }
             const response = await fetch(url, options);
 
-            if (response.status === 401) {
+            // 401 = token 缺失/过期/失效（后端已统一未认证语义）；403 兜底兼容旧后端
+            // （Spring Security 默认对无效 token 返回 403，本应用无角色级授权，403 同样意味着需要重新登录）
+            if (response.status === 401 || response.status === 403) {
                 showTokenExpiredModal();
                 return new Promise(() => {});
             }

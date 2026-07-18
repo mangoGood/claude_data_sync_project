@@ -473,9 +473,20 @@ public class WorkflowService {
         }
     }
 
+    /** 可暂停的运行中状态（与 cascadeBidiShadow 的 shadowActive 判定一致） */
+    private static final java.util.Set<WorkflowStatus> PAUSABLE_STATUSES = java.util.Set.of(
+            WorkflowStatus.PENDING, WorkflowStatus.RECEIVED, WorkflowStatus.STARTING,
+            WorkflowStatus.FULL_MIGRATING, WorkflowStatus.FULL_COMPLETED, WorkflowStatus.INCREMENT_RUNNING);
+
     @Transactional
     public void pauseWorkflow(String id, Long userId) {
         Workflow workflow = getWorkflowById(id, userId);
+
+        // 状态守卫：只有运行中的任务才能暂停。此前无校验，配置中/已完成/失败的任务
+        // 也会被强制改成 PAUSED 并发出无意义的停止消息，状态机随之错乱。
+        if (!PAUSABLE_STATUSES.contains(workflow.getStatus())) {
+            throw new RuntimeException("只能暂停运行中的任务，当前状态: " + workflow.getStatus().name());
+        }
 
         String currentStatus = workflow.getStatus().name();
 
@@ -507,6 +518,12 @@ public class WorkflowService {
     @Transactional
     public void resumeWorkflow(String id, Long userId) {
         Workflow workflow = getWorkflowById(id, userId);
+
+        // 状态守卫：只有已暂停的任务才能恢复（失败任务走 retry 接口）。
+        if (workflow.getStatus() != WorkflowStatus.PAUSED) {
+            throw new RuntimeException("只能恢复已暂停的任务，当前状态: " + workflow.getStatus().name());
+        }
+
         String previousStatus = workflow.getStatus().name();
         workflow.setStatus(WorkflowStatus.STARTING);
         workflowRepository.save(workflow);
