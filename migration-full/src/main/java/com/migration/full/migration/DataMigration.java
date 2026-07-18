@@ -42,6 +42,8 @@ public class DataMigration {
     private boolean shardEnabled;
     private long shardMinRows;
     private int shardCount;
+    // 列处理（仅表级同步、mysql→mysql）：SELECT 行过滤 + INSERT 列名映射；附加列由建表 DEFAULT 承载
+    private com.migration.config.ColumnProcessingConfig columnProcessing;
 
     public DataMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection,
                         int batchSize, boolean continueOnError, ProgressManager progressManager) {
@@ -70,6 +72,30 @@ public class DataMigration {
 
     private boolean sourceIsOracle() {
         return "oracle".equalsIgnoreCase(sourceConnection.getConfig().getDbType());
+    }
+
+    /** 注入列处理配置（未注入 = 无列处理，行为与既有逻辑完全一致）。 */
+    public void setColumnProcessing(com.migration.config.ColumnProcessingConfig columnProcessing) {
+        this.columnProcessing = columnProcessing;
+    }
+
+    /** 列处理仅在 mysql→mysql 同构链路生效。 */
+    private boolean columnProcessingApplicable() {
+        return columnProcessing != null && !columnProcessing.isEmpty()
+                && "mysql".equalsIgnoreCase(sourceConnection.getConfig().getDbType())
+                && "mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType());
+    }
+
+    /**
+     * 列过滤的 "保留行" WHERE 片段（源端 SELECT/COUNT 共用）；无过滤配置返回 null。
+     * 命中过滤条件（如 col1 &lt; 1）的行不同步；过滤列为 NULL 的行保留。
+     */
+    private String filterKeepClause(String tableName) {
+        if (!columnProcessingApplicable()) {
+            return null;
+        }
+        String srcDb = sourceConnection.getConfig().getDatabase();
+        return columnProcessing.buildKeepClause(srcDb, tableName, this::sourceQuoteIdentifier);
     }
 
     public void migrateAllData(List<TableInfo> tables) throws SQLException {
@@ -305,9 +331,12 @@ public class DataMigration {
             while (!abort.get() && currentLastId < upperInclusive) {
                 // 每页用独立连接：避免 Oracle 源端 PGA 累积（ORA-04036），做法与串行分页路径一致
                 Connection pageConn = shardSrc.getConnection();
+                String shardKeepClause = filterKeepClause(tableName);
                 String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName) +
                         " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? AND " +
-                        sourceQuoteIdentifier(primaryKeyColumn) + " <= ? ORDER BY " +
+                        sourceQuoteIdentifier(primaryKeyColumn) + " <= ? " +
+                        (shardKeepClause != null ? "AND " + shardKeepClause + " " : "") +
+                        "ORDER BY " +
                         sourceQuoteIdentifier(primaryKeyColumn) + " " + sourceDialect.limitClause(pageSize);
                 PreparedStatement selectStmt = pageConn.prepareStatement(pageSql);
                 selectStmt.setLong(1, currentLastId);
@@ -437,8 +466,11 @@ public class DataMigration {
                     // 关闭并重建连接强制释放源端会话 PGA
                     Connection pageConn = sourceConnection.getConnection();
                     // 分页子句按源库方言生成：MySQL → LIMIT，Oracle/PostgreSQL → FETCH FIRST ... ROWS ONLY
+                    String pageKeepClause = filterKeepClause(tableName);
                     String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName) +
-                            " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? ORDER BY " +
+                            " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? " +
+                            (pageKeepClause != null ? "AND " + pageKeepClause + " " : "") +
+                            "ORDER BY " +
                             sourceQuoteIdentifier(primaryKeyColumn) + " " + sourceDialect.limitClause(pageSize);
                     PreparedStatement selectStmt = pageConn.prepareStatement(pageSql);
                     selectStmt.setLong(1, currentLastId);
@@ -524,6 +556,10 @@ public class DataMigration {
             } else {
                 // ===== 无主键 fallback：单次全表查询 =====
                 String selectSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName);
+                String fullKeepClause = filterKeepClause(tableName);
+                if (fullKeepClause != null) {
+                    selectSql += " WHERE " + fullKeepClause;
+                }
                 PreparedStatement selectStmt = sourceConn.prepareStatement(selectSql);
                 ResultSet rs = selectStmt.executeQuery();
                 ResultSetMetaData metaData = rs.getMetaData();
@@ -691,7 +727,12 @@ public class DataMigration {
 
     private long getTableRowCount(String tableName) throws SQLException {
         String sql = "SELECT COUNT(*) FROM " + sourceQuoteIdentifier(tableName);
-        
+        // 列过滤：总行数按过滤后口径统计，进度/日志与实际搬运行数一致
+        String keepClause = filterKeepClause(tableName);
+        if (keepClause != null) {
+            sql += " WHERE " + keepClause;
+        }
+
         try (Statement stmt = sourceConnection.getConnection().createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
             
@@ -705,9 +746,15 @@ public class DataMigration {
 
     private List<String> getColumnNames(TableInfo table) {
         List<String> columns = new ArrayList<>();
+        boolean applyColumnMapping = columnProcessingApplicable();
+        String srcDb = applyColumnMapping ? sourceConnection.getConfig().getDatabase() : null;
         for (var column : table.getColumns()) {
             // Oracle→PG 场景：源端列名通常为大写，目标 PG 表已建为小写，这里转小写以匹配
             String colName = (sourceIsOracle() && targetIsPostgresql) ? column.getColumnName().toLowerCase() : column.getColumnName();
+            // 列名映射（mysql→mysql）：目标端 INSERT 列表用目标列名；源端 SELECT 仍用源列名
+            if (applyColumnMapping) {
+                colName = columnProcessing.mapColumn(srcDb, table.getTableName(), colName);
+            }
             columns.add(quoteIdentifier(colName));
         }
         return columns;

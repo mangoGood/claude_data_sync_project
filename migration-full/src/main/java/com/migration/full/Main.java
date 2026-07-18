@@ -260,6 +260,7 @@ public class Main {
             SchemaMigration schemaMigration = new SchemaMigration(
                 sourceConn, targetConn, config.isDropTables()
             );
+            schemaMigration.setColumnProcessing(config.getColumnProcessingConfig());
             schemaMigration.migrateAllTables(tables);
             logger.info("表结构迁移完成");
         }
@@ -284,6 +285,7 @@ public class Main {
                     config.getShardMinRows(),
                     config.getShardCount()
                 );
+                dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
                 dataMigration.migrateAllData(tables);
             }
             logger.info("数据迁移完成");

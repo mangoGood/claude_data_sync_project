@@ -62,6 +62,8 @@ public class SchemaEvolutionService {
     /** 表级同步的同步对象清单（db.table，小写）。非空时表级 DDL 仅对清单内的表应用——
      *  新表/未选表的 CREATE/ALTER/DROP 等一律屏蔽，与"表级不同步增量期新表"的数据面语义对齐。 */
     private final java.util.Set<String> includedTables = new java.util.HashSet<>();
+    /** 列处理配置：仅用于对列处理表的 DDL 告警（DDL 不做列级改写，需人工核对） */
+    private final com.migration.config.ColumnProcessingConfig columnProcessing;
 
     public SchemaEvolutionService(Properties props, Connection targetConnection) {
         this.mappingConfig = SchemaMappingConfig.loadFromProperties(props);
@@ -81,6 +83,7 @@ public class SchemaEvolutionService {
                 includedTables.add(t.trim().toLowerCase());
             }
         }
+        this.columnProcessing = com.migration.config.ColumnProcessingConfig.loadFromProperties(props);
 
         DdlTranslator.Direction direction;
         if (sourceIsPostgresql && !targetIsPostgresql) {
@@ -173,6 +176,21 @@ public class SchemaEvolutionService {
                 logger.info("表级同步：表 {} 不在同步对象清单，DDL 跳过: subtype={} | sql={}",
                         fullTable, ddlSubType, truncate(sql));
                 return ApplyResult.skipped("表 " + fullTable + " 不在表级同步对象清单，DDL 不应用");
+            }
+        }
+
+        // 列处理表的 DDL 告警：DDL 只做库/表名映射，不改写列名、不感知过滤/附加列——
+        // 对已改名列的 ALTER 可能在目标端失败或产生结构漂移，留痕提示人工核对。
+        if (!columnProcessing.isEmpty() && isTableScopedDdl(subtypeUpper)) {
+            String cpTable = resolveDdlTargetTable(sql, subtypeUpper, sourceDb);
+            if (cpTable != null) {
+                int dot = cpTable.indexOf('.');
+                String cpDb = dot > 0 ? cpTable.substring(0, dot) : sourceDb;
+                String cpTbl = dot > 0 ? cpTable.substring(dot + 1) : cpTable;
+                if (cpDb != null && columnProcessing.hasProcessing(cpDb, cpTbl)) {
+                    logger.warn("表 {} 配置了列处理（列过滤/列名映射/附加列），DDL 不做列级改写，请人工核对目标表结构: {}",
+                            cpTable, truncate(sql));
+                }
             }
         }
 

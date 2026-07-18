@@ -54,6 +54,9 @@ public class THLToSqlConverter {
     private final java.util.Map<String, String> tableNameMapping = new java.util.HashMap<>();
     /** 小写回退索引：适配 MySQL 源 lower_case_table_names 不区分大小写（精确命中优先） */
     private final java.util.Map<String, String> tableNameMappingLower = new java.util.HashMap<>();
+    /** 列处理（仅表级同步下发、mysql→mysql）：文本回退路径只做列名映射 */
+    private com.migration.config.ColumnProcessingConfig columnProcessing;
+    private boolean columnProcessingActive;
 
     private SchemaEvolutionService schemaEvolutionService;
 
@@ -112,6 +115,13 @@ public class THLToSqlConverter {
             logger.info("DML 表名映射已加载: {}", tableNameMapping);
         }
 
+        // 列处理（mysql→mysql）：文本回退路径只做列名映射（保证 SQL 与已改名的目标表结构一致，
+        // 附加列由建表 DEFAULT 承载天然生效）；列过滤需要类型化值判定，文本路径无法执行——
+        // 正常情况下 mysql→mysql DML 全部走类型化管道，这里仅对回退事件告警留痕。
+        this.columnProcessing = com.migration.config.ColumnProcessingConfig.loadFromProperties(props);
+        this.columnProcessingActive = !columnProcessing.isEmpty()
+                && sourceIsMysql && !isPostgresql;
+
         this.sqlClassifier = new SqlClassifier();
         this.conflictKeyParser = new SqlConflictKeyParser();
 
@@ -119,6 +129,28 @@ public class THLToSqlConverter {
         this.executedRecordFile = inputDir + "/.executed_records";
 
         loadExecutedRecords();
+    }
+
+    /**
+     * 列名映射（文本回退路径，mysql→mysql）：把行事件的列名数组改写为目标列名，
+     * 并对配置了列过滤的表告警（文本路径无类型化值，无法执行行过滤——命中过滤条件的行会漏过滤）。
+     */
+    private String[] applyColumnProcessingToColumns(String sourceDatabase, String sourceTable, String[] columnNames) {
+        if (!columnProcessingActive || sourceDatabase == null || sourceTable == null) {
+            return columnNames;
+        }
+        if (!columnProcessing.getFilters(sourceDatabase, sourceTable).isEmpty()) {
+            logger.warn("表 {}.{} 配置了列过滤，但该事件走了文本回退路径，无法执行行过滤（列名映射仍生效）",
+                    sourceDatabase, sourceTable);
+        }
+        if (columnNames == null || columnProcessing.getColumnMapping(sourceDatabase, sourceTable).isEmpty()) {
+            return columnNames;
+        }
+        String[] mapped = new String[columnNames.length];
+        for (int i = 0; i < columnNames.length; i++) {
+            mapped[i] = columnProcessing.mapColumn(sourceDatabase, sourceTable, columnNames[i].trim());
+        }
+        return mapped;
     }
 
     /** 表名映射：按 "源库.源表" 查目标表名，未配置返回原表名。精确命中优先，小写回退（源库不区分大小写场景）。 */
@@ -474,6 +506,8 @@ public class THLToSqlConverter {
         }
 
         // 表名映射：key 用源库名，必须在 database 被目标库名覆盖之前查
+        String sourceDb = database;
+        String sourceTable = table;
         table = mapTargetTableName(database, table);
         if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
             database = targetDatabaseName;
@@ -493,6 +527,9 @@ public class THLToSqlConverter {
         if (insertColsStr != null && !insertColsStr.isEmpty()) {
             columnNames = insertColsStr.split(",");
         }
+
+        // 列处理（mysql→mysql 回退路径）：列名映射改写，保证与目标表结构一致
+        columnNames = applyColumnProcessingToColumns(sourceDb, sourceTable, columnNames);
 
         // MySQL→PG：把 bool/bit 值转换为 PG 兼容字面量（tinyint(1)→true/false，bit→bytea）
         if (sourceIsMysql && targetIsPostgresql) {
@@ -966,6 +1003,8 @@ public class THLToSqlConverter {
         }
 
         // 表名映射：key 用源库名，必须在 database 被目标库名覆盖之前查
+        String sourceDb = database;
+        String sourceTable = table;
         table = mapTargetTableName(database, table);
         if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
             database = targetDatabaseName;
@@ -990,6 +1029,11 @@ public class THLToSqlConverter {
         String beforeColNamesStr = (String) metadata.get("update_before_column_names");
         String[] whereColNames = (beforeColNamesStr != null && !beforeColNamesStr.isEmpty())
                 ? beforeColNamesStr.split("\\s*,\\s*") : columnNames;
+
+        // 列处理（mysql→mysql 回退路径）：输出用目标列名；主键匹配仍用源列名（primary_keys 是源列名）
+        String[] setColNamesOut = applyColumnProcessingToColumns(sourceDb, sourceTable, setColNames);
+        String[] whereColNamesOut = (whereColNames == setColNames)
+                ? setColNamesOut : applyColumnProcessingToColumns(sourceDb, sourceTable, whereColNames);
 
         String pkColumnsStr = (String) metadata.get("primary_keys");
         java.util.Set<String> pkColumns = new java.util.HashSet<>();
@@ -1035,7 +1079,7 @@ public class THLToSqlConverter {
 
         for (int i = 0; i < values.length; i++) {
             if (i > 0) sql.append(", ");
-            String colName = (setColNames != null && i < setColNames.length) ? setColNames[i] : "column" + i;
+            String colName = (setColNamesOut != null && i < setColNamesOut.length) ? setColNamesOut[i] : "column" + i;
             sql.append(quoteIdentifier(colName)).append("=").append(values[i]);
         }
 
@@ -1045,18 +1089,19 @@ public class THLToSqlConverter {
             for (int i = 0; i < beforeValues.length; i++) {
                 String colName = (whereColNames != null && i < whereColNames.length) ? whereColNames[i] : "column" + i;
                 if (!pkColumns.contains(colName)) continue;
+                String colNameOut = (whereColNamesOut != null && i < whereColNamesOut.length) ? whereColNamesOut[i] : colName;
                 if (!first) sql.append(" AND ");
                 first = false;
                 if (beforeValues[i].equals("null") || beforeValues[i].equals("NULL")) {
-                    sql.append(quoteIdentifier(colName)).append(" IS NULL");
+                    sql.append(quoteIdentifier(colNameOut)).append(" IS NULL");
                 } else {
-                    sql.append(quoteIdentifier(colName)).append("=").append(beforeValues[i]);
+                    sql.append(quoteIdentifier(colNameOut)).append("=").append(beforeValues[i]);
                 }
             }
         } else {
             for (int i = 0; i < beforeValues.length; i++) {
                 if (i > 0) sql.append(" AND ");
-                String colName = (whereColNames != null && i < whereColNames.length) ? whereColNames[i] : "column" + i;
+                String colName = (whereColNamesOut != null && i < whereColNamesOut.length) ? whereColNamesOut[i] : "column" + i;
                 if (beforeValues[i].equals("null") || beforeValues[i].equals("NULL")) {
                     sql.append(quoteIdentifier(colName)).append(" IS NULL");
                 } else {
@@ -1126,6 +1171,8 @@ public class THLToSqlConverter {
         }
 
         // 表名映射：key 用源库名，必须在 database 被目标库名覆盖之前查
+        String sourceDb = database;
+        String sourceTable = table;
         table = mapTargetTableName(database, table);
         if (!targetDatabaseName.isEmpty() && !targetIsPostgresql) {
             database = targetDatabaseName;
@@ -1139,6 +1186,8 @@ public class THLToSqlConverter {
 
         String[] columnNames = getColumnNames(metadata);
         String[] columnTypes = getColumnTypes(metadata);
+        // 列处理（mysql→mysql 回退路径）：输出用目标列名；主键匹配仍用源列名
+        String[] columnNamesOut = applyColumnProcessingToColumns(sourceDb, sourceTable, columnNames);
 
         String pkColumnsStr = (String) metadata.get("primary_keys");
         java.util.Set<String> pkColumns = new java.util.HashSet<>();
@@ -1169,18 +1218,19 @@ public class THLToSqlConverter {
             for (int i = 0; i < values.length; i++) {
                 String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
                 if (!pkColumns.contains(colName)) continue;
+                String colNameOut = (columnNamesOut != null && i < columnNamesOut.length) ? columnNamesOut[i] : colName;
                 if (!first) sql.append(" AND ");
                 first = false;
                 if (values[i].equals("null") || values[i].equals("NULL")) {
-                    sql.append(quoteIdentifier(colName)).append(" IS NULL");
+                    sql.append(quoteIdentifier(colNameOut)).append(" IS NULL");
                 } else {
-                    sql.append(quoteIdentifier(colName)).append("=").append(values[i]);
+                    sql.append(quoteIdentifier(colNameOut)).append("=").append(values[i]);
                 }
             }
         } else {
             for (int i = 0; i < values.length; i++) {
                 if (i > 0) sql.append(" AND ");
-                String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
+                String colName = (columnNamesOut != null && i < columnNamesOut.length) ? columnNamesOut[i] : "column" + i;
                 if (values[i].equals("null") || values[i].equals("NULL")) {
                     sql.append(quoteIdentifier(colName)).append(" IS NULL");
                 } else {

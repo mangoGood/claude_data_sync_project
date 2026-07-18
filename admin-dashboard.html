@@ -939,6 +939,48 @@
             color: #52c41a;
         }
 
+        /* 列处理页签 */
+        .colproc-tabs {
+            display: flex;
+            gap: 2px;
+            border-bottom: 2px solid #f0f0f0;
+            margin-bottom: 12px;
+        }
+        .colproc-tab {
+            padding: 8px 18px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #666;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            user-select: none;
+        }
+        .colproc-tab:hover { color: #1890ff; }
+        .colproc-tab.active {
+            color: #1890ff;
+            border-bottom-color: #1890ff;
+            font-weight: 500;
+        }
+        .colproc-pane { display: none; }
+        .colproc-pane.active { display: block; }
+        .colproc-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 10px;
+            border: 1px solid #f0f0f0;
+            border-radius: 4px;
+            margin-bottom: 6px;
+            background: #fafafa;
+        }
+        .colproc-item-remove {
+            color: #ff4d4f;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 2px 6px;
+        }
+        .colproc-item-remove:hover { text-decoration: underline; }
+
         .step-content {
             display: none;
         }
@@ -2627,7 +2669,10 @@
                         <span>2. 选择同步对象</span>
                     </div>
                     <div class="step-item" id="cfgStep3Nav" onclick="cfgGoToStep(3)">
-                        <span>3. 校验检查</span>
+                        <span>3. 列处理</span>
+                    </div>
+                    <div class="step-item" id="cfgStep4Nav" onclick="cfgGoToStep(4)">
+                        <span id="cfgStep4NavLabel">4. 校验检查</span>
                     </div>
                 </div>
 
@@ -2716,7 +2761,78 @@
                     </div>
                 </div>
 
+                <!-- Step 3: 列处理（仅 MySQL→MySQL 表级同步；全部留空 = 与原有行为一致） -->
                 <div class="step-content" id="cfgStep3Content">
+                    <div id="cfgColProcDbLevelNotice" style="display: none; padding: 24px; text-align: center; color: #faad14; background: #fffbe6; border: 1px solid #ffe58f; border-radius: 4px;">
+                        库级同步不支持列处理，若要列处理请选择表级同步。
+                    </div>
+                    <div id="cfgColProcBody">
+                        <div style="font-size: 12px; color: #999; margin-bottom: 10px;">
+                            可选步骤：对选中的表配置列名过滤、列名映射或新增附加列；什么都不做则与原有同步行为完全一致。
+                            <span style="color: #fa8c16;">配置了列处理的任务无法进行内容对比和行数对比。</span>
+                        </div>
+                        <div class="colproc-tabs">
+                            <div class="colproc-tab active" id="cfgColTabFilterBtn" onclick="cfgSwitchColTab('filter')">列名过滤</div>
+                            <div class="colproc-tab" id="cfgColTabMappingBtn" onclick="cfgSwitchColTab('mapping')">列名映射</div>
+                            <div class="colproc-tab" id="cfgColTabExtraBtn" onclick="cfgSwitchColTab('extra')">新增附加列</div>
+                        </div>
+
+                        <!-- 列名过滤 -->
+                        <div class="colproc-pane active" id="cfgColPaneFilter">
+                            <div style="font-size: 12px; color: #999; margin-bottom: 8px;">
+                                设置过滤条件后，命中条件的行不会同步到目标端（例如 col1 &lt; 1 表示不同步 col1 小于 1 的行）。支持 tinyint/smallint/mediumint/int/bigint/bit/float/double/decimal/date/time/year/datetime/timestamp 类型的列。
+                            </div>
+                            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+                                <select class="form-input" id="cfgFilterTableSelect" style="width: 220px; height: 34px;" onchange="cfgOnColProcTableChange('filter')"></select>
+                                <select class="form-input" id="cfgFilterColumnSelect" style="width: 180px; height: 34px;"></select>
+                                <select class="form-input" id="cfgFilterOpSelect" style="width: 80px; height: 34px;">
+                                    <option value="<">&lt;</option>
+                                    <option value="<=">&lt;=</option>
+                                    <option value=">">&gt;</option>
+                                    <option value=">=">&gt;=</option>
+                                    <option value="=">=</option>
+                                    <option value="!=">!=</option>
+                                </select>
+                                <input type="text" class="form-input" id="cfgFilterValueInput" placeholder="值" style="width: 170px; height: 34px;">
+                                <button type="button" class="btn-test" onclick="cfgAddColumnFilter()">添加条件</button>
+                            </div>
+                            <div id="cfgFilterList" style="font-size: 13px;"></div>
+                        </div>
+
+                        <!-- 列名映射 -->
+                        <div class="colproc-pane" id="cfgColPaneMapping">
+                            <div style="font-size: 12px; color: #999; margin-bottom: 8px;">
+                                选择表后可修改该表同步到目标端的列名（不改变列类型）。留空或与源列名相同 = 不映射。
+                            </div>
+                            <div style="margin-bottom: 10px;">
+                                <select class="form-input" id="cfgMappingTableSelect" style="width: 220px; height: 34px;" onchange="cfgOnColProcTableChange('mapping')"></select>
+                            </div>
+                            <div id="cfgMappingList" style="font-size: 13px;"></div>
+                        </div>
+
+                        <!-- 新增附加列 -->
+                        <div class="colproc-pane" id="cfgColPaneExtra">
+                            <div style="font-size: 12px; color: #999; margin-bottom: 8px;">
+                                为目标表增加附加列：create_time = 该行首次同步到目标库的时间；update_time = 该行上次在目标库更新的时间；
+                                自定义列 = 常量“输入值@库名@表名”（如 20260714test1@db1@table1），用于多个源库同结构表汇入同一目标表时标识来源。
+                            </div>
+                            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+                                <select class="form-input" id="cfgExtraTableSelect" style="width: 220px; height: 34px;" onchange="cfgOnColProcTableChange('extra')"></select>
+                                <select class="form-input" id="cfgExtraKindSelect" style="width: 200px; height: 34px;" onchange="cfgOnExtraKindChange()">
+                                    <option value="CREATE_TIME">create_time（首次同步时间）</option>
+                                    <option value="UPDATE_TIME">update_time（最近更新时间）</option>
+                                    <option value="CUSTOM">自定义（值@库名@表名）</option>
+                                </select>
+                                <input type="text" class="form-input" id="cfgExtraNameInput" placeholder="列名" style="width: 150px; height: 34px;">
+                                <input type="text" class="form-input" id="cfgExtraValueInput" placeholder="输入值" style="width: 150px; height: 34px; display: none;">
+                                <button type="button" class="btn-test" onclick="cfgAddExtraColumn()">添加</button>
+                            </div>
+                            <div id="cfgExtraList" style="font-size: 13px;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step-content" id="cfgStep4Content">
                     <div class="validation-container">
                         <div class="validation-header">
                             <span>数据库同步前校验</span>
@@ -2730,7 +2846,7 @@
             </div>
             <div class="modal-footer">
                 <button class="btn-cancel" onclick="closeConfigModal()">取消</button>
-                <button class="btn-default" id="cfgPrevBtn" style="display: none;" onclick="cfgGoToStep(cfgCurrentStep - 1)">上一步</button>
+                <button class="btn-default" id="cfgPrevBtn" style="display: none;" onclick="cfgPrevStep()">上一步</button>
                 <button class="btn-confirm" id="cfgNextBtn" onclick="cfgNextStep()">下一步</button>
                 <button class="btn-confirm" id="cfgLaunchBtn" style="display: none;" onclick="launchTask()">启动任务</button>
             </div>
@@ -2760,6 +2876,9 @@
                     <select class="form-input" id="validationWorkflowSelect" style="height: 38px;">
                         <option value="">请选择增量同步中的任务</option>
                     </select>
+                    <div id="colProcCompareHint" style="display: none; font-size: 11px; color: #fa8c16; margin-top: 4px;">
+                        配置了列处理（列名过滤/列名映射/附加列）的任务无法进行内容对比和行数对比，已从下拉中隐藏。
+                    </div>
                 </div>
                 <div id="validationWorkflowInfo" style="display: none; margin-top: 12px; padding: 12px; background: #f5f5f5; border-radius: 4px;">
                     <div style="font-size: 13px; color: #666;">
@@ -5831,6 +5950,29 @@
         // 库名映射：key = 源库名，value = 目标库名（表级/库级同步均支持）。
         // 未配置/与源库同名 = 不映射。取代原"目标数据库名称"输入框（PG 目标的库名走连接区输入）。
         let cfgDbNameMapping = {};
+        // 列处理（仅 MySQL→MySQL 表级同步）：key 均为 "db.table"
+        let cfgColumnFilters = {};   // -> [{column, op, value}]
+        let cfgColumnMappings = {};  // -> {源列: 目标列}
+        let cfgExtraColumns = {};    // -> [{name, kind, value}]  kind: CREATE_TIME|UPDATE_TIME|CUSTOM
+        let cfgColumnsCache = {};    // -> [{name, dataType, columnType, primaryKey, filterable}]
+
+        // 列处理是否可用：仅 mysql→mysql 任务展示【3.列处理】步骤
+        function cfgColProcSupported() {
+            return cfgSourceType === 'mysql' && cfgTargetType === 'mysql';
+        }
+
+        function cfgClearAllColumnProcessing() {
+            cfgColumnFilters = {};
+            cfgColumnMappings = {};
+            cfgExtraColumns = {};
+        }
+
+        function cfgClearColumnProcessingForTable(db, tableName) {
+            const key = db + '.' + tableName;
+            delete cfgColumnFilters[key];
+            delete cfgColumnMappings[key];
+            delete cfgExtraColumns[key];
+        }
 
         // 目标库名输入变更：空值/与源库同名 = 取消映射
         window.cfgSetDbNameMapping = function(db, value) {
@@ -5855,6 +5997,7 @@
             cfgSelectedSyncObjects = {};
             cfgTableNameMapping = {};
             cfgDbNameMapping = {};
+            cfgClearAllColumnProcessing();
             const radio = document.querySelector(`input[name="cfgSyncGranularity"][value="${mode}"]`);
             if (radio) radio.checked = true;
             cfgRenderDatabases();
@@ -5877,6 +6020,12 @@
             Object.keys(cfgTableNameMapping).forEach(key => {
                 if (key.startsWith(db + '.')) delete cfgTableNameMapping[key];
             });
+            // 列处理配置随表选择一并清理
+            [cfgColumnFilters, cfgColumnMappings, cfgExtraColumns].forEach(store => {
+                Object.keys(store).forEach(key => {
+                    if (key.startsWith(db + '.')) delete store[key];
+                });
+            });
         }
 
         // 目标表名输入变更：空值/与源表同名 = 取消映射；仅允许常规标识符字符，防注入且与引擎改写规则一致
@@ -5896,6 +6045,352 @@
             cfgTableNameMapping[key] = v;
             cfgRenderSelectedObjects();
         }
+
+        // ==================== 列处理页面（步骤3，仅 mysql→mysql 表级） ====================
+
+        const COLPROC_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+        // 自定义附加列输入值白名单：与 agent 侧校验一致（值会拼进建表 DEFAULT 字面量）
+        const COLPROC_CUSTOM_VALUE_RE = /^[A-Za-z0-9_.\-]{1,128}$/;
+        const COLPROC_KIND_LABELS = {
+            CREATE_TIME: 'create_time（首次同步时间）',
+            UPDATE_TIME: 'update_time（最近更新时间）',
+            CUSTOM: '自定义'
+        };
+
+        // 渲染列处理页：库级同步显示不支持提示；表级同步填充三个页签的表下拉
+        function cfgRenderColProcPage() {
+            const notice = document.getElementById('cfgColProcDbLevelNotice');
+            const body = document.getElementById('cfgColProcBody');
+            if (cfgSyncGranularity === 'database') {
+                notice.style.display = 'block';
+                body.style.display = 'none';
+                return;
+            }
+            notice.style.display = 'none';
+            body.style.display = 'block';
+
+            const tables = [];
+            Object.keys(cfgSelectedSyncObjects).forEach(db => {
+                if (Array.isArray(cfgSelectedSyncObjects[db])) {
+                    cfgSelectedSyncObjects[db].forEach(t => tables.push(db + '.' + t));
+                }
+            });
+            ['cfgFilterTableSelect', 'cfgMappingTableSelect', 'cfgExtraTableSelect'].forEach(id => {
+                const select = document.getElementById(id);
+                const prev = select.value;
+                let options = '<option value="">请选择表</option>';
+                tables.forEach(t => {
+                    options += `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`;
+                });
+                select.innerHTML = options;
+                if (prev && tables.includes(prev)) select.value = prev;
+            });
+            cfgOnExtraKindChange();
+            cfgRenderFilterList();
+            cfgRenderMappingRows();
+            cfgRenderExtraList();
+        }
+
+        window.cfgSwitchColTab = function(tab) {
+            ['filter', 'mapping', 'extra'].forEach(t => {
+                const btn = document.getElementById('cfgColTab' + t.charAt(0).toUpperCase() + t.slice(1) + 'Btn');
+                const pane = document.getElementById('cfgColPane' + t.charAt(0).toUpperCase() + t.slice(1));
+                btn.className = 'colproc-tab' + (t === tab ? ' active' : '');
+                pane.className = 'colproc-pane' + (t === tab ? ' active' : '');
+            });
+        }
+
+        // 加载表的列信息（带缓存）
+        async function cfgLoadColumns(db, table) {
+            const key = db + '.' + table;
+            if (cfgColumnsCache[key]) return cfgColumnsCache[key];
+            const connectionStr = cfgBuildConnectionStringWithDb('source', db);
+            try {
+                const response = await fetchWithAuth(`${API_BASE_URL}/metadata/columns`, {
+                    method: 'POST',
+                    headers: getAuthHeaders(),
+                    body: JSON.stringify({ sourceConnection: connectionStr, database: db, table: table })
+                });
+                const result = await response.json();
+                if (result.success && result.data.columns) {
+                    cfgColumnsCache[key] = result.data.columns;
+                    return cfgColumnsCache[key];
+                }
+                showNotification(result.message || '加载列信息失败', 'error');
+            } catch (e) {
+                showNotification('加载列信息失败', 'error');
+            }
+            return null;
+        }
+
+        window.cfgOnColProcTableChange = async function(tab) {
+            if (tab === 'filter') {
+                const sel = document.getElementById('cfgFilterTableSelect').value;
+                const colSelect = document.getElementById('cfgFilterColumnSelect');
+                colSelect.innerHTML = '<option value="">加载中...</option>';
+                if (!sel) { colSelect.innerHTML = '<option value="">请先选择表</option>'; return; }
+                const dot = sel.indexOf('.');
+                const columns = await cfgLoadColumns(sel.substring(0, dot), sel.substring(dot + 1));
+                if (!columns) { colSelect.innerHTML = '<option value="">加载失败</option>'; return; }
+                const filterable = columns.filter(c => c.filterable);
+                if (filterable.length === 0) {
+                    colSelect.innerHTML = '<option value="">该表没有可过滤类型的列</option>';
+                    return;
+                }
+                let options = '<option value="">请选择列</option>';
+                filterable.forEach(c => {
+                    options += `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}（${escapeHtml(c.columnType)}）</option>`;
+                });
+                colSelect.innerHTML = options;
+            } else if (tab === 'mapping') {
+                const sel = document.getElementById('cfgMappingTableSelect').value;
+                if (sel) {
+                    const dot = sel.indexOf('.');
+                    await cfgLoadColumns(sel.substring(0, dot), sel.substring(dot + 1));
+                }
+                cfgRenderMappingRows();
+            } else {
+                const sel = document.getElementById('cfgExtraTableSelect').value;
+                if (sel) {
+                    const dot = sel.indexOf('.');
+                    await cfgLoadColumns(sel.substring(0, dot), sel.substring(dot + 1));
+                }
+                cfgRenderExtraList();
+            }
+        }
+
+        // ---------- 列名过滤 ----------
+
+        // 过滤值必须符合列类型：整数/bit/浮点定点/日期时间
+        function cfgValidateFilterValue(dataType, value) {
+            const t = (dataType || '').toLowerCase();
+            if (['tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint', 'year'].includes(t)) {
+                return /^-?\d{1,19}$/.test(value) || '该列为整数类型，请输入整数值';
+            }
+            if (t === 'bit') {
+                return /^\d{1,19}$/.test(value) || '该列为 bit 类型，请输入非负整数值（如 0 或 1）';
+            }
+            if (['decimal', 'numeric', 'float', 'double'].includes(t)) {
+                return /^-?\d{1,19}(\.\d{1,10})?$/.test(value) || '该列为数值类型，请输入数值';
+            }
+            if (t === 'date') {
+                return /^\d{4}-\d{2}-\d{2}$/.test(value) || '该列为日期类型，格式：YYYY-MM-DD';
+            }
+            if (t === 'datetime' || t === 'timestamp') {
+                return /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2}(\.\d{1,3})?)?$/.test(value)
+                    || '该列为日期时间类型，格式：YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS';
+            }
+            if (t === 'time') {
+                return /^-?\d{1,3}:\d{2}:\d{2}$/.test(value) || '该列为时间类型，格式：HH:MM:SS';
+            }
+            return '该列类型不支持列过滤（仅支持整数、浮点/定点、日期时间类型）';
+        }
+
+        window.cfgAddColumnFilter = function() {
+            const tableKey = document.getElementById('cfgFilterTableSelect').value;
+            const column = document.getElementById('cfgFilterColumnSelect').value;
+            const op = document.getElementById('cfgFilterOpSelect').value;
+            const value = document.getElementById('cfgFilterValueInput').value.trim();
+            if (!tableKey) { showNotification('请选择表', 'error'); return; }
+            if (!column) { showNotification('请选择列', 'error'); return; }
+            if (!value) { showNotification('请输入条件值', 'error'); return; }
+            const cols = cfgColumnsCache[tableKey] || [];
+            const colInfo = cols.find(c => c.name === column);
+            const check = cfgValidateFilterValue(colInfo ? colInfo.dataType : '', value);
+            if (check !== true) { showNotification(check, 'error'); return; }
+            if (!cfgColumnFilters[tableKey]) cfgColumnFilters[tableKey] = [];
+            if (cfgColumnFilters[tableKey].some(f => f.column === column && f.op === op && f.value === value)) {
+                showNotification('该过滤条件已存在', 'error');
+                return;
+            }
+            cfgColumnFilters[tableKey].push({ column, op, value });
+            document.getElementById('cfgFilterValueInput').value = '';
+            cfgRenderFilterList();
+        }
+
+        window.cfgRemoveColumnFilter = function(tableKey, idx) {
+            if (cfgColumnFilters[tableKey]) {
+                cfgColumnFilters[tableKey].splice(idx, 1);
+                if (cfgColumnFilters[tableKey].length === 0) delete cfgColumnFilters[tableKey];
+            }
+            cfgRenderFilterList();
+        }
+
+        function cfgRenderFilterList() {
+            const container = document.getElementById('cfgFilterList');
+            const keys = Object.keys(cfgColumnFilters);
+            if (keys.length === 0) {
+                container.innerHTML = '<div style="color: #999; padding: 8px 0;">暂无过滤条件</div>';
+                return;
+            }
+            let html = '';
+            keys.forEach(tableKey => {
+                cfgColumnFilters[tableKey].forEach((f, idx) => {
+                    html += `
+                        <div class="colproc-item">
+                            <span>${escapeHtml(tableKey)}：不同步 <b>${escapeHtml(f.column)} ${escapeHtml(f.op)} ${escapeHtml(f.value)}</b> 的行</span>
+                            <span class="colproc-item-remove" onclick="cfgRemoveColumnFilter('${escapeHtml(tableKey)}', ${idx})">删除</span>
+                        </div>`;
+                });
+            });
+            container.innerHTML = html;
+        }
+
+        // ---------- 列名映射 ----------
+
+        window.cfgSetColumnMapping = function(tableKey, srcCol, value) {
+            const v = (value || '').trim();
+            const mapping = cfgColumnMappings[tableKey] || {};
+            if (!v || v === srcCol) {
+                delete mapping[srcCol];
+                if (Object.keys(mapping).length === 0) delete cfgColumnMappings[tableKey];
+                else cfgColumnMappings[tableKey] = mapping;
+                cfgRenderMappingRows();
+                return;
+            }
+            if (!COLPROC_IDENT_RE.test(v)) {
+                showNotification('目标列名仅支持字母、数字、下划线和$，且不能以数字开头', 'error');
+                cfgRenderMappingRows();
+                return;
+            }
+            const cols = (cfgColumnsCache[tableKey] || []).map(c => c.name.toLowerCase());
+            const others = Object.entries(mapping).filter(([s]) => s !== srcCol).map(([, t]) => t.toLowerCase());
+            if (others.includes(v.toLowerCase())
+                || (cols.includes(v.toLowerCase()) && v.toLowerCase() !== srcCol.toLowerCase())) {
+                showNotification('目标列名与该表其他列名冲突', 'error');
+                cfgRenderMappingRows();
+                return;
+            }
+            mapping[srcCol] = v;
+            cfgColumnMappings[tableKey] = mapping;
+            cfgRenderMappingRows();
+        }
+
+        function cfgRenderMappingRows() {
+            const container = document.getElementById('cfgMappingList');
+            const tableKey = document.getElementById('cfgMappingTableSelect').value;
+            if (!tableKey) {
+                // 未选表时汇总展示已配置的映射
+                const keys = Object.keys(cfgColumnMappings);
+                if (keys.length === 0) {
+                    container.innerHTML = '<div style="color: #999; padding: 8px 0;">请选择表后配置列名映射</div>';
+                    return;
+                }
+                let html = '<div style="color: #999; margin-bottom: 6px;">已配置的列名映射（选择表可修改）：</div>';
+                keys.forEach(k => {
+                    Object.entries(cfgColumnMappings[k]).forEach(([s, t]) => {
+                        html += `<div class="colproc-item"><span>${escapeHtml(k)}：${escapeHtml(s)} → <b>${escapeHtml(t)}</b></span></div>`;
+                    });
+                });
+                container.innerHTML = html;
+                return;
+            }
+            const columns = cfgColumnsCache[tableKey];
+            if (!columns) {
+                container.innerHTML = '<div style="color: #999; padding: 8px 0;">加载列信息中...</div>';
+                return;
+            }
+            const mapping = cfgColumnMappings[tableKey] || {};
+            let html = `
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; font-size: 12px; color: #999; padding: 4px 0;">
+                    <span>源列名</span><span>类型</span><span>目标列名（留空 = 不改名）</span>
+                </div>`;
+            columns.forEach(c => {
+                const tgt = mapping[c.name] || '';
+                html += `
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; align-items: center; padding: 3px 0;">
+                        <span>${escapeHtml(c.name)}${c.primaryKey ? ' <span style="color:#1890ff;font-size:11px;">PK</span>' : ''}</span>
+                        <span style="color: #999;">${escapeHtml(c.columnType)}</span>
+                        <input type="text" class="form-input" style="height: 30px; font-size: 12px;"
+                               value="${escapeHtml(tgt)}" placeholder="${escapeHtml(c.name)}"
+                               onchange="cfgSetColumnMapping('${escapeHtml(tableKey)}', '${escapeHtml(c.name)}', this.value)">
+                    </div>`;
+            });
+            container.innerHTML = html;
+        }
+
+        // ---------- 新增附加列 ----------
+
+        window.cfgOnExtraKindChange = function() {
+            const kind = document.getElementById('cfgExtraKindSelect').value;
+            const nameInput = document.getElementById('cfgExtraNameInput');
+            document.getElementById('cfgExtraValueInput').style.display = (kind === 'CUSTOM') ? '' : 'none';
+            if (!nameInput.value.trim() || ['create_time', 'update_time'].includes(nameInput.value.trim())) {
+                nameInput.value = kind === 'CREATE_TIME' ? 'create_time' : (kind === 'UPDATE_TIME' ? 'update_time' : '');
+            }
+        }
+
+        window.cfgAddExtraColumn = function() {
+            const tableKey = document.getElementById('cfgExtraTableSelect').value;
+            const kind = document.getElementById('cfgExtraKindSelect').value;
+            const name = document.getElementById('cfgExtraNameInput').value.trim();
+            const value = document.getElementById('cfgExtraValueInput').value.trim();
+            if (!tableKey) { showNotification('请选择表', 'error'); return; }
+            if (!name) { showNotification('请输入附加列名', 'error'); return; }
+            if (!COLPROC_IDENT_RE.test(name)) {
+                showNotification('列名仅支持字母、数字、下划线和$，且不能以数字开头', 'error');
+                return;
+            }
+            if (kind === 'CUSTOM' && !COLPROC_CUSTOM_VALUE_RE.test(value)) {
+                showNotification('自定义输入值仅支持字母、数字及 _ - . （1-128位）', 'error');
+                return;
+            }
+            const lower = name.toLowerCase();
+            const cols = (cfgColumnsCache[tableKey] || []).map(c => c.name.toLowerCase());
+            const mapped = Object.values(cfgColumnMappings[tableKey] || {}).map(t => t.toLowerCase());
+            const extras = (cfgExtraColumns[tableKey] || []).map(e => e.name.toLowerCase());
+            if (cols.includes(lower) || mapped.includes(lower) || extras.includes(lower)) {
+                showNotification('附加列名与该表已有列名冲突', 'error');
+                return;
+            }
+            if ((cfgExtraColumns[tableKey] || []).some(e => e.kind === kind && kind !== 'CUSTOM')) {
+                showNotification('该表已添加过此类型的附加列', 'error');
+                return;
+            }
+            if (!cfgExtraColumns[tableKey]) cfgExtraColumns[tableKey] = [];
+            const item = { name, kind };
+            if (kind === 'CUSTOM') item.value = value;
+            cfgExtraColumns[tableKey].push(item);
+            document.getElementById('cfgExtraValueInput').value = '';
+            cfgRenderExtraList();
+        }
+
+        window.cfgRemoveExtraColumn = function(tableKey, idx) {
+            if (cfgExtraColumns[tableKey]) {
+                cfgExtraColumns[tableKey].splice(idx, 1);
+                if (cfgExtraColumns[tableKey].length === 0) delete cfgExtraColumns[tableKey];
+            }
+            cfgRenderExtraList();
+        }
+
+        function cfgRenderExtraList() {
+            const container = document.getElementById('cfgExtraList');
+            const keys = Object.keys(cfgExtraColumns);
+            if (keys.length === 0) {
+                container.innerHTML = '<div style="color: #999; padding: 8px 0;">暂无附加列</div>';
+                return;
+            }
+            let html = '';
+            keys.forEach(tableKey => {
+                const dot = tableKey.indexOf('.');
+                const db = tableKey.substring(0, dot);
+                const table = tableKey.substring(dot + 1);
+                cfgExtraColumns[tableKey].forEach((e, idx) => {
+                    const desc = e.kind === 'CUSTOM'
+                        ? `常量 ${escapeHtml(e.value)}@${escapeHtml(db)}@${escapeHtml(table)}`
+                        : escapeHtml(COLPROC_KIND_LABELS[e.kind] || e.kind);
+                    html += `
+                        <div class="colproc-item">
+                            <span>${escapeHtml(tableKey)}：<b>${escapeHtml(e.name)}</b>（${desc}）</span>
+                            <span class="colproc-item-remove" onclick="cfgRemoveExtraColumn('${escapeHtml(tableKey)}', ${idx})">删除</span>
+                        </div>`;
+                });
+            });
+            container.innerHTML = html;
+        }
+
+        // ==================== 列处理页面结束 ====================
+
         let cfgTablesCache = {};
         let cfgDatabasesCache = [];
         let cfgSchemasCache = [];
@@ -5971,6 +6466,8 @@
                 cfgDatabasesCache = [];
                 cfgSchemasCache = [];
                 cfgValidationPassed = false;
+                cfgClearAllColumnProcessing();
+                cfgColumnsCache = {};
 
                 // 同步粒度：默认表级；库级同步目前仅支持 MySQL 源（存储程序/触发器/事件复制为 MySQL 实现）
                 cfgSyncGranularity = 'table';
@@ -6015,6 +6512,22 @@
                             if (dbValue && dbValue.tableMapping && typeof dbValue.tableMapping === 'object') {
                                 Object.entries(dbValue.tableMapping).forEach(([src, tgt]) => {
                                     if (tgt && tgt !== src) cfgTableNameMapping[db + '.' + src] = tgt;
+                                });
+                            }
+                            // 恢复列处理配置（表级 entry 的 columnFilter/columnMapping/extraColumns，按表存放）
+                            if (dbValue && dbValue.columnFilter && typeof dbValue.columnFilter === 'object') {
+                                Object.entries(dbValue.columnFilter).forEach(([t, conds]) => {
+                                    if (Array.isArray(conds) && conds.length > 0) cfgColumnFilters[db + '.' + t] = conds;
+                                });
+                            }
+                            if (dbValue && dbValue.columnMapping && typeof dbValue.columnMapping === 'object') {
+                                Object.entries(dbValue.columnMapping).forEach(([t, m]) => {
+                                    if (m && typeof m === 'object' && Object.keys(m).length > 0) cfgColumnMappings[db + '.' + t] = m;
+                                });
+                            }
+                            if (dbValue && dbValue.extraColumns && typeof dbValue.extraColumns === 'object') {
+                                Object.entries(dbValue.extraColumns).forEach(([t, cols]) => {
+                                    if (Array.isArray(cols) && cols.length > 0) cfgExtraColumns[db + '.' + t] = cols;
                                 });
                             }
                         }
@@ -6274,9 +6787,15 @@
             });
         }
 
+        // 向导步骤序列：mysql→mysql 为 1连接→2对象→3列处理→4校验；其余库对无列处理步骤（1→2→4）
+        function cfgStepSequence() {
+            return cfgColProcSupported() ? [1, 2, 3, 4] : [1, 2, 4];
+        }
+
         function cfgGoToStep(step) {
-            if (step < 1 || step > 3) return;
-            
+            const seq = cfgStepSequence();
+            if (!seq.includes(step)) return;
+
             if (step === 2 && cfgCurrentStep === 1) {
                 const sourceErrors = cfgValidateConnectionFields('source');
                 if (sourceErrors.length > 0) {
@@ -6310,7 +6829,8 @@
                 });
             }
 
-            if (step === 3 && cfgCurrentStep === 2) {
+            // 离开步骤 2 向后走（进列处理或校验）：必须已选同步对象，且保存配置
+            if (step > 2 && cfgCurrentStep === 2) {
                 if (Object.keys(cfgSelectedSyncObjects).length === 0) {
                     showNotification('请至少选择一个同步对象', 'error');
                     return;
@@ -6325,27 +6845,55 @@
                 }
                 cfgSaveConfig();
             }
-            
+
+            // 离开列处理步骤向后走：把列处理配置持久化进 syncObjects
+            if (step === 4 && cfgCurrentStep === 3) {
+                cfgSaveConfig();
+            }
+
             cfgCurrentStep = step;
+            if (step === 3) {
+                cfgRenderColProcPage();
+            }
             cfgUpdateStepUI();
         }
 
         function cfgNextStep() {
-            cfgGoToStep(cfgCurrentStep + 1);
+            const seq = cfgStepSequence();
+            const idx = seq.indexOf(cfgCurrentStep);
+            if (idx >= 0 && idx < seq.length - 1) {
+                cfgGoToStep(seq[idx + 1]);
+            }
+        }
+
+        function cfgPrevStep() {
+            const seq = cfgStepSequence();
+            const idx = seq.indexOf(cfgCurrentStep);
+            if (idx > 0) {
+                cfgGoToStep(seq[idx - 1]);
+            }
         }
 
         function cfgUpdateStepUI() {
+            const colProc = cfgColProcSupported();
+            const lastStep = 4;
             document.getElementById('cfgStep1Nav').className = 'step-item' + (cfgCurrentStep === 1 ? ' active' : (cfgCurrentStep > 1 ? ' completed' : ''));
             document.getElementById('cfgStep2Nav').className = 'step-item' + (cfgCurrentStep === 2 ? ' active' : (cfgCurrentStep > 2 ? ' completed' : ''));
-            document.getElementById('cfgStep3Nav').className = 'step-item' + (cfgCurrentStep === 3 ? ' active' : '');
-            
+            const step3Nav = document.getElementById('cfgStep3Nav');
+            step3Nav.style.display = colProc ? '' : 'none';
+            step3Nav.className = 'step-item' + (cfgCurrentStep === 3 ? ' active' : (cfgCurrentStep > 3 ? ' completed' : ''));
+            document.getElementById('cfgStep4Nav').className = 'step-item' + (cfgCurrentStep === 4 ? ' active' : '');
+            // 非 mysql→mysql 无列处理步骤，校验检查按第 3 步展示
+            document.getElementById('cfgStep4NavLabel').textContent = colProc ? '4. 校验检查' : '3. 校验检查';
+
             document.getElementById('cfgStep1Content').className = 'step-content' + (cfgCurrentStep === 1 ? ' active' : '');
             document.getElementById('cfgStep2Content').className = 'step-content' + (cfgCurrentStep === 2 ? ' active' : '');
             document.getElementById('cfgStep3Content').className = 'step-content' + (cfgCurrentStep === 3 ? ' active' : '');
-            
-            document.getElementById('cfgNextBtn').style.display = (cfgCurrentStep >= 1 && cfgCurrentStep <= 2) ? 'inline-block' : 'none';
-            document.getElementById('cfgPrevBtn').style.display = (cfgCurrentStep >= 2 && cfgCurrentStep <= 3) ? 'inline-block' : 'none';
-            document.getElementById('cfgLaunchBtn').style.display = cfgCurrentStep === 3 ? 'inline-block' : 'none';
+            document.getElementById('cfgStep4Content').className = 'step-content' + (cfgCurrentStep === 4 ? ' active' : '');
+
+            document.getElementById('cfgNextBtn').style.display = (cfgCurrentStep < lastStep) ? 'inline-block' : 'none';
+            document.getElementById('cfgPrevBtn').style.display = (cfgCurrentStep > 1) ? 'inline-block' : 'none';
+            document.getElementById('cfgLaunchBtn').style.display = cfgCurrentStep === lastStep ? 'inline-block' : 'none';
         }
 
         async function cfgSaveConfig() {
@@ -6373,6 +6921,25 @@
                         });
                         if (Object.keys(mapping).length > 0) {
                             syncObjectsData[db].tableMapping = mapping;
+                        }
+                        // 列处理（仅表级 + mysql→mysql）：columnFilter/columnMapping/extraColumns 按表写入
+                        if (cfgColProcSupported()) {
+                            const colFilter = {}, colMapping = {}, extraCols = {};
+                            cfgSelectedSyncObjects[db].forEach(t => {
+                                const key = db + '.' + t;
+                                if (Array.isArray(cfgColumnFilters[key]) && cfgColumnFilters[key].length > 0) {
+                                    colFilter[t] = cfgColumnFilters[key];
+                                }
+                                if (cfgColumnMappings[key] && Object.keys(cfgColumnMappings[key]).length > 0) {
+                                    colMapping[t] = cfgColumnMappings[key];
+                                }
+                                if (Array.isArray(cfgExtraColumns[key]) && cfgExtraColumns[key].length > 0) {
+                                    extraCols[t] = cfgExtraColumns[key];
+                                }
+                            });
+                            if (Object.keys(colFilter).length > 0) syncObjectsData[db].columnFilter = colFilter;
+                            if (Object.keys(colMapping).length > 0) syncObjectsData[db].columnMapping = colMapping;
+                            if (Object.keys(extraCols).length > 0) syncObjectsData[db].extraColumns = extraCols;
                         }
                     }
                     // 库名映射：只写与源库名不同的有效映射（表级/库级均支持）
@@ -6706,6 +7273,7 @@
                 if (cfgSelectedSyncObjects[db].length === 0) delete cfgSelectedSyncObjects[db];
             }
             delete cfgTableNameMapping[db + '.' + tableName];
+            cfgClearColumnProcessingForTable(db, tableName);
             cfgRenderSelectedObjects();
             if (cfgTablesCache[db]) cfgRenderTables(db);
             else if (cfgTablesCache[`pg-${db}`]) {
@@ -7335,9 +7903,16 @@
             const hint = document.getElementById('contentCompareHint');
             if (hint) hint.style.display = compareType === 'CONTENT' ? 'block' : 'none';
 
+            // 列处理任务（列过滤/列名映射/附加列）：源端与目标端数据不再一一对应，
+            // 内容对比与行数对比均不支持，从下拉中隐藏并提示
+            const colProcCount = availableWorkflows.filter(w => w.hasColumnProcessing).length;
+            const colProcHint = document.getElementById('colProcCompareHint');
+            if (colProcHint) colProcHint.style.display = colProcCount > 0 ? 'block' : 'none';
+            const comparable = availableWorkflows.filter(w => !w.hasColumnProcessing);
+
             const list = compareType === 'CONTENT'
-                ? availableWorkflows.filter(supportsContentCompare)
-                : availableWorkflows;
+                ? comparable.filter(supportsContentCompare)
+                : comparable;
 
             if (list.length === 0) {
                 select.innerHTML = compareType === 'CONTENT'

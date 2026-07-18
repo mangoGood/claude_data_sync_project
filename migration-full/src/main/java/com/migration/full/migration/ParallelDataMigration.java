@@ -71,6 +71,7 @@ public class ParallelDataMigration {
                     DataMigration dataMigration = new DataMigration(
                             src, tgt, config.getBatchSize(), config.isContinueOnError(), progressManager,
                             config.isShardEnabled(), config.getShardMinRows(), config.getShardCount());
+                    dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
 
                     TableInfo table;
                     while ((table = queue.poll()) != null) {

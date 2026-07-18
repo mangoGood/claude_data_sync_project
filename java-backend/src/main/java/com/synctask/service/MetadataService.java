@@ -591,6 +591,56 @@ public class MetadataService {
                "config".equalsIgnoreCase(dbName);
     }
 
+    /** 列过滤支持的类型（整数/bit/浮点定点/日期时间），供前端“列名过滤”页签按类型放行 */
+    private static final Set<String> FILTERABLE_COLUMN_TYPES = new HashSet<>(Arrays.asList(
+        "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "bit",
+        "decimal", "numeric", "float", "double",
+        "date", "datetime", "timestamp", "time", "year"
+    ));
+
+    /**
+     * 查询表的列信息（列处理页面用，目前仅支持 MySQL 源）。
+     * 返回每列的 name/dataType/columnType/primaryKey/filterable。
+     */
+    public List<java.util.Map<String, Object>> listColumns(String connectionStr, String database, String table) {
+        ParsedConnection conn = parseConnection(connectionStr);
+        if (conn.isMongo() || conn.isPostgresql() || conn.isOracle() || conn.isElastic()) {
+            throw new RuntimeException("列处理目前仅支持 MySQL 数据源");
+        }
+        List<java.util.Map<String, Object>> columns = new ArrayList<>();
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+            try (Connection connection = DataSourcePoolManager.getConnection(
+                    buildJdbcUrl(conn, database), conn.username, conn.password);
+                 PreparedStatement stmt = connection.prepareStatement(
+                     "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLUMN_KEY FROM information_schema.COLUMNS " +
+                     "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION")) {
+                stmt.setString(1, database);
+                stmt.setString(2, table);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        java.util.Map<String, Object> col = new java.util.LinkedHashMap<>();
+                        String dataType = rs.getString("DATA_TYPE");
+                        col.put("name", rs.getString("COLUMN_NAME"));
+                        col.put("dataType", dataType);
+                        col.put("columnType", rs.getString("COLUMN_TYPE"));
+                        col.put("primaryKey", "PRI".equalsIgnoreCase(rs.getString("COLUMN_KEY")));
+                        col.put("filterable", dataType != null
+                                && FILTERABLE_COLUMN_TYPES.contains(dataType.toLowerCase()));
+                        columns.add(col);
+                    }
+                }
+            }
+            logger.info("表 {}.{} 查询到 {} 个列", database, table, columns.size());
+        } catch (SQLException e) {
+            logger.error("查询列信息失败: {}", e.getMessage());
+            throw new RuntimeException("查询列信息失败: " + e.getMessage());
+        } catch (ClassNotFoundException e) {
+            throw new RuntimeException("数据库驱动未找到: " + e.getMessage());
+        }
+        return columns;
+    }
+
     public List<TableInfo> listTables(String connectionStr, String database) {
         ParsedConnection conn = parseConnection(connectionStr);
 

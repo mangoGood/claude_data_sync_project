@@ -175,6 +175,11 @@ public class ConfigService {
         Map<String, String> collectedTableMappings = new java.util.LinkedHashMap<>();
         // 库名映射（entry 的 targetDb，表级/库级均可携带）：key = 源库，value = 目标库
         Map<String, String> collectedDbMappings = new java.util.LinkedHashMap<>();
+        // 列处理（仅表级同步 entry 携带，mysql→mysql）：key = "<源库>.<源表>"，
+        // value 为 ColumnProcessingConfig 约定的序列化串（filter: 列|op|值; mapping: 源列:目标列; extra: 名:类型[:值]）
+        Map<String, String> collectedColumnFilters = new java.util.LinkedHashMap<>();
+        Map<String, String> collectedColumnMappings = new java.util.LinkedHashMap<>();
+        Map<String, String> collectedExtraColumns = new java.util.LinkedHashMap<>();
         boolean syncObjectsUpdated = false;
 
         if (taskMessage.getSyncObjects() != null && !taskMessage.getSyncObjects().isEmpty()) {
@@ -252,6 +257,8 @@ public class ConfigService {
                             collectedTableMappings.put(dbName + "." + srcTable, tgtTable);
                         }
                     }
+                    collectColumnProcessing(dbName, dbValue,
+                            collectedColumnFilters, collectedColumnMappings, collectedExtraColumns);
                 }
             }
 
@@ -329,6 +336,30 @@ public class ConfigService {
                         (tgtDbName != null && !tgtDbName.isEmpty()) ? tgtDbName : srcDb);
                 props.setProperty("schema.mapping.table." + srcDbTable, effectiveTargetDb + "." + m.getValue());
                 logger.info("表名映射已配置: {} -> {}.{}", srcDbTable, effectiveTargetDb, m.getValue());
+            }
+        }
+
+        // 列处理（仅表级同步、mysql→mysql）：column.filter./column.mapping./column.extra.<源库>.<源表>，
+        // 供全量（建表列改名/附加列、SELECT 过滤、INSERT 列映射）与增量（DML 行过滤/列改名）消费。
+        // 重新下发同步对象时先清旧键，避免改配置后残留失效的列处理。
+        if (syncObjectsUpdated) {
+            for (String name : props.stringPropertyNames()) {
+                if (name.startsWith("column.filter.") || name.startsWith("column.mapping.")
+                        || name.startsWith("column.extra.")) {
+                    props.remove(name);
+                }
+            }
+            for (Map.Entry<String, String> m : collectedColumnFilters.entrySet()) {
+                props.setProperty("column.filter." + m.getKey(), m.getValue());
+                logger.info("列过滤已配置: {} -> {}", m.getKey(), m.getValue());
+            }
+            for (Map.Entry<String, String> m : collectedColumnMappings.entrySet()) {
+                props.setProperty("column.mapping." + m.getKey(), m.getValue());
+                logger.info("列名映射已配置: {} -> {}", m.getKey(), m.getValue());
+            }
+            for (Map.Entry<String, String> m : collectedExtraColumns.entrySet()) {
+                props.setProperty("column.extra." + m.getKey(), m.getValue());
+                logger.info("附加列已配置: {} -> {}", m.getKey(), m.getValue());
             }
         }
 
@@ -516,6 +547,108 @@ public class ConfigService {
         createLogbackConfig(taskDir, taskId);
         
         logger.info("Config file updated successfully for task: {}", taskId);
+    }
+
+    private static final java.util.regex.Pattern IDENTIFIER_PATTERN =
+            java.util.regex.Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*");
+    private static final java.util.Set<String> FILTER_OPS =
+            java.util.Set.of("<", "<=", ">", ">=", "=", "!=");
+    /** CUSTOM 附加列输入值白名单：字母数字与 _-.，禁止引号/@/分隔符（值会拼进建表 DEFAULT 字面量） */
+    private static final java.util.regex.Pattern CUSTOM_VALUE_PATTERN =
+            java.util.regex.Pattern.compile("[A-Za-z0-9_.\\-]{1,128}");
+
+    /**
+     * 解析单库 entry 的列处理配置（columnFilter/columnMapping/extraColumns，仅表级同步 entry 携带），
+     * 校验后序列化为 {@code com.migration.config.ColumnProcessingConfig} 约定的属性值格式。
+     * 非法项跳过并告警，不阻断任务下发。
+     *
+     * <p>JSON 形如：{@code {"columnFilter":{"t1":[{"column":"c1","op":"<","value":"1"}]},
+     * "columnMapping":{"t1":{"a":"b"}},
+     * "extraColumns":{"t1":[{"name":"ct","kind":"CREATE_TIME"},{"name":"src","kind":"CUSTOM","value":"v1"}]}}}
+     */
+    private void collectColumnProcessing(String dbName, Map<?, ?> dbValue,
+                                         Map<String, String> outFilters,
+                                         Map<String, String> outMappings,
+                                         Map<String, String> outExtras) {
+        Object filterObj = dbValue.get("columnFilter");
+        if (filterObj instanceof Map) {
+            for (Map.Entry<?, ?> t : ((Map<?, ?>) filterObj).entrySet()) {
+                String table = String.valueOf(t.getKey());
+                if (!(t.getValue() instanceof List)) continue;
+                StringBuilder sb = new StringBuilder();
+                for (Object item : (List<?>) t.getValue()) {
+                    if (!(item instanceof Map)) continue;
+                    Map<?, ?> f = (Map<?, ?>) item;
+                    String col = String.valueOf(f.get("column"));
+                    String op = String.valueOf(f.get("op"));
+                    String value = String.valueOf(f.get("value"));
+                    if (!IDENTIFIER_PATTERN.matcher(col).matches() || !FILTER_OPS.contains(op)
+                            || value.isEmpty() || value.contains("|") || value.contains(";")
+                            || value.contains("'") || value.length() > 64) {
+                        logger.warn("忽略非法列过滤条件: {}.{} [{} {} {}]", dbName, table, col, op, value);
+                        continue;
+                    }
+                    if (sb.length() > 0) sb.append(";");
+                    sb.append(col).append("|").append(op).append("|").append(value);
+                }
+                if (sb.length() > 0) {
+                    outFilters.put(dbName + "." + table, sb.toString());
+                }
+            }
+        }
+
+        Object mappingObj = dbValue.get("columnMapping");
+        if (mappingObj instanceof Map) {
+            for (Map.Entry<?, ?> t : ((Map<?, ?>) mappingObj).entrySet()) {
+                String table = String.valueOf(t.getKey());
+                if (!(t.getValue() instanceof Map)) continue;
+                StringBuilder sb = new StringBuilder();
+                for (Map.Entry<?, ?> m : ((Map<?, ?>) t.getValue()).entrySet()) {
+                    String src = String.valueOf(m.getKey());
+                    String tgt = String.valueOf(m.getValue());
+                    if (src.isEmpty() || tgt.isEmpty() || src.equals(tgt)) continue;
+                    if (!IDENTIFIER_PATTERN.matcher(src).matches() || !IDENTIFIER_PATTERN.matcher(tgt).matches()) {
+                        logger.warn("忽略非法列名映射: {}.{} [{} -> {}]", dbName, table, src, tgt);
+                        continue;
+                    }
+                    if (sb.length() > 0) sb.append(",");
+                    sb.append(src).append(":").append(tgt);
+                }
+                if (sb.length() > 0) {
+                    outMappings.put(dbName + "." + table, sb.toString());
+                }
+            }
+        }
+
+        Object extraObj = dbValue.get("extraColumns");
+        if (extraObj instanceof Map) {
+            for (Map.Entry<?, ?> t : ((Map<?, ?>) extraObj).entrySet()) {
+                String table = String.valueOf(t.getKey());
+                if (!(t.getValue() instanceof List)) continue;
+                StringBuilder sb = new StringBuilder();
+                for (Object item : (List<?>) t.getValue()) {
+                    if (!(item instanceof Map)) continue;
+                    Map<?, ?> e = (Map<?, ?>) item;
+                    String name = String.valueOf(e.get("name"));
+                    String kind = String.valueOf(e.get("kind")).toUpperCase();
+                    String value = e.get("value") != null ? String.valueOf(e.get("value")) : "";
+                    boolean kindOk = "CREATE_TIME".equals(kind) || "UPDATE_TIME".equals(kind) || "CUSTOM".equals(kind);
+                    if (!IDENTIFIER_PATTERN.matcher(name).matches() || !kindOk
+                            || ("CUSTOM".equals(kind) && !CUSTOM_VALUE_PATTERN.matcher(value).matches())) {
+                        logger.warn("忽略非法附加列: {}.{} [{} {} {}]", dbName, table, name, kind, value);
+                        continue;
+                    }
+                    if (sb.length() > 0) sb.append(",");
+                    sb.append(name).append(":").append(kind);
+                    if ("CUSTOM".equals(kind)) {
+                        sb.append(":").append(value);
+                    }
+                }
+                if (sb.length() > 0) {
+                    outExtras.put(dbName + "." + table, sb.toString());
+                }
+            }
+        }
     }
 
     /**

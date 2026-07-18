@@ -25,6 +25,8 @@ public class MigrationConfig {
     private Set<String> dbLevelDatabases;
     /** 表名映射："源库.源表" → 目标表名（仅表级同步配置，空 map = 无映射） */
     private Map<String, String> tableNameMapping;
+    /** 列处理配置（列过滤/列名映射/附加列，仅表级同步下发；无配置时为空实例） */
+    private ColumnProcessingConfig columnProcessingConfig;
     private String checkpointDbPath;
     private String taskId;
     private String sourceDbType;
@@ -121,7 +123,10 @@ public class MigrationConfig {
             }
         }
         
-        String defaultCheckpointPath = taskId != null ? 
+        // 列处理（仅表级同步下发，mysql→mysql）：column.filter./column.mapping./column.extra.<源库>.<源表>
+        columnProcessingConfig = ColumnProcessingConfig.loadFromProperties(props);
+
+        String defaultCheckpointPath = taskId != null ?
             "./files/" + taskId + "/checkpoint/checkpoint" : "./checkpoint/checkpoint";
         checkpointDbPath = props.getProperty("migration.checkpoint.db.path", defaultCheckpointPath);
     }
@@ -217,7 +222,12 @@ public class MigrationConfig {
     public Map<String, String> getTableNameMapping() {
         return tableNameMapping != null ? tableNameMapping : Collections.emptyMap();
     }
-    
+
+    /** 列处理配置（列过滤/列名映射/附加列）；未配置返回空实例。 */
+    public ColumnProcessingConfig getColumnProcessingConfig() {
+        return columnProcessingConfig != null ? columnProcessingConfig : new ColumnProcessingConfig();
+    }
+
     public String getCheckpointDbPath() {
         return checkpointDbPath;
     }

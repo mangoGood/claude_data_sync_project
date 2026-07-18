@@ -26,6 +26,8 @@ public class SchemaMigration {
     private SqlDialect targetDialect;
     // 跨库类型翻译器：按源→目标库对生成建表 DDL（取代散落的 createTableFromXToY 分发）
     private TypeTranslator translator;
+    // 列处理（仅表级同步、mysql→mysql）：建表期列名改写 + 附加列（DEFAULT 子句承载时间/来源语义）
+    private com.migration.config.ColumnProcessingConfig columnProcessing;
 
     public SchemaMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection, boolean dropTables) {
         this.sourceConnection = sourceConnection;
@@ -37,6 +39,18 @@ public class SchemaMigration {
         this.isPostgresql = targetIsPostgresql;
         this.targetDialect = SqlDialect.forType(targetConnection.getConfig().getDbType());
         this.translator = TypeTranslator.forPair(sourceConnection.getConfig().getDbType(), targetConnection.getConfig().getDbType());
+    }
+
+    /** 注入列处理配置（未注入 = 无列处理，行为与既有逻辑完全一致）。 */
+    public void setColumnProcessing(com.migration.config.ColumnProcessingConfig columnProcessing) {
+        this.columnProcessing = columnProcessing;
+    }
+
+    /** 列处理仅在 mysql→mysql 同构链路生效（其余库对建表路径不改动）。 */
+    private boolean columnProcessingApplicable() {
+        return columnProcessing != null && !columnProcessing.isEmpty()
+                && "mysql".equalsIgnoreCase(sourceConnection.getConfig().getDbType())
+                && "mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType());
     }
 
     public void migrateAllTables(List<TableInfo> tables) throws SQLException {
@@ -97,8 +111,66 @@ public class SchemaMigration {
         }
         createSql = cleanCreateSql(createSql);
         createSql = renameTableInCreateSql(createSql, table.getTableName(), table.getTargetTableName());
+        if (columnProcessingApplicable()) {
+            String srcDb = sourceConnection.getConfig().getDatabase();
+            createSql = rewriteColumnNamesInCreateSql(createSql, srcDb, table.getTableName());
+            createSql = appendExtraColumnsToCreateSql(createSql, srcDb, table.getTableName());
+        }
         targetConnection.execute(createSql);
         logger.debug("已创建表: {}", table.getTargetTableName());
+    }
+
+    /**
+     * 列名映射：把 CREATE TABLE 定义体内的源列名改写为目标列名（不改类型）。
+     * SHOW CREATE TABLE 的列名/索引列引用均为反引号包裹，整体替换 `src` → `tgt` 可同时
+     * 覆盖列定义与 PRIMARY KEY/KEY 里的列引用；只处理首个 '(' 之后的定义体，
+     * 避免误伤语句头的表名（表名与列名同名时）。
+     */
+    private String rewriteColumnNamesInCreateSql(String createSql, String srcDb, String srcTable) {
+        java.util.Map<String, String> mapping = columnProcessing.getColumnMapping(srcDb, srcTable);
+        if (mapping.isEmpty()) {
+            return createSql;
+        }
+        int bodyStart = createSql.indexOf('(');
+        if (bodyStart < 0) {
+            logger.warn("CREATE TABLE 语句无定义体，列名映射未生效: {}.{}", srcDb, srcTable);
+            return createSql;
+        }
+        String head = createSql.substring(0, bodyStart);
+        String body = createSql.substring(bodyStart);
+        for (java.util.Map.Entry<String, String> e : mapping.entrySet()) {
+            body = body.replace("`" + e.getKey() + "`", "`" + e.getValue() + "`");
+        }
+        return head + body;
+    }
+
+    /**
+     * 附加列：在 CREATE TABLE 定义体末尾追加列定义。
+     * SHOW CREATE TABLE 输出的定义体闭括号固定独占一行（"\n) ENGINE=..."），锚定该位置插入；
+     * CREATE_TIME/UPDATE_TIME 由 DATETIME DEFAULT/ON UPDATE CURRENT_TIMESTAMP 承载语义，
+     * CUSTOM 为常量 DEFAULT '输入值@源库@源表'，全量与增量 INSERT 均无需注值。
+     */
+    private String appendExtraColumnsToCreateSql(String createSql, String srcDb, String srcTable) {
+        java.util.List<com.migration.config.ColumnProcessingConfig.ExtraColumn> extraColumns =
+                columnProcessing.getExtraColumns(srcDb, srcTable);
+        if (extraColumns.isEmpty()) {
+            return createSql;
+        }
+        int closeIdx = createSql.lastIndexOf("\n)");
+        if (closeIdx < 0) {
+            // 兜底：非 SHOW CREATE TABLE 排版（如手写单行 DDL），取最后一个闭括号
+            closeIdx = createSql.lastIndexOf(')');
+            if (closeIdx < 0) {
+                logger.warn("CREATE TABLE 语句未找到定义体闭括号，附加列未生效: {}.{}", srcDb, srcTable);
+                return createSql;
+            }
+        }
+        StringBuilder defs = new StringBuilder();
+        for (com.migration.config.ColumnProcessingConfig.ExtraColumn extra : extraColumns) {
+            defs.append(",\n  ").append(extra.toMysqlColumnDef(srcDb, srcTable));
+        }
+        logger.info("附加列已加入建表语句: {}.{} 共 {} 列", srcDb, srcTable, extraColumns.size());
+        return createSql.substring(0, closeIdx) + defs + createSql.substring(closeIdx);
     }
 
     /**

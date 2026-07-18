@@ -37,6 +37,8 @@ public class ValidationTaskController {
                 // 前端按源/目标类型过滤内容对比支持范围（仅同构 SQL 任务支持内容对比）
                 map.put("sourceType", w.getSourceType() != null ? w.getSourceType() : "mysql");
                 map.put("targetType", w.getTargetType() != null ? w.getTargetType() : "mysql");
+                // 列处理任务（列过滤/列名映射/附加列）不支持行数/内容对比，前端据此隐藏并提示
+                map.put("hasColumnProcessing", validationTaskService.hasColumnProcessing(w.getSyncObjects()));
                 map.put("createdAt", w.getCreatedAt());
                 return map;
             }).collect(Collectors.toList());
