@@ -619,37 +619,7 @@ public class WorkflowService {
         boolean incrementStarted = Boolean.TRUE.equals(workflow.getIncrementStarted());
         
         if (incrementStarted) {
-            workflow.setStatus(WorkflowStatus.STARTING);
-            workflow.setIsBilling(true);
-            workflow.setErrorMessage(null);
-            workflow.setErrorCode(null);
-            workflow.setCompletedAt(null);
-            workflowRepository.save(workflow);
-            
-            addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务恢复中，增量同步曾已启动，将从增量位点继续同步");
-            
-            TaskCreatedMessage message = new TaskCreatedMessage();
-            message.setTaskId(workflow.getId());
-            message.setTaskName(workflow.getName());
-            message.setUserId(workflow.getUserId());
-            message.setSourceConnection(workflow.getSourceConnection());
-            message.setTargetConnection(workflow.getTargetConnection());
-            message.setMigrationMode(workflow.getMigrationMode());
-            message.setSyncObjects(parseSyncObjects(workflow.getSyncObjects()));
-            message.setSourceDbName(workflow.getSourceDbName());
-            message.setTargetDbName(workflow.getTargetDbName());
-            message.setCreatedAt(workflow.getCreatedAt());
-            message.setMessageType("resume");
-            message.setCurrentStatus("INCREMENT_RUNNING");
-            message.setSourceType(workflow.getSourceType());
-            message.setTargetType(workflow.getTargetType());
-            
-            try {
-                kafkaProducerService.sendControlMessage(message);
-                addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务恢复消息已发送到 Kafka（跳过全量同步，从增量位点继续）");
-            } catch (Exception e) {
-                addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
-            }
+            resumeIncrementWorkflow(workflow, null, null);
         } else {
             workflow.setStatus(WorkflowStatus.PENDING);
             workflow.setProgress(0);
@@ -682,6 +652,130 @@ public class WorkflowService {
         // resume 语义会处理影子当前处于 PAUSED 的情形；仍是 CONFIGURING（尚未进过增量）
         // 则等主任务进 INCREMENT_RUNNING 时由状态消费者自动首启（cascadeBidiShadow 内已判断）。
         cascadeBidiShadow(workflow, "resume");
+    }
+
+    /** 增量任务恢复：状态置 STARTING 并发 resume 控制消息（skip 参数非空时随消息下发人工裁决跳过清单）。 */
+    private void resumeIncrementWorkflow(Workflow workflow, String skipSeqnos, String skipEventIds) {
+        workflow.setStatus(WorkflowStatus.STARTING);
+        workflow.setIsBilling(true);
+        workflow.setErrorMessage(null);
+        workflow.setErrorCode(null);
+        workflow.setCompletedAt(null);
+        workflowRepository.save(workflow);
+
+        addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务恢复中，增量同步曾已启动，将从增量位点继续同步");
+
+        TaskCreatedMessage message = new TaskCreatedMessage();
+        message.setTaskId(workflow.getId());
+        message.setTaskName(workflow.getName());
+        message.setUserId(workflow.getUserId());
+        message.setSourceConnection(workflow.getSourceConnection());
+        message.setTargetConnection(workflow.getTargetConnection());
+        message.setMigrationMode(workflow.getMigrationMode());
+        message.setSyncObjects(parseSyncObjects(workflow.getSyncObjects()));
+        message.setSourceDbName(workflow.getSourceDbName());
+        message.setTargetDbName(workflow.getTargetDbName());
+        message.setCreatedAt(workflow.getCreatedAt());
+        message.setMessageType("resume");
+        message.setCurrentStatus("INCREMENT_RUNNING");
+        message.setSourceType(workflow.getSourceType());
+        message.setTargetType(workflow.getTargetType());
+        if (skipSeqnos != null && !skipSeqnos.isEmpty()) {
+            message.setSkipSeqnos(skipSeqnos);
+        }
+        if (skipEventIds != null && !skipEventIds.isEmpty()) {
+            message.setSkipEventIds(skipEventIds);
+        }
+
+        try {
+            kafkaProducerService.sendControlMessage(message);
+            addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务恢复消息已发送到 Kafka（跳过全量同步，从增量位点继续）");
+        } catch (Exception e) {
+            addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
+        }
+    }
+
+    private static final java.util.regex.Pattern FAILED_SEQNO_PATTERN =
+            java.util.regex.Pattern.compile("seqno=(\\d+)");
+    /** 错误信息里的稳定事件身份（binlog文件:位点）——resume 后 capture 重读 binlog 会重新分配 seqno，跳过必须按 eventId */
+    private static final java.util.regex.Pattern FAILED_EVENT_ID_PATTERN =
+            java.util.regex.Pattern.compile("eventId=([^\\]\\s]+)");
+
+    /**
+     * 人工裁决：跳过失败的增量事件并恢复任务。fail-stop 后运维确认该事件无法/无需修复
+     * （如目标端已人工处理、脏事件不可重放）时使用；被跳过的事件由增量进程记入死信
+     * （files/&lt;taskId&gt;/deadletter.jsonl），可经 GET /api/workflows/{id}/deadletter 查看。
+     */
+    @Transactional
+    public long skipEventAndRetry(String id, Long userId, Long seqno) {
+        Workflow workflow = getWorkflowById(id, userId);
+
+        if (workflow.getStatus() != WorkflowStatus.FAILED) {
+            throw new RuntimeException("只能对失败状态的任务跳过事件，当前状态: " + workflow.getStatus().name());
+        }
+        if (!Boolean.TRUE.equals(workflow.getIncrementStarted())) {
+            throw new RuntimeException("该任务未进入过增量同步，无失败增量事件可跳过（全量失败请直接重试）");
+        }
+
+        String errorMessage = workflow.getErrorMessage();
+        // 稳定身份优先：eventId（binlog文件:位点）跨重启不变；seqno 在 resume 重新提取后会变，
+        // 只按 seqno 跳过会永不收敛（同一毒事件每次重启换一个 seqno 再次失败）
+        String eventId = null;
+        if (errorMessage != null) {
+            java.util.regex.Matcher em = FAILED_EVENT_ID_PATTERN.matcher(errorMessage);
+            if (em.find()) {
+                eventId = em.group(1);
+            }
+        }
+        if (seqno == null) {
+            if (errorMessage != null) {
+                java.util.regex.Matcher m = FAILED_SEQNO_PATTERN.matcher(errorMessage);
+                if (m.find()) {
+                    seqno = Long.parseLong(m.group(1));
+                }
+            }
+            if (seqno == null && eventId == null) {
+                throw new RuntimeException("无法从错误信息中定位失败事件（无 eventId/seqno），请在请求中显式指定 seqno");
+            }
+        }
+
+        addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING,
+                "人工裁决：跳过失败事件 " + (eventId != null ? "eventId=" + eventId + " " : "")
+                        + (seqno != null ? "seqno=" + seqno : "")
+                        + " 并恢复任务，该事件将不被应用并记入死信记录");
+        // 有 eventId 时只按 eventId 跳过：seqno 重启后会重新分配，附带下发可能误跳到无辜事件；
+        // 仅当错误信息没有 eventId（老格式）时才退回 seqno
+        resumeIncrementWorkflow(workflow, eventId == null && seqno != null ? String.valueOf(seqno) : null, eventId);
+        cascadeBidiShadow(workflow, "resume");
+        return seqno != null ? seqno : -1L;
+    }
+
+    /** 死信记录查询：代理 agent 的 /api/agent/deadletter/{taskId}（先做属主校验）。 */
+    public Map<String, Object> getDeadletterRecords(String id, Long userId) {
+        getWorkflowById(id, userId);
+
+        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentToken = System.getenv("AGENT_API_TOKEN");
+        try {
+            java.net.URL url = new java.net.URL(agentBase + "/api/agent/deadletter/" + id);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            if (agentToken != null && !agentToken.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + agentToken);
+            }
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(10000);
+            if (conn.getResponseCode() != 200) {
+                throw new RuntimeException("agent 返回状态 " + conn.getResponseCode());
+            }
+            try (java.io.InputStream is = conn.getInputStream()) {
+                String body = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                Type type = new TypeToken<Map<String, Object>>() {}.getType();
+                return gson.fromJson(body, type);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("查询死信记录失败（agent 不可达或未运行）: " + e.getMessage());
+        }
     }
 
     private Map<String, Object> parseSyncObjects(String syncObjects) {

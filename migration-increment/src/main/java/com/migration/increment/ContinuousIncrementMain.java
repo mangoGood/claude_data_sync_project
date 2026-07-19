@@ -70,6 +70,16 @@ public class ContinuousIncrementMain {
     /** 已处理THL文件保留数量（安全余量），超过此数量的已处理文件将被清理 */
     private int thlRetentionCount = 2;
 
+    /**
+     * 人工裁决跳过的事件（fail-stop 后运维确认无法/无需修复时，经后端"跳过失败事件并重试"下发；
+     * 命中的事件不应用、写死信记录后推进位点）。
+     * 首选按 eventId（binlog文件:位点，increment.skip.event.ids）匹配——resume 后 capture 重读
+     * binlog 会给同一事件重新分配 seqno，seqno 跨重启不稳定；seqno 集（increment.skip.seqnos）
+     * 仅作为老错误信息（不带 eventId）的兼容兜底。
+     */
+    private final java.util.Set<Long> skipSeqnos = new java.util.HashSet<>();
+    private final java.util.Set<String> skipEventIds = new java.util.HashSet<>();
+
     public static void main(String[] args) {
         com.migration.common.OracleNetCompat.apply();
         logger.info("=== 增量同步服务启动 ===");
@@ -167,6 +177,27 @@ public class ContinuousIncrementMain {
         progressFile = "./files/" + taskId + "/checkpoint/.increment_progress";
         tableLatencyDir = "./files/" + taskId + "/binlog_output/table_latency";
         thlRetentionCount = Integer.parseInt(props.getProperty("increment.thl.retention.count", "2"));
+
+        String skipSeqnosProp = props.getProperty("increment.skip.seqnos", "").trim();
+        if (!skipSeqnosProp.isEmpty()) {
+            for (String s : skipSeqnosProp.split(",")) {
+                try {
+                    skipSeqnos.add(Long.parseLong(s.trim()));
+                } catch (NumberFormatException nfe) {
+                    logger.warn("忽略非法的跳过 seqno: {}", s);
+                }
+            }
+        }
+        String skipEventIdsProp = props.getProperty("increment.skip.event.ids", "").trim();
+        if (!skipEventIdsProp.isEmpty()) {
+            for (String s : skipEventIdsProp.split(",")) {
+                if (!s.trim().isEmpty()) skipEventIds.add(s.trim());
+            }
+        }
+        if (!skipSeqnos.isEmpty() || !skipEventIds.isEmpty()) {
+            logger.warn("人工裁决跳过事件已配置: eventIds={}, seqnos={}（命中事件不应用，写死信记录后推进位点）",
+                    skipEventIds, skipSeqnos);
+        }
         ensureDirExists(tableLatencyDir);
         // 初始化 THL 加密服务
         this.thlEncryptionService = new ThlEncryptionService(props);
@@ -434,6 +465,24 @@ public class ContinuousIncrementMain {
                     continue;
                 }
 
+                // 人工裁决跳过：命中 eventId（跨重启稳定）或 seqno（老错误信息兼容）的事件不应用，
+                // 写死信记录后按正常事件推进位点。放在转换之前——毒事件可能在转换阶段就抛异常，
+                // 转换只在死信记录里尽力而为
+                if ((!skipEventIds.isEmpty() && event.getEventId() != null && skipEventIds.contains(event.getEventId()))
+                        || (!skipSeqnos.isEmpty() && skipSeqnos.contains(event.getSeqno()))) {
+                    recordDeadLetter(event);
+                    lastExecutedSeqno = event.getSeqno();
+                    String skipBinlogFile = (String) event.getMetadata("binlog_file");
+                    Long skipBinlogPosition = (Long) event.getMetadata("binlog_position");
+                    checkpointManager.saveCheckpoint(
+                            event.getSeqno(),
+                            skipBinlogFile != null ? skipBinlogFile : "",
+                            skipBinlogPosition != null ? skipBinlogPosition : 0,
+                            event.getEventId() != null ? event.getEventId() : ""
+                    );
+                    continue;
+                }
+
                 // 类型化值管道优先（mysql→pg 且事件带 rows_typed）；不适用返回 null 走文本路径
                 List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
                 List<String> sqlStatements = (typedDmls == null)
@@ -488,13 +537,13 @@ public class ContinuousIncrementMain {
                                     } catch (SQLException retryEx) {
                                         txFailed = true;
                                         logger.error("重连后参数化SQL重试失败 (seqno={}): {}", event.getSeqno(), retryEx.getMessage());
-                                        writeErrorStatus("E3004", "不可恢复的SQL错误: " + retryEx.getMessage(), event.getSeqno());
+                                        writeErrorStatus("E3004", "不可恢复的SQL错误: " + retryEx.getMessage(), event);
                                         break;
                                     }
                                 } else {
                                     txFailed = true;
                                     logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}", event.getSeqno(), dml, errorMsg);
-                                    writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event.getSeqno());
+                                    writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event);
                                     break;
                                 }
                             }
@@ -534,7 +583,7 @@ public class ContinuousIncrementMain {
                             if (!isRecoverable) {
                                 txFailed = true;
                                 logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}", event.getSeqno(), sql.substring(0, Math.min(200, sql.length())), errorMsg);
-                                writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event.getSeqno());
+                                writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event);
                                 break;
                             }
                         }
@@ -979,10 +1028,113 @@ public class ContinuousIncrementMain {
         }
     }
 
+    /** 已写过死信的 eventId（分带SQL/仅元数据两类）：resume 重放 binlog 会反复命中同一跳过事件，按类去重避免重复追加。 */
+    private final java.util.Set<String> deadletterRecordedSql = new java.util.HashSet<>();
+    private final java.util.Set<String> deadletterRecordedMeta = new java.util.HashSet<>();
+    private boolean deadletterIndexLoaded = false;
+
+    /** 启动后首次写死信前，把既有 deadletter.jsonl 中的 eventId 载入去重索引（跨进程重启防重）。 */
+    private void loadDeadletterIndex() {
+        deadletterIndexLoaded = true;
+        File dlFile = new File("./files/" + taskId + "/deadletter.jsonl");
+        if (!dlFile.exists()) return;
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile("\"eventId\":\"([^\"]*)\"");
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(dlFile), java.nio.charset.StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                java.util.regex.Matcher m = p.matcher(line);
+                if (m.find() && !m.group(1).isEmpty()) {
+                    if (line.contains("\"statements\":[]")) deadletterRecordedMeta.add(m.group(1));
+                    else deadletterRecordedSql.add(m.group(1));
+                }
+            }
+        } catch (IOException e) {
+            logger.warn("读取既有死信记录失败（去重索引不完整，可能出现重复记录）: {}", e.getMessage());
+        }
+    }
+
     /**
-     * 写入错误状态文件，供 agent 监控循环检测并上报 FAILED 状态。
+     * 死信记录：人工裁决跳过的事件逐条追加到 files/<taskId>/deadletter.jsonl（每行一个 JSON 对象），
+     * 供 agent HTTP /api/agent/deadletter/<taskId> 读取、后端代理给 UI 展示。
+     * SQL 为尽力转换（毒事件可能在转换阶段就失败，此时只记事件元数据）。
+     * 同一 eventId 带SQL/仅元数据各至多记录一次——resume 重放会反复命中已跳过事件。
      */
-    private void writeErrorStatus(String errorCode, String errorMessage, long seqno) {
+    private void recordDeadLetter(THLEvent event) {
+        if (!deadletterIndexLoaded) {
+            loadDeadletterIndex();
+        }
+        List<String> statements = java.util.Collections.emptyList();
+        try {
+            statements = sqlConverter.convertToSql(event);
+        } catch (Exception e) {
+            logger.warn("死信事件 SQL 转换失败 (seqno={})，仅记录元数据: {}", event.getSeqno(), e.getMessage());
+        }
+        String eid = event.getEventId();
+        if (eid != null && !eid.isEmpty()) {
+            boolean firstOfKind = statements.isEmpty()
+                    ? deadletterRecordedMeta.add(eid)
+                    : deadletterRecordedSql.add(eid);
+            if (!firstOfKind) {
+                logger.info("死信已记录过 (eventId={}, seqno={})，跳过重复写入", eid, event.getSeqno());
+                return;
+            }
+        }
+        StringBuilder sb = new StringBuilder(256);
+        sb.append('{')
+          .append("\"ts\":").append(System.currentTimeMillis()).append(',')
+          .append("\"seqno\":").append(event.getSeqno()).append(',')
+          .append("\"eventId\":\"").append(jsonEscape(event.getEventId())).append("\",")
+          .append("\"eventType\":\"").append(jsonEscape(String.valueOf(event.getMetadata("event_type")))).append("\",")
+          .append("\"tableName\":\"").append(jsonEscape(String.valueOf(event.getMetadata("table_name")))).append("\",")
+          .append("\"binlogFile\":\"").append(jsonEscape(String.valueOf(event.getMetadata("binlog_file")))).append("\",")
+          .append("\"binlogPosition\":\"").append(jsonEscape(String.valueOf(event.getMetadata("binlog_position")))).append("\",")
+          .append("\"reason\":\"manual-skip\",")
+          .append("\"statements\":[");
+        for (int i = 0; i < statements.size(); i++) {
+            if (i > 0) sb.append(',');
+            String stmt = statements.get(i);
+            sb.append('"').append(jsonEscape(stmt.length() > 2000 ? stmt.substring(0, 2000) + "…" : stmt)).append('"');
+        }
+        sb.append("]}");
+
+        File dlFile = new File("./files/" + taskId + "/deadletter.jsonl");
+        dlFile.getParentFile().mkdirs();
+        try (PrintWriter pw = new PrintWriter(new FileWriter(dlFile, true))) {
+            pw.println(sb);
+        } catch (IOException e) {
+            logger.error("写入死信记录失败 (seqno={}): {}", event.getSeqno(), e.getMessage());
+        }
+        logger.warn("事件已按人工裁决跳过并记入死信: seqno={}, table={}, statements={}",
+                event.getSeqno(), event.getMetadata("table_name"), statements.size());
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null || "null".equals(s)) return "";
+        StringBuilder out = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': out.append("\\\""); break;
+                case '\\': out.append("\\\\"); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                default:
+                    if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+                    else out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    private void writeErrorStatus(String errorCode, String errorMessage, THLEvent event) {
+        long seqno = event.getSeqno();
+        // eventId（binlog文件:位点）跨重启稳定，嵌入错误信息供后端"跳过失败事件"按稳定身份下发；
+        // seqno 在 resume 重新提取后会变，仅作展示/兼容
+        if (event.getEventId() != null && !event.getEventId().isEmpty()) {
+            errorMessage = "[eventId=" + event.getEventId() + "] " + errorMessage;
+        }
         String metricsDir = "./files/" + taskId + "/binlog_output";
         File dir = new File(metricsDir);
         if (!dir.exists()) {

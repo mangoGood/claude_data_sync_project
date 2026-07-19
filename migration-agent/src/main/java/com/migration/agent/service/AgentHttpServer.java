@@ -81,6 +81,7 @@ public class AgentHttpServer {
             server.createContext("/api/table-latency", this::handleTableLatency);
             server.createContext("/api/fanout", this::handleFanout);
             server.createContext("/api/diagnostics", this::handleDiagnostics);
+            server.createContext("/api/agent/deadletter", this::handleDeadletter);
 
             server.start();
             logger.info("Agent HTTP Server started on port {}", port);
@@ -241,6 +242,52 @@ public class AgentHttpServer {
             }
         } catch (Exception e) {
             logger.error("Error handling metrics request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    /**
+     * 死信记录查询：GET /api/agent/deadletter/{taskId}
+     * 读取增量进程写入的 files/{taskId}/deadletter.jsonl（人工裁决跳过的事件），按行解析返回。
+     */
+    private void handleDeadletter(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+        try {
+            String[] parts = exchange.getRequestURI().getPath().split("/");
+            if (parts.length < 5 || parts[4].isEmpty()) {
+                sendResponse(exchange, 400, Map.of("success", false, "message", "taskId required: /api/agent/deadletter/{taskId}"));
+                return;
+            }
+            String taskId = parts[4];
+            // taskId 来自 URL，拼路径前拦掉路径穿越
+            if (taskId.contains("..") || taskId.contains("/") || taskId.contains("\\")) {
+                sendResponse(exchange, 400, Map.of("success", false, "message", "invalid taskId"));
+                return;
+            }
+            java.io.File dlFile = new java.io.File("./files/" + taskId + "/deadletter.jsonl");
+            java.util.List<Object> records = new java.util.ArrayList<>();
+            if (dlFile.exists()) {
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(new java.io.FileInputStream(dlFile), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.trim().isEmpty()) continue;
+                        try {
+                            records.add(gson.fromJson(line, Map.class));
+                        } catch (Exception parseEx) {
+                            records.add(Map.of("raw", line));
+                        }
+                    }
+                }
+            }
+            sendResponse(exchange, 200, Map.of("success", true, "taskId", taskId, "total", records.size(), "records", records));
+        } catch (Exception e) {
+            logger.error("Error handling deadletter request", e);
             sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
         }
     }

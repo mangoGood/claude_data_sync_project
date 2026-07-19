@@ -537,6 +537,12 @@ public class ConfigService {
         // （best-effort：查询失败或未设配额时不写入，行为与现状一致，不阻塞任务）。
         applyExecutionQuotaLimits(props, taskMessage.getUserId());
 
+        // 人工裁决跳过的增量事件（随 skip-event 的 resume 消息下发）：与已有配置取并集，
+        // 不随 syncObjects 重下发清除——位点越过后残留的键不会再命中，无害。
+        // eventId（binlog文件:位点）是跨重启稳定的首选身份；seqno 仅老错误信息兼容
+        mergeSkipListProperty(props, "increment.skip.event.ids", taskMessage.getSkipEventIds());
+        mergeSkipListProperty(props, "increment.skip.seqnos", taskMessage.getSkipSeqnos());
+
         // 落盘前加密敏感值（口令）：config.properties 不再存明文密码，子进程读取时按 ENC: 前缀解密。
         encryptSensitiveProps(props);
 
@@ -547,6 +553,17 @@ public class ConfigService {
         createLogbackConfig(taskDir, taskId);
         
         logger.info("Config file updated successfully for task: {}", taskId);
+    }
+
+    /** 跳过清单合并：新值与已有属性取并集后写回（保持顺序、去重）；新值为空则不动。 */
+    private void mergeSkipListProperty(java.util.Properties props, String key, String newValues) {
+        if (newValues == null || newValues.trim().isEmpty()) return;
+        java.util.Set<String> merged = new java.util.LinkedHashSet<>();
+        for (String s : (props.getProperty(key, "") + "," + newValues).split(",")) {
+            if (!s.trim().isEmpty()) merged.add(s.trim());
+        }
+        props.setProperty(key, String.join(",", merged));
+        logger.warn("人工裁决跳过事件已写入配置: {}={}", key, String.join(",", merged));
     }
 
     private static final java.util.regex.Pattern IDENTIFIER_PATTERN =

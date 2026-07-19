@@ -3577,6 +3577,9 @@
                 <button class="btn-default" onclick="advDiagnoseTask()">一键诊断</button>
                 <button class="btn-default" onclick="advShowConfigVersions()">配置版本</button>
                 <button class="btn-default" onclick="advCloneTask()">克隆任务</button>
+                <button class="btn-default" onclick="dlShowDeadletter()">死信记录</button>
+                <button class="btn-default" id="dlSkipEventBtn" style="display: none; color: #d93026; border-color: #d93026;"
+                        onclick="dlSkipEventAndRetry()">跳过失败事件并重试</button>
                 <button class="btn-cancel" id="closeDetailBtn">关闭</button>
             </div>
         </div>
@@ -3612,6 +3615,25 @@
             </div>
             <div class="modal-footer">
                 <button class="btn-cancel" onclick="document.getElementById('advConfigVersionModal').classList.remove('show')">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 死信记录模态框（人工裁决跳过的增量事件） -->
+    <div class="modal" id="dlDeadletterModal">
+        <div class="modal-content" style="width: 820px; max-height: 80vh;">
+            <div class="modal-header">
+                <h3 class="modal-title">死信记录</h3>
+                <span class="modal-close" onclick="document.getElementById('dlDeadletterModal').classList.remove('show')">&times;</span>
+            </div>
+            <div class="modal-body" style="max-height: calc(80vh - 140px); overflow-y: auto;">
+                <div style="font-size: 12px; color: #999; margin-bottom: 8px;">
+                    经"跳过失败事件并重试"人工裁决跳过的增量事件会记录在此（未应用到目标库），需人工核对补偿。
+                </div>
+                <div class="adv-table" id="dlDeadletterList"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" onclick="document.getElementById('dlDeadletterModal').classList.remove('show')">关闭</button>
             </div>
         </div>
     </div>
@@ -5497,6 +5519,19 @@
                     const task = result.data;
                     let statusInfo = statusMap[task.status] || statusMap['pending'];
                     const isFullAndIncre = task.migration_mode === 'fullAndIncre';
+
+                    // 死信裁决：失败且错误信息带 seqno= 的（增量失败特征）才显示"跳过失败事件并重试"
+                    _dlFailedSeqno = null;
+                    const dlSkipBtn = document.getElementById('dlSkipEventBtn');
+                    if (dlSkipBtn) {
+                        const seqMatch = /seqno=(\d+)/.exec(task.error_message || '');
+                        if (task.status === 'FAILED' && seqMatch) {
+                            _dlFailedSeqno = parseInt(seqMatch[1], 10);
+                            dlSkipBtn.style.display = '';
+                        } else {
+                            dlSkipBtn.style.display = 'none';
+                        }
+                    }
                     
                     // 全量+增量模式下，FULL_COMPLETED 状态显示为"增量同步中"
                     if (task.status === 'FULL_COMPLETED' && isFullAndIncre) {
@@ -8407,6 +8442,71 @@
             } else {
                 showNotification(d.message || '克隆失败', 'error');
             }
+        }
+
+        // ---------- 失败事件死信裁决 ----------
+
+        // showTaskDetail 时从 error_message 解析出的失败事件 seqno（仅 FAILED+增量失败特征时非空）
+        let _dlFailedSeqno = null;
+
+        window.dlSkipEventAndRetry = async function() {
+            if (!_advDetailTaskId || _dlFailedSeqno === null) return;
+            if (!confirm(`确定跳过失败事件 seqno=${_dlFailedSeqno} 并恢复任务？\n\n该事件将【不会】被应用到目标库，仅记入死信记录；源和目标可能因此产生差异，需人工核对补偿。`)) return;
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${_advDetailTaskId}/skip-event`, {
+                    method: 'POST', headers: getAuthHeaders(),
+                    body: JSON.stringify({ seqno: _dlFailedSeqno })
+                });
+                const d = await resp.json();
+                if (d.success) {
+                    showNotification(d.message || '已跳过事件并恢复任务', 'success');
+                    document.getElementById('taskDetailModal').classList.remove('show');
+                    fetchWorkflows();
+                } else {
+                    showNotification(d.message || '跳过失败', 'error');
+                }
+            } catch (e) {
+                showNotification('跳过失败事件请求异常', 'error');
+            }
+        }
+
+        window.dlShowDeadletter = async function() {
+            if (!_advDetailTaskId) return;
+            const modal = document.getElementById('dlDeadletterModal');
+            const container = document.getElementById('dlDeadletterList');
+            container.innerHTML = '<div class="adv-empty">加载中…</div>';
+            modal.classList.add('show');
+            let d;
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${_advDetailTaskId}/deadletter`);
+                d = await resp.json();
+            } catch (e) {
+                container.innerHTML = '<div class="adv-empty">查询失败：请求异常</div>';
+                return;
+            }
+            if (!d || d.success === false) {
+                container.innerHTML = `<div class="adv-empty">${escapeHtml((d && d.message) || '查询失败')}</div>`;
+                return;
+            }
+            const records = d.records || [];
+            if (records.length === 0) {
+                container.innerHTML = '<div class="adv-empty">暂无死信记录</div>';
+                return;
+            }
+            let rows = '';
+            records.forEach(r => {
+                const stmts = (r.statements || []).map(s => `<div class="adv-sql">${escapeHtml(s)}</div>`).join('');
+                rows += `<tr>
+                    <td>${r.seqno != null ? r.seqno : '-'}</td>
+                    <td style="white-space: nowrap;">${r.ts ? new Date(r.ts).toLocaleString() : '-'}</td>
+                    <td>${escapeHtml(r.tableName || '-')}</td>
+                    <td>${escapeHtml(r.eventType || '-')}</td>
+                    <td style="max-width: 360px;">${stmts || '<span style="color:#999;">（SQL 转换失败，仅存元数据）</span>'}</td>
+                </tr>`;
+            });
+            container.innerHTML = `<table><thead><tr>
+                <th>seqno</th><th>跳过时间</th><th>表</th><th>事件类型</th><th>未应用的 SQL</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
         }
 
         // ---------- 批量操作 ----------

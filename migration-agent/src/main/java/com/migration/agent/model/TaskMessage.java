@@ -32,6 +32,10 @@ public class TaskMessage implements Serializable {
     private String subscribeFormat;
     private Boolean fanoutEnabled;
     private List<DatabaseConfig> targetConnections;
+    /** 人工裁决要跳过的增量事件 seqno（逗号分隔），随 resume 消息下发，写入 increment.skip.seqnos */
+    private String skipSeqnos;
+    /** 人工裁决要跳过的增量事件 eventId（binlog文件:位点，逗号分隔）——跨重启稳定的首选身份，写入 increment.skip.event.ids */
+    private String skipEventIds;
 
     public static class DatabaseConfig {
         private String host;
@@ -271,5 +275,21 @@ public class TaskMessage implements Serializable {
 
     public void setTargetConnections(List<DatabaseConfig> targetConnections) {
         this.targetConnections = targetConnections;
+    }
+
+    public String getSkipSeqnos() {
+        return skipSeqnos;
+    }
+
+    public void setSkipSeqnos(String skipSeqnos) {
+        this.skipSeqnos = skipSeqnos;
+    }
+
+    public String getSkipEventIds() {
+        return skipEventIds;
+    }
+
+    public void setSkipEventIds(String skipEventIds) {
+        this.skipEventIds = skipEventIds;
     }
 }
