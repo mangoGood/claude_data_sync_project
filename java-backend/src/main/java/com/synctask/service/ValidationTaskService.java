@@ -309,11 +309,12 @@ public class ValidationTaskService {
                 }
             }
 
-            // 表名映射（表级同步）：syncObjectsMap 已压平丢失映射，显式补传给对比服务
+            // 表名/库名映射（表级同步）：syncObjectsMap 已压平丢失映射，显式补传给对比服务
             ContentCompareSession session = contentCompareService.startCompare(
                 sourceConnStr, targetConnStr,
                 sourceType, targetType, syncObjectsMap,
-                parseTableMappings(task.getSyncObjects()));
+                parseTableMappings(task.getSyncObjects()),
+                parseDbMappings(task.getSyncObjects()));
 
             addLog(taskId, ValidationTaskLog.LogLevel.INFO, "内容对比会话已创建: " + session.getSessionId());
 
@@ -703,6 +704,33 @@ public class ValidationTaskService {
         return result;
     }
 
+    /**
+     * 解析 syncObjects 里每库 entry 的库名映射（targetDb）：源库 → 目标库。
+     * 压平表清单的解析方法会丢掉它；多库任务的对比目标端必须按源库逐一解析目标库，
+     * 否则全部串到连接串里的单一库/首库上（与全量/增量链路 P0 串库同一性质）。
+     * 优先级与 agent ConfigService 一致：entry.targetDb ＞ 全局 targetDbName ＞ 与源库同名。
+     */
+    private Map<String, String> parseDbMappings(String syncObjectsJson) {
+        Map<String, String> result = new HashMap<>();
+        if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
+            return result;
+        }
+        try {
+            Map<String, Object> raw = gson.fromJson(syncObjectsJson, Map.class);
+            if (raw == null) return result;
+            for (Map.Entry<String, Object> entry : raw.entrySet()) {
+                if (!(entry.getValue() instanceof Map)) continue;
+                Object targetDbObj = ((Map<?, ?>) entry.getValue()).get("targetDb");
+                if (targetDbObj instanceof String && !((String) targetDbObj).isEmpty()) {
+                    result.put(entry.getKey(), (String) targetDbObj);
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("解析库名映射失败: {}", e.getMessage());
+        }
+        return result;
+    }
+
     private Map<String, List<String>> parseSyncObjectsSimple(String syncObjectsJson) {
         if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
             return new HashMap<>();
@@ -811,10 +839,13 @@ public class ValidationTaskService {
 
             // 表名映射（表级同步）：目标端行数按映射后的表名统计
             Map<String, Map<String, String>> tableMappings = parseTableMappings(task.getSyncObjects());
+            // 库名映射：多库任务目标库按源库逐一解析（entry.targetDb ＞ 连接串库名 ＞ 同名）
+            Map<String, String> dbMappings = parseDbMappings(task.getSyncObjects());
 
             for (Map.Entry<String, Map<String, List<String>>> dbEntry : syncObjects.entrySet()) {
                 String sourceDbName = dbEntry.getKey();
-                String targetDbName = targetConn.database != null ? targetConn.database : sourceDbName;
+                String targetDbName = dbMappings.getOrDefault(sourceDbName,
+                    targetConn.database != null ? targetConn.database : sourceDbName);
                 List<String> tables = dbEntry.getValue().get("tables");
 
                 if (tables == null || tables.isEmpty()) continue;
@@ -823,9 +854,10 @@ public class ValidationTaskService {
                 for (String tableName : tables) {
                     String targetTableName = dbTableMapping.getOrDefault(tableName, tableName);
                     totalTables++;
+                    boolean renamed = !targetTableName.equals(tableName) || !targetDbName.equals(sourceDbName);
                     addLog(taskId, ValidationTaskLog.LogLevel.INFO,
                         "行数对比表: " + sourceDbName + "." + tableName
-                            + (targetTableName.equals(tableName) ? "" : " → " + targetTableName));
+                            + (renamed ? " → " + targetDbName + "." + targetTableName : ""));
 
                     try {
                         TableDiffResult diff = compareTableData(
