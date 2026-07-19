@@ -43,6 +43,9 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     private String password;
     private String binlogFile;
     private long binlogPosition;
+    /** GTID 位点（capture.gtid.set，来自 checkpoint 的 gtid_executed 快照）；非空且启用时优先于 file+pos。 */
+    private String gtidSet;
+    private boolean gtidEnabled;
     private String outputDir;
     private String taskId;
     private long serverId;
@@ -91,6 +94,11 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         password = props.getProperty("source.db.password", "");
         binlogFile = props.getProperty("capture.binlog.file", "");
         binlogPosition = Long.parseLong(props.getProperty("capture.binlog.position", "4"));
+        // GTID 位点：gtid_executed 快照与 file+pos 在同一时刻记录（CheckpointManager），
+        // 有 GTID 集且未显式关闭时优先按 GTID 自动定位——源端 HA 切换/binlog 文件名变化时
+        // file+pos 失效而 GTID 仍然有效。gtid_executed 原文可能含换行，需归一化。
+        gtidEnabled = Boolean.parseBoolean(props.getProperty("capture.gtid.enabled", "true"));
+        gtidSet = props.getProperty("capture.gtid.set", "").replaceAll("\\s+", "");
         outputDir = props.getProperty("capture.output.dir", "binlog_output");
         taskId = props.getProperty("task.id", "unknown");
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
@@ -328,7 +336,12 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         eventDeserializer.setCompatibilityMode(
                 com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer.CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY);
         client.setEventDeserializer(eventDeserializer);
-        if (binlogFile != null && !binlogFile.isEmpty()) {
+        if (gtidEnabled && gtidSet != null && !gtidSet.isEmpty()) {
+            // GTID 自动定位：连接器向服务端声明已执行集，由服务端决定起始文件/位点；
+            // 流式过程中连接器自动维护该集（client.getGtidSet()），断线重连也按最新集续传
+            client.setGtidSet(gtidSet);
+            logger.info("按 GTID 集开始捕获（自动定位）: {}", gtidSet);
+        } else if (binlogFile != null && !binlogFile.isEmpty()) {
             client.setBinlogFilename(binlogFile);
             client.setBinlogPosition(binlogPosition);
             logger.info("从binlog位点开始捕获: {}:{}", binlogFile, binlogPosition);
@@ -760,6 +773,11 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         Properties posProps = new Properties();
         posProps.setProperty("binlog.file", currentBinlogFile);
         posProps.setProperty("binlog.position", String.valueOf(currentBinlogPosition));
+        // GTID 连接模式下连接器持续维护已执行集，一并持久化（位点可视化/排障用）
+        String currentGtidSet = client != null ? client.getGtidSet() : null;
+        if (currentGtidSet != null && !currentGtidSet.isEmpty()) {
+            posProps.setProperty("gtid.set", currentGtidSet.replaceAll("\\s+", ""));
+        }
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
 
         try (FileOutputStream fos = new FileOutputStream(positionFile)) {

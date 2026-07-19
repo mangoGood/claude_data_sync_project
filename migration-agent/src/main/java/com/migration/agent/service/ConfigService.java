@@ -737,12 +737,13 @@ public class ConfigService {
         String sourceType = props.getProperty("source.db.type", "mysql");
 
         try (Connection conn = DriverManager.getConnection(url, "sa", "")) {
-            String sql = "SELECT filename, position FROM checkpoint WHERE id = 1";
+            String sql = "SELECT filename, position, gtid FROM checkpoint WHERE id = 1";
             try (Statement stmt = conn.createStatement();
                  ResultSet rs = stmt.executeQuery(sql)) {
                 if (rs.next()) {
                     String filename = rs.getString("filename");
                     long position = rs.getLong("position");
+                    String gtid = rs.getString("gtid");
                     if (filename != null && !filename.isEmpty()) {
                         if ("postgresql".equals(sourceType)) {
                             props.setProperty("checkpoint.wal.lsn", filename);
@@ -761,6 +762,15 @@ public class ConfigService {
                             props.setProperty("checkpoint.binlog.position", String.valueOf(position));
                             props.setProperty("capture.binlog.file", filename);
                             props.setProperty("capture.binlog.position", String.valueOf(position));
+                            // GTID 集与 file+pos 同一时刻快照（CheckpointManager 记 checkpoint 时一并取
+                            // @@global.gtid_executed）：capture 有 GTID 集时优先按 GTID 自动定位，
+                            // 源端 HA 切换/binlog 文件名失效时仍能续传。gtid_executed 可能含换行，归一化后写入
+                            if (gtid != null && !gtid.trim().isEmpty()) {
+                                String normalizedGtid = gtid.replaceAll("\\s+", "");
+                                props.setProperty("checkpoint.gtid.set", normalizedGtid);
+                                props.setProperty("capture.gtid.set", normalizedGtid);
+                                logger.info("MySQL GTID checkpoint written to config: {}", normalizedGtid);
+                            }
                             logger.info("MySQL Checkpoint written to config: {}:{}", filename, position);
                         }
                     }

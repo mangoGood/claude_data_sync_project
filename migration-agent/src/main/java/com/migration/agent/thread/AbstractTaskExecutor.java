@@ -415,6 +415,14 @@ public abstract class AbstractTaskExecutor implements Runnable {
             props.setProperty("checkpoint.binlog.position", String.valueOf(checkpoint.getPosition()));
             props.setProperty("capture.binlog.file", checkpoint.getFilename());
             props.setProperty("capture.binlog.position", String.valueOf(checkpoint.getPosition()));
+            // GTID 集与 file+pos 同一时刻快照：capture 有 GTID 集时优先按 GTID 自动定位
+            // （源端 HA 切换/binlog 文件名失效时 file+pos 作废而 GTID 仍有效）
+            if (checkpoint.getGtid() != null && !checkpoint.getGtid().trim().isEmpty()) {
+                String normalizedGtid = checkpoint.getGtid().replaceAll("\\s+", "");
+                props.setProperty("checkpoint.gtid.set", normalizedGtid);
+                props.setProperty("capture.gtid.set", normalizedGtid);
+                logger.info("[{}] GTID 位点已写入配置文件: {}", threadName, normalizedGtid);
+            }
             props.setProperty("extract.skip.before.checkpoint", "true");
             try (java.io.OutputStream output = new java.io.FileOutputStream(configFile)) {
                 props.store(output, "Updated checkpoint for task: " + taskId);
