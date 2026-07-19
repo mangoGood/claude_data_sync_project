@@ -7,7 +7,7 @@ import java.util.List;
 
 @Repository
 public interface TaskScheduleRepository extends JpaRepository<TaskSchedule, Long> {
-    List<TaskSchedule> findByUserIdAndEnabledTrue(Long userId);
+    List<TaskSchedule> findByUserId(Long userId);
     List<TaskSchedule> findByWorkflowIdAndUserId(String workflowId, Long userId);
     List<TaskSchedule> findByEnabledTrue();
 }

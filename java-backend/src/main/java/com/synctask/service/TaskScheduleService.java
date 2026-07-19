@@ -71,7 +71,8 @@ public class TaskScheduleService {
     }
 
     public List<TaskSchedule> getSchedulesByUser(Long userId) {
-        return scheduleRepository.findByUserIdAndEnabledTrue(userId);
+        // 返回全部（含停用）——列表里停用的调度需要可见才能重新启用
+        return scheduleRepository.findByUserId(userId);
     }
 
     public List<TaskSchedule> getSchedulesByWorkflow(String workflowId, Long userId) {
@@ -207,9 +208,9 @@ public class TaskScheduleService {
         if (parts.length < 5 || parts.length > 7) {
             throw new RuntimeException("Cron表达式格式错误，应为5-7段：分 时 日 月 周 [年]");
         }
-        // 简单验证每段
+        // 简单验证每段（允许 Quartz 风格的 ?）
         for (int i = 0; i < 5; i++) {
-            if (!parts[i].matches("[\\d*/,-]+")) {
+            if (!parts[i].matches("[\\d*/,?\\-]+")) {
                 throw new RuntimeException("Cron表达式第" + (i + 1) + "段格式错误: " + parts[i]);
             }
         }
@@ -221,8 +222,10 @@ public class TaskScheduleService {
     private LocalDateTime calculateNextTrigger(String cronExpression) {
         try {
             String[] parts = cronExpression.trim().split("\\s+");
-            int minute = parseCronField(parts[0], 0, 59);
-            int hour = parseCronField(parts[1], 0, 23);
+            // 5段=分 时 日 月 周；6/7段（Quartz风格）首段为秒，跳过
+            int offset = parts.length >= 6 ? 1 : 0;
+            int minute = parseCronField(parts[offset], 0, 59);
+            int hour = parseCronField(parts[offset + 1], 0, 23);
             // 简化：忽略日、月、周，按分时计算下次触发
             LocalDateTime now = LocalDateTime.now().plusMinutes(1);
             LocalDateTime next = now.withMinute(minute).withHour(hour).withSecond(0).withNano(0);
