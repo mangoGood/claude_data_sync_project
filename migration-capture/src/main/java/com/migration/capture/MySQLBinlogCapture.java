@@ -46,6 +46,9 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     /** GTID 位点（capture.gtid.set，来自 checkpoint 的 gtid_executed 快照）；非空且启用时优先于 file+pos。 */
     private String gtidSet;
     private boolean gtidEnabled;
+    /** 位点落盘的时间兜底间隔：低流量任务下不足 1000 事件也要能看到当前位点。 */
+    private static final long POSITION_SAVE_INTERVAL_MS = 5000;
+    private volatile long lastPositionSaveTime = 0;
     private String outputDir;
     private String taskId;
     private long serverId;
@@ -598,6 +601,15 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             if (count % 1000 == 0) {
                 logger.info("已捕获 {} 个事件, 当前位点: {}:{}", count, currentBinlogFile, currentBinlogPosition);
                 savePosition();
+                lastPositionSaveTime = System.currentTimeMillis();
+            } else {
+                // 按时间兜底落位点：只按"每 1000 事件"保存时，低流量任务运行期间位点文件
+                // 长期不存在（位点可视化只能显示 PARTIAL），恰好是最需要看位点的场景
+                long now = System.currentTimeMillis();
+                if (now - lastPositionSaveTime >= POSITION_SAVE_INTERVAL_MS) {
+                    savePosition();
+                    lastPositionSaveTime = now;
+                }
             }
         } catch (Exception e) {
             logger.error("处理binlog事件异常: {}", e.getMessage(), e);

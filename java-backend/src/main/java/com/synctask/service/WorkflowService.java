@@ -750,6 +750,38 @@ public class WorkflowService {
         return seqno != null ? seqno : -1L;
     }
 
+    /** 同步位点可视化：代理 agent 的 /api/checkpoint/{taskId}（先做属主校验）。 */
+    public Map<String, Object> getCheckpointVisualization(String id, Long userId) {
+        getWorkflowById(id, userId);
+        return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）");
+    }
+
+    /** GET agent HTTP 接口并解析 JSON（带可选 Bearer token）。 */
+    private Map<String, Object> callAgentJson(String path, String errPrefix) {
+        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentToken = System.getenv("AGENT_API_TOKEN");
+        try {
+            java.net.URL url = new java.net.URL(agentBase + path);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            if (agentToken != null && !agentToken.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + agentToken);
+            }
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(10000);
+            if (conn.getResponseCode() != 200) {
+                throw new RuntimeException("agent 返回状态 " + conn.getResponseCode());
+            }
+            try (java.io.InputStream is = conn.getInputStream()) {
+                String body = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                Type type = new TypeToken<Map<String, Object>>() {}.getType();
+                return gson.fromJson(body, type);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(errPrefix + ": " + e.getMessage());
+        }
+    }
+
     /** 死信记录查询：代理 agent 的 /api/agent/deadletter/{taskId}（先做属主校验）。 */
     public Map<String, Object> getDeadletterRecords(String id, Long userId) {
         getWorkflowById(id, userId);

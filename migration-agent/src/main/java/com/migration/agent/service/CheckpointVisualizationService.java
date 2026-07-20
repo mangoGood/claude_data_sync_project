@@ -93,6 +93,12 @@ public class CheckpointVisualizationService {
                 binlog.put("available", true);
                 binlog.put("raw", fileVal + ":" + posVal);
             }
+            // GTID 集（capture 按 GTID 自动定位时由连接器持续维护并持久化）：
+            // 源端 HA 切换后 file+pos 会失效而 GTID 仍有效，位点视图需要能看到它
+            String gtidVal = props.getProperty("gtid.set");
+            if (gtidVal != null && !gtidVal.trim().isEmpty()) {
+                binlog.put("gtid", gtidVal.trim());
+            }
         } catch (Exception e) {
             logger.warn("读取 binlog 位点文件失败: {}", e.getMessage());
         }
@@ -169,7 +175,9 @@ public class CheckpointVisualizationService {
         if (thlAvailable && ckptAvailable) {
             long thlSeqno = (long) thl.get("seqno");
             long ckptSeqno = (long) checkpoint.get("seqno");
-            long pendingApply = thlSeqno - ckptSeqno;
+            // 心跳事件也会推进已应用 checkpoint，其 seqno 可能超过 THL 最新"数据事件" seqno，
+            // 相减会得到负数——语义上就是"已追平"，钳到 0，避免展示 -1 这类无意义积压
+            long pendingApply = Math.max(0, thlSeqno - ckptSeqno);
             gaps.put("pending_events", pendingApply);
             gaps.put("pending_apply", pendingApply);
             gaps.put("pendingApplyStatus", pendingApply > 1000 ? "CRITICAL" : pendingApply > 100 ? "WARNING" : "OK");
@@ -186,9 +194,12 @@ public class CheckpointVisualizationService {
             long capturePos = (long) binlog.get("position");
             String ckptFile = (String) checkpoint.get("binlog_file");
             long ckptPos = (long) checkpoint.get("binlog_position");
+            // 心跳事件的 checkpoint 不带 binlog 文件名（写空串）：空串不是有效文件名，
+            // 若按文件号解析会得到 0 并算出"落后 N 个文件"的假告警，此处一律按未知处理
+            if (ckptFile != null && ckptFile.trim().isEmpty()) ckptFile = null;
 
             if (captureFile != null && captureFile.equals(ckptFile)) {
-                long posGap = capturePos - ckptPos;
+                long posGap = Math.max(0, capturePos - ckptPos);
                 gaps.put("binlog_gap", posGap);
                 gaps.put("binlogPositionGap", posGap);
                 gaps.put("binlogFileGap", 0);
@@ -203,7 +214,11 @@ public class CheckpointVisualizationService {
                 gaps.put("binlogPositionGap", null);
                 gaps.put("binlogGapStatus", fileGap > 5 ? "WARNING" : "OK");
             } else {
+                // 无法比较（如 checkpoint 尚未记录 binlog 文件名）：明确置未知，不留空导致误判
                 gaps.put("binlog_gap", null);
+                gaps.put("binlogPositionGap", null);
+                gaps.put("binlogFileGap", null);
+                gaps.put("binlogGapStatus", "UNKNOWN");
             }
         } else {
             gaps.put("binlog_gap", null);

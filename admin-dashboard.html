@@ -1067,6 +1067,44 @@
             max-width: 480px;
         }
 
+        /* 同步位点可视化：capture → THL → 已应用 三段链路 */
+        .cp-stage {
+            border: 1px solid #e8e8e8;
+            border-radius: 6px;
+            padding: 12px 14px;
+            margin-bottom: 10px;
+            background: #fafafa;
+        }
+        .cp-stage-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .cp-kv {
+            display: flex;
+            font-size: 12px;
+            color: #666;
+            padding: 3px 0;
+        }
+        .cp-kv .k { width: 110px; color: #999; flex-shrink: 0; }
+        .cp-kv .v { font-family: monospace; word-break: break-all; color: #333; }
+        .cp-arrow { text-align: center; color: #bbb; font-size: 16px; margin: -4px 0 6px; }
+        .cp-badge {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            border: 1px solid transparent;
+        }
+        .cp-badge.ok { background: #f6ffed; color: #389e0d; border-color: #b7eb8f; }
+        .cp-badge.warn { background: #fffbe6; color: #d48806; border-color: #ffe58f; }
+        .cp-badge.crit { background: #fff2f0; color: #cf1322; border-color: #ffccc7; }
+        .cp-badge.na { background: #fafafa; color: #999; border-color: #e8e8e8; }
+
         /* 批量操作工具条：勾选任务后出现 */
         .batch-toolbar {
             display: none;
@@ -3585,6 +3623,7 @@
                 <button class="btn-default" onclick="advDiagnoseTask()">一键诊断</button>
                 <button class="btn-default" onclick="advShowConfigVersions()">配置版本</button>
                 <button class="btn-default" onclick="advCloneTask()">克隆任务</button>
+                <button class="btn-default" onclick="cpShowCheckpoint()">同步位点</button>
                 <button class="btn-default" onclick="dlShowDeadletter()">死信记录</button>
                 <button class="btn-default" id="dlSkipEventBtn" style="display: none; color: #d93026; border-color: #d93026;"
                         onclick="dlSkipEventAndRetry()">跳过失败事件并重试</button>
@@ -3623,6 +3662,26 @@
             </div>
             <div class="modal-footer">
                 <button class="btn-cancel" onclick="document.getElementById('advConfigVersionModal').classList.remove('show')">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 同步位点可视化模态框（capture → THL → 已应用 全链路位点） -->
+    <div class="modal" id="cpCheckpointModal">
+        <div class="modal-content" style="width: 780px; max-height: 85vh;">
+            <div class="modal-header">
+                <h3 class="modal-title">同步位点</h3>
+                <span class="modal-close" onclick="cpCloseCheckpoint()">&times;</span>
+            </div>
+            <div class="modal-body" style="max-height: calc(85vh - 140px); overflow-y: auto;">
+                <div style="font-size: 12px; color: #999; margin-bottom: 10px;">
+                    源库 binlog 捕获位点 → 落盘 THL seqno → 已应用 checkpoint 的全链路位点与积压差距（每 5 秒刷新）。
+                </div>
+                <div id="cpCheckpointBody"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-default" onclick="cpLoadCheckpoint()">刷新</button>
+                <button class="btn-cancel" onclick="cpCloseCheckpoint()">关闭</button>
             </div>
         </div>
     </div>
@@ -8563,6 +8622,103 @@
             container.innerHTML = `<table><thead><tr>
                 <th>seqno</th><th>跳过时间</th><th>表</th><th>事件类型</th><th>未应用的 SQL</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
+        }
+
+        // ---------- 同步位点可视化 ----------
+
+        let _cpTimer = null;
+
+        window.cpShowCheckpoint = function() {
+            if (!_advDetailTaskId) return;
+            document.getElementById('cpCheckpointModal').classList.add('show');
+            document.getElementById('cpCheckpointBody').innerHTML = '<div class="adv-empty">加载中…</div>';
+            cpLoadCheckpoint();
+            // 位点是活数据，打开期间定时刷新；关闭/页面不可见时不发请求，关闭即清理
+            if (_cpTimer) clearInterval(_cpTimer);
+            _cpTimer = setInterval(() => {
+                if (document.hidden) return;
+                if (!document.getElementById('cpCheckpointModal').classList.contains('show')) return;
+                cpLoadCheckpoint();
+            }, 5000);
+        }
+
+        window.cpCloseCheckpoint = function() {
+            document.getElementById('cpCheckpointModal').classList.remove('show');
+            if (_cpTimer) { clearInterval(_cpTimer); _cpTimer = null; }
+        }
+
+        function cpBadge(status) {
+            const map = {
+                HEALTHY: ['ok', '健康'], OK: ['ok', '正常'],
+                WARNING: ['warn', '警告'], CRITICAL: ['crit', '严重'],
+                PARTIAL: ['warn', '部分可用'], NO_DATA: ['na', '无数据'], UNKNOWN: ['na', '未知']
+            };
+            const [cls, text] = map[status] || ['na', status || '-'];
+            return `<span class="cp-badge ${cls}">${escapeHtml(text)}</span>`;
+        }
+
+        function cpRow(k, v) {
+            return `<div class="cp-kv"><span class="k">${escapeHtml(k)}</span><span class="v">${v === null || v === undefined || v === '' ? '<span style="color:#bbb;">—</span>' : escapeHtml(String(v))}</span></div>`;
+        }
+
+        window.cpLoadCheckpoint = async function() {
+            if (!_advDetailTaskId) return;
+            const body = document.getElementById('cpCheckpointBody');
+            let d;
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${_advDetailTaskId}/checkpoint`);
+                d = await resp.json();
+            } catch (e) {
+                body.innerHTML = '<div class="adv-empty">查询失败：请求异常</div>';
+                return;
+            }
+            if (!d || d.success === false) {
+                body.innerHTML = `<div class="adv-empty">${escapeHtml((d && d.message) || '查询失败')}</div>`;
+                return;
+            }
+
+            const binlog = d.binlog || {}, thl = d.thl || {}, ckpt = d.checkpoint || {}, gaps = d.gaps || {};
+            const pending = gaps.pending_apply != null ? gaps.pending_apply : gaps.pending_events;
+
+            let html = `<div style="margin-bottom:12px;font-size:13px;">链路状态：${cpBadge(d.linkStatus)}
+                <span style="color:#999;font-size:12px;margin-left:12px;">
+                    RPO ${d.rpo_ms != null ? d.rpo_ms + ' ms' : '—'} ·
+                    RTO ${d.rto_ms != null ? d.rto_ms + ' ms' : '—'}
+                </span></div>`;
+
+            // 1. capture 捕获位点
+            html += `<div class="cp-stage">
+                <div class="cp-stage-title">① 源库捕获（capture）${binlog.available ? '' : cpBadge('NO_DATA')}</div>
+                ${cpRow('binlog 文件', binlog.file)}
+                ${cpRow('binlog 位点', binlog.position)}
+                ${binlog.gtid ? cpRow('GTID 集', binlog.gtid) : ''}
+            </div><div class="cp-arrow">↓</div>`;
+
+            // 2. THL 落盘
+            html += `<div class="cp-stage">
+                <div class="cp-stage-title">② 落盘 THL（extract）${thl.available ? '' : cpBadge('NO_DATA')}</div>
+                ${cpRow('最新 seqno', thl.seqno)}
+            </div><div class="cp-arrow">↓</div>`;
+
+            // 3. 已应用位点（断点续传起点）
+            html += `<div class="cp-stage">
+                <div class="cp-stage-title">③ 已应用（increment checkpoint）${ckpt.available ? '' : cpBadge('NO_DATA')}</div>
+                ${cpRow('已应用 seqno', ckpt.seqno)}
+                ${cpRow('binlog 位点', ckpt.binlog_file ? ckpt.binlog_file + ':' + (ckpt.binlog_position != null ? ckpt.binlog_position : '') : null)}
+                ${cpRow('事件 ID', ckpt.event_id)}
+                ${cpRow('更新时间', ckpt.updated_at)}
+                <div style="font-size:11px;color:#999;margin-top:6px;">断点续传从此位点之后继续（重试/恢复的起点）</div>
+            </div>`;
+
+            // 差距
+            html += `<div class="cp-stage" style="background:#fff;">
+                <div class="cp-stage-title">链路积压</div>
+                <div class="cp-kv"><span class="k">待应用事件</span><span class="v">${pending != null ? pending : '—'} ${cpBadge(gaps.pendingApplyStatus)}</span></div>
+                <div class="cp-kv"><span class="k">binlog 差距</span><span class="v">${gaps.binlogPositionGap != null ? gaps.binlogPositionGap + ' 字节' : (gaps.binlogFileGap ? gaps.binlogFileGap + ' 个文件' : '—')} ${cpBadge(gaps.binlogGapStatus)}</span></div>
+            </div>`;
+
+            html += `<div style="font-size:11px;color:#bbb;text-align:right;">采样时间：${d.timestamp ? new Date(d.timestamp).toLocaleString() : '-'}</div>`;
+            body.innerHTML = html;
         }
 
         // ---------- 批量操作 ----------

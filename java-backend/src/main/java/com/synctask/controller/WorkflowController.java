@@ -308,6 +308,19 @@ public class WorkflowController {
         }
     }
 
+    /** 同步位点可视化：capture binlog/GTID → THL seqno → 已应用 checkpoint 的全链路位点与差距（代理 agent）。 */
+    @GetMapping("/{id}/checkpoint")
+    public ResponseEntity<?> getCheckpointVisualization(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getCheckpointVisualization(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     /** 死信记录：人工裁决跳过的增量事件清单（代理 agent）。 */
     @GetMapping("/{id}/deadletter")
     public ResponseEntity<?> getDeadletterRecords(
