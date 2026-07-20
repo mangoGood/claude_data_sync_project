@@ -543,6 +543,11 @@ public class ConfigService {
         mergeSkipListProperty(props, "increment.skip.event.ids", taskMessage.getSkipEventIds());
         mergeSkipListProperty(props, "increment.skip.seqnos", taskMessage.getSkipSeqnos());
 
+        // 增量并行应用（引擎级执行调优，非向导字段）：agent 级 env/系统属性开关，随 config 落盘、
+        // resume 时重写保持生效。默认不写=增量子进程按串行（parallelism=1）运行。
+        writeIntPropFromEnv(props, "increment.apply.parallelism", "INCREMENT_APPLY_PARALLELISM");
+        writeIntPropFromEnv(props, "increment.apply.batch.size", "INCREMENT_APPLY_BATCH_SIZE");
+
         // 落盘前加密敏感值（口令）：config.properties 不再存明文密码，子进程读取时按 ENC: 前缀解密。
         encryptSensitiveProps(props);
 
@@ -553,6 +558,20 @@ public class ConfigService {
         createLogbackConfig(taskDir, taskId);
         
         logger.info("Config file updated successfully for task: {}", taskId);
+    }
+
+    /** 从环境变量/系统属性读取整数写入 props（未设或非法则不写，保持子进程默认）。 */
+    private void writeIntPropFromEnv(java.util.Properties props, String key, String envName) {
+        String v = System.getenv(envName);
+        if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);
+        if (v == null || v.trim().isEmpty()) return;
+        try {
+            int n = Integer.parseInt(v.trim());
+            props.setProperty(key, String.valueOf(n));
+            logger.info("引擎调优参数已写入配置: {}={}", key, n);
+        } catch (NumberFormatException e) {
+            logger.warn("环境变量 {}={} 非法整数，忽略", envName, v);
+        }
     }
 
     /** 跳过清单合并：新值与已有属性取并集后写回（保持顺序、去重）；新值为空则不动。 */
