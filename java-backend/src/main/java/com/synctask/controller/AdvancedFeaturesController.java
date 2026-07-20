@@ -230,6 +230,17 @@ public class AdvancedFeaturesController {
         }
     }
 
+    // 4.1b 启动前 schema 预检
+    @PostMapping("/schema-precheck/{workflowId}")
+    public ResponseEntity<?> schemaPrecheck(@PathVariable String workflowId, Authentication auth) {
+        try {
+            Map<String, Object> result = diagnosticService.schemaPrecheck(workflowId, getUserId(auth));
+            return ResponseEntity.ok(Map.of("success", true, "data", result));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
     // 4.2 配置版本管理
     @GetMapping("/config-versions/{workflowId}")
     public ResponseEntity<?> getConfigVersions(@PathVariable String workflowId) {

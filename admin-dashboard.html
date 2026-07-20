@@ -7411,19 +7411,54 @@
         }
 
 
+        // 启动前 schema 预检门禁：返回 true=可继续启动，false=中止。
+        // PASS 直接放行；WARNING 提示后由用户确认；FAIL 需明确二次确认强制启动。
+        async function schemaPrecheckGate(workflowId) {
+            let data;
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/advanced/schema-precheck/${workflowId}`, {
+                    method: 'POST', headers: getAuthHeaders()
+                });
+                const j = await resp.json();
+                if (!j.success) {
+                    // 预检自身出错不应硬卡启动，提示后交由用户决定
+                    return confirm('schema 预检未能完成：' + (j.message || '未知错误') + '\n\n仍要启动吗？');
+                }
+                data = j.data;
+            } catch (e) {
+                return confirm('schema 预检请求异常，仍要启动吗？');
+            }
+
+            const overall = data.overall;
+            if (overall === 'PASS') return true;
+
+            const lines = (data.checks || [])
+                .filter(c => c.status === 'FAIL' || c.status === 'WARNING')
+                .map(c => `${c.status === 'FAIL' ? '✗' : '⚠'} ${c.checkName}：${c.message}${c.detail ? '\n    ' + c.detail : ''}`)
+                .join('\n');
+
+            if (overall === 'FAIL') {
+                return confirm(`schema 预检发现严重问题（可能导致同步失败）：\n\n${lines}\n\n确定要忽略并强制启动吗？`);
+            }
+            // WARNING
+            return confirm(`schema 预检有警告：\n\n${lines}\n\n确定继续启动吗？`);
+        }
+
         async function launchTask() {
             if (!checkAuth()) return;
-            
+
             if (!cfgValidationPassed) {
                 showNotification('请先完成校验检查并确保所有检查项通过', 'error');
                 return;
             }
-            
-            if (!confirm('确定要启动此同步任务吗？')) return;
-            
+
             try {
                 await cfgSaveConfig();
-                
+
+                // 启动前 schema 预检：把结构问题（源表缺失、无主键、列处理引用不存在的列、
+                // 目标同名表冲突）挡在启动前。FAIL 需二次确认强制启动，WARNING 提示后可继续。
+                if (!await schemaPrecheckGate(cfgWorkflowId)) return;
+
                 const response = await fetchWithAuth(`${API_BASE_URL}/workflows/${cfgWorkflowId}/launch`, {
                     method: 'POST',
                     headers: getAuthHeaders()
