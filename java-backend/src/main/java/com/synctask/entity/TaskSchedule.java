@@ -34,6 +34,10 @@ public class TaskSchedule {
     @Column(name = "schedule_type", length = 20)
     private String scheduleType = "FULL_SYNC";
 
+    /** 对比类型（仅 VALIDATION 调度用）: ROW_COUNT-行数对比, CONTENT-内容对比 */
+    @Column(name = "compare_type", length = 20)
+    private String compareType;
+
     @Column(name = "enabled")
     private Boolean enabled = true;
 
@@ -75,6 +79,8 @@ public class TaskSchedule {
     public void setScheduleName(String scheduleName) { this.scheduleName = scheduleName; }
     public String getScheduleType() { return scheduleType; }
     public void setScheduleType(String scheduleType) { this.scheduleType = scheduleType; }
+    public String getCompareType() { return compareType; }
+    public void setCompareType(String compareType) { this.compareType = compareType; }
     public Boolean getEnabled() { return enabled; }
     public void setEnabled(Boolean enabled) { this.enabled = enabled; }
     public LocalDateTime getLastTriggeredAt() { return lastTriggeredAt; }

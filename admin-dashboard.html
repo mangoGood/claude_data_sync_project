@@ -2708,13 +2708,21 @@
                 <div class="content">
                     <div class="adv-section">
                         <div class="adv-section-header">
-                            <span>定时全量同步</span>
-                            <span class="adv-section-hint">按 cron 表达式周期性触发任务的全量同步（调度器每 5 分钟重载）</span>
+                            <span>定时调度</span>
+                            <span class="adv-section-hint">按 cron 周期性触发任务的全量同步，或对增量中/灾备中任务定时做数据对比（调度器每 5 分钟重载）</span>
                         </div>
                         <div class="adv-form">
-                            <select class="form-input" id="schedTaskSelect" style="width: 240px;"></select>
-                            <input type="text" class="form-input" id="schedNameInput" placeholder="调度名称" style="width: 160px;">
-                            <input type="text" class="form-input" id="schedCronInput" placeholder="cron：分 时 日 月 周，如 0 2 * * *" title="5 段：分 时 日 月 周（每天凌晨2点 = 0 2 * * *）；兼容带秒的 6 段" style="width: 200px;">
+                            <select class="form-input" id="schedTaskSelect" style="width: 220px;"></select>
+                            <select class="form-input" id="schedTypeSelect" style="width: 130px;" onchange="advOnSchedTypeChange()">
+                                <option value="FULL_SYNC">全量同步</option>
+                                <option value="VALIDATION">数据校验</option>
+                            </select>
+                            <select class="form-input" id="schedCompareSelect" style="width: 120px; display: none;">
+                                <option value="ROW_COUNT">行数对比</option>
+                                <option value="CONTENT">内容对比</option>
+                            </select>
+                            <input type="text" class="form-input" id="schedNameInput" placeholder="调度名称" style="width: 140px;">
+                            <input type="text" class="form-input" id="schedCronInput" placeholder="cron：分 时 日 月 周，如 0 2 * * *" title="5 段：分 时 日 月 周（每天凌晨2点 = 0 2 * * *）；兼容带秒的 6 段" style="width: 190px;">
                             <button class="btn-test" onclick="advCreateSchedule()">创建调度</button>
                         </div>
                         <div class="adv-table" id="schedList"></div>
@@ -8025,9 +8033,13 @@
                 }
                 let rows = '';
                 list.forEach(s => {
+                    const typeLabel = s.scheduleType === 'VALIDATION'
+                        ? '数据校验·' + (s.compareType === 'CONTENT' ? '内容对比' : '行数对比')
+                        : '全量同步';
                     rows += `<tr>
                         <td>${escapeHtml(s.scheduleName || '-')}</td>
                         <td>${escapeHtml(advTaskName(s.workflowId))}</td>
+                        <td>${typeLabel}</td>
                         <td><code>${escapeHtml(s.cronExpression || '')}</code></td>
                         <td><span class="adv-badge ${s.enabled ? '' : 'off'}">${s.enabled ? '启用' : '停用'}</span></td>
                         <td>${advFmtTime(s.lastTriggeredAt)}</td>
@@ -8040,23 +8052,32 @@
                     </tr>`;
                 });
                 container.innerHTML = `<table><thead><tr>
-                    <th>名称</th><th>任务</th><th>cron</th><th>状态</th><th>上次触发</th><th>下次触发</th><th>已触发</th><th>操作</th>
+                    <th>名称</th><th>任务</th><th>类型</th><th>cron</th><th>状态</th><th>上次触发</th><th>下次触发</th><th>已触发</th><th>操作</th>
                 </tr></thead><tbody>${rows}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
         }
 
+        window.advOnSchedTypeChange = function() {
+            const type = document.getElementById('schedTypeSelect').value;
+            document.getElementById('schedCompareSelect').style.display = (type === 'VALIDATION') ? '' : 'none';
+        }
+
         window.advCreateSchedule = async function() {
             const workflowId = document.getElementById('schedTaskSelect').value;
             const scheduleName = document.getElementById('schedNameInput').value.trim();
             const cronExpression = document.getElementById('schedCronInput').value.trim();
+            const scheduleType = document.getElementById('schedTypeSelect').value;
+            const compareType = document.getElementById('schedCompareSelect').value;
             if (!workflowId) { showNotification('请选择任务', 'error'); return; }
             if (!scheduleName) { showNotification('请输入调度名称', 'error'); return; }
             if (!cronExpression) { showNotification('请输入 cron 表达式', 'error'); return; }
+            const body = { workflowId, scheduleName, cronExpression, scheduleType };
+            if (scheduleType === 'VALIDATION') body.compareType = compareType;
             const d = await advFetchJson(`${ADV_API}/schedules`, {
                 method: 'POST', headers: getAuthHeaders(),
-                body: JSON.stringify({ workflowId, scheduleName, cronExpression, scheduleType: 'FULL_SYNC' })
+                body: JSON.stringify(body)
             });
             if (d.success) {
                 showNotification('调度创建成功', 'success');

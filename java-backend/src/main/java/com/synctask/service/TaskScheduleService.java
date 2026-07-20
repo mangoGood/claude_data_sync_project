@@ -1,6 +1,7 @@
 package com.synctask.service;
 
 import com.synctask.entity.TaskSchedule;
+import com.synctask.entity.ValidationTask;
 import com.synctask.entity.Workflow;
 import com.synctask.entity.WorkflowStatus;
 import com.synctask.repository.TaskScheduleRepository;
@@ -42,21 +43,29 @@ public class TaskScheduleService {
     @Autowired
     private TaskDependencyService taskDependencyService;
 
+    @Autowired
+    private ValidationTaskService validationTaskService;
+
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private final ConcurrentHashMap<Long, ScheduledFuture<?>> scheduledTasks = new ConcurrentHashMap<>();
 
     @Transactional
     public TaskSchedule createSchedule(String workflowId, Long userId, String cronExpression,
-                                       String scheduleName, String scheduleType) {
+                                       String scheduleName, String scheduleType, String compareType) {
         // 验证Cron表达式
         validateCronExpression(cronExpression);
 
+        String type = scheduleType != null ? scheduleType : "FULL_SYNC";
         TaskSchedule schedule = new TaskSchedule();
         schedule.setWorkflowId(workflowId);
         schedule.setUserId(userId);
         schedule.setCronExpression(cronExpression);
         schedule.setScheduleName(scheduleName);
-        schedule.setScheduleType(scheduleType != null ? scheduleType : "FULL_SYNC");
+        schedule.setScheduleType(type);
+        // VALIDATION 调度记录对比类型（默认行数对比）；FULL_SYNC 调度忽略
+        if ("VALIDATION".equals(type)) {
+            schedule.setCompareType("CONTENT".equals(compareType) ? "CONTENT" : "ROW_COUNT");
+        }
         schedule.setEnabled(true);
         schedule.setTriggerCount(0);
 
@@ -184,16 +193,29 @@ public class TaskScheduleService {
 
                 workflowService.retryWorkflow(workflowId, schedule.getUserId());
             } else if ("VALIDATION".equals(schedule.getScheduleType())) {
-                // 触发数据校验（由DataValidationService处理）
-                logger.info("触发定时数据校验: workflowId={}", workflowId);
+                // 定时数据校验：复用 ValidationTaskService 自动创建并异步执行对比任务。
+                // compareType 取调度配置（默认行数对比）。createValidationTask 内部会校验任务状态
+                // （仅增量中/灾备中可对比）、列处理任务拒绝、并发对比互斥——不满足则抛出，记录后跳过本次。
+                String compareType = schedule.getCompareType() != null ? schedule.getCompareType() : "ROW_COUNT";
+                try {
+                    ValidationTask vt = validationTaskService.createValidationTask(
+                            workflowId, schedule.getUserId(), compareType);
+                    logger.info("定时对比任务已创建: workflowId={}, compareType={}, validationTaskId={}",
+                            workflowId, compareType, vt.getId());
+                } catch (Exception ve) {
+                    logger.warn("定时对比触发跳过（前置条件不满足）: workflowId={}, 原因: {}",
+                            workflowId, ve.getMessage());
+                }
             }
 
             schedule.setLastTriggeredAt(LocalDateTime.now());
             schedule.setTriggerCount(schedule.getTriggerCount() + 1);
             scheduleRepository.save(schedule);
 
-            // 检查任务依赖
-            taskDependencyService.checkAndTriggerDependencies(workflowId, "ON_SUCCESS");
+            // 依赖编排仅对全量同步调度有意义（对比不改变下游数据状态），VALIDATION 不触发下游
+            if (!"VALIDATION".equals(schedule.getScheduleType())) {
+                taskDependencyService.checkAndTriggerDependencies(workflowId, "ON_SUCCESS");
+            }
 
         } catch (Exception e) {
             logger.error("调度触发异常: scheduleId={}", schedule.getId(), e);

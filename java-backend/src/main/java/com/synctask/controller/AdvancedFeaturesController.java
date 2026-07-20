@@ -48,7 +48,7 @@ public class AdvancedFeaturesController {
             TaskSchedule schedule = scheduleService.createSchedule(
                     (String) req.get("workflowId"), userId,
                     (String) req.get("cronExpression"), (String) req.get("scheduleName"),
-                    (String) req.get("scheduleType"));
+                    (String) req.get("scheduleType"), (String) req.get("compareType"));
             return ResponseEntity.ok(Map.of("success", true, "data", schedule));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
