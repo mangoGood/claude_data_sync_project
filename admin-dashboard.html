@@ -1594,5 +1594,8 @@
     </div>
 
     <script src="admin-dashboard.js"></script>
+    <!-- 高级功能独立 ES module：主脚本(经典,parse 时执行)先设 window.__dash，
+         本 module(defer,解析后执行)再读取，顺序有保证 -->
+    <script type="module" src="dashboard-advanced.js"></script>
 </body>
 </html>
