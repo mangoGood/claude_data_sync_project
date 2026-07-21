@@ -1,7 +1,13 @@
-// 从 admin-dashboard.html 抽出的脚本（拆分单文件：verbatim 外置为经典脚本，
-// 全局作用域与 onclick 处理器行为完全不变；后端从 file:../ 同源提供）。
-// 全局作用域组件化（ES module 化以根治跨特性状态污染）为后续增量，
-// 以 test_scripts/e2e_smoke.py 作回归网分批推进。
+"use strict";
+// admin-dashboard 主脚本。module 化第 1 阶段：启用严格模式（消除隐式全局、把
+// 潜在的"赋值未声明变量"从静默建全局变成显式报错）。第 2 阶段转为 ES module，
+// 顶层 state 变模块私有以根治跨特性全局状态污染，onclick 引用的函数经末尾块显式挂 window。
+(function () {
+// ↑ IIFE 模块封装：顶层声明改为 IIFE 作用域，不再自动挂到 window/全局命名空间；
+//   只有下方 Object.assign 显式导出的（被 onclick 等处理器引用的）函数才对外可见。
+//   顶层 state（let/var/非导出 const）就此私有化，根治跨特性全局状态污染。
+//   仍是经典脚本上下文（非 ES module）：window.x= 导出与裸调用经全局对象回退照常工作，
+//   零裸调用破坏风险；多文件 ES module 拆分为后续增量。
         // Global error handler
         window.onerror = function(message, source, lineno, colno, error) {
             console.error('Global error:', message, 'at', source, ':', lineno, ':', colno, error);
@@ -8759,3 +8765,23 @@
         initResizableColumns('syncPage', 'colWidths_sync');
         initResizableColumns('drPage', 'colWidths_dr');
         initResizableColumns('subscribePage', 'colWidths_subscribe');
+
+    // ==== 显式导出：onclick/onchange 等内联处理器引用的函数（IIFE 内私有→挂 window）====
+    Object.assign(window, {
+    _loadMoreDiffs, _loadMoreMismatchTables, _toggleDiffExpand, addPgTable, addTable, auditNextPage,
+    auditPrevPage, cfgAddPgTable, cfgAddTable, cfgGoToStep, cfgNextStep, cfgOnConnectionFieldChange,
+    cfgPrevStep, cfgRefreshObjects, cfgRemoveTable, cfgRunValidation, cfgSelectAllPgTables, cfgSelectAllTables,
+    cfgTestConnection, cfgToggleDatabase, cfgTogglePgSchema, closeChartModal, closeConfigModal, closeDetailModal,
+    closeSubscribeDetailModal, closeSubscribeModal, confirmCreateSubscribeEntry, confirmDrFailover, createTaskFromModal, createValidationTask,
+    deleteSubscribeTask, deleteValidationTask, downloadDiagnosticsBundle, escapeAttr, escapeHtml, fetchAuditLogs,
+    goToDrPage, goToPage, goToValidationPage, handleSort, handleTokenExpired, launchSubscribeTask,
+    launchTask, logout, onMetricsTimeRangeChange, openAccountSettings, openChartModal, openCreateValidationModal,
+    openDrConfig, openSubscribeConfig, openTaskConfig, pauseSubscribeTask, refreshMetrics, removeFilterTag,
+    removeSubscribeFilterTag, removeTable, renderValidationWorkflowOptions, repairValidationTaskAction, resumeSubscribeTask, retrySubscribeTask,
+    saveSubscribeConfig, selectAllPgTables, selectAllTables, selectSourceType, selectTargetType, setChartGrain,
+    showDrTaskDetail, showSubscribeDetail, showTaskDetail, stopSubscribeTask, subAddTable, subEntrySelectSourceType,
+    subGoToStep, subNextStep, subOnConnectionFieldChange, subRemoveTable, subRunValidation, subSelectAllTables,
+    subTestKafkaConnection, subTestSourceConnection, subToggleDatabase, subscribeGoToPage, switchAdvTab, switchPage,
+    toggleDatabase, toggleLatencyChart, toggleMetricsAutoRefresh, togglePgSchema, viewMetrics, viewValidationDetail
+    });
+})();
