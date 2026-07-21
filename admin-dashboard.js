@@ -3468,7 +3468,8 @@
                     else if (errorType === 'NETWORK_ERROR') displayMsg = '✗ 网络错误：无法连接到数据库服务器';
                     else if (errorType === 'DB_TYPE_MISMATCH') displayMsg = '✗ 类型不匹配：' + errorMsg;
                     else if (errorType === 'TIMEOUT') displayMsg = '✗ 连接超时：20秒内未连接到数据库服务器';
-                    else displayMsg = '✗ 连接失败：' + errorMsg.substring(0, 80);
+                    // 后端 errorMsg 已是完整描述（如"连接失败：xxx"），直接展示，避免"✗ 连接失败：连接失败："重复前缀
+                    else displayMsg = '✗ ' + errorMsg.substring(0, 100);
                     statusDiv.innerHTML = `<div>${displayMsg}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     cfgConnectionTestStatus[type] = false;
                 } else {

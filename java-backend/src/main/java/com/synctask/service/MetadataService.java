@@ -215,9 +215,15 @@ public class MetadataService {
                 return new ConnectionTestResult(false, "AUTH_FAILED",
                     "认证失败：用户名或密码错误", "请检查用户名和密码是否正确");
             }
-            if (msg != null && (msg.contains("Connection refused") || msg.contains("timed out") || msg.contains("timeout") || msg.contains("ORA-12541"))) {
+            // "Communications link failure" 是 MySQL 驱动在 TCP 根本连不上时的顶层报文
+            // （底层往往是 Connection refused，但顶层不含该词），最常见就是地址/端口填错——
+            // 归到 NETWORK_ERROR 并给出"检查地址和端口"的明确指引，别让用户对着裸驱动报文猜。
+            if (msg != null && (msg.contains("Connection refused") || msg.contains("timed out")
+                    || msg.contains("timeout") || msg.contains("ORA-12541")
+                    || msg.contains("Communications link failure") || msg.contains("No route to host")
+                    || msg.contains("Connection reset"))) {
                 return new ConnectionTestResult(false, "NETWORK_ERROR",
-                    "网络连接失败：" + e.getMessage(), "请检查数据库服务器地址和端口是否正确，以及网络是否可达");
+                    "网络不可达：无法建立到数据库的连接", "请检查主机地址和端口是否正确、数据库服务是否已启动且可从本机访问");
             }
             return new ConnectionTestResult(false, "CONNECTION_FAILED",
                 "连接失败：" + e.getMessage(), "请检查连接参数是否正确");
