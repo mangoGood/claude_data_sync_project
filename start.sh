@@ -35,15 +35,31 @@ export MIGRATION_AGENT_MYSQL_DB_URL="$DB_URL"
 export MIGRATION_AGENT_MYSQL_DB_USER="root"
 export MIGRATION_AGENT_MYSQL_DB_PASSWORD="rootpassword"
 
-# ---- 凭证加密主密钥（agent 与 backend 共用，缺失则退化为内置开发默认密钥）----
-# 由 create_env.sh 首次创建环境时生成并落盘，每次启动都注入同一份，
-# 避免主密钥"只活在某次手工导出的 shell 里"，导致下次重启后旧的 ENC: 密文全部无法解密。
-MASTER_KEY_FILE="$PROJECT_DIR/.synctask_master_key"
-if [ -f "$MASTER_KEY_FILE" ]; then
-  export SYNCTASK_MASTER_KEY="$(cat "$MASTER_KEY_FILE")"
-else
-  echo "[start] ⚠ 未找到 $MASTER_KEY_FILE，将使用内置开发默认主密钥（不安全，且与此前手工设置过自定义密钥加密的数据不兼容）。建议运行 ./create_env.sh 生成持久化主密钥。"
-fi
+# ---- 持久化密钥（agent 与 backend 共用）----
+# 三者都落盘到项目目录的隐藏文件，每次启动注入同一份，避免密钥"只活在某次手工 shell 里"：
+#   .synctask_master_key —— 凭证加密主密钥（缺失会让此前 ENC: 密文无法解密）
+#   .synctask_jwt_secret —— JWT 签名密钥（缺失会让后端每次重启随机签名，已登录用户全被踢下线）
+#   .synctask_agent_token —— agent 敏感接口鉴权 token（缺失会让 failover/start-increment 无鉴权）
+# 缺失即生成（openssl 优先，退化到 /dev/urandom），生成后 chmod 600。
+gen_secret() {  # $1=文件路径 $2=字节数
+  local f="$1" n="${2:-32}"
+  if [ ! -f "$f" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+      openssl rand -base64 "$n" | tr -d '\n' > "$f"
+    else
+      head -c "$n" /dev/urandom | base64 | tr -d '\n' > "$f"
+    fi
+    chmod 600 "$f"
+    echo "[start] 已生成持久化密钥: $(basename "$f")"
+  fi
+}
+gen_secret "$PROJECT_DIR/.synctask_master_key" 32
+gen_secret "$PROJECT_DIR/.synctask_jwt_secret" 48
+gen_secret "$PROJECT_DIR/.synctask_agent_token" 32
+export SYNCTASK_MASTER_KEY="$(cat "$PROJECT_DIR/.synctask_master_key")"
+export JWT_SECRET="$(cat "$PROJECT_DIR/.synctask_jwt_secret")"
+export AGENT_API_TOKEN="$(cat "$PROJECT_DIR/.synctask_agent_token")"
+echo "[start] 已注入 SYNCTASK_MASTER_KEY / JWT_SECRET / AGENT_API_TOKEN（持久化，重启后 token 不失效）"
 
 # ---- 1. 启动已存在的 Docker 基础设施（不创建）----
 if ! docker inspect synctask-mysql >/dev/null 2>&1; then
@@ -70,9 +86,25 @@ if [ "$status" != "healthy" ]; then
 fi
 
 echo "[start] 等待 Kafka (localhost:29092)..."
-for i in $(seq 1 30); do nc -z localhost 29092 2>/dev/null && break; sleep 2; done
-# 提示：若 Kafka 反复没有就绪，很可能是 stop/start 间隔太久导致 ZK ephemeral 节点未过期，
-# 触发 KeeperException$NodeExistsException 崩溃循环；此时需 ./remove_env.sh 后再 ./create_env.sh 重建。
+kafka_up=0
+for i in $(seq 1 30); do nc -z localhost 29092 2>/dev/null && { kafka_up=1; break; }; sleep 2; done
+# Kafka 崩溃循环主动探测：stop/start 间隔过久时上一个 broker 的 ZK ephemeral znode 未过期，
+# 新 broker 注册抛 KeeperException$NodeExistsException 后立即退出、被 docker 反复重启。
+# 这种情况下端口探测会一直失败——直接检查容器状态并给出确切修复命令，别让用户对着
+# "任务永远 PENDING" 猜半天。
+if [ "$kafka_up" != "1" ]; then
+  kstate="$(docker inspect -f '{{.State.Status}}' synctask-kafka 2>/dev/null || echo unknown)"
+  krestarts="$(docker inspect -f '{{.RestartCount}}' synctask-kafka 2>/dev/null || echo 0)"
+  echo "[start] ✗ Kafka 29092 未就绪 (容器状态=$kstate, 重启次数=$krestarts)"
+  if docker logs --tail 50 synctask-kafka 2>&1 | grep -q "NodeExistsException"; then
+    echo "[start] ✗ 检测到 ZooKeeper NodeExistsException 崩溃循环（stop/start 间隔过久导致）。"
+    echo "[start]   修复：docker compose -f $COMPOSE_FILE down && docker compose -f $COMPOSE_FILE up -d"
+    echo "[start]   （无持久卷，down+up 会清空 ZK/Kafka 状态；切勿只 restart 两个容器）"
+  else
+    echo "[start]   请检查: docker logs --tail 100 synctask-kafka"
+  fi
+  exit 1
+fi
 
 # ---- 2. 首次运行时构建（缺 jar 才构建）----
 if [ ! -f migration-agent/target/migration-agent-1.0.0.jar ]; then
@@ -85,7 +117,9 @@ if pgrep -f 'migration-agent/target/migration-agent-1.0.0.jar' >/dev/null 2>&1; 
   echo "[start] agent 已在运行，跳过"
 else
   echo "[start] 启动 migration-agent (AgentMain, HTTP:8083)..."
-  nohup "$JAVA_HOME/bin/java" -jar migration-agent/target/migration-agent-1.0.0.jar \
+  # -Dh2.bindAddress=127.0.0.1：显式兜底（AgentMain.main 已在代码里设，此处防御，
+  # 且子进程由 ProcessManager 各自透传）。本机 hostname 解析为 LAN IP 时 H2 跨进程轮询会挂起。
+  nohup "$JAVA_HOME/bin/java" -Dh2.bindAddress=127.0.0.1 -jar migration-agent/target/migration-agent-1.0.0.jar \
     > "$LOG_DIR/agent.out" 2>&1 &
   echo $! > "$LOG_DIR/agent.pid"
 fi

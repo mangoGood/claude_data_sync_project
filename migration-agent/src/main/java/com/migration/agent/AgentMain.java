@@ -76,6 +76,9 @@ public class AgentMain {
         // （成为 AUTO_SERVER 的持有方），同样强制绑定回环地址，避免绑到局域网 IP。
         // 必须在任何 H2 Driver 类加载前设置（SysProperties 以 static final 读取一次）。
         System.setProperty("h2.bindAddress", "127.0.0.1");
+
+        validateSecretsOrExit();
+
         AgentMain agent = new AgentMain();
         agent.start();
         
@@ -83,6 +86,39 @@ public class AgentMain {
             logger.info("Shutting down agent...");
             agent.stop();
         }));
+    }
+
+    /**
+     * 启动时安全配置校验：严格模式（SYNCTASK_STRICT_SECRETS=true）下敏感项缺失即退出，
+     * 而非默默让敏感接口无鉴权运行 / 用内置默认主密钥解密。默认宽松（仅告警），不阻断本地起停。
+     */
+    private static void validateSecretsOrExit() {
+        String flag = System.getenv("SYNCTASK_STRICT_SECRETS");
+        if (flag == null || flag.isBlank()) flag = System.getProperty("synctask.strict.secrets", "");
+        boolean strict = "true".equalsIgnoreCase(flag.trim()) || "1".equals(flag.trim());
+
+        java.util.List<String> problems = new java.util.ArrayList<>();
+        String apiToken = System.getenv("AGENT_API_TOKEN");
+        if (apiToken == null || apiToken.isBlank()) {
+            problems.add("AGENT_API_TOKEN 未配置——failover / start-increment 等敏感 HTTP 接口将无鉴权放行");
+        }
+        String masterKey = System.getenv("SYNCTASK_MASTER_KEY");
+        if (masterKey == null || masterKey.isBlank()) masterKey = System.getProperty("synctask.master.key");
+        if (masterKey == null || masterKey.isBlank()) {
+            problems.add("SYNCTASK_MASTER_KEY 未配置——将退化为内置默认主密钥，与生产密文不兼容");
+        }
+
+        if (problems.isEmpty()) {
+            logger.info("Agent 启动安全校验通过（strict={}）", strict);
+            return;
+        }
+        String detail = String.join("\n  - ", problems);
+        if (strict) {
+            logger.error("Agent 启动安全校验失败（严格模式）：\n  - {}\n请注入上述密钥后重启。", detail);
+            System.exit(1);
+        } else {
+            logger.warn("⚠ Agent 启动安全校验发现问题（宽松模式，仅告警；生产请设 SYNCTASK_STRICT_SECRETS=true）：\n  - {}", detail);
+        }
     }
     
     public void start() {
