@@ -2655,6 +2655,9 @@
         let cfgColumnMappings = {};  // -> {源列: 目标列}
         let cfgExtraColumns = {};    // -> [{name, kind, value}]  kind: CREATE_TIME|UPDATE_TIME|CUSTOM
         let cfgColumnsCache = {};    // -> [{name, dataType, columnType, primaryKey, filterable}]
+        // 内容对比差异分页游标（openTaskConfig 打开时重置）。原为隐式全局（未声明直接赋值），
+        // 经典脚本 sloppy 模式下静默建 window 属性；改用 "use strict"+IIFE 后未声明赋值会 ReferenceError。
+        let cfgCompareDiffPage = 0;
 
         // 列处理是否可用：仅 mysql→mysql 任务展示【3.列处理】步骤
         function cfgColProcSupported() {
