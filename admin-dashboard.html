@@ -401,21 +401,31 @@
                             <div class="search-box-wrapper">
                                 <div class="search-box" id="drSearchBox">
                                     <span class="search-icon">🔍</span>
-                                    <input type="text" class="search-input" id="drSearchInput" placeholder="搜索灾备任务名称/ID">
+                                    <input type="text" class="search-input" id="drSearchInput" placeholder="灾备任务名称/ID（回车或点刷新查询）">
+                                    <span class="clear-filters-btn" id="drClearFiltersBtn" title="还原筛选条件" onclick="clearDrFiltersAndRefetch(event)">清空</span>
                                 </div>
-                                <!-- 灾备任务源库与目标库类型一致，只需一个数据库类型筛选；
-                                     选项与"同步任务管理"的数据库类型筛选保持一致 -->
-                                <select class="page-size" id="drDbTypeFilterSelect" title="数据库类型" style="margin-left: 8px;">
-                                    <option value="">数据库类型：全部</option>
-                                    <option value="mysql">MySQL</option>
-                                    <option value="postgresql">PostgreSQL</option>
-                                    <option value="oracle">Oracle</option>
-                                    <option value="mongodb">MongoDB</option>
-                                </select>
-                                <div class="toolbar-actions">
-                                    <button class="icon-btn" id="drRefreshBtn" title="刷新">↻</button>
+                                <!-- 点击查询框展开筛选：灾备两端类型一致，只有"数据库类型"一个维度；
+                                     下拉样式与"同步任务管理"点击查询框展开的筛选下拉保持一致 -->
+                                <div class="filter-dropdown" id="drFilterDropdown">
+                                    <div class="filter-option" data-filter="dbType">
+                                        <span class="filter-icon">🗄️</span>
+                                        <span>数据库类型</span>
+                                    </div>
+                                </div>
+                                <div class="status-dropdown" id="drDbTypeDropdown">
+                                    <div class="status-option type-option" data-db-type="mysql">MySQL</div>
+                                    <div class="status-option type-option" data-db-type="postgresql">PostgreSQL</div>
+                                    <div class="status-option type-option" data-db-type="oracle">Oracle</div>
+                                    <div class="status-option type-option" data-db-type="mongodb">MongoDB</div>
                                 </div>
                             </div>
+                            <div class="toolbar-actions">
+                                <button class="icon-btn" id="drRefreshBtn" title="刷新">↻</button>
+                            </div>
+                        </div>
+                        <!-- 已选筛选条件：小标签展示在查询框下方，标签右上角红✕移除 -->
+                        <div class="toolbar-row filter-tags-row">
+                            <div class="filter-tags" id="drFilterTags"></div>
                         </div>
                     </div>
 

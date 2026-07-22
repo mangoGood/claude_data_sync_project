@@ -572,24 +572,110 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
         });
 
         document.getElementById('drRefreshBtn').addEventListener('click', () => fetchDrTasks());
-        document.getElementById('drSearchInput').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') fetchDrTasks(1);
-        });
         document.getElementById('drPageSizeSelect').addEventListener('change', (e) => {
             drPageSize = parseInt(e.target.value);
-            fetchDrTasks(1);
-        });
-        // 灾备任务两端类型一致：单个"数据库类型"筛选同时下发 sourceType 与 targetType
-        document.getElementById('drDbTypeFilterSelect').addEventListener('change', (e) => {
-            const dbType = e.target.value || null;
-            drFilterSourceType = dbType;
-            drFilterTargetType = dbType;
             fetchDrTasks(1);
         });
         document.getElementById('drViewFailedBtn').addEventListener('click', () => {
             document.getElementById('drSearchInput').value = '';
             fetchDrTasksWithStatus('FAILED');
         });
+
+        // 查询框只承载名称/ID（回车或点刷新生效）；数据库类型经点击下拉选择后以小标签展示在
+        // 查询框下方（样式与同步任务管理一致）。灾备两端类型一致：单个"数据库类型"同时下发
+        // sourceType 与 targetType。
+        function initDrFilterDropdown() {
+            const searchInput = document.getElementById('drSearchInput');
+            const filterDropdown = document.getElementById('drFilterDropdown');
+            const dbTypeDropdown = document.getElementById('drDbTypeDropdown');
+
+            const showFilter = (e) => { if (e) e.stopPropagation(); filterDropdown.classList.add('show'); };
+            searchInput.addEventListener('focus', showFilter);
+            searchInput.addEventListener('click', showFilter);
+
+            document.addEventListener('click', (e) => {
+                if (!e.target.closest('.search-box-wrapper')) {
+                    filterDropdown.classList.remove('show');
+                    dbTypeDropdown.classList.remove('show');
+                }
+            });
+
+            filterDropdown.querySelectorAll('.filter-option').forEach(option => {
+                option.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    filterDropdown.classList.remove('show');
+                    dbTypeDropdown.classList.add('show');
+                });
+            });
+
+            dbTypeDropdown.querySelectorAll('.type-option').forEach(option => {
+                option.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const dbType = option.dataset.dbType || null;
+                    drFilterSourceType = dbType;
+                    drFilterTargetType = dbType;
+                    addDrFilterTag('数据库类型', formatDbTypeLabel(dbType), 'dbType');
+                    dbTypeDropdown.classList.remove('show');
+                    fetchDrTasks(1);
+                });
+            });
+
+            searchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    filterDropdown.classList.remove('show');
+                    dbTypeDropdown.classList.remove('show');
+                    updateDrClearFiltersVisibility();
+                    fetchDrTasks(1);
+                } else if (e.key === 'Escape') {
+                    filterDropdown.classList.remove('show');
+                    dbTypeDropdown.classList.remove('show');
+                }
+            });
+            searchInput.addEventListener('input', updateDrClearFiltersVisibility);
+        }
+
+        function addDrFilterTag(label, value, type) {
+            const filterTags = document.getElementById('drFilterTags');
+            const existing = filterTags.querySelector(`[data-type="${type}"]`);
+            if (existing) existing.remove();
+            const tag = document.createElement('span');
+            tag.className = 'filter-tag';
+            tag.dataset.type = type;
+            tag.innerHTML = `${label}：${escapeHtml(value)}<span class="tag-remove" onclick="removeDrFilterTag('${type}')">×</span>`;
+            filterTags.appendChild(tag);
+            updateDrClearFiltersVisibility();
+        }
+
+        function removeDrFilterTag(type) {
+            document.getElementById('drFilterTags').querySelectorAll(`[data-type="${type}"]`).forEach(t => t.remove());
+            if (type === 'dbType') {
+                drFilterSourceType = null;
+                drFilterTargetType = null;
+            }
+            updateDrClearFiltersVisibility();
+            fetchDrTasks(1);
+        }
+
+        function updateDrClearFiltersVisibility() {
+            const btn = document.getElementById('drClearFiltersBtn');
+            if (!btn) return;
+            const hasTags = document.getElementById('drFilterTags').children.length > 0;
+            const hasKeyword = !!document.getElementById('drSearchInput').value.trim();
+            btn.style.display = (hasTags || hasKeyword) ? 'inline' : 'none';
+        }
+
+        function clearDrFiltersAndRefetch(e) {
+            if (e) e.stopPropagation();
+            drFilterSourceType = null;
+            drFilterTargetType = null;
+            document.getElementById('drSearchInput').value = '';
+            document.getElementById('drFilterTags').innerHTML = '';
+            updateDrClearFiltersVisibility();
+            fetchDrTasks(1);
+        }
+
+        initDrFilterDropdown();
+        updateDrClearFiltersVisibility();
 
         async function fetchDrTasksWithStatus(status) {
             if (!checkAuth()) return;
@@ -613,5 +699,5 @@ __dash.drStatusMap = drStatusMap;
 // ==== 显式导出：onclick + 主脚本引用的 DR 函数 ====
 Object.assign(window, {
     confirmDrFailover, fetchDrTasks, goToDrPage, openDrConfig, selectDrDbType, selectDrMode,
-    showDrTaskDetail
+    showDrTaskDetail, removeDrFilterTag, clearDrFiltersAndRefetch
 });
