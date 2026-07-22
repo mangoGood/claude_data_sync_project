@@ -1948,6 +1948,32 @@
                         }
                     }
 
+                    // 列处理配置展示（列过滤/列映射/附加列，mysql→mysql 表级才有）：
+                    // 只在确有配置时才渲染该区块，否则整块隐藏。
+                    let colProcHtml = '';
+                    if (task.sync_objects) {
+                        try {
+                            const so = JSON.parse(task.sync_objects);
+                            const rows = [];
+                            const kindLabel = { CREATE_TIME: '创建时间', UPDATE_TIME: '更新时间', CUSTOM: '自定义值' };
+                            for (const [db, dv] of Object.entries(so || {})) {
+                                if (!dv || typeof dv !== 'object') continue;
+                                const cf = dv.columnFilter || {}, cm = dv.columnMapping || {}, ec = dv.extraColumns || {};
+                                const tables = new Set([...Object.keys(cf), ...Object.keys(cm), ...Object.keys(ec)]);
+                                for (const t of tables) {
+                                    const parts = [];
+                                    (cf[t] || []).forEach(f => parts.push(`<span style="color:#d46b08;">过滤</span> ${escapeHtml(f.column)} ${escapeHtml(f.op)} ${escapeHtml(String(f.value))} <span style="color:#999;">(命中不同步)</span>`));
+                                    Object.entries(cm[t] || {}).forEach(([s, d]) => parts.push(`<span style="color:#1890ff;">列映射</span> ${escapeHtml(s)} → ${escapeHtml(d)}`));
+                                    (ec[t] || []).forEach(e => parts.push(`<span style="color:#389e0d;">附加列</span> ${escapeHtml(e.name)} = ${escapeHtml(kindLabel[e.kind] || e.kind)}${e.value ? '：' + escapeHtml(String(e.value)) : ''}`));
+                                    if (parts.length) rows.push(`<div style="font-size:12px;padding:4px 0;border-bottom:1px dashed #f0f0f0;"><b>${escapeHtml(db)}.${escapeHtml(t)}</b><div style="margin-top:2px;">${parts.map(p => `<div style="padding:1px 0;">${p}</div>`).join('')}</div></div>`);
+                                }
+                            }
+                            if (rows.length) {
+                                colProcHtml = `<div style="max-height:160px;overflow-y:auto;border:1px solid #e8e8e8;border-radius:4px;padding:8px;">${rows.join('')}</div>`;
+                            }
+                        } catch (e) { /* 忽略解析失败 */ }
+                    }
+
                     // 连接信息只展示类型与地址，不暴露连接串（含账号口令）
                     const extractHostPort = (conn) => {
                         const m = (conn || '').match(/@([^:/@]+):(\d+)/);
@@ -2013,6 +2039,11 @@
 
                             <div style="font-size: 13px; color: #666;">${syncGranularity === '库级' ? '同步库:' : '同步表:'}</div>
                             <div style="font-size: 13px;">${syncObjectsHtml}</div>
+
+                            ${colProcHtml ? `
+                            <div style="font-size: 13px; color: #666;">列处理配置:</div>
+                            <div style="font-size: 13px;">${colProcHtml}</div>
+                            ` : ''}
 
                             <div style="font-size: 13px; color: #666;">源库类型:</div>
                             <div style="font-size: 13px;">${sourceTypeLabel}</div>
