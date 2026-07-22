@@ -60,7 +60,8 @@ services:
       chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
       exec docker-entrypoint.sh mongod --configsvr --replSet csrsSrc --keyFile /etc/mongo-key --bind_ip_all"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.10
 
   synctask-mongos-src-sh1:
     image: docker.1ms.run/mongo:latest
@@ -71,7 +72,8 @@ services:
       chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
       exec docker-entrypoint.sh mongod --shardsvr --replSet srcSh1 --keyFile /etc/mongo-key --bind_ip_all"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.11
 
   synctask-mongos-src-sh2:
     image: docker.1ms.run/mongo:latest
@@ -82,7 +84,8 @@ services:
       chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
       exec docker-entrypoint.sh mongod --shardsvr --replSet srcSh2 --keyFile /etc/mongo-key --bind_ip_all"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.12
 
   synctask-mongos-src:
     image: docker.1ms.run/mongo:latest
@@ -99,7 +102,8 @@ services:
     ports:
       - "27217:27017"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.13
 
   # ============ MongoDB 分片集群（目标）：configsvr + 1 shard + mongos(:27218) ============
   synctask-mongos-dst-cfg:
@@ -111,7 +115,8 @@ services:
       chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
       exec docker-entrypoint.sh mongod --configsvr --replSet csrsDst --keyFile /etc/mongo-key --bind_ip_all"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.14
 
   synctask-mongos-dst-sh1:
     image: docker.1ms.run/mongo:latest
@@ -122,7 +127,8 @@ services:
       chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
       exec docker-entrypoint.sh mongod --shardsvr --replSet dstSh1 --keyFile /etc/mongo-key --bind_ip_all"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.15
 
   synctask-mongos-dst:
     image: docker.1ms.run/mongo:latest
@@ -138,7 +144,8 @@ services:
     ports:
       - "27218:27017"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.16
 
   synctask-es:
     image: docker.1ms.run/elasticsearch:8.11.1
@@ -153,7 +160,8 @@ services:
     ports:
       - "9200:9200"
     networks:
-      - synctask-db-net
+      synctask-db-net:
+        ipv4_address: 192.168.155.17
 
 networks:
   synctask-db-net:

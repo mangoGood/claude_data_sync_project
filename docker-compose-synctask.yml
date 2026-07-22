@@ -17,7 +17,8 @@ services:
       timeout: 5s
       retries: 20
     networks:
-      - synctask-net
+      synctask-net:
+        ipv4_address: 192.168.150.10
 
   synctask-zk:
     image: docker.1ms.run/confluentinc/cp-zookeeper:7.3.0
@@ -26,7 +27,8 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     networks:
-      - synctask-net
+      synctask-net:
+        ipv4_address: 192.168.150.11
 
   synctask-kafka:
     image: docker.1ms.run/confluentinc/cp-kafka:7.3.0
@@ -48,8 +50,14 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     networks:
-      - synctask-net
+      synctask-net:
+        ipv4_address: 192.168.150.12
 
 networks:
   synctask-net:
     driver: bridge
+    # 固定子网 + 各容器静态 IP：避免容器/宿主重启后容器 IP 变化
+    # （OrbStack/Docker 默认按启动顺序动态分配，重启后可能漂移）。
+    ipam:
+      config:
+        - subnet: 192.168.150.0/24
