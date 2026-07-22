@@ -130,12 +130,13 @@ public class THLToSqlConverter {
             logger.info("DML 库名映射已加载: {}", databaseMapping);
         }
 
-        // 列处理（mysql→mysql）：文本回退路径只做列名映射（保证 SQL 与已改名的目标表结构一致，
-        // 附加列由建表 DEFAULT 承载天然生效）；列过滤需要类型化值判定，文本路径无法执行——
-        // 正常情况下 mysql→mysql DML 全部走类型化管道，这里仅对回退事件告警留痕。
+        // 列处理（同引擎 mysql→mysql / pg→pg）：文本回退路径只做列名映射（保证 SQL 与已改名的
+        // 目标表结构一致，附加列由建表 DEFAULT 承载天然生效）；列过滤需要类型化值判定，文本路径
+        // 无法执行——正常情况下同引擎 DML 全部走类型化管道，这里仅对回退事件告警留痕。
         this.columnProcessing = com.migration.config.ColumnProcessingConfig.loadFromProperties(props);
         this.columnProcessingActive = !columnProcessing.isEmpty()
-                && sourceIsMysql && !isPostgresql;
+                && ((sourceIsMysql && !isPostgresql)
+                    || (sourceIsPostgresql && targetIsPostgresql));
 
         this.sqlClassifier = new SqlClassifier();
         this.conflictKeyParser = new SqlConflictKeyParser();

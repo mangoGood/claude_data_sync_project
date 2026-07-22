@@ -175,7 +175,7 @@ public class ConfigService {
         Map<String, String> collectedTableMappings = new java.util.LinkedHashMap<>();
         // 库名映射（entry 的 targetDb，表级/库级均可携带）：key = 源库，value = 目标库
         Map<String, String> collectedDbMappings = new java.util.LinkedHashMap<>();
-        // 列处理（仅表级同步 entry 携带，mysql→mysql）：key = "<源库>.<源表>"，
+        // 列处理（仅表级同步 entry 携带，同引擎 mysql→mysql / pg→pg）：key = "<源库>.<源表>"，
         // value 为 ColumnProcessingConfig 约定的序列化串（filter: 列|op|值; mapping: 源列:目标列; extra: 名:类型[:值]）
         Map<String, String> collectedColumnFilters = new java.util.LinkedHashMap<>();
         Map<String, String> collectedColumnMappings = new java.util.LinkedHashMap<>();
@@ -339,7 +339,7 @@ public class ConfigService {
             }
         }
 
-        // 列处理（仅表级同步、mysql→mysql）：column.filter./column.mapping./column.extra.<源库>.<源表>，
+        // 列处理（仅表级同步、同引擎 mysql→mysql / pg→pg）：column.filter./column.mapping./column.extra.<源库>.<源表>，
         // 供全量（建表列改名/附加列、SELECT 过滤、INSERT 列映射）与增量（DML 行过滤/列改名）消费。
         // 重新下发同步对象时先清旧键，避免改配置后残留失效的列处理。
         if (syncObjectsUpdated) {

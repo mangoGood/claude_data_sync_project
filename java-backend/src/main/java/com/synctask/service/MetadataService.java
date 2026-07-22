@@ -601,21 +601,32 @@ public class MetadataService {
                "config".equalsIgnoreCase(dbName);
     }
 
-    /** 列过滤支持的类型（整数/bit/浮点定点/日期时间），供前端“列名过滤”页签按类型放行 */
+    /** 列过滤支持的 MySQL 类型（整数/bit/浮点定点/日期时间），供前端“列名过滤”页签按类型放行 */
     private static final Set<String> FILTERABLE_COLUMN_TYPES = new HashSet<>(Arrays.asList(
         "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "bit",
         "decimal", "numeric", "float", "double",
         "date", "datetime", "timestamp", "time", "year"
     ));
 
+    /** 列过滤支持的 PostgreSQL 类型（information_schema.columns.data_type 口径）：整数/定点/浮点/布尔/日期时间。 */
+    private static final Set<String> FILTERABLE_PG_COLUMN_TYPES = new HashSet<>(Arrays.asList(
+        "smallint", "integer", "bigint", "numeric", "decimal", "real", "double precision",
+        "boolean", "date",
+        "timestamp without time zone", "timestamp with time zone",
+        "time without time zone", "time with time zone"
+    ));
+
     /**
-     * 查询表的列信息（列处理页面用，目前仅支持 MySQL 源）。
+     * 查询表的列信息（列处理页面用，支持 MySQL 与 PostgreSQL 同构源）。
      * 返回每列的 name/dataType/columnType/primaryKey/filterable。
      */
     public List<java.util.Map<String, Object>> listColumns(String connectionStr, String database, String table) {
         ParsedConnection conn = parseConnection(connectionStr);
-        if (conn.isMongo() || conn.isPostgresql() || conn.isOracle() || conn.isElastic()) {
-            throw new RuntimeException("列处理目前仅支持 MySQL 数据源");
+        if (conn.isPostgresql()) {
+            return listPostgresColumns(conn, database, table);
+        }
+        if (conn.isMongo() || conn.isOracle() || conn.isElastic()) {
+            throw new RuntimeException("列处理目前仅支持 MySQL 与 PostgreSQL 同构数据源");
         }
         List<java.util.Map<String, Object>> columns = new ArrayList<>();
         try {
@@ -649,6 +660,81 @@ public class MetadataService {
             throw new RuntimeException("数据库驱动未找到: " + e.getMessage());
         }
         return columns;
+    }
+
+    /**
+     * 查询 PostgreSQL 表的列信息（列处理页面用）。connectionStr 携带 PG 数据库名，
+     * database 参数是 PG schema（与 syncObjects 的库键一致，PG schema 对应库级概念）。
+     */
+    private List<java.util.Map<String, Object>> listPostgresColumns(ParsedConnection conn, String schema, String table) {
+        String effectiveSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
+        List<java.util.Map<String, Object>> columns = new ArrayList<>();
+        try {
+            Class.forName("org.postgresql.Driver");
+            try (Connection connection = DataSourcePoolManager.getConnection(
+                    buildJdbcUrl(conn, conn.database), conn.username, conn.password)) {
+                // 主键列集合
+                Set<String> pkColumns = new HashSet<>();
+                try (PreparedStatement stmt = connection.prepareStatement(
+                        "SELECT kcu.column_name FROM information_schema.table_constraints tc " +
+                        "JOIN information_schema.key_column_usage kcu " +
+                        "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema " +
+                        "WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = ? AND tc.table_name = ?")) {
+                    stmt.setString(1, effectiveSchema);
+                    stmt.setString(2, table);
+                    try (ResultSet rs = stmt.executeQuery()) {
+                        while (rs.next()) {
+                            pkColumns.add(rs.getString(1));
+                        }
+                    }
+                }
+                try (PreparedStatement stmt = connection.prepareStatement(
+                        "SELECT column_name, data_type, character_maximum_length, numeric_precision, numeric_scale " +
+                        "FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position")) {
+                    stmt.setString(1, effectiveSchema);
+                    stmt.setString(2, table);
+                    try (ResultSet rs = stmt.executeQuery()) {
+                        while (rs.next()) {
+                            java.util.Map<String, Object> col = new java.util.LinkedHashMap<>();
+                            String colName = rs.getString("column_name");
+                            String dataType = rs.getString("data_type");
+                            col.put("name", colName);
+                            col.put("dataType", dataType);
+                            col.put("columnType", buildPgColumnType(rs, dataType));
+                            col.put("primaryKey", pkColumns.contains(colName));
+                            col.put("filterable", dataType != null
+                                    && FILTERABLE_PG_COLUMN_TYPES.contains(dataType.toLowerCase()));
+                            columns.add(col);
+                        }
+                    }
+                }
+            }
+            logger.info("PG 表 {}.{} 查询到 {} 个列", effectiveSchema, table, columns.size());
+        } catch (SQLException e) {
+            logger.error("查询 PG 列信息失败: {}", e.getMessage());
+            throw new RuntimeException("查询列信息失败: " + e.getMessage());
+        } catch (ClassNotFoundException e) {
+            throw new RuntimeException("数据库驱动未找到: " + e.getMessage());
+        }
+        return columns;
+    }
+
+    /** 组装 PG 列的展示类型串：varchar(n) / numeric(p,s) / 原始 data_type。 */
+    private String buildPgColumnType(ResultSet rs, String dataType) throws SQLException {
+        if (dataType == null) {
+            return "";
+        }
+        long charLen = rs.getLong("character_maximum_length");
+        if (!rs.wasNull() && charLen > 0) {
+            return dataType + "(" + charLen + ")";
+        }
+        int precision = rs.getInt("numeric_precision");
+        boolean precisionNull = rs.wasNull();
+        int scale = rs.getInt("numeric_scale");
+        if (!precisionNull && ("numeric".equalsIgnoreCase(dataType) || "decimal".equalsIgnoreCase(dataType))) {
+            return dataType + "(" + precision + "," + scale + ")";
+        }
+        return dataType;
     }
 
     public List<TableInfo> listTables(String connectionStr, String database) {

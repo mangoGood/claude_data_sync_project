@@ -2681,7 +2681,7 @@
         // 库名映射：key = 源库名，value = 目标库名（表级/库级同步均支持）。
         // 未配置/与源库同名 = 不映射。取代原"目标数据库名称"输入框（PG 目标的库名走连接区输入）。
         let cfgDbNameMapping = {};
-        // 列处理（仅 MySQL→MySQL 表级同步）：key 均为 "db.table"
+        // 列处理（同引擎 MySQL→MySQL / PG→PG 表级同步）：key 均为 "db.table"
         let cfgColumnFilters = {};   // -> [{column, op, value}]
         let cfgColumnMappings = {};  // -> {源列: 目标列}
         let cfgExtraColumns = {};    // -> [{name, kind, value}]  kind: CREATE_TIME|UPDATE_TIME|CUSTOM
@@ -2690,9 +2690,10 @@
         // 经典脚本 sloppy 模式下静默建 window 属性；改用 "use strict"+IIFE 后未声明赋值会 ReferenceError。
         let cfgCompareDiffPage = 0;
 
-        // 列处理是否可用：仅 mysql→mysql 任务展示【3.列处理】步骤
+        // 列处理是否可用：同引擎任务（mysql→mysql / pg→pg）展示【3.列处理】步骤
         function cfgColProcSupported() {
-            return cfgSourceType === 'mysql' && cfgTargetType === 'mysql';
+            return (cfgSourceType === 'mysql' && cfgTargetType === 'mysql')
+                || (cfgSourceType === 'postgresql' && cfgTargetType === 'postgresql');
         }
 
         function cfgClearAllColumnProcessing() {
@@ -2780,7 +2781,7 @@
             cfgRenderSelectedObjects();
         }
 
-        // ==================== 列处理页面（步骤3，仅 mysql→mysql 表级） ====================
+        // ==================== 列处理页面（步骤3，同引擎 mysql→mysql / pg→pg 表级） ====================
 
         const COLPROC_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_$]*$/;
         // 自定义附加列输入值白名单：与 agent 侧校验一致（值会拼进建表 DEFAULT 字面量）
@@ -3522,7 +3523,7 @@
             });
         }
 
-        // 向导步骤序列：mysql→mysql 为 1连接→2对象→3列处理→4校验；其余库对无列处理步骤（1→2→4）
+        // 向导步骤序列：同引擎(mysql→mysql/pg→pg) 为 1连接→2对象→3列处理→4校验；其余库对无列处理步骤（1→2→4）
         function cfgStepSequence() {
             return cfgColProcSupported() ? [1, 2, 3, 4] : [1, 2, 4];
         }
