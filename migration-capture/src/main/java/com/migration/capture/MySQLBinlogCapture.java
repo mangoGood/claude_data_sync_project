@@ -101,7 +101,17 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         // 有 GTID 集且未显式关闭时优先按 GTID 自动定位——源端 HA 切换/binlog 文件名变化时
         // file+pos 失效而 GTID 仍然有效。gtid_executed 原文可能含换行，需归一化。
         gtidEnabled = Boolean.parseBoolean(props.getProperty("capture.gtid.enabled", "true"));
+        // 只有源库 gtid_mode=ON 才能按 GTID 自动定位（AUTO_POSITION）。关键坑：源库
+        // gtid_mode=OFF 时 @@global.gtid_executed 仍可能非空（曾经开过 GTID 的历史遗留），
+        // checkpoint 会把它当作可用 GTID 集写进 capture.gtid.set——但对 OFF 的源发起
+        // AUTO_POSITION 会被拒："replication sender thread cannot start in AUTO_POSITION
+        // mode: this server has GTID_MODE = OFF"，导致 binlog 拉取彻底失败、增量不同步。
+        // 因此以 gtid_mode 而非 gtid_executed 是否非空为准，非 ON 一律回退 file+pos。
         gtidSet = props.getProperty("capture.gtid.set", "").replaceAll("\\s+", "");
+        if (gtidEnabled && !gtidSet.isEmpty() && !sourceGtidModeOn()) {
+            logger.warn("源库 gtid_mode 非 ON（gtid_executed={} 可能是历史遗留），放弃 GTID 自动定位，回退 file+pos", gtidSet);
+            gtidSet = "";
+        }
         outputDir = props.getProperty("capture.output.dir", "binlog_output");
         taskId = props.getProperty("task.id", "unknown");
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
@@ -813,6 +823,22 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
     public long getLastRpoMs() {
         return lastRpoMs;
+    }
+
+    /** 源库 gtid_mode 是否为 ON / ON_PERMISSIVE（AUTO_POSITION 前提）。查询失败保守返回 false 走 file+pos。 */
+    private boolean sourceGtidModeOn() {
+        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        try (Connection conn = DriverManager.getConnection(url, user, password);
+             Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_mode")) {
+            if (rs.next()) {
+                String mode = rs.getString(1);
+                return mode != null && mode.toUpperCase().startsWith("ON");
+            }
+        } catch (Exception e) {
+            logger.warn("查询源库 gtid_mode 失败，保守回退 file+pos: {}", e.getMessage());
+        }
+        return false;
     }
 
     private void initClockOffset() {
