@@ -97,11 +97,15 @@ public class DataMigration {
         return conn;
     }
 
-    /** 列处理仅在 mysql→mysql 同构链路生效。 */
+    /** 列处理仅在同引擎链路（mysql→mysql / pg→pg）生效（引用符已按方言生成）。 */
     private boolean columnProcessingApplicable() {
-        return columnProcessing != null && !columnProcessing.isEmpty()
-                && "mysql".equalsIgnoreCase(sourceConnection.getConfig().getDbType())
-                && "mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType());
+        if (columnProcessing == null || columnProcessing.isEmpty()) {
+            return false;
+        }
+        String src = sourceConnection.getConfig().getDbType();
+        String tgt = targetConnection.getConfig().getDbType();
+        return ("mysql".equalsIgnoreCase(src) && "mysql".equalsIgnoreCase(tgt))
+                || ("postgresql".equalsIgnoreCase(src) && "postgresql".equalsIgnoreCase(tgt));
     }
 
     /**
@@ -769,7 +773,7 @@ public class DataMigration {
         for (var column : table.getColumns()) {
             // Oracle→PG 场景：源端列名通常为大写，目标 PG 表已建为小写，这里转小写以匹配
             String colName = (sourceIsOracle() && targetIsPostgresql) ? column.getColumnName().toLowerCase() : column.getColumnName();
-            // 列名映射（mysql→mysql）：目标端 INSERT 列表用目标列名；源端 SELECT 仍用源列名
+            // 列名映射（mysql→mysql / pg→pg）：目标端 INSERT 列表用目标列名；源端 SELECT 仍用源列名
             if (applyColumnMapping) {
                 colName = columnProcessing.mapColumn(srcDb, table.getTableName(), colName);
             }

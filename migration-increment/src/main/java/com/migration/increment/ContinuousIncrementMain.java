@@ -15,6 +15,10 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.sql.*;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ContinuousIncrementMain {
@@ -69,6 +73,28 @@ public class ContinuousIncrementMain {
 
     /** 已处理THL文件保留数量（安全余量），超过此数量的已处理文件将被清理 */
     private int thlRetentionCount = 2;
+
+    /**
+     * 人工裁决跳过的事件（fail-stop 后运维确认无法/无需修复时，经后端"跳过失败事件并重试"下发；
+     * 命中的事件不应用、写死信记录后推进位点）。
+     * 首选按 eventId（binlog文件:位点，increment.skip.event.ids）匹配——resume 后 capture 重读
+     * binlog 会给同一事件重新分配 seqno，seqno 跨重启不稳定；seqno 集（increment.skip.seqnos）
+     * 仅作为老错误信息（不带 eventId）的兼容兜底。
+     */
+    private final java.util.Set<Long> skipSeqnos = new java.util.HashSet<>();
+    private final java.util.Set<String> skipEventIds = new java.util.HashSet<>();
+
+    /**
+     * 增量并行应用并发度（increment.apply.parallelism，默认 1=原串行路径不动）。
+     * >1 时按表 hash 分片到 N 个 worker（各自独立目标连接），同表事件保序、跨表并发。
+     * 跨表乱序由 FOREIGN_KEY_CHECKS=0 + 幂等 upsert 兜底（与全量并行、resume 整段重放同一套保证）。
+     * DDL/心跳/被裁决跳过等非行事件作 barrier（先 drain 当前批，再串行处理）。
+     */
+    private int applyParallelism = 1;
+    /** 单个并行批的事件数上限（increment.apply.batch.size）：批越大并行度利用越充分，但失败回退与内存占用越大。 */
+    private int applyBatchSize = 500;
+    /** 并行应用执行器（懒初始化，仅 applyParallelism>1 时创建；进程停止时关闭）。 */
+    private ParallelApplyExecutor parallelExecutor;
 
     public static void main(String[] args) {
         com.migration.common.OracleNetCompat.apply();
@@ -167,6 +193,34 @@ public class ContinuousIncrementMain {
         progressFile = "./files/" + taskId + "/checkpoint/.increment_progress";
         tableLatencyDir = "./files/" + taskId + "/binlog_output/table_latency";
         thlRetentionCount = Integer.parseInt(props.getProperty("increment.thl.retention.count", "2"));
+
+        String skipSeqnosProp = props.getProperty("increment.skip.seqnos", "").trim();
+        if (!skipSeqnosProp.isEmpty()) {
+            for (String s : skipSeqnosProp.split(",")) {
+                try {
+                    skipSeqnos.add(Long.parseLong(s.trim()));
+                } catch (NumberFormatException nfe) {
+                    logger.warn("忽略非法的跳过 seqno: {}", s);
+                }
+            }
+        }
+        String skipEventIdsProp = props.getProperty("increment.skip.event.ids", "").trim();
+        if (!skipEventIdsProp.isEmpty()) {
+            for (String s : skipEventIdsProp.split(",")) {
+                if (!s.trim().isEmpty()) skipEventIds.add(s.trim());
+            }
+        }
+        if (!skipSeqnos.isEmpty() || !skipEventIds.isEmpty()) {
+            logger.warn("人工裁决跳过事件已配置: eventIds={}, seqnos={}（命中事件不应用，写死信记录后推进位点）",
+                    skipEventIds, skipSeqnos);
+        }
+
+        applyParallelism = Math.max(1, Integer.parseInt(props.getProperty("increment.apply.parallelism", "1")));
+        applyBatchSize = Math.max(1, Integer.parseInt(props.getProperty("increment.apply.batch.size", "500")));
+        if (applyParallelism > 1) {
+            logger.info("增量并行应用已启用: 并发度={}, 批大小={}（按表分片，同表保序，跨表并发）",
+                    applyParallelism, applyBatchSize);
+        }
         ensureDirExists(tableLatencyDir);
         // 初始化 THL 加密服务
         this.thlEncryptionService = new ThlEncryptionService(props);
@@ -179,21 +233,23 @@ public class ContinuousIncrementMain {
                 thlDirectory, targetHost, targetPort, targetDatabase, lastExecutedSeqno);
     }
 
-    private void connectToTargetDatabase() throws SQLException {
-        String url;
+    /** 目标库 JDBC URL（串行主连接与并行 worker 连接共用，避免 URL 口径漂移）。 */
+    private String buildTargetJdbcUrl() {
         if (isPostgresql) {
             String jdbcUrl = props.getProperty("target.db.jdbc.url");
             if (jdbcUrl != null && !jdbcUrl.isEmpty()) {
-                url = jdbcUrl;
-            } else {
-                // stringtype=unspecified：字符串参数由 PG 按列类型推断（interval/jsonb/时间等绑定依赖）
-                url = "jdbc:postgresql://" + targetHost + ":" + targetPort + "/" + targetDatabase
-                        + "?stringtype=unspecified";
+                return jdbcUrl;
             }
-        } else {
-            url = "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
-                    "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+            // stringtype=unspecified：字符串参数由 PG 按列类型推断（interval/jsonb/时间等绑定依赖）
+            return "jdbc:postgresql://" + targetHost + ":" + targetPort + "/" + targetDatabase
+                    + "?stringtype=unspecified";
         }
+        return "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
+                "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+    }
+
+    private void connectToTargetDatabase() throws SQLException {
+        String url = buildTargetJdbcUrl();
         targetConnection = ConnectionPoolManager.getConnection(url, targetUser, targetPassword);
         logger.info("已连接目标数据库: {}:{}/{} (类型: {})", targetHost, targetPort, targetDatabase,
                 isPostgresql ? "postgresql" : "mysql");
@@ -395,6 +451,12 @@ public class ContinuousIncrementMain {
             return;
         }
 
+        // 并行应用（opt-in）：默认 applyParallelism=1 时不进入此分支，串行路径完全不变
+        if (applyParallelism > 1) {
+            processThlFileParallel(thlFile, isLatestFile);
+            return;
+        }
+
         logger.info("处理THL文件: {}", fileName);
         int eventCount = 0;
         // 本文件是否被中途打断（优雅停止 / 不可恢复错误 fail-stop）：
@@ -431,6 +493,24 @@ public class ContinuousIncrementMain {
                         }
                     }
 
+                    continue;
+                }
+
+                // 人工裁决跳过：命中 eventId（跨重启稳定）或 seqno（老错误信息兼容）的事件不应用，
+                // 写死信记录后按正常事件推进位点。放在转换之前——毒事件可能在转换阶段就抛异常，
+                // 转换只在死信记录里尽力而为
+                if ((!skipEventIds.isEmpty() && event.getEventId() != null && skipEventIds.contains(event.getEventId()))
+                        || (!skipSeqnos.isEmpty() && skipSeqnos.contains(event.getSeqno()))) {
+                    recordDeadLetter(event);
+                    lastExecutedSeqno = event.getSeqno();
+                    String skipBinlogFile = (String) event.getMetadata("binlog_file");
+                    Long skipBinlogPosition = (Long) event.getMetadata("binlog_position");
+                    checkpointManager.saveCheckpoint(
+                            event.getSeqno(),
+                            skipBinlogFile != null ? skipBinlogFile : "",
+                            skipBinlogPosition != null ? skipBinlogPosition : 0,
+                            event.getEventId() != null ? event.getEventId() : ""
+                    );
                     continue;
                 }
 
@@ -488,13 +568,13 @@ public class ContinuousIncrementMain {
                                     } catch (SQLException retryEx) {
                                         txFailed = true;
                                         logger.error("重连后参数化SQL重试失败 (seqno={}): {}", event.getSeqno(), retryEx.getMessage());
-                                        writeErrorStatus("E3004", "不可恢复的SQL错误: " + retryEx.getMessage(), event.getSeqno());
+                                        writeErrorStatus("E3004", "不可恢复的SQL错误: " + retryEx.getMessage(), event);
                                         break;
                                     }
                                 } else {
                                     txFailed = true;
                                     logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}", event.getSeqno(), dml, errorMsg);
-                                    writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event.getSeqno());
+                                    writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event);
                                     break;
                                 }
                             }
@@ -534,7 +614,7 @@ public class ContinuousIncrementMain {
                             if (!isRecoverable) {
                                 txFailed = true;
                                 logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}", event.getSeqno(), sql.substring(0, Math.min(200, sql.length())), errorMsg);
-                                writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event.getSeqno());
+                                writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event);
                                 break;
                             }
                         }
@@ -979,10 +1059,492 @@ public class ContinuousIncrementMain {
         }
     }
 
+    /** 已写过死信的 eventId（分带SQL/仅元数据两类）：resume 重放 binlog 会反复命中同一跳过事件，按类去重避免重复追加。 */
+    private final java.util.Set<String> deadletterRecordedSql = new java.util.HashSet<>();
+    private final java.util.Set<String> deadletterRecordedMeta = new java.util.HashSet<>();
+    private boolean deadletterIndexLoaded = false;
+
+    /** 启动后首次写死信前，把既有 deadletter.jsonl 中的 eventId 载入去重索引（跨进程重启防重）。 */
+    private void loadDeadletterIndex() {
+        deadletterIndexLoaded = true;
+        File dlFile = new File("./files/" + taskId + "/deadletter.jsonl");
+        if (!dlFile.exists()) return;
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile("\"eventId\":\"([^\"]*)\"");
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(dlFile), java.nio.charset.StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                java.util.regex.Matcher m = p.matcher(line);
+                if (m.find() && !m.group(1).isEmpty()) {
+                    if (line.contains("\"statements\":[]")) deadletterRecordedMeta.add(m.group(1));
+                    else deadletterRecordedSql.add(m.group(1));
+                }
+            }
+        } catch (IOException e) {
+            logger.warn("读取既有死信记录失败（去重索引不完整，可能出现重复记录）: {}", e.getMessage());
+        }
+    }
+
     /**
-     * 写入错误状态文件，供 agent 监控循环检测并上报 FAILED 状态。
+     * 死信记录：人工裁决跳过的事件逐条追加到 files/<taskId>/deadletter.jsonl（每行一个 JSON 对象），
+     * 供 agent HTTP /api/agent/deadletter/<taskId> 读取、后端代理给 UI 展示。
+     * SQL 为尽力转换（毒事件可能在转换阶段就失败，此时只记事件元数据）。
+     * 同一 eventId 带SQL/仅元数据各至多记录一次——resume 重放会反复命中已跳过事件。
      */
-    private void writeErrorStatus(String errorCode, String errorMessage, long seqno) {
+    private void recordDeadLetter(THLEvent event) {
+        if (!deadletterIndexLoaded) {
+            loadDeadletterIndex();
+        }
+        List<String> statements = java.util.Collections.emptyList();
+        try {
+            statements = sqlConverter.convertToSql(event);
+        } catch (Exception e) {
+            logger.warn("死信事件 SQL 转换失败 (seqno={})，仅记录元数据: {}", event.getSeqno(), e.getMessage());
+        }
+        String eid = event.getEventId();
+        if (eid != null && !eid.isEmpty()) {
+            boolean firstOfKind = statements.isEmpty()
+                    ? deadletterRecordedMeta.add(eid)
+                    : deadletterRecordedSql.add(eid);
+            if (!firstOfKind) {
+                logger.info("死信已记录过 (eventId={}, seqno={})，跳过重复写入", eid, event.getSeqno());
+                return;
+            }
+        }
+        StringBuilder sb = new StringBuilder(256);
+        sb.append('{')
+          .append("\"ts\":").append(System.currentTimeMillis()).append(',')
+          .append("\"seqno\":").append(event.getSeqno()).append(',')
+          .append("\"eventId\":\"").append(jsonEscape(event.getEventId())).append("\",")
+          .append("\"eventType\":\"").append(jsonEscape(String.valueOf(event.getMetadata("event_type")))).append("\",")
+          .append("\"tableName\":\"").append(jsonEscape(String.valueOf(event.getMetadata("table_name")))).append("\",")
+          .append("\"binlogFile\":\"").append(jsonEscape(String.valueOf(event.getMetadata("binlog_file")))).append("\",")
+          .append("\"binlogPosition\":\"").append(jsonEscape(String.valueOf(event.getMetadata("binlog_position")))).append("\",")
+          .append("\"reason\":\"manual-skip\",")
+          .append("\"statements\":[");
+        for (int i = 0; i < statements.size(); i++) {
+            if (i > 0) sb.append(',');
+            String stmt = statements.get(i);
+            sb.append('"').append(jsonEscape(stmt.length() > 2000 ? stmt.substring(0, 2000) + "…" : stmt)).append('"');
+        }
+        sb.append("]}");
+
+        File dlFile = new File("./files/" + taskId + "/deadletter.jsonl");
+        dlFile.getParentFile().mkdirs();
+        try (PrintWriter pw = new PrintWriter(new FileWriter(dlFile, true))) {
+            pw.println(sb);
+        } catch (IOException e) {
+            logger.error("写入死信记录失败 (seqno={}): {}", event.getSeqno(), e.getMessage());
+        }
+        logger.warn("事件已按人工裁决跳过并记入死信: seqno={}, table={}, statements={}",
+                event.getSeqno(), event.getMetadata("table_name"), statements.size());
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null || "null".equals(s)) return "";
+        StringBuilder out = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': out.append("\\\""); break;
+                case '\\': out.append("\\\\"); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                default:
+                    if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+                    else out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    // ==================== 并行应用（increment.apply.parallelism>1） ====================
+    //
+    // 设计：转换在主线程按 seqno 顺序进行（规避转换器线程安全问题、保持 DDL 的 SchemaEvolution 副作用有序），
+    // 仅"执行"并行——主线程把已转换事件按表 hash 分发到 N 个 worker，各 worker 在自己的连接上按序应用其表的事件。
+    // barrier（DDL/心跳/被裁决跳过/无表名事件）先 drain 当前批，再主线程串行处理，随后继续。
+    // checkpoint 只推进到"连续完成的低水位"：任一事件失败即 fail-stop，位点停在最小失败 seqno 之前；
+    // 失败点之后已并行落库的其它表事件在 resume 时被幂等重放（与串行 fail-stop、resume 整段重放同一保证）。
+
+    /** 一个待应用的已转换事件（typed 与 text 二选一）。 */
+    private static final class WorkItem {
+        final THLEvent event;
+        final List<ParameterizedDml> typedDmls;
+        final List<String> sqlStatements;
+        WorkItem(THLEvent event, List<ParameterizedDml> typedDmls, List<String> sqlStatements) {
+            this.event = event;
+            this.typedDmls = typedDmls;
+            this.sqlStatements = sqlStatements;
+        }
+    }
+
+    /** 并行执行器：固定 N 线程 + N 个独立目标连接（跨文件复用，进程停止时关闭）。 */
+    private final class ParallelApplyExecutor {
+        final int n;
+        final Connection[] conns;
+        final ExecutorService pool;
+        ParallelApplyExecutor(int n) throws SQLException {
+            this.n = n;
+            this.conns = new Connection[n];
+            for (int i = 0; i < n; i++) {
+                Connection c = ConnectionPoolManager.getConnection(buildTargetJdbcUrl(), targetUser, targetPassword);
+                if (!isPostgresql) {
+                    try (Statement st = c.createStatement()) { st.execute("SET FOREIGN_KEY_CHECKS=0"); }
+                    catch (SQLException e) { logger.warn("worker 连接设置 FOREIGN_KEY_CHECKS=0 失败: {}", e.getMessage()); }
+                }
+                if (bidirectionalEnabled) ensureMarkerTableOn(c);
+                conns[i] = c;
+            }
+            this.pool = Executors.newFixedThreadPool(n, r -> {
+                Thread t = new Thread(r, "increment-apply-worker");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        void close() {
+            pool.shutdownNow();
+            for (Connection c : conns) {
+                try { if (c != null) c.close(); } catch (SQLException ignored) {}
+            }
+        }
+    }
+
+    private boolean isParallelizable(THLEvent event) {
+        if (!isDataChangeEvent(event)) return false;
+        String table = (String) event.getMetadata("table_name");
+        return table != null && !table.isEmpty();
+    }
+
+    private void processThlFileParallel(File thlFile, boolean isLatestFile) {
+        String fileName = thlFile.getName();
+        logger.info("处理THL文件(并行 x{}): {}", applyParallelism, fileName);
+        boolean aborted = false;
+
+        try {
+            if (parallelExecutor == null) {
+                parallelExecutor = new ParallelApplyExecutor(applyParallelism);
+            }
+        } catch (SQLException e) {
+            logger.error("初始化并行应用执行器失败，本文件跳过: {}", e.getMessage());
+            return;
+        }
+
+        try (THLFileReader reader = createThlReader(thlFile.getAbsolutePath())) {
+            List<WorkItem> batch = new ArrayList<>();
+            // 读游标独立于已提交低水位 lastExecutedSeqno：批内事件读入后 lastExecutedSeqno 尚未推进，
+            // 必须用单独游标前进，否则 readEventAfter 会反复返回批首事件。fail-stop 时文件按
+            // lastExecutedSeqno（低水位）标记，resume 从低水位重读——批内已并行落库者被幂等重放
+            long readCursor = lastExecutedSeqno;
+            THLEvent event;
+            while ((event = reader.readEventAfter(readCursor)) != null) {
+                if (!running.get()) { aborted = true; break; }
+                readCursor = event.getSeqno();
+
+                boolean isSkip = (!skipEventIds.isEmpty() && event.getEventId() != null && skipEventIds.contains(event.getEventId()))
+                        || (!skipSeqnos.isEmpty() && skipSeqnos.contains(event.getSeqno()));
+
+                // barrier：心跳 / 被裁决跳过 / 非并行化（DDL、无表名）——先 drain 当前批再串行处理
+                if (event.getType() == THLEvent.HEARTBEAT_EVENT || isSkip || !isParallelizable(event)) {
+                    if (!flushBatch(batch)) { aborted = true; break; }
+                    batch.clear();
+                    if (!handleBarrierEvent(event, isSkip)) { aborted = true; break; }
+                    continue;
+                }
+
+                // 并行化 DML：转换在主线程完成（保持有序、规避转换器线程安全）
+                List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
+                List<String> sqlStatements = (typedDmls == null) ? sqlConverter.convertToSql(event) : null;
+                batch.add(new WorkItem(event, typedDmls, sqlStatements));
+
+                if (batch.size() >= applyBatchSize) {
+                    if (!flushBatch(batch)) { aborted = true; break; }
+                    batch.clear();
+                }
+            }
+            if (!aborted) {
+                if (!flushBatch(batch)) aborted = true;
+                batch.clear();
+            }
+        } catch (Exception e) {
+            logger.error("处理THL文件(并行)出错: {}, 错误: {}", fileName, e.getMessage(), e);
+            if (isLatestFile) processedFiles.put(fileName, lastExecutedSeqno);
+            else processedFiles.put(fileName, -1L);
+            saveProgress();
+            return;
+        }
+
+        // 中途打断（fail-stop / 优雅停止）：只记已应用到的 seqno，绝不标 -1（与串行同）
+        if (aborted) {
+            processedFiles.put(fileName, lastExecutedSeqno);
+            saveProgress();
+            return;
+        }
+        if (isLatestFile) {
+            processedFiles.put(fileName, lastExecutedSeqno);
+        } else {
+            processedFiles.put(fileName, -1L);
+            cleanupProcessedThlFiles();
+        }
+        saveProgress();
+    }
+
+    /** barrier 事件串行处理。返回 false 表示应 fail-stop/abort 停止本文件。 */
+    private boolean handleBarrierEvent(THLEvent event, boolean isSkip) {
+        // 心跳：仅推进位点 + RTO
+        if (event.getType() == THLEvent.HEARTBEAT_EVENT) {
+            advanceCheckpoint(event);
+            reportRtoFromEvent(event, true);
+            return true;
+        }
+        // 人工裁决跳过：写死信后推进位点（不应用）
+        if (isSkip) {
+            recordDeadLetter(event);
+            advanceCheckpoint(event);
+            return true;
+        }
+        // 其余（DDL / 无表名的数据事件）：主线程转换 + 在 worker[0] 连接上串行应用
+        List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
+        List<String> sqlStatements = (typedDmls == null) ? sqlConverter.convertToSql(event) : null;
+        Connection conn = parallelExecutor.conns[0];
+        try {
+            applyEventTx(event, conn, typedDmls, sqlStatements);
+        } catch (SQLException e) {
+            logger.error("并行模式 barrier 事件应用失败 fail-stop (seqno={}): {}", event.getSeqno(), e.getMessage());
+            writeErrorStatus("E3004", "不可恢复的SQL错误: " + e.getMessage(), event);
+            running.set(false);
+            return false;
+        }
+        int rows = (typedDmls != null) ? typedDmls.size() : (sqlStatements != null ? sqlStatements.size() : 0);
+        acquireRateLimit(rows);
+        advanceCheckpoint(event);
+        recordTableLatency(event, determineOpTypeFromEvent(event, sqlStatements));
+        reportRtoFromEvent(event, false);
+        return true;
+    }
+
+    /**
+     * 应用一批并行化 DML：按表 hash 分片到 worker，各 worker 按序应用其表的事件。
+     * 返回 true=全批成功（位点推进到批末）；false=有失败已 fail-stop（位点推进到最小失败 seqno 之前）。
+     */
+    private boolean flushBatch(List<WorkItem> batch) {
+        if (batch.isEmpty()) return true;
+        final int n = parallelExecutor.n;
+
+        // 按表 hash 分片，保持各分片内 seqno 升序（batch 本身升序）
+        List<List<WorkItem>> shards = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) shards.add(new ArrayList<>());
+        for (WorkItem wi : batch) {
+            String table = (String) wi.event.getMetadata("table_name");
+            int idx = Math.floorMod(table.hashCode(), n);
+            shards.get(idx).add(wi);
+        }
+
+        List<Future<Long>> futures = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            final List<WorkItem> shard = shards.get(i);
+            final Connection conn = parallelExecutor.conns[i];
+            futures.add(parallelExecutor.pool.submit((Callable<Long>) () -> {
+                for (WorkItem wi : shard) {
+                    try {
+                        applyEventTx(wi.event, conn, wi.typedDmls, wi.sqlStatements);
+                        recordTableLatency(wi.event, determineOpTypeFromEvent(wi.event, wi.sqlStatements));
+                    } catch (SQLException e) {
+                        logger.error("并行 worker 应用失败 (seqno={}): {}", wi.event.getSeqno(), e.getMessage());
+                        return wi.event.getSeqno(); // 该表在此 seqno 失败，停止本 worker（同表后续不再应用）
+                    }
+                }
+                return Long.MAX_VALUE; // 无失败
+            }));
+        }
+
+        long minFailed = Long.MAX_VALUE;
+        boolean interrupted = false;
+        for (Future<Long> f : futures) {
+            try {
+                minFailed = Math.min(minFailed, f.get());
+            } catch (Exception e) {
+                logger.error("并行 worker 执行异常: {}", e.getMessage());
+                minFailed = Math.min(minFailed, batch.get(0).event.getSeqno()); // 保守：从批首失败
+                interrupted = true;
+            }
+        }
+
+        if (minFailed == Long.MAX_VALUE && !interrupted) {
+            // 全批成功：位点推进到批末，限速按全批行数
+            long rows = 0;
+            for (WorkItem wi : batch) {
+                rows += (wi.typedDmls != null) ? wi.typedDmls.size()
+                        : (wi.sqlStatements != null ? wi.sqlStatements.size() : 0);
+            }
+            acquireRateLimit(rows);
+            WorkItem last = batch.get(batch.size() - 1);
+            advanceCheckpoint(last.event);
+            reportRtoFromEvent(last.event, false);
+            return true;
+        }
+
+        // 有失败：位点推进到"最小失败 seqno 之前"的批内最大 seqno（这些必已成功，minFailed 是全局最小失败）
+        THLEvent lowWater = null;
+        THLEvent failing = null;
+        for (WorkItem wi : batch) {
+            long s = wi.event.getSeqno();
+            if (s < minFailed) lowWater = wi.event;
+            if (s == minFailed) failing = wi.event;
+        }
+        if (lowWater != null) {
+            advanceCheckpoint(lowWater);
+        }
+        if (failing != null) {
+            writeErrorStatus("E3004", "不可恢复的SQL错误（并行应用）", failing);
+        }
+        logger.error("增量并行应用 fail-stop：最小失败 seqno={} 未计入位点，停止处理；修复后 resume 从该事件继续",
+                minFailed == Long.MAX_VALUE ? -1 : minFailed);
+        running.set(false);
+        return false;
+    }
+
+    /** 推进 lastExecutedSeqno 并落 checkpoint（位点信息取自事件元数据）。 */
+    private void advanceCheckpoint(THLEvent event) {
+        lastExecutedSeqno = event.getSeqno();
+        String binlogFile = (String) event.getMetadata("binlog_file");
+        Long binlogPosition = (Long) event.getMetadata("binlog_position");
+        checkpointManager.saveCheckpoint(
+                event.getSeqno(),
+                binlogFile != null ? binlogFile : "",
+                binlogPosition != null ? binlogPosition : 0,
+                event.getEventId() != null ? event.getEventId() : ""
+        );
+    }
+
+    private void acquireRateLimit(long rows) {
+        if (rows <= 0) return;
+        try {
+            rowRateLimiter.acquire(rows);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void reportRtoFromEvent(THLEvent event, boolean heartbeat) {
+        if (event.getSourceTstamp() == null) return;
+        long now = System.currentTimeMillis();
+        long rtoMs = now - event.getSourceTstamp().getTime();
+        if (rtoMs < 0) return;
+        lastAppliedSourceTs = event.getSourceTstamp().getTime();
+        if (heartbeat || now - lastRtoReportTime > RTO_REPORT_INTERVAL_MS) {
+            lastRtoMs = rtoMs;
+            lastRtoReportTime = now;
+            writeRtoMetric(rtoMs);
+        }
+    }
+
+    private void ensureMarkerTableOn(Connection conn) {
+        String table = com.migration.common.bidi.BidiConstants.MARKER_TABLE;
+        String ddl = isPostgresql
+                ? "CREATE TABLE IF NOT EXISTS \"" + table + "\" (id INT PRIMARY KEY, node_id VARCHAR(64), last_seqno BIGINT, updated_at BIGINT)"
+                : "CREATE TABLE IF NOT EXISTS `" + table + "` (id INT PRIMARY KEY, node_id VARCHAR(64), last_seqno BIGINT, updated_at BIGINT)";
+        try (Statement st = conn.createStatement()) {
+            boolean prevAuto = conn.getAutoCommit();
+            if (!prevAuto) conn.setAutoCommit(true);
+            st.execute(ddl);
+        } catch (SQLException e) {
+            logger.warn("worker 连接创建 origin 标记表失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 在给定连接上以单事务应用一个事件已转换好的 DML（typed 或 text 二选一），提交或回滚。
+     * 幂等容错规则与串行路径 {@link #processThlFile} 内联逻辑保持一致——重复键、UPDATE/DELETE 未影响行 视为成功；
+     * 改动其一务必同步另一处。不做重连（并行 worker 上连接错误直接 fail-stop）。
+     */
+    private void applyEventTx(THLEvent event, Connection conn,
+                             List<ParameterizedDml> typedDmls, List<String> sqlStatements) throws SQLException {
+        boolean origAuto = conn.getAutoCommit();
+        if (origAuto) conn.setAutoCommit(false);
+        try {
+            // 双向防回环：数据事件先写 origin 标记（事务首条语句），与业务 DML 原子提交
+            if (bidirectionalEnabled && isDataChangeEvent(event)) {
+                try { writeOriginMarkerOn(conn, event.getSeqno()); }
+                catch (SQLException me) { logger.warn("写 origin 标记失败 (seqno={}): {}", event.getSeqno(), me.getMessage()); }
+            }
+            if (typedDmls != null) {
+                for (ParameterizedDml dml : typedDmls) {
+                    try {
+                        try (PreparedStatement ps = conn.prepareStatement(dml.getSql())) {
+                            List<Object> params = dml.getParams();
+                            for (int i = 0; i < params.size(); i++) ps.setObject(i + 1, params.get(i));
+                            ps.executeUpdate();
+                        }
+                    } catch (SQLException e) {
+                        String msg = e.getMessage();
+                        if (msg != null && (msg.contains("Duplicate entry") || msg.contains("duplicate key"))) {
+                            logger.warn("重复键忽略 (seqno={}): {}", event.getSeqno(), msg);
+                        } else {
+                            throw e;
+                        }
+                    }
+                }
+            } else if (sqlStatements != null) {
+                for (String sql : sqlStatements) {
+                    if (sql == null || sql.trim().isEmpty()) continue;
+                    String trimmed = sql.trim();
+                    if (trimmed.equalsIgnoreCase("COMMIT;") || trimmed.equalsIgnoreCase("COMMIT")) continue;
+                    if (isPostgresql && trimmed.toUpperCase().startsWith("SET SEARCH_PATH")) {
+                        try (Statement stmt = conn.createStatement()) { stmt.execute(trimmed); }
+                        continue;
+                    }
+                    try {
+                        try (Statement stmt = conn.createStatement()) { stmt.execute(trimmed); }
+                    } catch (SQLException e) {
+                        String up = trimmed.toUpperCase();
+                        String msg = e.getMessage();
+                        if (msg != null && (msg.contains("Duplicate entry") || msg.contains("1062"))) {
+                            logger.warn("重复键忽略 (seqno={}): {}", event.getSeqno(), msg);
+                        } else if ((up.startsWith("UPDATE") || up.startsWith("DELETE")) && msg != null
+                                && (msg.contains("0 rows affected") || msg.contains("not found"))) {
+                            logger.warn("UPDATE/DELETE 未影响任何行, 已忽略 (seqno={})", event.getSeqno());
+                        } else {
+                            throw e;
+                        }
+                    }
+                }
+            }
+            conn.commit();
+        } catch (SQLException e) {
+            try { conn.rollback(); } catch (SQLException ignored) {}
+            throw e;
+        } finally {
+            try { if (origAuto) conn.setAutoCommit(true); } catch (SQLException ignored) {}
+        }
+    }
+
+    /** origin 标记写入的连接参数化版本（并行 worker 各自连接）。 */
+    private void writeOriginMarkerOn(Connection conn, long seqno) throws SQLException {
+        String table = com.migration.common.bidi.BidiConstants.MARKER_TABLE;
+        int id = com.migration.common.bidi.BidiConstants.MARKER_ROW_ID;
+        long now = System.currentTimeMillis();
+        String sql = isPostgresql
+                ? "INSERT INTO \"" + table + "\" (id, node_id, last_seqno, updated_at) VALUES (?, ?, ?, ?) " +
+                  "ON CONFLICT (id) DO UPDATE SET node_id=EXCLUDED.node_id, last_seqno=EXCLUDED.last_seqno, updated_at=EXCLUDED.updated_at"
+                : "INSERT INTO `" + table + "` (id, node_id, last_seqno, updated_at) VALUES (?, ?, ?, ?) " +
+                  "ON DUPLICATE KEY UPDATE node_id=VALUES(node_id), last_seqno=VALUES(last_seqno), updated_at=VALUES(updated_at)";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, id);
+            ps.setString(2, bidiNodeId);
+            ps.setLong(3, seqno);
+            ps.setLong(4, now);
+            ps.executeUpdate();
+        }
+    }
+
+    private void writeErrorStatus(String errorCode, String errorMessage, THLEvent event) {
+        long seqno = event.getSeqno();
+        // eventId（binlog文件:位点）跨重启稳定，嵌入错误信息供后端"跳过失败事件"按稳定身份下发；
+        // seqno 在 resume 重新提取后会变，仅作展示/兼容
+        if (event.getEventId() != null && !event.getEventId().isEmpty()) {
+            errorMessage = "[eventId=" + event.getEventId() + "] " + errorMessage;
+        }
         String metricsDir = "./files/" + taskId + "/binlog_output";
         File dir = new File(metricsDir);
         if (!dir.exists()) {
@@ -1004,6 +1566,9 @@ public class ContinuousIncrementMain {
     public void close() {
         saveProgress();
         checkpointManager.close();
+        if (parallelExecutor != null) {
+            parallelExecutor.close();
+        }
         if (targetConnection != null) {
             try {
                 targetConnection.close();

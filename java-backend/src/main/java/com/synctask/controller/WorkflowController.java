@@ -283,6 +283,57 @@ public class WorkflowController {
         }
     }
 
+    /**
+     * 人工裁决：跳过失败的增量事件并恢复任务（事件记入死信）。
+     * body 可选 {"seqno": N}；不传时从任务错误信息里解析 seqno=N。
+     */
+    @PostMapping("/{id}/skip-event")
+    public ResponseEntity<?> skipEventAndRetry(
+            @PathVariable String id,
+            @RequestBody(required = false) Map<String, Object> body,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            Long seqno = null;
+            if (body != null && body.get("seqno") != null) {
+                seqno = ((Number) body.get("seqno")).longValue();
+            }
+            long skipped = workflowService.skipEventAndRetry(id, userPrincipal.getId(), seqno);
+            auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.RETRY_TASK, id,
+                    "跳过失败事件 seqno=" + skipped + " 并恢复（死信裁决）");
+            return ResponseEntity.ok(new ApiResponse(true, "已跳过事件 seqno=" + skipped + " 并恢复任务，该事件记入死信记录"));
+        } catch (Exception e) {
+            auditLogService.logFailure(userPrincipal.getId(), AuditLog.Action.RETRY_TASK, id, null, e.getMessage());
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** 同步位点可视化：capture binlog/GTID → THL seqno → 已应用 checkpoint 的全链路位点与差距（代理 agent）。 */
+    @GetMapping("/{id}/checkpoint")
+    public ResponseEntity<?> getCheckpointVisualization(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getCheckpointVisualization(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** 死信记录：人工裁决跳过的增量事件清单（代理 agent）。 */
+    @GetMapping("/{id}/deadletter")
+    public ResponseEntity<?> getDeadletterRecords(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getDeadletterRecords(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     @PostMapping("/{id}/failover")
     public ResponseEntity<?> failoverWorkflow(
             @PathVariable String id,

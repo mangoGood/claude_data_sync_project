@@ -28,18 +28,30 @@ public class ContentCompareService {
     public ContentCompareSession startCompare(String sourceConnection, String targetConnection,
                                                String sourceType, String targetType,
                                                Map<String, List<String>> syncObjects) {
-        return startCompare(sourceConnection, targetConnection, sourceType, targetType, syncObjects, null);
+        return startCompare(sourceConnection, targetConnection, sourceType, targetType, syncObjects, null, null);
+    }
+
+    public ContentCompareSession startCompare(String sourceConnection, String targetConnection,
+                                               String sourceType, String targetType,
+                                               Map<String, List<String>> syncObjects,
+                                               Map<String, Map<String, String>> explicitTableMappings) {
+        return startCompare(sourceConnection, targetConnection, sourceType, targetType,
+                syncObjects, explicitTableMappings, null);
     }
 
     /**
      * @param explicitTableMappings 表名映射（db → {源表: 目标表}），来自任务 syncObjects 的 tableMapping。
      *                              ValidationTaskService 传入压平后的表清单时映射已丢失，需在此显式补传；
      *                              为 null 时退回从 syncObjects 原始 value 里解析（MetadataController 直传路径）。
+     * @param explicitDbMappings    库名映射（源库 → 目标库），来自任务 syncObjects 每库 entry 的 targetDb。
+     *                              多库任务目标库必须按源库逐一解析；解析优先级与 agent ConfigService 一致：
+     *                              entry.targetDb ＞ 连接串显式库名（单库改名/全局重定向）＞ 与源库同名。
      */
     public ContentCompareSession startCompare(String sourceConnection, String targetConnection,
                                                String sourceType, String targetType,
                                                Map<String, List<String>> syncObjects,
-                                               Map<String, Map<String, String>> explicitTableMappings) {
+                                               Map<String, Map<String, String>> explicitTableMappings,
+                                               Map<String, String> explicitDbMappings) {
         if (!sourceType.equalsIgnoreCase(targetType)) {
             throw new IllegalArgumentException("内容对比仅支持源库和目标库为相同类型的数据库");
         }
@@ -53,6 +65,9 @@ public class ContentCompareService {
         boolean isPg = "postgresql".equalsIgnoreCase(sourceType);
         ParsedConn sourceConn = parseConnection(sourceConnection);
         ParsedConn targetConn = parseConnection(targetConnection);
+        // 连接串显式带的目标库（单库改名/全局重定向语义）。多库任务连接串不带库名，
+        // 此值为 null，目标库按下方 per-db 规则逐库解析——不能像旧逻辑那样统一钉在首库上
+        String connTargetDb = targetConn.database;
 
         if (!isPg) {
             String firstDb = syncObjects.keySet().stream().findFirst().orElse(null);
@@ -76,6 +91,8 @@ public class ContentCompareService {
                 if (explicitTableMappings != null && explicitTableMappings.containsKey(dbName)) {
                     tableMapping = explicitTableMappings.get(dbName);
                 }
+                // 该库 entry 自带的库名映射（MetadataController 直传原始 value 的路径）
+                String entryTargetDb = null;
 
                 if (tables != null && !tables.isEmpty()) {
                     try {
@@ -92,6 +109,10 @@ public class ContentCompareService {
                                 ((Map<?, ?>) mappingObj).forEach((k, v) -> m.put(String.valueOf(k), String.valueOf(v)));
                                 tableMapping = m;
                             }
+                            Object targetDbObj = map.get("targetDb");
+                            if (targetDbObj instanceof String && !((String) targetDbObj).isEmpty()) {
+                                entryTargetDb = (String) targetDbObj;
+                            }
                         }
                     } catch (Exception e) {
                         logger.debug("Using tables as-is for db={}", dbName);
@@ -100,18 +121,29 @@ public class ContentCompareService {
 
                 if (actualTables == null || actualTables.isEmpty()) continue;
 
+                // 目标库按源库逐一解析：entry.targetDb ＞ 连接串显式库名 ＞ 与源库同名。
+                // 多库任务若统一用 targetConn.database（旧逻辑=首库兜底），所有表的目标端都会串到首库
+                String mappedTargetDb;
+                if (explicitDbMappings != null && explicitDbMappings.containsKey(dbName)) {
+                    mappedTargetDb = explicitDbMappings.get(dbName);
+                } else if (entryTargetDb != null) {
+                    mappedTargetDb = entryTargetDb;
+                } else if (connTargetDb != null) {
+                    mappedTargetDb = connTargetDb;
+                } else {
+                    mappedTargetDb = dbName;
+                }
+
                 for (String tableName : actualTables) {
                     String targetTableName = tableMapping.getOrDefault(tableName, tableName);
                     TableCompareTask task = new TableCompareTask();
                     task.setSourceDb(isPg ? sourceConn.database : dbName);
-                    // mysql 目标库名可能与源库名不同（如 prod -> prod_replica）：targetConn.database
-                    // 在上面已从连接串或 syncObjects 兜底解析好，不能像源库那样直接用 dbName（源库名）
-                    task.setTargetDb(isPg ? targetConn.database : targetConn.database);
+                    task.setTargetDb(isPg ? targetConn.database : mappedTargetDb);
                     task.setSourceTable(tableName);
                     task.setTargetTable(targetTableName);
 
                     String qualifiedSource = isPg ? tableName : dbName + "." + tableName;
-                    String qualifiedTarget = isPg ? targetTableName : targetConn.database + "." + targetTableName;
+                    String qualifiedTarget = isPg ? targetTableName : mappedTargetDb + "." + targetTableName;
 
                     task.setPrimaryKeyColumn(detectPrimaryKey(sourceDb, qualifiedSource, isPg, sourceConn.database));
                     task.setColumns(getColumnMeta(sourceDb, qualifiedSource, isPg, sourceConn.database));

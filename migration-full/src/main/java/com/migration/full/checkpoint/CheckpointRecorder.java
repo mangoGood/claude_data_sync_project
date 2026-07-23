@@ -108,15 +108,30 @@ public class CheckpointRecorder {
                 }
             }
 
-            // 尝试获取 GTID（如果 MySQL 开启了 GTID）
+            // 仅 gtid_mode=ON 才记录 GTID：OFF 时 gtid_executed 仍可能非空（历史遗留），
+            // 据此让 capture 走 AUTO_POSITION 会被源库拒绝、增量拉取失败。以 gtid_mode 为准。
+            boolean gtidOn = false;
             try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_executed")) {
+                 ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_mode")) {
                 if (rs.next()) {
-                    gtid = rs.getString(1);
-                    logger.info("当前 GTID: {}", gtid);
+                    String mode = rs.getString(1);
+                    gtidOn = mode != null && mode.toUpperCase().startsWith("ON");
                 }
             } catch (SQLException e) {
-                logger.warn("获取 GTID 失败，可能未开启 GTID 模式: {}", e.getMessage());
+                logger.warn("查询 gtid_mode 失败，按未开启处理: {}", e.getMessage());
+            }
+            if (gtidOn) {
+                try (Statement stmt = conn.createStatement();
+                     ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_executed")) {
+                    if (rs.next()) {
+                        gtid = rs.getString(1);
+                        logger.info("当前 GTID: {}", gtid);
+                    }
+                } catch (SQLException e) {
+                    logger.warn("获取 GTID 失败: {}", e.getMessage());
+                }
+            } else {
+                logger.info("源库 gtid_mode 非 ON，不记录 GTID，增量走 file+pos");
             }
 
         } catch (SQLException e) {

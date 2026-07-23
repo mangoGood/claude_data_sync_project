@@ -92,8 +92,11 @@ public class TypedDmlConverter {
             }
         }
         this.columnProcessing = com.migration.config.ColumnProcessingConfig.loadFromProperties(props);
+        // 列处理（行过滤/列名映射）在同引擎链路生效：mysql→mysql / pg→pg。类型化管道对两者
+        // 均携带 rows_typed，rowExcluded/mapColumns 与库类型无关。
         this.columnProcessingActive = !columnProcessing.isEmpty()
-                && "mysql".equals(source) && "mysql".equals(target);
+                && (("mysql".equals(source) && "mysql".equals(target))
+                    || ("postgresql".equals(source) && "postgresql".equals(target)));
 
         logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={}, tableMappings={}, columnProcessing={})",
                 enabled, source, target, switchOn, tableNameMapping.size(), columnProcessingActive);

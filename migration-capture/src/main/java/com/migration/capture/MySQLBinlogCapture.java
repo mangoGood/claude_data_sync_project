@@ -43,6 +43,12 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     private String password;
     private String binlogFile;
     private long binlogPosition;
+    /** GTID 位点（capture.gtid.set，来自 checkpoint 的 gtid_executed 快照）；非空且启用时优先于 file+pos。 */
+    private String gtidSet;
+    private boolean gtidEnabled;
+    /** 位点落盘的时间兜底间隔：低流量任务下不足 1000 事件也要能看到当前位点。 */
+    private static final long POSITION_SAVE_INTERVAL_MS = 5000;
+    private volatile long lastPositionSaveTime = 0;
     private String outputDir;
     private String taskId;
     private long serverId;
@@ -91,6 +97,21 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         password = props.getProperty("source.db.password", "");
         binlogFile = props.getProperty("capture.binlog.file", "");
         binlogPosition = Long.parseLong(props.getProperty("capture.binlog.position", "4"));
+        // GTID 位点：gtid_executed 快照与 file+pos 在同一时刻记录（CheckpointManager），
+        // 有 GTID 集且未显式关闭时优先按 GTID 自动定位——源端 HA 切换/binlog 文件名变化时
+        // file+pos 失效而 GTID 仍然有效。gtid_executed 原文可能含换行，需归一化。
+        gtidEnabled = Boolean.parseBoolean(props.getProperty("capture.gtid.enabled", "true"));
+        // 只有源库 gtid_mode=ON 才能按 GTID 自动定位（AUTO_POSITION）。关键坑：源库
+        // gtid_mode=OFF 时 @@global.gtid_executed 仍可能非空（曾经开过 GTID 的历史遗留），
+        // checkpoint 会把它当作可用 GTID 集写进 capture.gtid.set——但对 OFF 的源发起
+        // AUTO_POSITION 会被拒："replication sender thread cannot start in AUTO_POSITION
+        // mode: this server has GTID_MODE = OFF"，导致 binlog 拉取彻底失败、增量不同步。
+        // 因此以 gtid_mode 而非 gtid_executed 是否非空为准，非 ON 一律回退 file+pos。
+        gtidSet = props.getProperty("capture.gtid.set", "").replaceAll("\\s+", "");
+        if (gtidEnabled && !gtidSet.isEmpty() && !sourceGtidModeOn()) {
+            logger.warn("源库 gtid_mode 非 ON（gtid_executed={} 可能是历史遗留），放弃 GTID 自动定位，回退 file+pos", gtidSet);
+            gtidSet = "";
+        }
         outputDir = props.getProperty("capture.output.dir", "binlog_output");
         taskId = props.getProperty("task.id", "unknown");
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
@@ -328,7 +349,12 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         eventDeserializer.setCompatibilityMode(
                 com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer.CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY);
         client.setEventDeserializer(eventDeserializer);
-        if (binlogFile != null && !binlogFile.isEmpty()) {
+        if (gtidEnabled && gtidSet != null && !gtidSet.isEmpty()) {
+            // GTID 自动定位：连接器向服务端声明已执行集，由服务端决定起始文件/位点；
+            // 流式过程中连接器自动维护该集（client.getGtidSet()），断线重连也按最新集续传
+            client.setGtidSet(gtidSet);
+            logger.info("按 GTID 集开始捕获（自动定位）: {}", gtidSet);
+        } else if (binlogFile != null && !binlogFile.isEmpty()) {
             client.setBinlogFilename(binlogFile);
             client.setBinlogPosition(binlogPosition);
             logger.info("从binlog位点开始捕获: {}:{}", binlogFile, binlogPosition);
@@ -585,6 +611,15 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             if (count % 1000 == 0) {
                 logger.info("已捕获 {} 个事件, 当前位点: {}:{}", count, currentBinlogFile, currentBinlogPosition);
                 savePosition();
+                lastPositionSaveTime = System.currentTimeMillis();
+            } else {
+                // 按时间兜底落位点：只按"每 1000 事件"保存时，低流量任务运行期间位点文件
+                // 长期不存在（位点可视化只能显示 PARTIAL），恰好是最需要看位点的场景
+                long now = System.currentTimeMillis();
+                if (now - lastPositionSaveTime >= POSITION_SAVE_INTERVAL_MS) {
+                    savePosition();
+                    lastPositionSaveTime = now;
+                }
             }
         } catch (Exception e) {
             logger.error("处理binlog事件异常: {}", e.getMessage(), e);
@@ -760,6 +795,11 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         Properties posProps = new Properties();
         posProps.setProperty("binlog.file", currentBinlogFile);
         posProps.setProperty("binlog.position", String.valueOf(currentBinlogPosition));
+        // GTID 连接模式下连接器持续维护已执行集，一并持久化（位点可视化/排障用）
+        String currentGtidSet = client != null ? client.getGtidSet() : null;
+        if (currentGtidSet != null && !currentGtidSet.isEmpty()) {
+            posProps.setProperty("gtid.set", currentGtidSet.replaceAll("\\s+", ""));
+        }
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
 
         try (FileOutputStream fos = new FileOutputStream(positionFile)) {
@@ -783,6 +823,22 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
     public long getLastRpoMs() {
         return lastRpoMs;
+    }
+
+    /** 源库 gtid_mode 是否为 ON / ON_PERMISSIVE（AUTO_POSITION 前提）。查询失败保守返回 false 走 file+pos。 */
+    private boolean sourceGtidModeOn() {
+        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        try (Connection conn = DriverManager.getConnection(url, user, password);
+             Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_mode")) {
+            if (rs.next()) {
+                String mode = rs.getString(1);
+                return mode != null && mode.toUpperCase().startsWith("ON");
+            }
+        } catch (Exception e) {
+            logger.warn("查询源库 gtid_mode 失败，保守回退 file+pos: {}", e.getMessage());
+        }
+        return false;
     }
 
     private void initClockOffset() {

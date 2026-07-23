@@ -28,6 +28,17 @@ class TypedDmlConverterColumnProcessingTest {
         return new TypedDmlConverter(props);
     }
 
+    /** pg→pg 同引擎链路的列处理开关与 mysql→mysql 一致（行过滤/列名映射类型无关）。 */
+    private TypedDmlConverter pgConverter() {
+        Properties props = new Properties();
+        props.setProperty("source.db.type", "postgresql");
+        props.setProperty("target.db.type", "postgresql");
+        props.setProperty("target.db.database", "tdb");
+        props.setProperty("column.filter.db1.t1", "amount|<|10");
+        props.setProperty("column.mapping.db1.t1", "old_name:new_name");
+        return new TypedDmlConverter(props);
+    }
+
     private THLEvent event(String type) {
         THLEvent e = new THLEvent();
         e.setSeqno(1);
@@ -126,6 +137,19 @@ class TypedDmlConverterColumnProcessingTest {
         assertEquals(1, dmls.size());
         assertTrue(dmls.get(0).getSql().startsWith("DELETE FROM"));
         assertEquals(java.util.List.of(2), dmls.get(0).getParams());
+    }
+
+    @Test
+    @DisplayName("pg→pg：列处理生效——命中过滤的行被跳过，列名映射改写 SQL")
+    void pgInsertFilterAndMapping() {
+        THLEvent e = event("INSERT");
+        e.addMetadata("rows_typed", rows(row(1, 5, "a"), row(2, 20, "b")));
+        List<ParameterizedDml> dmls = pgConverter().convert(e);
+        assertEquals(1, dmls.size()); // amount=5 < 10 被过滤，与 mysql→mysql 一致
+        String sql = dmls.get(0).getSql();
+        assertTrue(sql.contains("new_name"), "列名映射应改写 INSERT 列表: " + sql);
+        assertTrue(!sql.contains("old_name"), "源列名不应出现在 SQL 中: " + sql);
+        assertEquals(java.util.List.of(2, 20, "b"), dmls.get(0).getParams());
     }
 
     @Test

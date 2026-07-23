@@ -175,7 +175,7 @@ public class ConfigService {
         Map<String, String> collectedTableMappings = new java.util.LinkedHashMap<>();
         // 库名映射（entry 的 targetDb，表级/库级均可携带）：key = 源库，value = 目标库
         Map<String, String> collectedDbMappings = new java.util.LinkedHashMap<>();
-        // 列处理（仅表级同步 entry 携带，mysql→mysql）：key = "<源库>.<源表>"，
+        // 列处理（仅表级同步 entry 携带，同引擎 mysql→mysql / pg→pg）：key = "<源库>.<源表>"，
         // value 为 ColumnProcessingConfig 约定的序列化串（filter: 列|op|值; mapping: 源列:目标列; extra: 名:类型[:值]）
         Map<String, String> collectedColumnFilters = new java.util.LinkedHashMap<>();
         Map<String, String> collectedColumnMappings = new java.util.LinkedHashMap<>();
@@ -339,7 +339,7 @@ public class ConfigService {
             }
         }
 
-        // 列处理（仅表级同步、mysql→mysql）：column.filter./column.mapping./column.extra.<源库>.<源表>，
+        // 列处理（仅表级同步、同引擎 mysql→mysql / pg→pg）：column.filter./column.mapping./column.extra.<源库>.<源表>，
         // 供全量（建表列改名/附加列、SELECT 过滤、INSERT 列映射）与增量（DML 行过滤/列改名）消费。
         // 重新下发同步对象时先清旧键，避免改配置后残留失效的列处理。
         if (syncObjectsUpdated) {
@@ -537,6 +537,17 @@ public class ConfigService {
         // （best-effort：查询失败或未设配额时不写入，行为与现状一致，不阻塞任务）。
         applyExecutionQuotaLimits(props, taskMessage.getUserId());
 
+        // 人工裁决跳过的增量事件（随 skip-event 的 resume 消息下发）：与已有配置取并集，
+        // 不随 syncObjects 重下发清除——位点越过后残留的键不会再命中，无害。
+        // eventId（binlog文件:位点）是跨重启稳定的首选身份；seqno 仅老错误信息兼容
+        mergeSkipListProperty(props, "increment.skip.event.ids", taskMessage.getSkipEventIds());
+        mergeSkipListProperty(props, "increment.skip.seqnos", taskMessage.getSkipSeqnos());
+
+        // 增量并行应用（引擎级执行调优，非向导字段）：agent 级 env/系统属性开关，随 config 落盘、
+        // resume 时重写保持生效。默认不写=增量子进程按串行（parallelism=1）运行。
+        writeIntPropFromEnv(props, "increment.apply.parallelism", "INCREMENT_APPLY_PARALLELISM");
+        writeIntPropFromEnv(props, "increment.apply.batch.size", "INCREMENT_APPLY_BATCH_SIZE");
+
         // 落盘前加密敏感值（口令）：config.properties 不再存明文密码，子进程读取时按 ENC: 前缀解密。
         encryptSensitiveProps(props);
 
@@ -547,6 +558,31 @@ public class ConfigService {
         createLogbackConfig(taskDir, taskId);
         
         logger.info("Config file updated successfully for task: {}", taskId);
+    }
+
+    /** 从环境变量/系统属性读取整数写入 props（未设或非法则不写，保持子进程默认）。 */
+    private void writeIntPropFromEnv(java.util.Properties props, String key, String envName) {
+        String v = System.getenv(envName);
+        if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);
+        if (v == null || v.trim().isEmpty()) return;
+        try {
+            int n = Integer.parseInt(v.trim());
+            props.setProperty(key, String.valueOf(n));
+            logger.info("引擎调优参数已写入配置: {}={}", key, n);
+        } catch (NumberFormatException e) {
+            logger.warn("环境变量 {}={} 非法整数，忽略", envName, v);
+        }
+    }
+
+    /** 跳过清单合并：新值与已有属性取并集后写回（保持顺序、去重）；新值为空则不动。 */
+    private void mergeSkipListProperty(java.util.Properties props, String key, String newValues) {
+        if (newValues == null || newValues.trim().isEmpty()) return;
+        java.util.Set<String> merged = new java.util.LinkedHashSet<>();
+        for (String s : (props.getProperty(key, "") + "," + newValues).split(",")) {
+            if (!s.trim().isEmpty()) merged.add(s.trim());
+        }
+        props.setProperty(key, String.join(",", merged));
+        logger.warn("人工裁决跳过事件已写入配置: {}={}", key, String.join(",", merged));
     }
 
     private static final java.util.regex.Pattern IDENTIFIER_PATTERN =
@@ -720,12 +756,13 @@ public class ConfigService {
         String sourceType = props.getProperty("source.db.type", "mysql");
 
         try (Connection conn = DriverManager.getConnection(url, "sa", "")) {
-            String sql = "SELECT filename, position FROM checkpoint WHERE id = 1";
+            String sql = "SELECT filename, position, gtid FROM checkpoint WHERE id = 1";
             try (Statement stmt = conn.createStatement();
                  ResultSet rs = stmt.executeQuery(sql)) {
                 if (rs.next()) {
                     String filename = rs.getString("filename");
                     long position = rs.getLong("position");
+                    String gtid = rs.getString("gtid");
                     if (filename != null && !filename.isEmpty()) {
                         if ("postgresql".equals(sourceType)) {
                             props.setProperty("checkpoint.wal.lsn", filename);
@@ -744,6 +781,15 @@ public class ConfigService {
                             props.setProperty("checkpoint.binlog.position", String.valueOf(position));
                             props.setProperty("capture.binlog.file", filename);
                             props.setProperty("capture.binlog.position", String.valueOf(position));
+                            // GTID 集与 file+pos 同一时刻快照（CheckpointManager 记 checkpoint 时一并取
+                            // @@global.gtid_executed）：capture 有 GTID 集时优先按 GTID 自动定位，
+                            // 源端 HA 切换/binlog 文件名失效时仍能续传。gtid_executed 可能含换行，归一化后写入
+                            if (gtid != null && !gtid.trim().isEmpty()) {
+                                String normalizedGtid = gtid.replaceAll("\\s+", "");
+                                props.setProperty("checkpoint.gtid.set", normalizedGtid);
+                                props.setProperty("capture.gtid.set", normalizedGtid);
+                                logger.info("MySQL GTID checkpoint written to config: {}", normalizedGtid);
+                            }
                             logger.info("MySQL Checkpoint written to config: {}:{}", filename, position);
                         }
                     }

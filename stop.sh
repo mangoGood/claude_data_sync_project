@@ -12,6 +12,7 @@ cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
 COMPOSE_FILE="docker-compose-synctask.yml"
 DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
+MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 
 echo "[stop] 停止后端 (spring-boot:run / 38080)..."
@@ -33,7 +34,12 @@ echo "[stop] 停止 Docker 基础设施 (mysql / kafka / zookeeper)，不删除�
 docker compose -f "$COMPOSE_FILE" stop
 
 if docker inspect synctask-mongo-a >/dev/null 2>&1; then
-  echo "[stop] 停止 Mongo/ES 基础设施 (mongo-a / mongo-b / es)，不删除容器..."
+  echo "[stop] 停止 Mongo 副本集 (mongo-a / mongo-b)，不删除容器..."
+  docker compose -f "$MONGO_COMPOSE_FILE" stop
+fi
+
+if docker inspect synctask-es >/dev/null 2>&1; then
+  echo "[stop] 停止 ES 基础设施 (es)，不删除容器..."
   docker compose -f "$DB_COMPOSE_FILE" stop
 fi
 

@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.Properties;
 
 /**
- * 列处理配置（仅表级同步下发，目前仅 mysql→mysql 链路消费）。
+ * 列处理配置（仅表级同步下发，由同构链路 mysql→mysql / postgresql→postgresql 消费）。
  *
  * <p>三种能力，键均以 "源库.源表" 定位（与 schema.mapping.table.* 的 key 约定一致，
  * 提供小写回退适配 MySQL 源 lower_case_table_names 不区分大小写）：
@@ -50,6 +50,12 @@ public class ColumnProcessingConfig {
             this.customValue = customValue;
         }
 
+        /** 按目标库方言生成建表列定义（不含前导逗号）。 */
+        public String toColumnDef(String sourceDb, String sourceTable, boolean postgres) {
+            return postgres ? toPostgresColumnDef(sourceDb, sourceTable)
+                            : toMysqlColumnDef(sourceDb, sourceTable);
+        }
+
         /**
          * 生成 MySQL 建表列定义（不含前导逗号）。
          * CREATE_TIME/UPDATE_TIME 用 DATETIME 默认值语义，CUSTOM 为常量 DEFAULT。
@@ -63,6 +69,23 @@ public class ColumnProcessingConfig {
                 default:
                     String v = (customValue == null ? "" : customValue) + "@" + sourceDb + "@" + sourceTable;
                     return "`" + name + "` VARCHAR(512) DEFAULT '" + v.replace("'", "''") + "' COMMENT '来源标识列'";
+            }
+        }
+
+        /**
+         * 生成 PostgreSQL 建表列定义（不含前导逗号，双引号标识符）。
+         * CREATE_TIME/UPDATE_TIME 用 TIMESTAMP DEFAULT CURRENT_TIMESTAMP；PG 无列级
+         * ON UPDATE 语义，UPDATE_TIME 仅承载首次写入值（后续自动刷新需触发器，超出建表范围，
+         * 增量 DML 不逐条注值——与 MySQL 路径一致按 DEFAULT 承载）。CUSTOM 为常量 DEFAULT。
+         */
+        public String toPostgresColumnDef(String sourceDb, String sourceTable) {
+            switch (kind) {
+                case CREATE_TIME:
+                case UPDATE_TIME:
+                    return "\"" + name + "\" TIMESTAMP DEFAULT CURRENT_TIMESTAMP";
+                default:
+                    String v = (customValue == null ? "" : customValue) + "@" + sourceDb + "@" + sourceTable;
+                    return "\"" + name + "\" VARCHAR(512) DEFAULT '" + v.replace("'", "''") + "'";
             }
         }
     }

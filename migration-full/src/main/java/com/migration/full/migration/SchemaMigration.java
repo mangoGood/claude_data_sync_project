@@ -23,6 +23,7 @@ public class SchemaMigration {
     private boolean sourceIsPostgresql;
     private boolean targetIsPostgresql;
     private boolean sourceIsOracle;
+    private SqlDialect sourceDialect;
     private SqlDialect targetDialect;
     // 跨库类型翻译器：按源→目标库对生成建表 DDL（取代散落的 createTableFromXToY 分发）
     private TypeTranslator translator;
@@ -37,6 +38,7 @@ public class SchemaMigration {
         this.sourceIsOracle = "oracle".equalsIgnoreCase(sourceConnection.getConfig().getDbType());
         this.targetIsPostgresql = "postgresql".equalsIgnoreCase(targetConnection.getConfig().getDbType());
         this.isPostgresql = targetIsPostgresql;
+        this.sourceDialect = SqlDialect.forType(sourceConnection.getConfig().getDbType());
         this.targetDialect = SqlDialect.forType(targetConnection.getConfig().getDbType());
         this.translator = TypeTranslator.forPair(sourceConnection.getConfig().getDbType(), targetConnection.getConfig().getDbType());
     }
@@ -46,11 +48,15 @@ public class SchemaMigration {
         this.columnProcessing = columnProcessing;
     }
 
-    /** 列处理仅在 mysql→mysql 同构链路生效（其余库对建表路径不改动）。 */
+    /** 列处理仅在同引擎链路（mysql→mysql / pg→pg）生效（异构库对建表路径不改动）。 */
     private boolean columnProcessingApplicable() {
-        return columnProcessing != null && !columnProcessing.isEmpty()
-                && "mysql".equalsIgnoreCase(sourceConnection.getConfig().getDbType())
-                && "mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType());
+        if (columnProcessing == null || columnProcessing.isEmpty()) {
+            return false;
+        }
+        String src = sourceConnection.getConfig().getDbType();
+        String tgt = targetConnection.getConfig().getDbType();
+        return ("mysql".equalsIgnoreCase(src) && "mysql".equalsIgnoreCase(tgt))
+                || ("postgresql".equalsIgnoreCase(src) && "postgresql".equalsIgnoreCase(tgt));
     }
 
     public void migrateAllTables(List<TableInfo> tables) throws SQLException {
@@ -132,9 +138,9 @@ public class SchemaMigration {
 
     /**
      * 列名映射：把 CREATE TABLE 定义体内的源列名改写为目标列名（不改类型）。
-     * SHOW CREATE TABLE 的列名/索引列引用均为反引号包裹，整体替换 `src` → `tgt` 可同时
-     * 覆盖列定义与 PRIMARY KEY/KEY 里的列引用；只处理首个 '(' 之后的定义体，
-     * 避免误伤语句头的表名（表名与列名同名时）。
+     * 源端建表语句的列名/索引列引用均被方言引用符包裹（MySQL 反引号、PG 双引号），
+     * 整体替换 {@code <q>src<q>} → {@code <q>tgt<q>} 可同时覆盖列定义与 PRIMARY KEY/KEY 里的
+     * 列引用；只处理首个 '(' 之后的定义体，避免误伤语句头的表名（表名与列名同名时）。
      */
     private String rewriteColumnNamesInCreateSql(String createSql, String srcDb, String srcTable) {
         java.util.Map<String, String> mapping = columnProcessing.getColumnMapping(srcDb, srcTable);
@@ -146,18 +152,19 @@ public class SchemaMigration {
             logger.warn("CREATE TABLE 语句无定义体，列名映射未生效: {}.{}", srcDb, srcTable);
             return createSql;
         }
+        String q = sourceDialect.quoteChar();
         String head = createSql.substring(0, bodyStart);
         String body = createSql.substring(bodyStart);
         for (java.util.Map.Entry<String, String> e : mapping.entrySet()) {
-            body = body.replace("`" + e.getKey() + "`", "`" + e.getValue() + "`");
+            body = body.replace(q + e.getKey() + q, q + e.getValue() + q);
         }
         return head + body;
     }
 
     /**
      * 附加列：在 CREATE TABLE 定义体末尾追加列定义。
-     * SHOW CREATE TABLE 输出的定义体闭括号固定独占一行（"\n) ENGINE=..."），锚定该位置插入；
-     * CREATE_TIME/UPDATE_TIME 由 DATETIME DEFAULT/ON UPDATE CURRENT_TIMESTAMP 承载语义，
+     * 源端建表语句的定义体闭括号固定独占一行（MySQL "\n) ENGINE=..."、PG 元数据生成 "\n)"），
+     * 锚定该位置插入；列定义按目标方言生成（MySQL DATETIME/ON UPDATE、PG TIMESTAMP DEFAULT），
      * CUSTOM 为常量 DEFAULT '输入值@源库@源表'，全量与增量 INSERT 均无需注值。
      */
     private String appendExtraColumnsToCreateSql(String createSql, String srcDb, String srcTable) {
@@ -177,7 +184,7 @@ public class SchemaMigration {
         }
         StringBuilder defs = new StringBuilder();
         for (com.migration.config.ColumnProcessingConfig.ExtraColumn extra : extraColumns) {
-            defs.append(",\n  ").append(extra.toMysqlColumnDef(srcDb, srcTable));
+            defs.append(",\n  ").append(extra.toColumnDef(srcDb, srcTable, targetIsPostgresql));
         }
         logger.info("附加列已加入建表语句: {}.{} 共 {} 列", srcDb, srcTable, extraColumns.size());
         return createSql.substring(0, closeIdx) + defs + createSql.substring(closeIdx);

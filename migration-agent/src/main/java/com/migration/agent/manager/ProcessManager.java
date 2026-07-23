@@ -52,12 +52,17 @@ public class ProcessManager {
         
         java.util.List<String> command = new java.util.ArrayList<>();
         command.add("java");
-        
+
+        // 子进程（full/increment/capture）也强制 H2 绑定回环地址：这些进程各自开 AUTO_SERVER 模式的
+        // H2（progress/checkpoint 库）供跨进程轮询，若绑到局域网 IP（本机 hostname 解析为 LAN IP 时），
+        // 跨进程连接会挂起数分钟。agent 自身在 main() 已设，子进程是独立 JVM 必须显式透传，否则失效。
+        command.add("-Dh2.bindAddress=127.0.0.1");
+
         if (taskId != null) {
             command.add("-Dtask.id=" + taskId);
             command.add("-Dlogback.configurationFile=files/" + taskId + "/logback.xml");
         }
-        
+
         command.add("-jar");
         command.add(jarPath);
         

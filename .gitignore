@@ -5,3 +5,5 @@ logs/
 target/
 files/
 .synctask_master_key
+.synctask_jwt_secret
+.synctask_agent_token

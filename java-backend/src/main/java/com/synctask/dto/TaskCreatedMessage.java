@@ -24,6 +24,10 @@ public class TaskCreatedMessage {
     private String kafkaTopicPrefix;
     private String kafkaTopicStrategy;
     private String subscribeFormat;
+    /** 人工裁决要跳过的增量事件 seqno（逗号分隔），随 skip-event 的 resume 消息下发 */
+    private String skipSeqnos;
+    /** 人工裁决要跳过的增量事件 eventId（binlog文件:位点，逗号分隔）——跨重启稳定的首选身份 */
+    private String skipEventIds;
 
     public TaskCreatedMessage() {
         this.messageType = "TASK_CREATED";
@@ -187,5 +191,21 @@ public class TaskCreatedMessage {
 
     public void setSubscribeFormat(String subscribeFormat) {
         this.subscribeFormat = subscribeFormat;
+    }
+
+    public String getSkipSeqnos() {
+        return skipSeqnos;
+    }
+
+    public void setSkipSeqnos(String skipSeqnos) {
+        this.skipSeqnos = skipSeqnos;
+    }
+
+    public String getSkipEventIds() {
+        return skipEventIds;
+    }
+
+    public void setSkipEventIds(String skipEventIds) {
+        this.skipEventIds = skipEventIds;
     }
 }

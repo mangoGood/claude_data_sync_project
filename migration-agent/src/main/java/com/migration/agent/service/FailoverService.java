@@ -180,6 +180,9 @@ public class FailoverService {
             configProps.remove("capture.binlog.position");
             configProps.remove("checkpoint.binlog.file");
             configProps.remove("checkpoint.binlog.position");
+            // 主备倒换后源库已是原目标库，旧源的 GTID 集在新源上无意义，残留会导致按错误历史自动定位
+            configProps.remove("capture.gtid.set");
+            configProps.remove("checkpoint.gtid.set");
             try (OutputStream cos = new FileOutputStream(configFile)) {
                 configProps.store(cos, "Updated for failover - binlog position cleared");
             }

@@ -12,11 +12,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 COMPOSE_FILE="docker-compose-synctask.yml"
 DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
+MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
+
+# Mongo 副本集成员主机（固定 IP，见 docker-compose-synctask-mongo.yml）：rs.initiate 用固定 IP
+# 作为 member host，重启不漂移。宿主机侧仍连 localhost:27117/27118（directConnection）。
+MONGO_A_HOST="172.28.10.11:27017"
+MONGO_B_HOST="172.28.10.12:27017"
 
 echo "[create_env] 创建并启动 Docker 基础设施 (mysql:33306, kafka:29092, zookeeper)..."
 docker compose -f "$COMPOSE_FILE" up -d
 
-echo "[create_env] 创建并启动 Mongo/ES 基础设施 (mongo-a:27117, mongo-b:27118, es:9200)..."
+echo "[create_env] 创建并启动 Mongo 副本集 (mongo-a:27117, mongo-b:27118, 固定 IP)..."
+docker compose -f "$MONGO_COMPOSE_FILE" up -d
+
+echo "[create_env] 创建并启动 ES 基础设施 (es:9200)..."
 docker compose -f "$DB_COMPOSE_FILE" up -d
 
 echo "[create_env] 等待 MySQL 健康检查通过..."
@@ -45,56 +54,11 @@ for i in $(seq 1 30); do
   docker exec synctask-mongo-b mongosh --quiet --eval 'db.runCommand("ping")' >/dev/null 2>&1 && break
   sleep 2
 done
-echo "[create_env] 初始化 Mongo 副本集 rsA / rsB（幂等，已初始化则跳过）..."
+echo "[create_env] 初始化 Mongo 副本集 rsA / rsB（幂等，已初始化则跳过；member host 用固定 IP）..."
 docker exec synctask-mongo-a mongosh -u root -p rootpassword --quiet --eval \
-  'try { rs.initiate({_id:"rsA", members:[{_id:0, host:"127.0.0.1:27017"}]}) } catch(e) { print(e.message) }' || true
+  "try { rs.initiate({_id:\"rsA\", members:[{_id:0, host:\"${MONGO_A_HOST}\"}]}) } catch(e) { print(e.message) }" || true
 docker exec synctask-mongo-b mongosh -u root -p rootpassword --quiet --eval \
-  'try { rs.initiate({_id:"rsB", members:[{_id:0, host:"127.0.0.1:27017"}]}) } catch(e) { print(e.message) }' || true
-
-# ---- Mongo 分片集群初始化（源：2 shard + 目标：1 shard；全部幂等可重复执行）----
-# configsvr 默认端口 27019、shardsvr 默认 27018；集群内互访用服务名，宿主机只连 mongos。
-init_sharded_cluster() {
-  local prefix="$1" csrs="$2" mongos_host_port="$3"; shift 3
-  local shards=("$@")   # 形如 srcSh1:synctask-mongos-src-sh1
-
-  echo "[create_env] 初始化分片集群 ${prefix}（configsvr + ${#shards[@]} shard + mongos）..."
-  for i in $(seq 1 30); do
-    docker exec "${prefix}-cfg" mongosh --port 27019 --quiet --eval 'db.runCommand("ping")' >/dev/null 2>&1 && break
-    sleep 2
-  done
-  docker exec "${prefix}-cfg" mongosh --port 27019 --quiet --eval \
-    "try { rs.initiate({_id:\"${csrs}\", configsvr:true, members:[{_id:0, host:\"${prefix}-cfg:27019\"}]}) } catch(e) { print(e.message) }" || true
-
-  local entry rsname host
-  for entry in "${shards[@]}"; do
-    rsname="${entry%%:*}"; host="${entry#*:}"
-    for i in $(seq 1 30); do
-      docker exec "$host" mongosh --port 27018 --quiet --eval 'db.runCommand("ping")' >/dev/null 2>&1 && break
-      sleep 2
-    done
-    docker exec "$host" mongosh --port 27018 --quiet --eval \
-      "try { rs.initiate({_id:\"${rsname}\", members:[{_id:0, host:\"${host}:27018\"}]}) } catch(e) { print(e.message) }" || true
-  done
-
-  echo "[create_env] 等待 mongos ${prefix} 就绪..."
-  for i in $(seq 1 40); do
-    docker exec "${prefix}" mongosh --quiet --eval 'db.runCommand("ping")' >/dev/null 2>&1 && break
-    sleep 3
-  done
-  # localhost exception 建 root（已存在则捕获报错跳过）
-  docker exec "${prefix}" mongosh --quiet --eval \
-    'try { db.getSiblingDB("admin").createUser({user:"root", pwd:"rootpassword", roles:["root"]}) } catch(e) { print(e.message) }' || true
-  for entry in "${shards[@]}"; do
-    rsname="${entry%%:*}"; host="${entry#*:}"
-    docker exec "${prefix}" mongosh -u root -p rootpassword --quiet --eval \
-      "try { sh.addShard(\"${rsname}/${host}:27018\") } catch(e) { print(e.message) }" || true
-  done
-}
-
-init_sharded_cluster synctask-mongos-src csrsSrc 27217 \
-  srcSh1:synctask-mongos-src-sh1 srcSh2:synctask-mongos-src-sh2
-init_sharded_cluster synctask-mongos-dst csrsDst 27218 \
-  dstSh1:synctask-mongos-dst-sh1
+  "try { rs.initiate({_id:\"rsB\", members:[{_id:0, host:\"${MONGO_B_HOST}\"}]}) } catch(e) { print(e.message) }" || true
 
 echo "[create_env] 等待 Elasticsearch 就绪..."
 for i in $(seq 1 40); do

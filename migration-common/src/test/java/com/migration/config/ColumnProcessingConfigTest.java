@@ -99,6 +99,25 @@ class ColumnProcessingConfigTest {
     }
 
     @Test
+    @DisplayName("附加列 PG 建表定义：双引号标识符，时间列 TIMESTAMP DEFAULT，自定义列常量")
+    void pgExtraColumnDefs() {
+        ColumnProcessingConfig config = load();
+        List<ColumnProcessingConfig.ExtraColumn> extras = config.getExtraColumns("db1", "t1");
+        // CREATE_TIME / UPDATE_TIME 均为 TIMESTAMP DEFAULT CURRENT_TIMESTAMP（PG 无列级 ON UPDATE）
+        assertEquals("\"create_time\" TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                extras.get(0).toPostgresColumnDef("db1", "t1"));
+        assertEquals("\"update_time\" TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                extras.get(1).toPostgresColumnDef("db1", "t1"));
+        assertEquals("\"src_flag\" VARCHAR(512) DEFAULT '20260714test1@db1@t1'",
+                extras.get(2).toPostgresColumnDef("db1", "t1"));
+        // 方言分派：postgres=true 走 PG 定义，false 走 MySQL 定义
+        assertEquals(extras.get(0).toPostgresColumnDef("db1", "t1"),
+                extras.get(0).toColumnDef("db1", "t1", true));
+        assertEquals(extras.get(0).toMysqlColumnDef("db1", "t1"),
+                extras.get(0).toColumnDef("db1", "t1", false));
+    }
+
+    @Test
     @DisplayName("bit 列比较：Boolean/byte[]/BitSet 折算为无符号整数值")
     void bitComparison() {
         Properties props = new Properties();

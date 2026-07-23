@@ -48,7 +48,7 @@ public class AdvancedFeaturesController {
             TaskSchedule schedule = scheduleService.createSchedule(
                     (String) req.get("workflowId"), userId,
                     (String) req.get("cronExpression"), (String) req.get("scheduleName"),
-                    (String) req.get("scheduleType"));
+                    (String) req.get("scheduleType"), (String) req.get("compareType"));
             return ResponseEntity.ok(Map.of("success", true, "data", schedule));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
@@ -224,6 +224,17 @@ public class AdvancedFeaturesController {
     public ResponseEntity<?> diagnose(@PathVariable String workflowId, Authentication auth) {
         try {
             Map<String, Object> result = diagnosticService.diagnose(workflowId, getUserId(auth));
+            return ResponseEntity.ok(Map.of("success", true, "data", result));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    // 4.1b 启动前 schema 预检
+    @PostMapping("/schema-precheck/{workflowId}")
+    public ResponseEntity<?> schemaPrecheck(@PathVariable String workflowId, Authentication auth) {
+        try {
+            Map<String, Object> result = diagnosticService.schemaPrecheck(workflowId, getUserId(auth));
             return ResponseEntity.ok(Map.of("success", true, "data", result));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));

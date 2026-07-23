@@ -134,22 +134,43 @@ public class CheckpointManager {
                 }
             }
             
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_executed")) {
-                if (rs.next()) {
-                    gtid = rs.getString(1);
-                    logger.info("当前 GTID: {}", gtid);
+            // 只有 gtid_mode=ON 才记录 GTID：gtid_mode=OFF 时 gtid_executed 仍可能非空
+            // （曾开过 GTID 的历史遗留），若据此让 capture 走 AUTO_POSITION 会被源库拒绝、
+            // 导致 binlog 拉取失败、增量不同步。以 gtid_mode 为准。
+            if (isGtidModeOn(conn)) {
+                try (Statement stmt = conn.createStatement();
+                     ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_executed")) {
+                    if (rs.next()) {
+                        gtid = rs.getString(1);
+                        logger.info("当前 GTID: {}", gtid);
+                    }
+                } catch (SQLException e) {
+                    logger.warn("获取 GTID 失败: {}", e.getMessage());
                 }
-            } catch (SQLException e) {
-                logger.warn("获取 GTID 失败，可能未开启 GTID 模式: {}", e.getMessage());
+            } else {
+                logger.info("源库 gtid_mode 非 ON，不记录 GTID，增量走 file+pos");
             }
-            
+
         } catch (SQLException e) {
             logger.error("获取 binlog position 失败", e);
             throw new RuntimeException("无法获取 binlog position", e);
         }
-        
+
         return new BinlogPositionInfo(filename, position, gtid, System.currentTimeMillis());
+    }
+
+    /** 源库 gtid_mode 是否 ON / ON_PERMISSIVE。查询失败保守返回 false（不记录 GTID）。 */
+    private boolean isGtidModeOn(Connection conn) {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_mode")) {
+            if (rs.next()) {
+                String mode = rs.getString(1);
+                return mode != null && mode.toUpperCase().startsWith("ON");
+            }
+        } catch (SQLException e) {
+            logger.warn("查询 gtid_mode 失败，按未开启处理: {}", e.getMessage());
+        }
+        return false;
     }
 
     public BinlogPositionInfo getCurrentPositionFromPostgres(String sourceHost, int sourcePort,

@@ -65,6 +65,8 @@ public final class MongoSyncMain {
     private final Properties props;
     /** 同步对象：db -> 集合清单；空清单 = 整库（dbLevel） */
     private final Map<String, List<String>> syncObjects;
+    /** 列处理（列过滤/列名映射/附加列）；无配置时各集合短路走原始文档 */
+    private final MongoDocumentProcessor processor;
     private final Path progressPath;
     private final Path tokenPath;
 
@@ -81,6 +83,7 @@ public final class MongoSyncMain {
         this.taskId = taskId;
         this.props = props;
         this.syncObjects = parseSyncObjects(props.getProperty("migration.sync.objects", ""));
+        this.processor = MongoDocumentProcessor.fromProperties(props);
         this.progressPath = Paths.get("files", taskId, "mongo_progress.json");
         this.tokenPath = Paths.get("files", taskId, "checkpoint", "mongo_resume_token.json");
     }
@@ -119,6 +122,9 @@ public final class MongoSyncMain {
         boolean fullAndIncre = "fullAndIncre".equals(props.getProperty("migration.mode", "full"));
         logger.info("Mongo 同步启动: taskId={}, mode={}, syncObjects={}",
                 taskId, fullAndIncre ? "fullAndIncre" : "full", syncObjects.keySet());
+        if (!processor.isEmpty()) {
+            logger.info("列处理已启用（列过滤/列名映射/附加列按集合生效）");
+        }
 
         try (MongoClient source = MongoClients.create(clientSettings("source"));
              MongoClient target = MongoClients.create(clientSettings("target"))) {
@@ -167,7 +173,7 @@ public final class MongoSyncMain {
             for (String collName : e.getValue()) {
                 currentCollection = dbName + "." + collName;
                 writeProgress();
-                copyCollection(srcDb.getCollection(collName), tgtDb.getCollection(collName));
+                copyCollection(dbName, collName, srcDb.getCollection(collName), tgtDb.getCollection(collName));
                 completedCollections++;
                 writeProgress();
                 logger.info("集合 {} 全量完成 ({}/{})", currentCollection, completedCollections, totalCollections);
@@ -176,8 +182,10 @@ public final class MongoSyncMain {
         logger.info("全量完成: {} 个集合, 共 {} 文档", totalCollections, copiedDocs);
     }
 
-    private void copyCollection(MongoCollection<Document> src, MongoCollection<Document> tgt) {
-        // 索引先行（跳过默认 _id_），保证数据落入后即有约束/查询性能
+    private void copyCollection(String db, String coll, MongoCollection<Document> src, MongoCollection<Document> tgt) {
+        boolean active = processor.isActive(db, coll);
+        // 索引先行（跳过默认 _id_），保证数据落入后即有约束/查询性能。
+        // 列名映射时索引 key 字段也随之改写（源 note 上的唯一索引 → 目标 remark 上）。
         for (Document idx : src.listIndexes()) {
             String name = idx.getString("name");
             if ("_id_".equals(name)) {
@@ -185,6 +193,13 @@ public final class MongoSyncMain {
             }
             try {
                 Document keys = (Document) idx.get("key");
+                Document targetKeys = keys;
+                if (active) {
+                    targetKeys = new Document();
+                    for (Map.Entry<String, Object> k : keys.entrySet()) {
+                        targetKeys.put(processor.mapField(db, coll, k.getKey()), k.getValue());
+                    }
+                }
                 com.mongodb.client.model.IndexOptions opts = new com.mongodb.client.model.IndexOptions().name(name);
                 if (Boolean.TRUE.equals(idx.getBoolean("unique", false))) {
                     opts.unique(true);
@@ -192,7 +207,7 @@ public final class MongoSyncMain {
                 if (Boolean.TRUE.equals(idx.getBoolean("sparse", false))) {
                     opts.sparse(true);
                 }
-                tgt.createIndex(keys, opts);
+                tgt.createIndex(targetKeys, opts);
             } catch (Exception ex) {
                 logger.warn("复制索引 {} 失败（继续数据复制）: {}", name, ex.getMessage());
             }
@@ -203,7 +218,11 @@ public final class MongoSyncMain {
         try (MongoCursor<Document> cursor = src.find().batchSize(FULL_BATCH_SIZE).iterator()) {
             while (cursor.hasNext()) {
                 Document doc = cursor.next();
-                batch.add(new ReplaceOneModel<>(new Document("_id", doc.get("_id")), doc, upsert));
+                if (active && processor.excluded(db, coll, doc)) {
+                    continue; // 命中列过滤，跳过不同步
+                }
+                Document out = active ? processor.transform(db, coll, doc) : doc;
+                batch.add(new ReplaceOneModel<>(new Document("_id", out.get("_id")), out, upsert));
                 if (batch.size() >= FULL_BATCH_SIZE) {
                     tgt.bulkWrite(batch, new com.mongodb.client.model.BulkWriteOptions().ordered(false));
                     copiedDocs += batch.size();
@@ -278,6 +297,7 @@ public final class MongoSyncMain {
         }
 
         MongoCollection<Document> tgt = target.getDatabase(db).getCollection(coll);
+        boolean active = processor.isActive(db, coll);
         OperationType op = event.getOperationType();
         try {
             switch (op) {
@@ -288,7 +308,14 @@ public final class MongoSyncMain {
                     // UPDATE 且 fullDocument 为 null = 文档在 lookup 前已被删除，交给后续 DELETE 事件
                     Document full = event.getFullDocument();
                     if (full != null) {
-                        tgt.replaceOne(new Document("_id", full.get("_id")), full, upsert);
+                        if (active && processor.excluded(db, coll, full)) {
+                            // 后镜像命中列过滤 → 目标端按 _id 删除（与 mysql/pg 的
+                            // "UPDATE 后镜像被过滤转 DELETE" 语义一致，处理"原本符合、改后不符合"）
+                            tgt.deleteOne(new Document("_id", full.get("_id")));
+                        } else {
+                            Document out = active ? processor.transform(db, coll, full) : full;
+                            tgt.replaceOne(new Document("_id", out.get("_id")), out, upsert);
+                        }
                     }
                     break;
                 }
