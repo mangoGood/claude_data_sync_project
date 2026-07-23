@@ -7,7 +7,8 @@ Redis → Redis 端到端测试（走真实 backend + agent + Kafka 全链路）
   - 场景 A：全量同步（migration.mode=full）→ FULL_COMPLETED，校验目标 == 源
   - 场景 B：全量+增量（fullAndIncre）→ INCREMENT_RUNNING，写增量后校验目标
 
-前置：docker 容器 redis-src(6390) / redis-tgt(6391)，均 --requirepass syncredis。
+前置：docker compose -f docker-compose-synctask-redis.yml up -d
+     （synctask-redis-a:6390 源 / synctask-redis-b:6391 目标，均 requirepass syncredis）
 用法：python3 test_scripts/redis/redis_e2e.py
 """
 import json
@@ -41,11 +42,11 @@ def rc(container, *args):
 
 
 def src(*a):
-    return rc("redis-src", *a)
+    return rc("synctask-redis-a", *a)
 
 
 def tgt(*a):
-    return rc("redis-tgt", *a)
+    return rc("synctask-redis-b", *a)
 
 
 def api(method, path, token=None, **kw):

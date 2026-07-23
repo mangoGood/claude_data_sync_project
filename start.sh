@@ -14,6 +14,7 @@ PROJECT_DIR="$(pwd)"
 COMPOSE_FILE="docker-compose-synctask.yml"
 DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
 MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
+REDIS_COMPOSE_FILE="docker-compose-synctask-redis.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
@@ -78,6 +79,11 @@ fi
 if docker inspect synctask-es >/dev/null 2>&1; then
   echo "[start] 启动 ES 基础设施 (es:9200)..."
   docker compose -f "$DB_COMPOSE_FILE" start
+fi
+
+if docker inspect synctask-redis-a >/dev/null 2>&1; then
+  echo "[start] 启动 Redis (redis-a:6390, redis-b:6391)..."
+  docker compose -f "$REDIS_COMPOSE_FILE" start
 fi
 
 echo "[start] 等待 MySQL 健康检查通过..."
