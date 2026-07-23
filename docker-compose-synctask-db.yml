@@ -10,142 +10,142 @@
 #   elastic/espassword. Used by mysql->elasticsearch sync (migration-elastic).
 # Brought up with: docker compose -f docker-compose-synctask-db.yml up -d
 services:
-  synctask-mongo-a:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongo-a
-    restart: unless-stopped
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: rootpassword
-      MONGO_INITDB_DATABASE: myapp_db
-    ports:
-      - "27117:27017"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.3
-    # 单成员副本集（非普通单机）：migration-mongo 的增量同步依赖 Change Streams，
-    # 该特性仅在副本集/分片集群可用；keyFile 每次容器启动时生成，单成员无需与其它
-    # 节点共享同一份，只需内部一致即可启用鉴权协议。
-    command: >
-      bash -c "openssl rand -base64 96 > /etc/mongo-key && chmod 400 /etc/mongo-key &&
-      chown mongodb /etc/mongo-key && exec docker-entrypoint.sh mongod --replSet rsA --keyFile /etc/mongo-key --bind_ip_all"
+  # synctask-mongo-a:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongo-a
+  #   restart: unless-stopped
+  #   environment:
+  #     MONGO_INITDB_ROOT_USERNAME: root
+  #     MONGO_INITDB_ROOT_PASSWORD: rootpassword
+  #     MONGO_INITDB_DATABASE: myapp_db
+  #   ports:
+  #     - "27117:27017"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.3
+  #   # 单成员副本集（非普通单机）：migration-mongo 的增量同步依赖 Change Streams，
+  #   # 该特性仅在副本集/分片集群可用；keyFile 每次容器启动时生成，单成员无需与其它
+  #   # 节点共享同一份，只需内部一致即可启用鉴权协议。
+  #   command: >
+  #     bash -c "openssl rand -base64 96 > /etc/mongo-key && chmod 400 /etc/mongo-key &&
+  #     chown mongodb /etc/mongo-key && exec docker-entrypoint.sh mongod --replSet rsA --keyFile /etc/mongo-key --bind_ip_all"
 
-  synctask-mongo-b:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongo-b
-    restart: unless-stopped
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: rootpassword
-      MONGO_INITDB_DATABASE: myapp_db
-    ports:
-      - "27118:27017"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.4
-    command: >
-      bash -c "openssl rand -base64 96 > /etc/mongo-key && chmod 400 /etc/mongo-key &&
-      chown mongodb /etc/mongo-key && exec docker-entrypoint.sh mongod --replSet rsB --keyFile /etc/mongo-key --bind_ip_all"
+  # synctask-mongo-b:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongo-b
+  #   restart: unless-stopped
+  #   environment:
+  #     MONGO_INITDB_ROOT_USERNAME: root
+  #     MONGO_INITDB_ROOT_PASSWORD: rootpassword
+  #     MONGO_INITDB_DATABASE: myapp_db
+  #   ports:
+  #     - "27118:27017"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.4
+  #   command: >
+  #     bash -c "openssl rand -base64 96 > /etc/mongo-key && chmod 400 /etc/mongo-key &&
+  #     chown mongodb /etc/mongo-key && exec docker-entrypoint.sh mongod --replSet rsB --keyFile /etc/mongo-key --bind_ip_all"
 
-  # ============ MongoDB 分片集群（源）：configsvr + 2 shard + mongos(:27217) ============
-  # 分片集群成员间认证要求全簇共享同一 keyFile（与单成员副本集"各自随机生成"不同），
-  # 测试环境固定写死；集群内互访用服务名，宿主机只需连 mongos（27217/27218）。
-  # 初始化（rs.initiate / 建 root 用户 / addShard）由 create_env.sh 幂等完成。
-  synctask-mongos-src-cfg:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongos-src-cfg
-    restart: unless-stopped
-    command: >
-      bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
-      chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
-      exec docker-entrypoint.sh mongod --configsvr --replSet csrsSrc --keyFile /etc/mongo-key --bind_ip_all"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.10
+  # # ============ MongoDB 分片集群（源）：configsvr + 2 shard + mongos(:27217) ============
+  # # 分片集群成员间认证要求全簇共享同一 keyFile（与单成员副本集"各自随机生成"不同），
+  # # 测试环境固定写死；集群内互访用服务名，宿主机只需连 mongos（27217/27218）。
+  # # 初始化（rs.initiate / 建 root 用户 / addShard）由 create_env.sh 幂等完成。
+  # synctask-mongos-src-cfg:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongos-src-cfg
+  #   restart: unless-stopped
+  #   command: >
+  #     bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
+  #     chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
+  #     exec docker-entrypoint.sh mongod --configsvr --replSet csrsSrc --keyFile /etc/mongo-key --bind_ip_all"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.10
 
-  synctask-mongos-src-sh1:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongos-src-sh1
-    restart: unless-stopped
-    command: >
-      bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
-      chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
-      exec docker-entrypoint.sh mongod --shardsvr --replSet srcSh1 --keyFile /etc/mongo-key --bind_ip_all"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.11
+  # synctask-mongos-src-sh1:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongos-src-sh1
+  #   restart: unless-stopped
+  #   command: >
+  #     bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
+  #     chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
+  #     exec docker-entrypoint.sh mongod --shardsvr --replSet srcSh1 --keyFile /etc/mongo-key --bind_ip_all"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.11
 
-  synctask-mongos-src-sh2:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongos-src-sh2
-    restart: unless-stopped
-    command: >
-      bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
-      chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
-      exec docker-entrypoint.sh mongod --shardsvr --replSet srcSh2 --keyFile /etc/mongo-key --bind_ip_all"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.12
+  # synctask-mongos-src-sh2:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongos-src-sh2
+  #   restart: unless-stopped
+  #   command: >
+  #     bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
+  #     chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
+  #     exec docker-entrypoint.sh mongod --shardsvr --replSet srcSh2 --keyFile /etc/mongo-key --bind_ip_all"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.12
 
-  synctask-mongos-src:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongos-src
-    restart: unless-stopped
-    depends_on:
-      - synctask-mongos-src-cfg
-      - synctask-mongos-src-sh1
-      - synctask-mongos-src-sh2
-    command: >
-      bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
-      chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
-      exec docker-entrypoint.sh mongos --configdb csrsSrc/synctask-mongos-src-cfg:27019 --keyFile /etc/mongo-key --bind_ip_all"
-    ports:
-      - "27217:27017"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.13
+  # synctask-mongos-src:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongos-src
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - synctask-mongos-src-cfg
+  #     - synctask-mongos-src-sh1
+  #     - synctask-mongos-src-sh2
+  #   command: >
+  #     bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
+  #     chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
+  #     exec docker-entrypoint.sh mongos --configdb csrsSrc/synctask-mongos-src-cfg:27019 --keyFile /etc/mongo-key --bind_ip_all"
+  #   ports:
+  #     - "27217:27017"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.13
 
-  # ============ MongoDB 分片集群（目标）：configsvr + 1 shard + mongos(:27218) ============
-  synctask-mongos-dst-cfg:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongos-dst-cfg
-    restart: unless-stopped
-    command: >
-      bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
-      chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
-      exec docker-entrypoint.sh mongod --configsvr --replSet csrsDst --keyFile /etc/mongo-key --bind_ip_all"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.14
+  # # ============ MongoDB 分片集群（目标）：configsvr + 1 shard + mongos(:27218) ============
+  # synctask-mongos-dst-cfg:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongos-dst-cfg
+  #   restart: unless-stopped
+  #   command: >
+  #     bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
+  #     chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
+  #     exec docker-entrypoint.sh mongod --configsvr --replSet csrsDst --keyFile /etc/mongo-key --bind_ip_all"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.14
 
-  synctask-mongos-dst-sh1:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongos-dst-sh1
-    restart: unless-stopped
-    command: >
-      bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
-      chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
-      exec docker-entrypoint.sh mongod --shardsvr --replSet dstSh1 --keyFile /etc/mongo-key --bind_ip_all"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.15
+  # synctask-mongos-dst-sh1:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongos-dst-sh1
+  #   restart: unless-stopped
+  #   command: >
+  #     bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
+  #     chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
+  #     exec docker-entrypoint.sh mongod --shardsvr --replSet dstSh1 --keyFile /etc/mongo-key --bind_ip_all"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.15
 
-  synctask-mongos-dst:
-    image: docker.1ms.run/mongo:latest
-    container_name: synctask-mongos-dst
-    restart: unless-stopped
-    depends_on:
-      - synctask-mongos-dst-cfg
-      - synctask-mongos-dst-sh1
-    command: >
-      bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
-      chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
-      exec docker-entrypoint.sh mongos --configdb csrsDst/synctask-mongos-dst-cfg:27019 --keyFile /etc/mongo-key --bind_ip_all"
-    ports:
-      - "27218:27017"
-    networks:
-      synctask-db-net:
-        ipv4_address: 192.168.155.16
+  # synctask-mongos-dst:
+  #   image: docker.1ms.run/mongo:latest
+  #   container_name: synctask-mongos-dst
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - synctask-mongos-dst-cfg
+  #     - synctask-mongos-dst-sh1
+  #   command: >
+  #     bash -c "echo 'tWLuFMoHnUq+TbB51gaPjyneNLUupGfPgjE8WlQW3Q6rO3OWq6//gBwg9i6L9t+GO31GtrApnRzRu/XWlqfyg1khiKcoSTY3aTIxz4U479i//hNRPYUFHEOh' > /etc/mongo-key &&
+  #     chmod 400 /etc/mongo-key && chown mongodb /etc/mongo-key &&
+  #     exec docker-entrypoint.sh mongos --configdb csrsDst/synctask-mongos-dst-cfg:27019 --keyFile /etc/mongo-key --bind_ip_all"
+  #   ports:
+  #     - "27218:27017"
+  #   networks:
+  #     synctask-db-net:
+  #       ipv4_address: 192.168.155.16
 
   synctask-es:
     image: docker.1ms.run/elasticsearch:8.11.1
@@ -161,7 +161,7 @@ services:
       - "9200:9200"
     networks:
       synctask-db-net:
-        ipv4_address: 192.168.155.17
+        ipv4_address: 192.168.155.2
 
 networks:
   synctask-db-net:

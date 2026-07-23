@@ -2693,7 +2693,8 @@
         // 列处理是否可用：同引擎任务（mysql→mysql / pg→pg）展示【3.列处理】步骤
         function cfgColProcSupported() {
             return (cfgSourceType === 'mysql' && cfgTargetType === 'mysql')
-                || (cfgSourceType === 'postgresql' && cfgTargetType === 'postgresql');
+                || (cfgSourceType === 'postgresql' && cfgTargetType === 'postgresql')
+                || (cfgSourceType === 'mongodb' && cfgTargetType === 'mongodb');
         }
 
         function cfgClearAllColumnProcessing() {

@@ -1,0 +1,62 @@
+# Dedicated MongoDB source + target replica sets for mongodb->mongodb sync (migration-mongo).
+# Split out of docker-compose-synctask-db.yml (which now only carries Elasticsearch) so the
+# mongo stack can be brought up/down independently and, crucially, so its replica-set members
+# get FIXED IPs that never drift across restarts.
+#
+# Why fixed IPs matter: a single-member replica set stores its member host in the RS config
+# (rs.initiate). If that host resolves to a container IP that docker reassigns on restart, the
+# member becomes unreachable under its own config → no primary is elected → Change Streams and
+# writes stall. Pinning each container to a static IP on a dedicated /24 (synctask-mongo-net)
+# and initiating the RS with that same static IP (see create_env.sh) keeps the config valid
+# across any number of restarts.
+#
+# - synctask-mongo-a : replica set rsA, static IP 172.28.10.11, host port 27117 (source)
+# - synctask-mongo-b : replica set rsB, static IP 172.28.10.12, host port 27118 (target)
+#   root/rootpassword, auth via per-container keyFile (single-member RS: the key only needs to be
+#   internally consistent). Clients connect to localhost:2711x with directConnection=true.
+# Brought up with: docker compose -f docker-compose-synctask-mongo.yml up -d
+# rs.initiate (with the static IP as member host) is run idempotently by create_env.sh.
+services:
+  synctask-mongo-a:
+    image: docker.1ms.run/mongo:latest
+    container_name: synctask-mongo-a
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpassword
+    ports:
+      - "27117:27017"
+    networks:
+      synctask-mongo-net:
+        ipv4_address: 172.28.10.11
+    # 单成员副本集（非普通单机）：migration-mongo 的增量同步依赖 Change Streams，
+    # 该特性仅在副本集/分片集群可用；keyFile 每次容器启动时生成，单成员只需内部一致即可启用鉴权。
+    command: >
+      bash -c "openssl rand -base64 96 > /etc/mongo-key && chmod 400 /etc/mongo-key &&
+      chown mongodb /etc/mongo-key &&
+      exec docker-entrypoint.sh mongod --replSet rsA --keyFile /etc/mongo-key --bind_ip_all"
+
+  synctask-mongo-b:
+    image: docker.1ms.run/mongo:latest
+    container_name: synctask-mongo-b
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpassword
+    ports:
+      - "27118:27017"
+    networks:
+      synctask-mongo-net:
+        ipv4_address: 172.28.10.12
+    command: >
+      bash -c "openssl rand -base64 96 > /etc/mongo-key && chmod 400 /etc/mongo-key &&
+      chown mongodb /etc/mongo-key &&
+      exec docker-entrypoint.sh mongod --replSet rsB --keyFile /etc/mongo-key --bind_ip_all"
+
+networks:
+  synctask-mongo-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24
+          gateway: 172.28.10.1

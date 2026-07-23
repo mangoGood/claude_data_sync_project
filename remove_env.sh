@@ -9,11 +9,15 @@ set -uo pipefail
 cd "$(dirname "$0")"
 COMPOSE_FILE="docker-compose-synctask.yml"
 DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
+MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
 
 echo "[remove_env] 停止并删除 Docker 基础设施 (mysql / kafka / zookeeper)..."
 docker compose -f "$COMPOSE_FILE" down
 
-echo "[remove_env] 停止并删除 Mongo/ES 基础设施 (mongo-a / mongo-b / es)..."
+echo "[remove_env] 停止并删除 Mongo 副本集 (mongo-a / mongo-b)..."
+docker compose -f "$MONGO_COMPOSE_FILE" down
+
+echo "[remove_env] 停止并删除 ES 基础设施 (es)..."
 docker compose -f "$DB_COMPOSE_FILE" down
 
 echo ""

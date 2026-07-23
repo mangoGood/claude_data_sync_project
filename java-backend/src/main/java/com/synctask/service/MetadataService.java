@@ -625,8 +625,11 @@ public class MetadataService {
         if (conn.isPostgresql()) {
             return listPostgresColumns(conn, database, table);
         }
-        if (conn.isMongo() || conn.isOracle() || conn.isElastic()) {
-            throw new RuntimeException("列处理目前仅支持 MySQL 与 PostgreSQL 同构数据源");
+        if (conn.isMongo()) {
+            return listMongoFields(conn, database, table);
+        }
+        if (conn.isOracle() || conn.isElastic()) {
+            throw new RuntimeException("列处理目前仅支持 MySQL / PostgreSQL / MongoDB 同构数据源");
         }
         List<java.util.Map<String, Object>> columns = new ArrayList<>();
         try {
@@ -717,6 +720,70 @@ public class MetadataService {
             throw new RuntimeException("数据库驱动未找到: " + e.getMessage());
         }
         return columns;
+    }
+
+    /**
+     * 采样 MongoDB 集合的字段（列处理页面用）。Mongo 无固定 schema：抽样若干文档取并集字段，
+     * 按首个非空值的 BSON 类型推断 dataType 与 filterable（数值/日期/布尔可过滤，与 mysql/pg 口径一致；
+     * 字符串/对象/数组不可过滤）。{@code _id} 标记 primaryKey，不参与过滤/映射。
+     * database=库名、table=集合名（与 syncObjects 的库键一致）。
+     */
+    private List<java.util.Map<String, Object>> listMongoFields(ParsedConnection conn, String database, String collection) {
+        final int SAMPLE = 200;
+        java.util.LinkedHashMap<String, java.util.Map<String, Object>> fields = new java.util.LinkedHashMap<>();
+        try (com.mongodb.client.MongoClient client = buildMongoClient(conn)) {
+            com.mongodb.client.MongoCollection<org.bson.Document> coll =
+                    client.getDatabase(database).getCollection(collection);
+            try (com.mongodb.client.MongoCursor<org.bson.Document> cursor =
+                         coll.find().limit(SAMPLE).iterator()) {
+                while (cursor.hasNext()) {
+                    org.bson.Document doc = cursor.next();
+                    for (java.util.Map.Entry<String, Object> e : doc.entrySet()) {
+                        java.util.Map<String, Object> col = fields.get(e.getKey());
+                        boolean firstConcrete = (col == null) || "null".equals(col.get("dataType"));
+                        if (col == null) {
+                            col = new java.util.LinkedHashMap<>();
+                            col.put("name", e.getKey());
+                            col.put("primaryKey", "_id".equals(e.getKey()));
+                            col.put("dataType", "null");
+                            col.put("columnType", "null");
+                            col.put("filterable", false);
+                            fields.put(e.getKey(), col);
+                        }
+                        // 首个非空值决定类型/可过滤性；_id 不可过滤（是删除/定位键，不做列过滤）
+                        if (firstConcrete && e.getValue() != null) {
+                            String bsonType = bsonTypeName(e.getValue());
+                            col.put("dataType", bsonType);
+                            col.put("columnType", bsonType);
+                            col.put("filterable", !"_id".equals(e.getKey()) && MONGO_FILTERABLE_TYPES.contains(bsonType));
+                        }
+                    }
+                }
+            }
+            logger.info("Mongo 集合 {}.{} 采样到 {} 个字段", database, collection, fields.size());
+        } catch (Exception e) {
+            logger.error("采样 Mongo 字段失败: {}", e.getMessage());
+            throw new RuntimeException("查询列信息失败: " + e.getMessage());
+        }
+        return new ArrayList<>(fields.values());
+    }
+
+    private static final Set<String> MONGO_FILTERABLE_TYPES = new HashSet<>(java.util.Arrays.asList(
+            "int", "long", "double", "decimal", "date", "bool"));
+
+    /** BSON 运行时值 → 展示用类型名（与 filterable 口径对应）。 */
+    private static String bsonTypeName(Object v) {
+        if (v instanceof Integer) return "int";
+        if (v instanceof Long) return "long";
+        if (v instanceof Double || v instanceof Float) return "double";
+        if (v instanceof org.bson.types.Decimal128) return "decimal";
+        if (v instanceof java.util.Date) return "date";
+        if (v instanceof Boolean) return "bool";
+        if (v instanceof String) return "string";
+        if (v instanceof org.bson.types.ObjectId) return "objectId";
+        if (v instanceof org.bson.Document) return "object";
+        if (v instanceof java.util.List) return "array";
+        return v.getClass().getSimpleName().toLowerCase();
     }
 
     /** 组装 PG 列的展示类型串：varchar(n) / numeric(p,s) / 原始 data_type。 */

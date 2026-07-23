@@ -13,6 +13,7 @@ cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
 COMPOSE_FILE="docker-compose-synctask.yml"
 DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
+MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
@@ -70,7 +71,12 @@ echo "[start] 启动 Docker 基础设施 (mysql:33306, kafka:29092, zookeeper)..
 docker compose -f "$COMPOSE_FILE" start
 
 if docker inspect synctask-mongo-a >/dev/null 2>&1; then
-  echo "[start] 启动 Mongo/ES 基础设施 (mongo-a:27117, mongo-b:27118, es:9200)..."
+  echo "[start] 启动 Mongo 副本集 (mongo-a:27117, mongo-b:27118)..."
+  docker compose -f "$MONGO_COMPOSE_FILE" start
+fi
+
+if docker inspect synctask-es >/dev/null 2>&1; then
+  echo "[start] 启动 ES 基础设施 (es:9200)..."
   docker compose -f "$DB_COMPOSE_FILE" start
 fi
 
