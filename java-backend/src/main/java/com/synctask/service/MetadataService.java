@@ -991,17 +991,28 @@ public class MetadataService {
                     dbTypeName + "源库连接成功", "info");
 
             if (sourceIsPg) {
+                // 订阅恒为增量：PG 版本号 + WAL + 复制槽/发送进程 + 复制权限 + REPLICA IDENTITY + 外键
+                checkPgSourceVersionSupported(sourceDb, result, true);
                 checkPgWalConfig(sourceDb, result);
                 checkPgReplicationSlot(sourceDb, result);
+                checkPgWalSenders(sourceDb, result, true);
+                checkPgReplicationPermissions(sourceDb, result, true);
+                checkPgReplicaIdentity(sourceDb, result, true);
+                checkPgForeignKeys(sourceDb, result);
             } else if (sourceIsOracle) {
+                checkOracleVersionSupported(sourceDb, result);
                 checkOracleLogMinerConfig(sourceDb, result);
                 checkOracleArchiveLog(sourceDb, result);
+                checkOracleForeignKeys(sourceDb, result);
             } else {
                 checkBinlogEnabled(sourceDb, result);
                 checkBinlogFormat(sourceDb, result);
                 checkBinlogRowImage(sourceDb, result);
                 String sourceVersion = getMySQLVersion(sourceDb);
+                checkSourceVersionSupported(sourceVersion, result);
                 checkServerId(sourceDb, sourceVersion, result);
+                checkStorageEngine(sourceDb, result);
+                checkForeignKeyConstraints(sourceDb, result);
             }
 
             checkSubscribePermissions(sourceDb, sourceIsPg, sourceIsOracle, result);
@@ -1012,8 +1023,7 @@ public class MetadataService {
                     "连接失败: " + e.getMessage(), "error");
         }
 
-        boolean allPassed = result.getCheckItems().stream().allMatch(ValidationResult.CheckItem::isPassed);
-        result.setAllPassed(allPassed);
+        finalizeAllPassed(result);
 
         return result;
     }
@@ -1217,9 +1227,21 @@ public class MetadataService {
         boolean bothPg = sourceIsPg && targetIsPg;
         boolean oracleToPg = sourceIsOracle && targetIsPg;
         boolean bidirectional = "BIDIRECTIONAL".equalsIgnoreCase(drMode);
+        boolean isDr = "BIDIRECTIONAL".equalsIgnoreCase(drMode) || "UNIDIRECTIONAL".equalsIgnoreCase(drMode);
+
+        boolean needIncrement = "fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode);
 
         ParsedConnection sourceConn = parseConnection(sourceConnection);
         ParsedConnection targetConn = parseConnection(targetConnection);
+
+        // 灾备任务（单向/双向）源库与目标库必须是不同实例：同一实例做灾备无隔离意义，实例故障源/目标一起丢。
+        // 预连接强制拦截（error 阻断启动），不因能否连通而放行。
+        if (isDr && sameInstance(sourceConn, targetConn)) {
+            result.addItem("灾备源目标隔离", "灾备任务源库与目标库必须是不同的数据库实例", false,
+                    "源库与目标库指向同一实例（" + sourceConn.host + ":" + sourceConn.port
+                            + "），灾备任务要求源库与目标库为不同的 " + (sourceIsPg ? "PostgreSQL" : "MySQL") + " 实例",
+                    "error");
+        }
 
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(sourceConn),
@@ -1238,7 +1260,9 @@ public class MetadataService {
                 String sourceVersion = getMySQLVersion(sourceDb);
                 String targetVersion = getMySQLVersion(targetDb);
 
-                if ("fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode)) {
+                checkSourceVersionSupported(sourceVersion, result);
+
+                if (needIncrement) {
                     checkBinlogEnabled(sourceDb, result);
                     checkBinlogFormat(sourceDb, result);
                     checkBinlogRowImage(sourceDb, result);
@@ -1246,39 +1270,65 @@ public class MetadataService {
                 }
 
                 checkVersionCompatibility(sourceVersion, targetVersion, result);
+                checkStorageEngine(sourceDb, result);
+                checkForeignKeyConstraints(sourceDb, result);
                 checkSqlModeCompatibility(sourceDb, targetDb, result);
                 checkSourcePermissions(sourceDb, migrationMode, result);
                 checkTargetPermissions(targetDb, targetVersion, result);
-            }
 
-            if (mysqlToPg) {
-                if ("fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode)) {
-                    checkBinlogEnabled(sourceDb, result);
-                    checkBinlogFormat(sourceDb, result);
-                    checkBinlogRowImage(sourceDb, result);
+                // 双向灾备：反向通道 B→A 的 capture 跑在目标库 B，B 也需开启 binlog；且源/目标 server_id 须不同。
+                if (bidirectional && needIncrement) {
+                    checkBidirectionalTargetMysql(targetDb, result);
+                    checkServerIdDistinct(sourceDb, targetDb, result);
                 }
             }
 
+            if (mysqlToPg) {
+                String sourceVersion = getMySQLVersion(sourceDb);
+                checkSourceVersionSupported(sourceVersion, result);
+                if (needIncrement) {
+                    checkBinlogEnabled(sourceDb, result);
+                    checkBinlogFormat(sourceDb, result);
+                    checkBinlogRowImage(sourceDb, result);
+                    checkServerId(sourceDb, sourceVersion, result);
+                }
+                checkStorageEngine(sourceDb, result);
+                checkForeignKeyConstraints(sourceDb, result);
+                checkSourcePermissions(sourceDb, migrationMode, result);
+            }
+
             if (pgToMysql) {
-                // PG→MySQL: 检查源端PG的WAL配置
+                // PG→MySQL: 源端 PG 版本号 + WAL 配置 + 复制权限/发送进程 + REPLICA IDENTITY + 外键
+                checkPgSourceVersionSupported(sourceDb, result, needIncrement);
                 checkPgWalConfig(sourceDb, result);
+                checkPgWalSenders(sourceDb, result, needIncrement);
+                checkPgReplicationPermissions(sourceDb, result, needIncrement);
+                checkPgReplicaIdentity(sourceDb, result, needIncrement);
+                checkPgForeignKeys(sourceDb, result);
             }
 
             if (bothPg) {
-                // PG→PG（含单向/双向灾备）：增量捕获需要源端 WAL 为 logical。
-                if ("fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode)) {
+                // PG→PG（含单向/双向灾备）：源端 PG 版本号；增量捕获需要源端 WAL 为 logical。
+                checkPgSourceVersionSupported(sourceDb, result, needIncrement);
+                if (needIncrement) {
                     checkPgWalConfig(sourceDb, result);
                     checkPgReplicationSlot(sourceDb, result);
+                    checkPgWalSenders(sourceDb, result, needIncrement);
+                    checkPgReplicationPermissions(sourceDb, result, needIncrement);
+                    checkPgReplicaIdentity(sourceDb, result, needIncrement);
                     // 双向灾备：反向通道（B→A）的 capture 跑在目标库 B 上，故 B 也需 logical WAL。
                     if (bidirectional) {
                         checkPgWalConfigLabeled(targetDb, result, "目标库");
                     }
                 }
+                checkPgForeignKeys(sourceDb, result);
             }
 
             if (oracleToPg) {
-                // Oracle→PG: 检查源端Oracle的LogMiner/归档日志配置
+                // Oracle→PG: 源端 Oracle 版本号 + LogMiner/归档日志配置 + 外键
+                checkOracleVersionSupported(sourceDb, result);
                 checkOracleLogMinerConfig(sourceDb, result, migrationMode);
+                checkOracleForeignKeys(sourceDb, result);
             }
 
         } catch (SQLException e) {
@@ -1288,8 +1338,7 @@ public class MetadataService {
             }
         }
 
-        boolean allPassed = result.getCheckItems().stream().allMatch(ValidationResult.CheckItem::isPassed);
-        result.setAllPassed(allPassed);
+        finalizeAllPassed(result);
 
         return result;
     }
@@ -1328,11 +1377,17 @@ public class MetadataService {
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(sourceConn), sourceConn.username, sourceConn.password)) {
             result.addItem("源库连接", "源数据库连接检查", true, "MySQL源库连接成功", "info");
+            String sourceVersion = getMySQLVersion(sourceDb);
+            checkSourceVersionSupported(sourceVersion, result);
             if ("fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode)) {
                 checkBinlogEnabled(sourceDb, result);
                 checkBinlogFormat(sourceDb, result);
                 checkBinlogRowImage(sourceDb, result);
+                checkServerId(sourceDb, sourceVersion, result);
             }
+            checkStorageEngine(sourceDb, result);
+            checkForeignKeyConstraints(sourceDb, result);
+            checkSourcePermissions(sourceDb, migrationMode, result);
         } catch (SQLException e) {
             logger.error("MySQL 源库校验失败: {}", e.getMessage());
             result.addItem("源库连接", "源数据库连接检查", false, "连接失败: " + e.getMessage(), "error");
@@ -1382,8 +1437,7 @@ public class MetadataService {
                     "连接失败: " + e.getMessage(), "error");
         }
 
-        boolean allPassed = result.getCheckItems().stream().allMatch(ValidationResult.CheckItem::isPassed);
-        result.setAllPassed(allPassed);
+        finalizeAllPassed(result);
         return result;
     }
 
@@ -1415,8 +1469,7 @@ public class MetadataService {
         checkMongoEndpoint(sourceConn, "源库", true, migrationMode, result);
         checkMongoEndpoint(targetConn, "目标库", false, migrationMode, result);
 
-        boolean allPassed = result.getCheckItems().stream().allMatch(ValidationResult.CheckItem::isPassed);
-        result.setAllPassed(allPassed);
+        finalizeAllPassed(result);
         return result;
     }
 
@@ -1428,6 +1481,9 @@ public class MetadataService {
             org.bson.Document hello = mongoHello(client);
             result.addItem(side + "连接", side + "MongoDB连接检查", true,
                     "MongoDB" + side + "连接成功", "info");
+
+            // 账号权限：源端 Change Streams 需读权限、目标端需写权限
+            checkMongoPermissions(client, side, result);
 
             // 副本集/分片集群检查：源端 Change Streams 依赖副本集 oplog；分片集群经 mongos
             // 打开的 change stream 会聚合全部 shard 的写入（官方集群级 CDC 机制），等同通过。
@@ -1623,8 +1679,7 @@ public class MetadataService {
             result.addItem("连接检查", "数据库连接检查", false, "连接失败: " + e.getMessage(), "error");
         }
         
-        boolean allPassed = result.getCheckItems().stream().allMatch(ValidationResult.CheckItem::isPassed);
-        result.setAllPassed(allPassed);
+        finalizeAllPassed(result);
         
         return result;
     }
@@ -1789,6 +1844,323 @@ public class MetadataService {
             result.addItem("目标数据库权限", "目标数据库需要SELECT、CREATE、DROP、INSERT、UPDATE、ALTER等权限", passed, message, "error");
         } catch (SQLException e) {
             result.addItem("目标数据库权限", "检查目标数据库账号权限", false, "检查失败: " + e.getMessage(), "error");
+        }
+    }
+
+    // ==================== 新增预检项（对齐阿里云 DTS 预检查） ====================
+
+    /**
+     * 汇总校验结论：仅 error 级未通过项阻断启动（allPassed=false）；warning 级仅提示、不阻断。
+     * 这样"存储引擎/外键约束/sql_mode 不一致"等提示项不会硬卡住可以正常运行的同步。
+     */
+    private void finalizeAllPassed(ValidationResult result) {
+        boolean blocked = result.getCheckItems().stream()
+                .anyMatch(i -> !i.isPassed() && "error".equalsIgnoreCase(i.getSeverity()));
+        result.setAllPassed(!blocked);
+    }
+
+    /** 源库版本号检查（MySQL）：低于 5.6 判为不支持（error）；5.6.x 可用但建议升级（warning）；5.7+ 通过。 */
+    private void checkSourceVersionSupported(String sourceVersion, ValidationResult result) {
+        if (sourceVersion == null || sourceVersion.isEmpty() || "unknown".equalsIgnoreCase(sourceVersion)) {
+            result.addItem("源库版本号", "源库 MySQL 版本需不低于 5.6", true,
+                    "无法获取源库版本号，跳过版本检查", "warning");
+            return;
+        }
+        if (!isVersionAtLeast(sourceVersion, "5.6.0")) {
+            result.addItem("源库版本号", "源库 MySQL 版本需不低于 5.6", false,
+                    "源库版本为 " + sourceVersion + "，低于最低支持版本 5.6，可能无法正常同步", "error");
+        } else if (!isVersionAtLeast(sourceVersion, "5.7.0")) {
+            result.addItem("源库版本号", "源库 MySQL 版本需不低于 5.6", false,
+                    "源库版本为 " + sourceVersion + "，建议升级到 5.7 及以上以获得更稳定的增量捕获", "warning");
+        } else {
+            result.addItem("源库版本号", "源库 MySQL 版本需不低于 5.6", true,
+                    "源库版本为 " + sourceVersion + "，受支持", "info");
+        }
+    }
+
+    /** PG 源库版本号检查：逻辑复制（增量）需要 PostgreSQL 9.4 及以上。 */
+    private void checkPgSourceVersionSupported(Connection conn, ValidationResult result, boolean needIncrement) {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SHOW server_version")) {
+            if (rs.next()) {
+                String version = rs.getString(1);
+                boolean ok = !needIncrement || isVersionAtLeast(version, "9.4.0");
+                result.addItem("源库版本号", "PostgreSQL 逻辑复制需要 9.4 及以上", ok,
+                        ok ? "源库版本为 PostgreSQL " + version + "，受支持"
+                           : "源库版本为 PostgreSQL " + version + "，逻辑复制增量同步需要 9.4 及以上",
+                        ok ? "info" : "error");
+            }
+        } catch (SQLException e) {
+            result.addItem("源库版本号", "PostgreSQL 版本检查", true,
+                    "版本检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    /** 存储引擎检查（MySQL 源）：非 InnoDB（尤其 MyISAM）缺事务/行级锁，增量同步一致性存在风险。 */
+    private void checkStorageEngine(Connection conn, ValidationResult result) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT table_schema, table_name, engine FROM information_schema.tables " +
+                "WHERE table_type = 'BASE TABLE' " +
+                "AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys') " +
+                "AND (engine IS NULL OR engine <> 'InnoDB') " +
+                "ORDER BY table_schema, table_name LIMIT 50")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                List<String> nonInnodb = new ArrayList<>();
+                while (rs.next()) {
+                    nonInnodb.add(rs.getString(1) + "." + rs.getString(2) + "(" + rs.getString(3) + ")");
+                }
+                if (nonInnodb.isEmpty()) {
+                    result.addItem("存储引擎", "源库表建议使用 InnoDB 引擎", true,
+                            "源库所有表均为 InnoDB 引擎", "info");
+                } else {
+                    String list = String.join(", ", nonInnodb.subList(0, Math.min(10, nonInnodb.size())));
+                    if (nonInnodb.size() > 10) list += " 等";
+                    result.addItem("存储引擎", "源库表建议使用 InnoDB 引擎", false,
+                            "存在 " + nonInnodb.size() + " 个非 InnoDB 引擎表（MyISAM 等不支持事务/行级锁，增量一致性存在风险）: " + list,
+                            "warning");
+                }
+            }
+        } catch (SQLException e) {
+            result.addItem("存储引擎", "源库表建议使用 InnoDB 引擎", true,
+                    "存储引擎检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    /** 约束完整性检查（MySQL 源）：源库存在外键时提示——外键不随数据自动同步，父/子表写入顺序可能失败。 */
+    private void checkForeignKeyConstraints(Connection conn, ValidationResult result) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT DISTINCT table_schema, table_name, referenced_table_schema, referenced_table_name " +
+                "FROM information_schema.key_column_usage " +
+                "WHERE referenced_table_name IS NOT NULL " +
+                "AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys') " +
+                "ORDER BY table_schema, table_name LIMIT 100")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                List<String> fks = new ArrayList<>();
+                while (rs.next()) {
+                    fks.add(rs.getString(1) + "." + rs.getString(2) + " → "
+                            + rs.getString(3) + "." + rs.getString(4));
+                }
+                if (fks.isEmpty()) {
+                    result.addItem("约束完整性", "外键约束不会自动同步，需确认同步范围", true,
+                            "源库无外键约束", "info");
+                } else {
+                    String list = String.join(", ", fks.subList(0, Math.min(8, fks.size())));
+                    if (fks.size() > 8) list += " 等";
+                    result.addItem("约束完整性", "外键约束不会自动同步，需确认同步范围", false,
+                            "源库存在 " + fks.size() + " 个外键依赖，外键不会自动同步到目标；" +
+                            "请确认同步范围已包含相关父表，避免父/子表写入顺序导致失败: " + list,
+                            "warning");
+                }
+            }
+        } catch (SQLException e) {
+            result.addItem("约束完整性", "外键约束不会自动同步，需确认同步范围", true,
+                    "约束完整性检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    // ---- Oracle 源库补充预检项 ----
+
+    /** Oracle 源库版本号检查：LogMiner 增量捕获建议 11g 及以上。 */
+    private void checkOracleVersionSupported(Connection conn, ValidationResult result) {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT version FROM v$instance")) {
+            if (rs.next()) {
+                String v = rs.getString(1);
+                boolean ok = isVersionAtLeast(v, "11.0.0.0");
+                result.addItem("源库版本号", "Oracle LogMiner 建议 11g 及以上", ok,
+                        ok ? "源库版本为 Oracle " + v + "，受支持"
+                           : "源库版本为 Oracle " + v + "，LogMiner 增量捕获建议 11g 及以上", ok ? "info" : "warning");
+            }
+        } catch (SQLException e) {
+            result.addItem("源库版本号", "Oracle 版本检查", true,
+                    "版本检查失败（可能权限不足，非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    /** 约束完整性检查（Oracle 源，当前用户 schema）：外键不随数据自动同步，父/子表写入顺序可能失败。 */
+    private void checkOracleForeignKeys(Connection conn, ValidationResult result) {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT COUNT(*) FROM user_constraints WHERE constraint_type = 'R' AND status = 'ENABLED'")) {
+            if (rs.next()) {
+                int n = rs.getInt(1);
+                if (n == 0) {
+                    result.addItem("约束完整性", "外键约束不会自动同步，需确认同步范围", true,
+                            "源库(当前用户)无启用的外键约束", "info");
+                } else {
+                    result.addItem("约束完整性", "外键约束不会自动同步，需确认同步范围", false,
+                            "源库存在 " + n + " 个启用的外键约束，外键不会自动同步到目标；请确认同步范围已包含相关父表", "warning");
+                }
+            }
+        } catch (SQLException e) {
+            result.addItem("约束完整性", "外键约束检查", true,
+                    "外键检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    // ---- PostgreSQL 源库补充预检项 ----
+
+    /** PG 逻辑复制需要 max_wal_senders > 0。 */
+    private void checkPgWalSenders(Connection conn, ValidationResult result, boolean needIncrement) {
+        if (!needIncrement) return;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SHOW max_wal_senders")) {
+            if (rs.next()) {
+                int n = 0;
+                try { n = Integer.parseInt(rs.getString(1).trim()); } catch (Exception ignore) {}
+                boolean ok = n > 0;
+                result.addItem("WAL发送进程", "逻辑复制需要 max_wal_senders > 0", ok,
+                        ok ? "max_wal_senders=" + n + "，满足逻辑复制" : "max_wal_senders=" + n + "，逻辑复制需要大于 0",
+                        ok ? "info" : "error");
+            }
+        } catch (SQLException e) {
+            result.addItem("WAL发送进程", "逻辑复制需要 max_wal_senders > 0", true,
+                    "检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    /** PG 源库复制权限：逻辑复制需要 REPLICATION 属性或超级用户。 */
+    private void checkPgReplicationPermissions(Connection conn, ValidationResult result, boolean needIncrement) {
+        if (!needIncrement) return;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = current_user")) {
+            if (rs.next()) {
+                boolean ok = rs.getBoolean(1);
+                result.addItem("源库复制权限", "逻辑复制需要 REPLICATION 或超级用户权限", ok,
+                        ok ? "当前用户具备逻辑复制所需权限（REPLICATION/superuser）"
+                           : "当前用户缺少 REPLICATION 权限，无法建立逻辑复制", ok ? "info" : "error");
+            }
+        } catch (SQLException e) {
+            result.addItem("源库复制权限", "逻辑复制需要 REPLICATION 权限", true,
+                    "权限检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    /** 约束完整性检查（PG 源，排除系统 schema）。 */
+    private void checkPgForeignKeys(Connection conn, ValidationResult result) {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT count(*) FROM information_schema.table_constraints " +
+                     "WHERE constraint_type = 'FOREIGN KEY' " +
+                     "AND constraint_schema NOT IN ('pg_catalog','information_schema')")) {
+            if (rs.next()) {
+                int n = rs.getInt(1);
+                if (n == 0) {
+                    result.addItem("约束完整性", "外键约束不会自动同步，需确认同步范围", true, "源库无外键约束", "info");
+                } else {
+                    result.addItem("约束完整性", "外键约束不会自动同步，需确认同步范围", false,
+                            "源库存在 " + n + " 个外键约束，外键不会自动同步到目标；请确认同步范围已包含相关父表", "warning");
+                }
+            }
+        } catch (SQLException e) {
+            result.addItem("约束完整性", "外键约束检查", true,
+                    "外键检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    /** PG REPLICA IDENTITY 检查：无主键且 REPLICA IDENTITY 非 FULL 的表，逻辑复制 UPDATE/DELETE 无法定位行。 */
+    private void checkPgReplicaIdentity(Connection conn, ValidationResult result, boolean needIncrement) {
+        if (!needIncrement) return;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid " +
+                     "WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') " +
+                     "AND c.relreplident IN ('d','n') " +
+                     "AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary) " +
+                     "ORDER BY 1,2 LIMIT 50")) {
+            List<String> bad = new ArrayList<>();
+            while (rs.next()) bad.add(rs.getString(1) + "." + rs.getString(2));
+            if (bad.isEmpty()) {
+                result.addItem("REPLICA IDENTITY", "增量 UPDATE/DELETE 需要主键或 REPLICA IDENTITY FULL", true,
+                        "所有表均有主键或已配置 REPLICA IDENTITY", "info");
+            } else {
+                String list = String.join(", ", bad.subList(0, Math.min(10, bad.size())));
+                if (bad.size() > 10) list += " 等";
+                result.addItem("REPLICA IDENTITY", "增量 UPDATE/DELETE 需要主键或 REPLICA IDENTITY FULL", false,
+                        "以下表无主键且 REPLICA IDENTITY 非 FULL，逻辑复制 UPDATE/DELETE 无法定位行（" + bad.size() + " 个）: " + list,
+                        "warning");
+            }
+        } catch (SQLException e) {
+            result.addItem("REPLICA IDENTITY", "增量 UPDATE/DELETE 需要主键或 REPLICA IDENTITY FULL", true,
+                    "检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    // ---- MongoDB 源库补充预检项 ----
+
+    /** Mongo 账号权限：源端 Change Streams 需读权限、目标端需写权限；无认证角色时告警。 */
+    private void checkMongoPermissions(com.mongodb.client.MongoClient client, String side, ValidationResult result) {
+        try {
+            org.bson.Document status = client.getDatabase("admin")
+                    .runCommand(new org.bson.Document("connectionStatus", 1));
+            org.bson.Document authInfo = status.get("authInfo", org.bson.Document.class);
+            java.util.List<?> roles = authInfo != null ? authInfo.getList("authenticatedUserRoles", Object.class) : null;
+            if (roles == null || roles.isEmpty()) {
+                result.addItem(side + "权限", side + "MongoDB 账号权限检查", false,
+                        side + "未认证或无任何角色；源端 Change Streams 需读取权限、目标端需写入权限", "warning");
+            } else {
+                result.addItem(side + "权限", side + "MongoDB 账号权限检查", true,
+                        side + "账号角色: " + roles, "info");
+            }
+        } catch (Exception e) {
+            result.addItem(side + "权限", side + "MongoDB 账号权限检查", true,
+                    side + "权限检查失败（非致命）: " + e.getMessage(), "warning");
+        }
+    }
+
+    // ---- 灾备（DR）源/目标实例隔离 ----
+
+    /** 源/目标是否指向同一数据库实例（host 归一化后 host+port 相同即视为同实例）。 */
+    private boolean sameInstance(ParsedConnection a, ParsedConnection b) {
+        if (a == null || b == null) return false;
+        return normHost(a.host).equals(normHost(b.host)) && a.port == b.port;
+    }
+
+    /** host 归一化：本机各写法（localhost/127.0.0.1/::1/0.0.0.0）视为同一主机。 */
+    private String normHost(String h) {
+        if (h == null) return "";
+        String s = h.trim().toLowerCase();
+        if (s.equals("localhost") || s.equals("127.0.0.1") || s.equals("::1") || s.equals("0.0.0.0")) {
+            return "127.0.0.1";
+        }
+        return s;
+    }
+
+    // ---- 双向灾备（DR）补充预检项 ----
+
+    /** 双向灾备 MySQL：反向通道 B→A 的 capture 跑在目标库 B，B 也需开启 binlog(ROW)。 */
+    private void checkBidirectionalTargetMysql(Connection targetDb, ValidationResult result) {
+        try {
+            String logBin = getVariable(targetDb, "log_bin");
+            boolean on = "ON".equalsIgnoreCase(logBin) || "1".equals(logBin);
+            result.addItem("目标库Binlog", "双向灾备反向通道需要目标库开启 binlog", on,
+                    on ? "目标库 binlog 已开启" : "目标库 binlog 未开启，双向灾备反向通道无法捕获",
+                    on ? "info" : "error");
+            String format = getVariable(targetDb, "binlog_format");
+            boolean row = "ROW".equalsIgnoreCase(format);
+            result.addItem("目标库Binlog格式", "双向灾备反向通道需要目标库 binlog_format=ROW", row,
+                    row ? "目标库 binlog_format=ROW" : "目标库 binlog_format=" + format + "，需为 ROW",
+                    row ? "info" : "error");
+        } catch (SQLException e) {
+            result.addItem("目标库Binlog", "双向灾备反向通道需要目标库开启 binlog", false,
+                    "检查失败: " + e.getMessage(), "warning");
+        }
+    }
+
+    /** 双向灾备 MySQL：源/目标 server_id 必须不同（互为主从的复制拓扑要求）。 */
+    private void checkServerIdDistinct(Connection sourceDb, Connection targetDb, ValidationResult result) {
+        try {
+            String s = getVariable(sourceDb, "server_id");
+            String t = getVariable(targetDb, "server_id");
+            boolean distinct = s != null && !s.equals(t);
+            result.addItem("Server ID 唯一性", "双向灾备源/目标 server_id 必须不同", distinct,
+                    distinct ? "源 server_id=" + s + "，目标 server_id=" + t + "，满足唯一"
+                             : "源与目标 server_id 相同(" + s + ")，双向灾备复制拓扑要求二者不同",
+                    distinct ? "info" : "error");
+        } catch (SQLException e) {
+            result.addItem("Server ID 唯一性", "双向灾备源/目标 server_id 必须不同", true,
+                    "检查失败（非致命）: " + e.getMessage(), "warning");
         }
     }
 
