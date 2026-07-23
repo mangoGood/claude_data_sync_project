@@ -1212,10 +1212,13 @@
                 });
             }
             
-            const summaryClass = data.allPassed ? 'passed' : 'failed';
-            const summaryText = data.allPassed ? '✓ 所有检查项均已通过，可以创建任务' : '✗ 存在未通过的检查项，请修复后再创建任务';
+            const hasWarn = (data.checkItems || []).some(i => !i.passed && i.severity === 'warning');
+            const summaryClass = data.allPassed ? (hasWarn ? 'warning' : 'passed') : 'failed';
+            const summaryText = data.allPassed
+                ? (hasWarn ? '⚠ 检查通过，但存在警告项（不阻断创建，建议确认）' : '✓ 所有检查项均已通过，可以创建任务')
+                : '✗ 存在阻断性问题，请修复后再创建任务';
             html += `<div class="validation-summary ${summaryClass}">${summaryText}</div>`;
-            
+
             resultDiv.innerHTML = html;
             validationPassed = data.allPassed;
         }
@@ -2674,6 +2677,7 @@
         let cfgWorkflowId = null;
         let cfgSourceType = 'mysql';
         let cfgTargetType = 'mysql';
+        let cfgDrMode = null;   // 灾备模式(UNIDIRECTIONAL/BIDIRECTIONAL)，供校验检查传给后端触发双向灾备专项检查
         let cfgConnectionTestStatus = { source: null, target: null };
         let cfgSelectedSyncObjects = {};
         // 同步粒度：table=表级（现状，选表快照）；database=库级（整库+增量期新对象自动同步）。
@@ -3221,6 +3225,7 @@
                 cfgWorkflowId = taskId;
                 cfgSourceType = task.source_type || 'mysql';
                 cfgTargetType = task.target_type || 'mysql';
+                cfgDrMode = (task.task_type === 'DR') ? (task.dr_mode || 'UNIDIRECTIONAL') : null;
                 cfgCurrentStep = 1;
                 cfgConnectionTestStatus = { source: null, target: null };
                 cfgSelectedSyncObjects = {};
@@ -3810,7 +3815,8 @@
                         targetConnection: targetConnection,
                         migrationMode: migrationMode,
                         sourceType: cfgSourceType,
-                        targetType: cfgTargetType
+                        targetType: cfgTargetType,
+                        drMode: cfgDrMode
                     })
                 });
                 
@@ -3852,10 +3858,13 @@
                 });
             }
             
-            const summaryClass = data.allPassed ? 'passed' : 'failed';
-            const summaryText = data.allPassed ? '✓ 所有检查项均已通过，可以启动任务' : '✗ 存在未通过的检查项，请修复后再启动任务';
+            const hasWarn = (data.checkItems || []).some(i => !i.passed && i.severity === 'warning');
+            const summaryClass = data.allPassed ? (hasWarn ? 'warning' : 'passed') : 'failed';
+            const summaryText = data.allPassed
+                ? (hasWarn ? '⚠ 检查通过，但存在警告项（不阻断启动，建议确认后再启动）' : '✓ 所有检查项均已通过，可以启动任务')
+                : '✗ 存在阻断性问题，请修复后再启动任务';
             html += `<div class="validation-summary ${summaryClass}">${summaryText}</div>`;
-            
+
             resultDiv.innerHTML = html;
             cfgValidationPassed = data.allPassed;
         }

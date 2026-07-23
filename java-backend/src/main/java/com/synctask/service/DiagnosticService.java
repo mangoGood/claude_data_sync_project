@@ -329,6 +329,7 @@ public class DiagnosticService {
                 checks.add(checkPrimaryKeys(src, entries));
             }
             checks.add(checkColumnRefs(src, entries));
+            checks.add(checkForeignKeyIntegrity(src, entries));
         } catch (Exception e) {
             checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
         }
@@ -458,6 +459,67 @@ public class DiagnosticService {
         }
         return check("列处理引用列", "FAIL",
                 "列处理引用了不存在的源列（" + missing.size() + " 个）", String.join(", ", missing));
+    }
+
+    /**
+     * 约束完整性检查（对象级）：对已选表，若其外键父表不在同步范围内，
+     * 增量/全量写入子表时可能因外键约束失败——提示（WARNING）用户把父表纳入同步范围。
+     * 整库同步（dbLevel）的库视为整库在范围内，其库内表引用同库父表不告警。
+     */
+    private Map<String, Object> checkForeignKeyIntegrity(Connection src, List<DbEntry> entries) throws Exception {
+        List<String[]> selected = new ArrayList<>();
+        Map<String, java.util.Set<String>> inScope = new HashMap<>();
+        java.util.Set<String> dbLevelSchemas = new java.util.HashSet<>();
+        for (DbEntry de : entries) {
+            if (de.dbLevel) { dbLevelSchemas.add(de.sourceDb); continue; }
+            java.util.Set<String> set = inScope.computeIfAbsent(de.sourceDb, x -> new java.util.HashSet<>());
+            for (String t : de.tables) {
+                set.add(t.toLowerCase());
+                if (tableExists(src, de.sourceDb, t)) selected.add(new String[]{de.sourceDb, t});
+            }
+        }
+        if (selected.isEmpty()) {
+            return check("约束完整性", "PASS", "无需检查外键约束（无显式选表）", null);
+        }
+        List<String> oos = findOutOfScopeForeignKeys(src, selected, inScope, dbLevelSchemas);
+        if (oos.isEmpty()) {
+            return check("约束完整性", "PASS", "已选表的外键父表均在同步范围内", null);
+        }
+        return check("约束完整性", "WARNING",
+                "以下外键的父表不在同步范围内，可能导致外键约束失败（" + oos.size() + " 个）",
+                String.join(", ", oos));
+    }
+
+    /**
+     * 对每张已选源表查其外键父表；父表既不属于整库同步的库、也不在已选表集合中，则判为"越界外键"。
+     * 抽成包级静态方法便于直接对 Connection 做单元测试。
+     */
+    static List<String> findOutOfScopeForeignKeys(Connection src, List<String[]> selectedTables,
+            Map<String, java.util.Set<String>> inScopeTables,
+            java.util.Set<String> dbLevelSchemas) throws Exception {
+        List<String> out = new ArrayList<>();
+        try (PreparedStatement ps = src.prepareStatement(
+                "SELECT DISTINCT referenced_table_schema, referenced_table_name " +
+                "FROM information_schema.key_column_usage " +
+                "WHERE table_schema = ? AND table_name = ? AND referenced_table_name IS NOT NULL")) {
+            for (String[] st : selectedTables) {
+                ps.setString(1, st[0]);
+                ps.setString(2, st[1]);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String refSchema = rs.getString(1);
+                        String refTable = rs.getString(2);
+                        boolean inScope = dbLevelSchemas.contains(refSchema)
+                                || inScopeTables.getOrDefault(refSchema, java.util.Collections.emptySet())
+                                        .contains(refTable == null ? null : refTable.toLowerCase());
+                        if (!inScope) {
+                            out.add(st[0] + "." + st[1] + " → " + refSchema + "." + refTable);
+                        }
+                    }
+                }
+            }
+        }
+        return out;
     }
 
     private Map<String, Object> checkTargetConflicts(Connection tgt, List<DbEntry> entries, Workflow workflow) throws Exception {

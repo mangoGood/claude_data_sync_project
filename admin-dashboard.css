@@ -1596,6 +1596,11 @@
             color: #f5222d;
         }
 
+        .validation-summary.warning {
+            background: #fffbe6;
+            color: #d48806;
+        }
+
         .compare-table-item {
             display: flex;
             align-items: center;
