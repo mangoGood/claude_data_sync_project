@@ -77,6 +77,11 @@ public class MigrationAgentThread implements Runnable {
         if ("elasticsearch".equalsIgnoreCase(taskMessage.getTargetType())) {
             return new ElasticSyncTask(taskMessage, kafkaProducer, taskStateService, config);
         }
+        // Redis → Redis：独立单进程管线（PSYNC 全量 RDB + 复制命令流增量），不走 SQL 侧
+        // capture/extract/increment；全量幂等可重跑，故 skipFullMigration 也路由到同一执行器。
+        if ("redis".equalsIgnoreCase(taskMessage.getSourceType())) {
+            return new RedisSyncTask(taskMessage, kafkaProducer, taskStateService, config);
+        }
         if (skipFullMigration) {
             return new IncrementSyncTask(taskMessage, kafkaProducer, taskStateService, config);
         }

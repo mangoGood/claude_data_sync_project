@@ -184,7 +184,7 @@ public class TaskMessageHandler {
             logger.info("Resuming task: {} with mode: {}, progress: {}, status: {}",
                 taskId, migrationMode, progress, savedStatus);
 
-            if ("fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
+            if (isSingleProcessEngine(taskMessage) || "fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
                 boolean skipFullMigration = "FULL_COMPLETED".equals(savedStatus) ||
                                            "INCREMENT_RUNNING".equals(savedStatus) ||
                                            "SUBSCRIBE_RUNNING".equals(savedStatus);
@@ -205,6 +205,18 @@ public class TaskMessageHandler {
             logger.error("Error handling resume message for task: {}", taskId, e);
             sendStatus(taskId, "FAILED", "Error resuming task: " + e.getMessage(), 0);
         }
+    }
+
+    /**
+     * 单进程引擎（mongodb 源 / elasticsearch 目标 / redis 源）：全量与增量都委派给
+     * {@code MigrationAgentThread} 内对应的 SyncTask（子进程自读 migration.mode 决定全量后
+     * 是否进入增量），不走 SQL 侧 legacy MigrationTaskManager（migration-full）——否则仅全量
+     * 模式会被误路由到 SQL 全量引擎，对 Redis/Mongo/ES 无意义且不产出数据。
+     */
+    private boolean isSingleProcessEngine(TaskMessage taskMessage) {
+        return "mongodb".equalsIgnoreCase(taskMessage.getSourceType())
+                || "elasticsearch".equalsIgnoreCase(taskMessage.getTargetType())
+                || "redis".equalsIgnoreCase(taskMessage.getSourceType());
     }
 
     private void processTask(TaskMessage taskMessage, String taskId, String migrationMode) {
@@ -228,7 +240,7 @@ public class TaskMessageHandler {
                 logger.warn("Config file not found at: {}", configFile.getAbsolutePath());
             }
 
-            if ("fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
+            if (isSingleProcessEngine(taskMessage) || "fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
                 taskProcessService.startMigrationAgentThread(taskMessage, false);
                 logger.info("MigrationAgentThread started for {} task: {}", migrationMode, taskId);
             } else {

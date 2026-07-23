@@ -87,6 +87,13 @@
             <version>4.11.1</version>
         </dependency>
 
+        <!-- Redis 元数据探测（连接测试 PING、逻辑库枚举 INFO keyspace、同步预校验） -->
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>5.2.0</version>
+        </dependency>
+
         <dependency>
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>

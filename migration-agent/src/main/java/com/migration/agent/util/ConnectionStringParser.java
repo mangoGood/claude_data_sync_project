@@ -20,6 +20,9 @@ public class ConnectionStringParser {
 
     private static final Pattern ELASTIC_PATTERN =
         Pattern.compile("elastic://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+
+    private static final Pattern REDIS_PATTERN =
+        Pattern.compile("redis://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
     
     private static final Pattern JDBC_MYSQL_PATTERN =
         Pattern.compile("jdbc:mysql://([^:]+):(\\d+)/([^?]+)(?:\\?.*)?");
@@ -97,8 +100,15 @@ public class ConnectionStringParser {
         
         @Override
         public String toString() {
-            // 协议名（mysql/postgresql/oracle）由方言归一，未知类型回退 mysql；mongodb 不走 SQL 方言
-            String protocol = "mongodb".equalsIgnoreCase(type) ? "mongodb" : SqlDialect.forType(type).getType();
+            // 协议名（mysql/postgresql/oracle）由方言归一，未知类型回退 mysql；mongodb/redis 不走 SQL 方言
+            String protocol;
+            if ("mongodb".equalsIgnoreCase(type)) {
+                protocol = "mongodb";
+            } else if ("redis".equalsIgnoreCase(type)) {
+                protocol = "redis";
+            } else {
+                protocol = SqlDialect.forType(type).getType();
+            }
             return String.format("%s://%s:***@%s:%d/%s", protocol, username, host, port, database);
         }
     }
@@ -129,6 +139,8 @@ public class ConnectionStringParser {
             pattern = MONGO_PATTERN;
         } else if (trimmed.startsWith("elastic://")) {
             pattern = ELASTIC_PATTERN;
+        } else if (trimmed.startsWith("redis://")) {
+            pattern = REDIS_PATTERN;
         } else {
             pattern = MYSQL_PATTERN;
         }
@@ -145,6 +157,8 @@ public class ConnectionStringParser {
                 expectedFormat = "mongodb://user:pass@host:port";
             } else if (pattern == ELASTIC_PATTERN) {
                 expectedFormat = "elastic://user:pass@host:port";
+            } else if (pattern == REDIS_PATTERN) {
+                expectedFormat = "redis://user:pass@host:port";
             } else {
                 expectedFormat = "mysql://user:pass@host:port/db";
             }
@@ -165,6 +179,8 @@ public class ConnectionStringParser {
             info.setType("mongodb");
         } else if (trimmed.startsWith("elastic://")) {
             info.setType("elasticsearch");
+        } else if (trimmed.startsWith("redis://")) {
+            info.setType("redis");
         } else {
             info.setType("mysql");
         }

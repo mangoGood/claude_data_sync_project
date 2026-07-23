@@ -48,7 +48,7 @@
         let tablesCache = {};
         
         // 数据库类型显示名（大小写固定）
-        const dbTypeLabelMap = { 'mysql': 'MySQL', 'postgresql': 'PostgreSQL', 'oracle': 'Oracle', 'mongodb': 'MongoDB', 'elasticsearch': 'Elasticsearch' };
+        const dbTypeLabelMap = { 'mysql': 'MySQL', 'postgresql': 'PostgreSQL', 'oracle': 'Oracle', 'mongodb': 'MongoDB', 'elasticsearch': 'Elasticsearch', 'redis': 'Redis' };
         function formatDbTypeLabel(type) {
             return dbTypeLabelMap[(type || '').toLowerCase()] || (type || 'MySQL');
         }
@@ -422,7 +422,7 @@
             'E4004': { desc: '主键冲突写入失败', solution: '请检查目标库是否已存在相同主键的数据，可通过恢复任务自动跳过重复数据' },
             'E5001': { desc: '源数据库配置为空', solution: '请检查任务创建时源数据库连接信息是否填写完整' },
             'E5002': { desc: '目标数据库配置为空', solution: '请检查任务创建时目标数据库连接信息是否填写完整' },
-            'E5003': { desc: '连接串解析失败', solution: '请检查连接串格式是否正确，正确格式: mysql://user:pass@host:port 或 postgresql://user:pass@host:port 或 oracle://user:pass@host:port/service 或 mongodb://user:pass@host:port 或 elastic://user:pass@host:port' },
+            'E5003': { desc: '连接串解析失败', solution: '请检查连接串格式是否正确，正确格式: mysql://user:pass@host:port 或 postgresql://user:pass@host:port 或 oracle://user:pass@host:port/service 或 mongodb://user:pass@host:port 或 elastic://user:pass@host:port 或 redis://user:pass@host:port' },
             'E9999': { desc: '未知错误', solution: '请查看Agent日志获取详细错误信息，或联系技术支持' }
         };
 
@@ -1052,12 +1052,14 @@
             document.getElementById('sourceTypePg').className = 'db-type-card' + (type === 'postgresql' ? ' selected' : '');
             document.getElementById('sourceTypeOracle').className = 'db-type-card' + (type === 'oracle' ? ' selected' : '');
             document.getElementById('sourceTypeMongo').className = 'db-type-card' + (type === 'mongodb' ? ' selected' : '');
+            const sourceRedisCard = document.getElementById('sourceTypeRedis');
+            if (sourceRedisCard) sourceRedisCard.className = 'db-type-card' + (type === 'redis' ? ' selected' : '');
 
             updateTargetTypeCards();
         }
 
         function selectTargetType(type) {
-            const targetCardIds = { 'mysql': 'targetTypeMysql', 'postgresql': 'targetTypePg', 'mongodb': 'targetTypeMongo', 'elasticsearch': 'targetTypeEs' };
+            const targetCardIds = { 'mysql': 'targetTypeMysql', 'postgresql': 'targetTypePg', 'mongodb': 'targetTypeMongo', 'elasticsearch': 'targetTypeEs', 'redis': 'targetTypeRedis' };
             const card = document.getElementById(targetCardIds[type]);
             if (!card || card.classList.contains('disabled')) {
                 return;
@@ -1075,25 +1077,28 @@
             }
         }
 
-        // 类型互斥：MongoDB 只能同 MongoDB 互相同步（副本集到副本集），其余类型不能选 MongoDB 目标；
-        // Elasticsearch 只能作为目标且仅 MySQL 源可选（binlog 增量捕获）
+        // 类型互斥：MongoDB 只能同 MongoDB、Redis 只能同 Redis 互相同步（同类型点对点），其余类型
+        // 不能选这两类目标；Elasticsearch 只能作为目标且仅 MySQL 源可选（binlog 增量捕获）
         function updateTargetTypeCards() {
             const targetMysqlCard = document.getElementById('targetTypeMysql');
             const targetPgCard = document.getElementById('targetTypePg');
             const targetMongoCard = document.getElementById('targetTypeMongo');
             const targetEsCard = document.getElementById('targetTypeEs');
+            const targetRedisCard = document.getElementById('targetTypeRedis');
 
-            if (selectedSourceType === 'mongodb') {
-                selectedTargetType = 'mongodb';
+            // 同类型点对点引擎（Mongo→Mongo / Redis→Redis）：源为该类型时目标锁定同类型，其余禁用
+            if (selectedSourceType === 'mongodb' || selectedSourceType === 'redis') {
+                selectedTargetType = selectedSourceType;
                 targetMysqlCard.className = 'db-type-card disabled';
                 targetPgCard.className = 'db-type-card disabled';
-                targetMongoCard.className = 'db-type-card selected';
+                targetMongoCard.className = 'db-type-card' + (selectedSourceType === 'mongodb' ? ' selected' : ' disabled');
                 targetEsCard.className = 'db-type-card disabled';
+                if (targetRedisCard) targetRedisCard.className = 'db-type-card' + (selectedSourceType === 'redis' ? ' selected' : ' disabled');
                 return;
             }
 
             const esAllowed = selectedSourceType === 'mysql';
-            if (selectedTargetType === 'mongodb' || !selectedTargetType
+            if (selectedTargetType === 'mongodb' || selectedTargetType === 'redis' || !selectedTargetType
                     || (selectedTargetType === 'elasticsearch' && !esAllowed)) {
                 selectedTargetType = 'mysql';
             }
@@ -1103,6 +1108,7 @@
             targetEsCard.className = esAllowed
                 ? 'db-type-card' + (selectedTargetType === 'elasticsearch' ? ' selected' : '')
                 : 'db-type-card disabled';
+            if (targetRedisCard) targetRedisCard.className = 'db-type-card disabled';
         }
         
         function updateConnectionPlaceholders() {
@@ -3237,10 +3243,11 @@
                 cfgClearAllColumnProcessing();
                 cfgColumnsCache = {};
 
-                // 同步粒度：默认表级；库级同步目前仅支持 MySQL 源（存储程序/触发器/事件复制为 MySQL 实现）
-                cfgSyncGranularity = 'table';
-                const gTableRadio = document.querySelector('input[name="cfgSyncGranularity"][value="table"]');
-                if (gTableRadio) gTableRadio.checked = true;
+                // 同步粒度：默认表级；库级同步目前仅支持 MySQL 源（存储程序/触发器/事件复制为 MySQL 实现）。
+                // Redis 同步对象=逻辑库（无表/集合层级），强制库级并隐藏粒度切换。
+                cfgSyncGranularity = (cfgSourceType === 'redis') ? 'database' : 'table';
+                const gInitRadio = document.querySelector('input[name="cfgSyncGranularity"][value="' + cfgSyncGranularity + '"]');
+                if (gInitRadio) gInitRadio.checked = true;
                 const granularityGroup = document.getElementById('cfgGranularityGroup');
                 if (granularityGroup) {
                     granularityGroup.style.display = (cfgSourceType === 'mysql' && cfgTargetType === 'mysql') ? '' : 'none';
@@ -3344,6 +3351,7 @@
             if (dbType === 'oracle') return 'oracle';
             if (dbType === 'mongodb') return 'mongodb';
             if (dbType === 'elasticsearch') return 'elastic';
+            if (dbType === 'redis') return 'redis';
             return 'mysql';
         }
 
@@ -3367,7 +3375,7 @@
         function cfgClearConnectionFields(type) {
             const prefix = 'cfg' + capitalize(type);
             const dbType = (type === 'source') ? cfgSourceType : cfgTargetType;
-            const defaultPort = dbType === 'postgresql' ? '5432' : (dbType === 'oracle' ? '1521' : (dbType === 'mongodb' ? '27017' : (dbType === 'elasticsearch' ? '9200' : '3306')));
+            const defaultPort = dbType === 'postgresql' ? '5432' : (dbType === 'oracle' ? '1521' : (dbType === 'mongodb' ? '27017' : (dbType === 'elasticsearch' ? '9200' : (dbType === 'redis' ? '6379' : '3306'))));
             document.getElementById(prefix + 'Host').value = '';
             document.getElementById(prefix + 'Port').value = defaultPort;
             document.getElementById(prefix + 'Username').value = '';

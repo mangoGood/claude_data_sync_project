@@ -47,6 +47,7 @@ public class AgentConfig {
         props.setProperty("jar.subscribe.path", "migration-subscribe/target/migration-subscribe-1.0.0.jar");
         props.setProperty("jar.mongo.path", "migration-mongo/target/migration-mongo-1.0.0.jar");
         props.setProperty("jar.elastic.path", "migration-elastic/target/migration-elastic-1.0.0.jar");
+        props.setProperty("jar.redis.path", "migration-redis/target/migration-redis-1.0.0.jar");
 
         props.setProperty("monitor.capture.interval.ms", "30000");
         props.setProperty("monitor.extract.interval.ms", "30000");
@@ -163,6 +164,10 @@ public class AgentConfig {
 
     public String getElasticJarPath() {
         return props.getProperty("jar.elastic.path");
+    }
+
+    public String getRedisJarPath() {
+        return props.getProperty("jar.redis.path");
     }
 
     public long getCaptureMonitorIntervalMs() {
