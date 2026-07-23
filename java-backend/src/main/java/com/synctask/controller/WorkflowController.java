@@ -87,7 +87,9 @@ public class WorkflowController {
                     request.getKafkaTopicStrategy(),
                     request.getSubscribeFormat(),
                     request.getFanoutEnabled(),
-                    request.getTargetConnections()
+                    request.getTargetConnections(),
+                    request.getSyncAccount(),
+                    request.getSyncAccountSuperPrivilege()
             );
             auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.UPDATE_CONFIG,
                     id, AuditLogService.buildDetails(workflow.getName(),
@@ -361,6 +363,8 @@ public class WorkflowController {
         map.put("is_billing", workflow.getIsBilling());
         map.put("migration_mode", workflow.getMigrationMode());
         map.put("sync_objects", workflow.getSyncObjects());
+        map.put("sync_account", workflow.getSyncAccount());
+        map.put("sync_account_super_privilege", workflow.getSyncAccountSuperPrivilege());
         map.put("is_deleted", workflow.getIsDeleted());
         map.put("created_at", workflow.getCreatedAt());
         map.put("updated_at", workflow.getUpdatedAt());
@@ -424,6 +428,8 @@ public class WorkflowController {
         private String subscribeFormat;
         private Boolean fanoutEnabled;
         private String targetConnections;
+        private Boolean syncAccount;
+        private Boolean syncAccountSuperPrivilege;
 
         public String getSourceConnection() { return sourceConnection; }
         public void setSourceConnection(String sourceConnection) { this.sourceConnection = sourceConnection; }
@@ -453,6 +459,10 @@ public class WorkflowController {
         public void setFanoutEnabled(Boolean fanoutEnabled) { this.fanoutEnabled = fanoutEnabled; }
         public String getTargetConnections() { return targetConnections; }
         public void setTargetConnections(String targetConnections) { this.targetConnections = targetConnections; }
+        public Boolean getSyncAccount() { return syncAccount; }
+        public void setSyncAccount(Boolean syncAccount) { this.syncAccount = syncAccount; }
+        public Boolean getSyncAccountSuperPrivilege() { return syncAccountSuperPrivilege; }
+        public void setSyncAccountSuperPrivilege(Boolean syncAccountSuperPrivilege) { this.syncAccountSuperPrivilege = syncAccountSuperPrivilege; }
     }
 
     public static class ApiResponse {

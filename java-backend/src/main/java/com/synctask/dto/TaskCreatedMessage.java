@@ -28,6 +28,10 @@ public class TaskCreatedMessage {
     private String skipSeqnos;
     /** 人工裁决要跳过的增量事件 eventId（binlog文件:位点，逗号分隔）——跨重启稳定的首选身份 */
     private String skipEventIds;
+    /** 账号同步（仅 mysql→mysql）：是否同步账号 */
+    private Boolean syncAccount;
+    /** 是否同步超级账号权限 */
+    private Boolean syncAccountSuperPrivilege;
 
     public TaskCreatedMessage() {
         this.messageType = "TASK_CREATED";
@@ -207,5 +211,21 @@ public class TaskCreatedMessage {
 
     public void setSkipEventIds(String skipEventIds) {
         this.skipEventIds = skipEventIds;
+    }
+
+    public Boolean getSyncAccount() {
+        return syncAccount;
+    }
+
+    public void setSyncAccount(Boolean syncAccount) {
+        this.syncAccount = syncAccount;
+    }
+
+    public Boolean getSyncAccountSuperPrivilege() {
+        return syncAccountSuperPrivilege;
+    }
+
+    public void setSyncAccountSuperPrivilege(Boolean syncAccountSuperPrivilege) {
+        this.syncAccountSuperPrivilege = syncAccountSuperPrivilege;
     }
 }

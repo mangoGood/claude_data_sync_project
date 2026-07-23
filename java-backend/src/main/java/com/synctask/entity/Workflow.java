@@ -137,6 +137,13 @@ public class Workflow {
     @Column(name = "fanout_target_count")
     private Integer fanoutTargetCount = 1;
 
+    // 账号同步（仅 mysql→mysql）：是否同步账号，及是否同步超级账号权限。
+    @Column(name = "sync_account")
+    private Boolean syncAccount = false;
+
+    @Column(name = "sync_account_super_privilege")
+    private Boolean syncAccountSuperPrivilege = false;
+
     @PrePersist
     protected void onCreate() {
         createdAt = LocalDateTime.now();
@@ -482,5 +489,21 @@ public class Workflow {
 
     public void setFanoutTargetCount(Integer fanoutTargetCount) {
         this.fanoutTargetCount = fanoutTargetCount;
+    }
+
+    public Boolean getSyncAccount() {
+        return syncAccount;
+    }
+
+    public void setSyncAccount(Boolean syncAccount) {
+        this.syncAccount = syncAccount;
+    }
+
+    public Boolean getSyncAccountSuperPrivilege() {
+        return syncAccountSuperPrivilege;
+    }
+
+    public void setSyncAccountSuperPrivilege(Boolean syncAccountSuperPrivilege) {
+        this.syncAccountSuperPrivilege = syncAccountSuperPrivilege;
     }
 }

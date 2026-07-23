@@ -369,6 +369,17 @@ public class ConfigService {
         props.setProperty("target.db.type", targetType);
         logger.info("Source database type: {}, Target database type: {}", sourceType, targetType);
 
+        // 账号同步（仅 mysql→mysql）：sync.account.enabled 打开后，全量阶段同步存量账号、
+        // 增量阶段同步账号管理语句；sync.account.super 决定是否连同超级/管理权限。
+        // 每次下发同步对象时按任务当前配置重写，未勾选=false（引擎默认行为，不同步账号）。
+        boolean syncAccount = Boolean.TRUE.equals(taskMessage.getSyncAccount());
+        boolean syncAccountSuper = Boolean.TRUE.equals(taskMessage.getSyncAccountSuperPrivilege());
+        props.setProperty("sync.account.enabled", String.valueOf(syncAccount));
+        props.setProperty("sync.account.super", String.valueOf(syncAccountSuper));
+        if (syncAccount) {
+            logger.info("账号同步已启用: sync.account.enabled=true, sync.account.super={}", syncAccountSuper);
+        }
+
         if ("mongodb".equalsIgnoreCase(sourceType)) {
             // MongoDB 同步走 migration-mongo 单进程（mongodb-driver 直连，非 JDBC）：
             // 不写 SQL 侧 JDBC/capture 属性。SQL 管线是否增量由 agent 编排进程决定，

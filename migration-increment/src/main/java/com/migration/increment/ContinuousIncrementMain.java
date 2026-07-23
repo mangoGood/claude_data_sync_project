@@ -189,6 +189,8 @@ public class ContinuousIncrementMain {
         // 注入 SchemaEvolutionService，启用 DDL 自动应用和在线 DDL 影子表过滤
         sqlConverter.setSchemaEvolutionService(
                 new com.migration.increment.schema.SchemaEvolutionService(props, targetConnection));
+        // 注入 AccountSyncService（仅 mysql→mysql）：拦截 binlog 账号管理语句直接应用到目标库
+        sqlConverter.setAccountSyncService(new AccountSyncService(props, targetConnection));
 
         progressFile = "./files/" + taskId + "/checkpoint/.increment_progress";
         tableLatencyDir = "./files/" + taskId + "/binlog_output/table_latency";
