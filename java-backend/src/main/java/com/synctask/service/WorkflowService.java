@@ -143,7 +143,8 @@ public class WorkflowService {
                                   String targetDbName, String sourceType, String targetType,
                                   String kafkaBootstrapServers, String kafkaTopicPrefix,
                                   String kafkaTopicStrategy, String subscribeFormat,
-                                  Boolean fanoutEnabled, String targetConnections) {
+                                  Boolean fanoutEnabled, String targetConnections,
+                                  Boolean syncAccount, Boolean syncAccountSuperPrivilege) {
         Workflow workflow = getWorkflowById(workflowId, userId);
 
         if (workflow.getStatus() != WorkflowStatus.CONFIGURING) {
@@ -166,6 +167,8 @@ public class WorkflowService {
         if (kafkaTopicPrefix != null) workflow.setKafkaTopicPrefix(kafkaTopicPrefix);
         if (kafkaTopicStrategy != null) workflow.setKafkaTopicStrategy(kafkaTopicStrategy);
         if (subscribeFormat != null) workflow.setSubscribeFormat(subscribeFormat);
+        if (syncAccount != null) workflow.setSyncAccount(syncAccount);
+        if (syncAccountSuperPrivilege != null) workflow.setSyncAccountSuperPrivilege(syncAccountSuperPrivilege);
         if (fanoutEnabled != null) {
             workflow.setFanoutEnabled(fanoutEnabled);
             if (fanoutEnabled && targetConnections != null) {

@@ -54,8 +54,12 @@ public class Main {
             String sourceDb = config.getSourceConfig().getDatabase();
             Set<String> includedDatabases = config.getIncludedDatabases();
 
-            boolean isMultiDbMode = (sourceDb == null || sourceDb.isEmpty()) 
+            boolean isMultiDbMode = (sourceDb == null || sourceDb.isEmpty())
                 && includedDatabases != null && !includedDatabases.isEmpty();
+
+            // 账号同步（仅 mysql→mysql）：账号是服务器级对象，与库无关，全量阶段整任务同步一次。
+            // 存量账号在此随表结构同步一并落到目标库；增量期的账号变更由增量链路负责。
+            syncAccountsIfEnabled(config);
 
             if (isMultiDbMode) {
                 logger.info("检测到多库迁移模式，共 {} 个数据库: {}", includedDatabases.size(), includedDatabases);
@@ -78,7 +82,56 @@ public class Main {
         }
     }
 
-    private static void migrateMultipleDatabases(MigrationConfig config, Set<String> includedDatabases, 
+    /**
+     * 账号同步（仅 mysql→mysql，sync.account.enabled=true）：把源库存量账号（含口令哈希与授权）
+     * 同步到目标库。账号是服务器级对象，整个全量任务同步一次；目标连接账号与系统账号跳过。
+     * 失败仅告警，不影响表数据迁移。
+     */
+    private static void syncAccountsIfEnabled(MigrationConfig config) {
+        if (!config.isSyncAccount()) {
+            return;
+        }
+        if (!"mysql".equalsIgnoreCase(config.getSourceDbType())
+                || !"mysql".equalsIgnoreCase(config.getTargetDbType())) {
+            logger.info("账号同步仅支持 MySQL→MySQL，当前 {}→{}，跳过账号同步",
+                    config.getSourceDbType(), config.getTargetDbType());
+            return;
+        }
+
+        logger.info("\n========================================");
+        logger.info("开始同步账号（含超级账号权限={}）", config.isSyncAccountSuper());
+        logger.info("========================================");
+
+        DatabaseConnection sourceConn = new DatabaseConnection(accountSyncConnConfig(config.getSourceConfig()));
+        DatabaseConnection targetConn = new DatabaseConnection(accountSyncConnConfig(config.getTargetConfig()));
+        try {
+            Set<String> skipUsers = new HashSet<>();
+            String targetUser = config.getTargetConfig().getUsername();
+            if (targetUser != null && !targetUser.isEmpty()) {
+                skipUsers.add(targetUser);   // 目标连接账号不动，避免改坏自身连接
+            }
+            int count = com.migration.account.MySqlAccountReplicator.replicate(
+                    sourceConn.getConnection(), targetConn.getConnection(),
+                    config.isSyncAccountSuper(), skipUsers);
+            logger.info("账号同步完成：共同步 {} 个账号", count);
+        } catch (Exception e) {
+            logger.error("账号同步失败（不影响数据迁移）: {}", e.getMessage(), e);
+        } finally {
+            sourceConn.close();
+            targetConn.close();
+        }
+    }
+
+    /**
+     * 账号同步连接配置：账号是服务器级对象，与具体库无关。统一连到 information_schema（恒存在）——
+     * 账号同步在建目标库之前运行，若用目标库名连接，全新目标实例上该库尚不存在会连不上。
+     */
+    private static DatabaseConfig accountSyncConnConfig(DatabaseConfig base) {
+        return new DatabaseConfig(base.getHost(), base.getPort(), "information_schema",
+                base.getUsername(), base.getPassword(), base.getDbType());
+    }
+
+    private static void migrateMultipleDatabases(MigrationConfig config, Set<String> includedDatabases,
                                                   ProgressManager progressManager) throws Exception {
         Set<String> includedTables = config.getIncludedTables();
         Map<String, Set<String>> dbTablesMap = groupTablesByDatabase(includedTables, includedDatabases);

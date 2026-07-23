@@ -47,7 +47,9 @@ public class KafkaProducerService {
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());
         message.setKafkaTopicStrategy(workflow.getKafkaTopicStrategy());
         message.setSubscribeFormat(workflow.getSubscribeFormat());
-        
+        message.setSyncAccount(workflow.getSyncAccount());
+        message.setSyncAccountSuperPrivilege(workflow.getSyncAccountSuperPrivilege());
+
         if (workflow.getSyncObjects() != null && !workflow.getSyncObjects().isEmpty()) {
             try {
                 Type type = new TypeToken<Map<String, Object>>(){}.getType();
@@ -92,7 +94,9 @@ public class KafkaProducerService {
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());
         message.setKafkaTopicStrategy(workflow.getKafkaTopicStrategy());
         message.setSubscribeFormat(workflow.getSubscribeFormat());
-        
+        message.setSyncAccount(workflow.getSyncAccount());
+        message.setSyncAccountSuperPrivilege(workflow.getSyncAccountSuperPrivilege());
+
         if (workflow.getSyncObjects() != null && !workflow.getSyncObjects().isEmpty()) {
             try {
                 Type type = new TypeToken<Map<String, Object>>(){}.getType();

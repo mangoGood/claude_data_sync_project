@@ -33,6 +33,10 @@ public class MigrationConfig {
     private String taskId;
     private String sourceDbType;
     private String targetDbType;
+    /** 账号同步（sync.account.enabled，仅 mysql→mysql）：全量阶段把源库存量账号同步到目标库。 */
+    private boolean syncAccount;
+    /** 是否同步超级账号权限（sync.account.super）：false 时全局 GRANT 剔除超级/管理权限。 */
+    private boolean syncAccountSuper;
 
     public MigrationConfig(String configFile) throws IOException {
         loadConfig(configFile);
@@ -136,6 +140,11 @@ public class MigrationConfig {
         
         // 列处理（仅表级同步下发，mysql→mysql）：column.filter./column.mapping./column.extra.<源库>.<源表>
         columnProcessingConfig = ColumnProcessingConfig.loadFromProperties(props);
+
+        // 账号同步（仅 mysql→mysql）：sync.account.enabled 打开后全量阶段同步存量账号，
+        // sync.account.super 决定是否连同超级/管理权限一并同步
+        syncAccount = Boolean.parseBoolean(props.getProperty("sync.account.enabled", "false"));
+        syncAccountSuper = Boolean.parseBoolean(props.getProperty("sync.account.super", "false"));
 
         String defaultCheckpointPath = taskId != null ?
             "./files/" + taskId + "/checkpoint/checkpoint" : "./checkpoint/checkpoint";
@@ -273,5 +282,15 @@ public class MigrationConfig {
 
     public String getTargetDbType() {
         return targetDbType;
+    }
+
+    /** 账号同步是否启用（sync.account.enabled，仅 mysql→mysql 全量阶段生效）。 */
+    public boolean isSyncAccount() {
+        return syncAccount;
+    }
+
+    /** 是否同步超级账号权限（sync.account.super）。 */
+    public boolean isSyncAccountSuper() {
+        return syncAccountSuper;
     }
 }

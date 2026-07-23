@@ -864,16 +864,19 @@
             <div class="modal-body" style="max-height: calc(90vh - 140px); overflow-y: auto;">
                 <div class="step-nav">
                     <div class="step-item active" id="cfgStep1Nav" onclick="cfgGoToStep(1)">
-                        <span>1. 填写连接信息</span>
+                        <span id="cfgStep1NavLabel">1. 填写连接信息</span>
                     </div>
                     <div class="step-item" id="cfgStep2Nav" onclick="cfgGoToStep(2)">
-                        <span>2. 选择同步对象</span>
+                        <span id="cfgStep2NavLabel">2. 选择同步对象</span>
                     </div>
                     <div class="step-item" id="cfgStep3Nav" onclick="cfgGoToStep(3)">
-                        <span>3. 列处理</span>
+                        <span id="cfgStep3NavLabel">3. 列处理</span>
                     </div>
                     <div class="step-item" id="cfgStep4Nav" onclick="cfgGoToStep(4)">
-                        <span id="cfgStep4NavLabel">4. 校验检查</span>
+                        <span id="cfgStep4NavLabel">4. 账号同步</span>
+                    </div>
+                    <div class="step-item" id="cfgStep5Nav" onclick="cfgGoToStep(5)">
+                        <span id="cfgStep5NavLabel">5. 校验检查</span>
                     </div>
                 </div>
 
@@ -1033,7 +1036,33 @@
                     </div>
                 </div>
 
+                <!-- Step 4: 账号同步（仅 MySQL→MySQL；不勾选=与原有行为一致，不同步任何账号） -->
                 <div class="step-content" id="cfgStep4Content">
+                    <div style="font-size: 12px; color: #999; margin-bottom: 12px;">
+                        可选步骤：把源库账号同步到目标库。<b>不勾选则与原有同步行为完全一致</b>（不同步任何账号）。
+                        勾选后——全量同步：存量账号在同步表结构时一并同步；全量+增量同步：存量账号在全量阶段同步，
+                        增量期对账号的新建/改口令/改权限/删除等操作在增量过程中同步。
+                        系统账号（root、mysql.*）与目标连接账号不会同步。
+                    </div>
+                    <div style="border: 1px solid #e8e8e8; border-radius: 4px; padding: 16px; max-width: 640px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px;">
+                            <input type="checkbox" id="cfgSyncAccount" onchange="cfgOnSyncAccountToggle()">
+                            <span><b>同步账号</b>（含账号口令与授权）</span>
+                        </label>
+                        <div id="cfgSyncAccountSuperWrap" style="margin-top: 14px; padding-left: 26px;">
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px;">
+                                <input type="checkbox" id="cfgSyncAccountSuper">
+                                <span>同步超级账号权限</span>
+                            </label>
+                            <div style="font-size: 11px; color: #fa8c16; margin-top: 6px;">
+                                勾选后会连同 SUPER、FILE、CREATE USER、GRANT OPTION、REPLICATION、*_ADMIN 等全局管理权限一并授予目标账号；
+                                不勾选则只同步库/表级权限，全局 GRANT 会剔除超级/管理权限（GRANT ALL PRIVILEGES ON *.* 整条跳过），账号本身仍会创建。
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step-content" id="cfgStep5Content">
                     <div class="validation-container">
                         <div class="validation-header">
                             <span>数据库同步前校验</span>

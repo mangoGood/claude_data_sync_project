@@ -62,6 +62,8 @@ public class THLToSqlConverter {
     private boolean columnProcessingActive;
 
     private SchemaEvolutionService schemaEvolutionService;
+    /** 账号同步（仅 mysql→mysql）：拦截 binlog 里的账号管理语句直接应用到目标库 */
+    private AccountSyncService accountSyncService;
 
     private LinkedHashMap<Long, String> executedRecords;
     private String executedRecordFile;
@@ -1302,6 +1304,14 @@ public class THLToSqlConverter {
             return statements;
         }
 
+        // 账号管理语句（CREATE/ALTER/DROP/RENAME USER、GRANT、REVOKE、SET PASSWORD…）在通用 DDL 分派前拦截：
+        // 账号是服务器级对象，与库无关，不能走库/表范围过滤与库名改写。由 AccountSyncService 直接应用到目标库
+        // （含超级权限过滤/受保护账号跳过）。命中即返回空列表（已由服务应用或有意跳过，不重复执行）。
+        if (accountSyncService != null && accountSyncService.handle(sql)) {
+            logger.debug("账号语句已由 AccountSyncService 处理: {}", sql);
+            return statements;
+        }
+
         SqlClassifier.ClassificationResult classification = sqlClassifier.classify(sql);
         logger.debug("SQL classification result: {}", classification);
 
@@ -1572,6 +1582,14 @@ public class THLToSqlConverter {
     public void setSchemaEvolutionService(SchemaEvolutionService service) {
         this.schemaEvolutionService = service;
         logger.info("SchemaEvolutionService 已注入，DDL 自动应用和在线 DDL 过滤已启用");
+    }
+
+    /**
+     * 注入 AccountSyncService（仅 mysql→mysql）：账号语句在通用 DDL 分派前被拦截，
+     * 直接应用到目标库（含超级权限过滤），不经库/表范围过滤与库名改写。
+     */
+    public void setAccountSyncService(AccountSyncService service) {
+        this.accountSyncService = service;
     }
 
     public void removeSeqnoBefore(long seqno) {

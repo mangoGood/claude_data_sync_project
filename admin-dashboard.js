@@ -2045,6 +2045,11 @@
                             <div style="font-size: 13px;">${colProcHtml}</div>
                             ` : ''}
 
+                            ${task.sync_account ? `
+                            <div style="font-size: 13px; color: #666;">账号同步:</div>
+                            <div style="font-size: 13px;">已开启${task.sync_account_super_privilege ? '（含超级账号权限）' : '（不含超级账号权限）'}</div>
+                            ` : ''}
+
                             <div style="font-size: 13px; color: #666;">源库类型:</div>
                             <div style="font-size: 13px;">${sourceTypeLabel}</div>
 
@@ -2697,6 +2702,28 @@
                 || (cfgSourceType === 'mongodb' && cfgTargetType === 'mongodb');
         }
 
+        // 账号同步是否可用：仅 mysql→mysql 展示【账号同步】步骤
+        function cfgAccountSyncSupported() {
+            return cfgSourceType === 'mysql' && cfgTargetType === 'mysql';
+        }
+
+        // 账号同步页勾选状态渲染：主开关联动"同步超级账号权限"子项可用性
+        function cfgRenderAccountSyncPage() {
+            const superWrap = document.getElementById('cfgSyncAccountSuperWrap');
+            const superBox = document.getElementById('cfgSyncAccountSuper');
+            const enabled = document.getElementById('cfgSyncAccount').checked;
+            if (superWrap) superWrap.style.opacity = enabled ? '1' : '0.45';
+            if (superBox) superBox.disabled = !enabled;
+        }
+
+        // 主开关切换：关闭同步账号时，超级权限子项一并取消勾选并置灰
+        window.cfgOnSyncAccountToggle = function() {
+            if (!document.getElementById('cfgSyncAccount').checked) {
+                document.getElementById('cfgSyncAccountSuper').checked = false;
+            }
+            cfgRenderAccountSyncPage();
+        }
+
         function cfgClearAllColumnProcessing() {
             cfgColumnFilters = {};
             cfgColumnMappings = {};
@@ -3287,7 +3314,12 @@
                         document.getElementById('cfgModeFull').checked = true;
                     }
                 }
-                
+
+                // 账号同步开关恢复（仅 mysql→mysql；其它库对不展示该步，勾选状态保持关闭）
+                document.getElementById('cfgSyncAccount').checked = !!task.sync_account;
+                document.getElementById('cfgSyncAccountSuper').checked = !!task.sync_account_super_privilege;
+                cfgRenderAccountSyncPage();
+
                 cfgUpdateDbNameRows();
                 cfgUpdateStepUI();
                 
@@ -3524,9 +3556,16 @@
             });
         }
 
-        // 向导步骤序列：同引擎(mysql→mysql/pg→pg) 为 1连接→2对象→3列处理→4校验；其余库对无列处理步骤（1→2→4）
+        // 向导步骤序列：1连接 2对象 [3列处理] [4账号同步] 5校验。
+        //   mysql→mysql：1→2→3→4→5（含列处理+账号同步）
+        //   pg→pg / mongo→mongo：1→2→3→5（含列处理，无账号同步）
+        //   其余库对：1→2→5
         function cfgStepSequence() {
-            return cfgColProcSupported() ? [1, 2, 3, 4] : [1, 2, 4];
+            const seq = [1, 2];
+            if (cfgColProcSupported()) seq.push(3);
+            if (cfgAccountSyncSupported()) seq.push(4);
+            seq.push(5);
+            return seq;
         }
 
         function cfgGoToStep(step) {
@@ -3583,14 +3622,17 @@
                 cfgSaveConfig();
             }
 
-            // 离开列处理步骤向后走：把列处理配置持久化进 syncObjects
-            if (step === 4 && cfgCurrentStep === 3) {
+            // 离开列处理(3)或账号同步(4)步骤向后走：持久化配置（列处理进 syncObjects、账号开关进任务）
+            if ((cfgCurrentStep === 3 || cfgCurrentStep === 4) && step > cfgCurrentStep) {
                 cfgSaveConfig();
             }
 
             cfgCurrentStep = step;
             if (step === 3) {
                 cfgRenderColProcPage();
+            }
+            if (step === 4) {
+                cfgRenderAccountSyncPage();
             }
             cfgUpdateStepUI();
         }
@@ -3612,25 +3654,32 @@
         }
 
         function cfgUpdateStepUI() {
-            const colProc = cfgColProcSupported();
-            const lastStep = 4;
-            document.getElementById('cfgStep1Nav').className = 'step-item' + (cfgCurrentStep === 1 ? ' active' : (cfgCurrentStep > 1 ? ' completed' : ''));
-            document.getElementById('cfgStep2Nav').className = 'step-item' + (cfgCurrentStep === 2 ? ' active' : (cfgCurrentStep > 2 ? ' completed' : ''));
-            const step3Nav = document.getElementById('cfgStep3Nav');
-            step3Nav.style.display = colProc ? '' : 'none';
-            step3Nav.className = 'step-item' + (cfgCurrentStep === 3 ? ' active' : (cfgCurrentStep > 3 ? ' completed' : ''));
-            document.getElementById('cfgStep4Nav').className = 'step-item' + (cfgCurrentStep === 4 ? ' active' : '');
-            // 非 mysql→mysql 无列处理步骤，校验检查按第 3 步展示
-            document.getElementById('cfgStep4NavLabel').textContent = colProc ? '4. 校验检查' : '3. 校验检查';
+            const seq = cfgStepSequence();
+            const labels = { 1: '填写连接信息', 2: '选择同步对象', 3: '列处理', 4: '账号同步', 5: '校验检查' };
+            const curIdx = seq.indexOf(cfgCurrentStep);
+            // 5 个可能的步骤：按当前库对的步骤序列决定显示/隐藏与显示编号（编号=序列内位置）
+            for (let s = 1; s <= 5; s++) {
+                const nav = document.getElementById('cfgStep' + s + 'Nav');
+                const content = document.getElementById('cfgStep' + s + 'Content');
+                const idx = seq.indexOf(s);
+                if (idx < 0) {
+                    if (nav) nav.style.display = 'none';
+                    if (content) content.className = 'step-content';
+                    continue;
+                }
+                if (nav) {
+                    nav.style.display = '';
+                    nav.className = 'step-item' + (cfgCurrentStep === s ? ' active' : (curIdx > idx ? ' completed' : ''));
+                    const label = document.getElementById('cfgStep' + s + 'NavLabel');
+                    if (label) label.textContent = (idx + 1) + '. ' + labels[s];
+                }
+                if (content) content.className = 'step-content' + (cfgCurrentStep === s ? ' active' : '');
+            }
 
-            document.getElementById('cfgStep1Content').className = 'step-content' + (cfgCurrentStep === 1 ? ' active' : '');
-            document.getElementById('cfgStep2Content').className = 'step-content' + (cfgCurrentStep === 2 ? ' active' : '');
-            document.getElementById('cfgStep3Content').className = 'step-content' + (cfgCurrentStep === 3 ? ' active' : '');
-            document.getElementById('cfgStep4Content').className = 'step-content' + (cfgCurrentStep === 4 ? ' active' : '');
-
-            document.getElementById('cfgNextBtn').style.display = (cfgCurrentStep < lastStep) ? 'inline-block' : 'none';
-            document.getElementById('cfgPrevBtn').style.display = (cfgCurrentStep > 1) ? 'inline-block' : 'none';
-            document.getElementById('cfgLaunchBtn').style.display = cfgCurrentStep === lastStep ? 'inline-block' : 'none';
+            const lastStep = seq[seq.length - 1];
+            document.getElementById('cfgNextBtn').style.display = (cfgCurrentStep !== lastStep) ? 'inline-block' : 'none';
+            document.getElementById('cfgPrevBtn').style.display = (curIdx > 0) ? 'inline-block' : 'none';
+            document.getElementById('cfgLaunchBtn').style.display = (cfgCurrentStep === lastStep) ? 'inline-block' : 'none';
         }
 
         async function cfgSaveConfig() {
@@ -3713,6 +3762,11 @@
                 targetDbName = sourceDbName || firstDb;
             }
             
+            // 账号同步（仅 mysql→mysql）：从账号同步页勾选状态读取；非 mysql→mysql 恒为 false。
+            const syncAccount = cfgAccountSyncSupported() && !!document.getElementById('cfgSyncAccount').checked;
+            const syncAccountSuperPrivilege = syncAccount
+                && !!document.getElementById('cfgSyncAccountSuper').checked;
+
             try {
                 await fetchWithAuth(`${API_BASE_URL}/workflows/${cfgWorkflowId}/config`, {
                     method: 'PUT',
@@ -3725,7 +3779,9 @@
                         sourceDbName,
                         targetDbName: targetDbName,
                         sourceType: cfgSourceType,
-                        targetType: cfgTargetType
+                        targetType: cfgTargetType,
+                        syncAccount,
+                        syncAccountSuperPrivilege
                     })
                 });
             } catch (error) {

@@ -32,6 +32,10 @@ public class TaskMessage implements Serializable {
     private String subscribeFormat;
     private Boolean fanoutEnabled;
     private List<DatabaseConfig> targetConnections;
+    /** 账号同步（仅 mysql→mysql）：是否同步账号，写入 sync.account.enabled */
+    private Boolean syncAccount;
+    /** 是否同步超级账号权限，写入 sync.account.super */
+    private Boolean syncAccountSuperPrivilege;
     /** 人工裁决要跳过的增量事件 seqno（逗号分隔），随 resume 消息下发，写入 increment.skip.seqnos */
     private String skipSeqnos;
     /** 人工裁决要跳过的增量事件 eventId（binlog文件:位点，逗号分隔）——跨重启稳定的首选身份，写入 increment.skip.event.ids */
@@ -291,5 +295,21 @@ public class TaskMessage implements Serializable {
 
     public void setSkipEventIds(String skipEventIds) {
         this.skipEventIds = skipEventIds;
+    }
+
+    public Boolean getSyncAccount() {
+        return syncAccount;
+    }
+
+    public void setSyncAccount(Boolean syncAccount) {
+        this.syncAccount = syncAccount;
+    }
+
+    public Boolean getSyncAccountSuperPrivilege() {
+        return syncAccountSuperPrivilege;
+    }
+
+    public void setSyncAccountSuperPrivilege(Boolean syncAccountSuperPrivilege) {
+        this.syncAccountSuperPrivilege = syncAccountSuperPrivilege;
     }
 }
