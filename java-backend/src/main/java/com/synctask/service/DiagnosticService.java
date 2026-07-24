@@ -326,7 +326,11 @@ public class DiagnosticService {
         try (Connection src = openConn(srcConn)) {
             checks.add(checkSourceObjectsExist(src, entries));
             if (needsIncrement) {
-                checks.add(checkPrimaryKeys(src, entries));
+                if ("tidb".equalsIgnoreCase(workflow.getSourceType())) {
+                    checks.add(checkTidbReplicableKeys(src, entries));
+                } else {
+                    checks.add(checkPrimaryKeys(src, entries));
+                }
             }
             checks.add(checkColumnRefs(src, entries));
             checks.add(checkForeignKeyIntegrity(src, entries));
@@ -437,6 +441,47 @@ public class DiagnosticService {
         return check("增量主键", "WARNING",
                 "以下表无主键，增量 UPDATE/DELETE 无法按主键定位行，可能同步异常（" + noPk.size() + " 个）",
                 String.join(", ", noPk));
+    }
+
+    /**
+     * TiDB 增量的可复制性检查。与 MySQL 源的差别在于严重级别：MySQL 的 binlog 带完整行镜像，
+     * 无主键表还能靠全列 WHERE 兜底（WARNING）；而 TiCDC 直接<b>拒绝复制</b>既无主键也无
+     * NOT NULL 唯一索引的表，这类表的增量变更一条都不会到达目标端，因此按阻断项报。
+     */
+    private Map<String, Object> checkTidbReplicableKeys(Connection src, List<DbEntry> entries) throws Exception {
+        List<String> notReplicable = new ArrayList<>();
+        for (DbEntry de : entries) {
+            if (de.dbLevel || !schemaExists(src, de.sourceDb)) continue;
+            for (String t : de.tables) {
+                if (!tableExists(src, de.sourceDb, t)) continue;
+                if (!hasPrimaryKey(src, de.sourceDb, t) && !hasNotNullUniqueIndex(src, de.sourceDb, t)) {
+                    notReplicable.add(de.sourceDb + "." + t);
+                }
+            }
+        }
+        if (notReplicable.isEmpty()) {
+            return check("增量可复制性", "PASS", "增量同步的表均有主键或非空唯一索引，TiCDC 可复制", null);
+        }
+        return check("增量可复制性", "FAIL",
+                "以下表既无主键也无非空唯一索引，TiCDC 不会复制其变更（" + notReplicable.size() + " 个）",
+                String.join(", ", notReplicable));
+    }
+
+    /** 表上是否存在全部列均 NOT NULL 的唯一索引（TiCDC 认可的复制键之一）。 */
+    private boolean hasNotNullUniqueIndex(Connection conn, String schema, String table) throws Exception {
+        String sql = "SELECT s.INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS s "
+                + "JOIN INFORMATION_SCHEMA.COLUMNS c ON c.TABLE_SCHEMA = s.TABLE_SCHEMA "
+                + " AND c.TABLE_NAME = s.TABLE_NAME AND c.COLUMN_NAME = s.COLUMN_NAME "
+                + "WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME = ? AND s.NON_UNIQUE = 0 "
+                + "GROUP BY s.INDEX_NAME "
+                + "HAVING SUM(CASE WHEN c.IS_NULLABLE = 'YES' THEN 1 ELSE 0 END) = 0";
+        try (java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
     }
 
     private Map<String, Object> checkColumnRefs(Connection src, List<DbEntry> entries) throws Exception {

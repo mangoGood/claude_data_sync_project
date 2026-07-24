@@ -22,8 +22,14 @@ public class MetadataService {
 
     private static final Logger logger = LoggerFactory.getLogger(MetadataService.class);
 
+    /** TiCDC OpenAPI 地址，用于 TiDB 源增量任务的预校验（与 agent 的 ticdc.api.url 指向同一服务）。 */
+    @org.springframework.beans.factory.annotation.Value("${sync.ticdc.api-url:http://127.0.0.1:18300}")
+    private String ticdcApiUrl;
+
+    // 口令部分用 * 而非 +：空口令实例（如默认安装的 TiDB root）连接串形如
+    // mysql://root:@host:port，用 + 会整体匹配失败并报“连接串格式不正确”。
     private static final Pattern CONNECTION_PATTERN = Pattern.compile(
-        "(?:mysql|postgresql|oracle|mongodb|elastic|redis)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
+        "(?:mysql|postgresql|oracle|mongodb|elastic|redis)://([^:]+):([^@]*)@([^:]+):(\\d+)(?:/(.*))?"
     );
 
     public static class ParsedConnection {
@@ -211,7 +217,9 @@ public class MetadataService {
         // 且一次性测试不应催生常驻池。
         try (Connection connection = java.sql.DriverManager.getConnection(jdbcUrl, conn.username, conn.password)) {
             if (connection.isValid(5)) {
-                String dbTypeName = isPg ? "PostgreSQL" : (isOracle ? "Oracle" : "MySQL");
+                // TiDB 用 mysql:// 连接串走 MySQL 驱动，连接串无从区分，按所选类型给出提示
+                String dbTypeName = isPg ? "PostgreSQL"
+                        : (isOracle ? "Oracle" : ("tidb".equalsIgnoreCase(expectedType) ? "TiDB" : "MySQL"));
                 return new ConnectionTestResult(true, null, dbTypeName + "连接成功", null);
             } else {
                 return new ConnectionTestResult(false, "CONNECTION_FAILED", "连接验证失败", "请检查数据库服务器状态");
@@ -1339,9 +1347,14 @@ public class MetadataService {
 
         boolean sourceIsPg = "postgresql".equalsIgnoreCase(sourceType);
         boolean sourceIsOracle = "oracle".equalsIgnoreCase(sourceType);
+        // TiDB 讲 MySQL 协议（连接串同为 mysql://，JDBC 走 MySQL 驱动），但增量出口是 TiCDC
+        // 而不是 binlog——必须从 bothMysql 里摘出来单独校验，否则会去查 log_bin/binlog_format，
+        // 在 TiDB 上恒为关闭，把本来正常的任务误判成不可创建。
+        boolean sourceIsTidb = "tidb".equalsIgnoreCase(sourceType);
         boolean targetIsPg = "postgresql".equalsIgnoreCase(targetType);
-        boolean bothMysql = !sourceIsPg && !sourceIsOracle && !targetIsPg;
-        boolean mysqlToPg = !sourceIsPg && !sourceIsOracle && targetIsPg;
+        boolean bothMysql = !sourceIsPg && !sourceIsOracle && !sourceIsTidb && !targetIsPg;
+        boolean tidbToMysql = sourceIsTidb && !targetIsPg;
+        boolean mysqlToPg = !sourceIsPg && !sourceIsOracle && !sourceIsTidb && targetIsPg;
         boolean pgToMysql = sourceIsPg && !targetIsPg;
         boolean bothPg = sourceIsPg && targetIsPg;
         boolean oracleToPg = sourceIsOracle && targetIsPg;
@@ -1369,7 +1382,8 @@ public class MetadataService {
                 buildJdbcUrl(targetConn),
                 targetConn.username, targetConn.password)) {
 
-            String sourceLabel = sourceIsPg ? "PostgreSQL" : (sourceIsOracle ? "Oracle" : "MySQL");
+            String sourceLabel = sourceIsPg ? "PostgreSQL"
+                    : (sourceIsOracle ? "Oracle" : (sourceIsTidb ? "TiDB" : "MySQL"));
             result.addItem("源库连接", "源数据库连接检查", true,
                 sourceLabel + "源库连接成功", "info");
             result.addItem("目标库连接", "目标数据库连接检查", true,
@@ -1400,6 +1414,22 @@ public class MetadataService {
                     checkBidirectionalTargetMysql(targetDb, result);
                     checkServerIdDistinct(sourceDb, targetDb, result);
                 }
+            }
+
+            if (tidbToMysql) {
+                // TiDB → MySQL：版本 / TiCDC 服务（增量前提）/ 目标端兼容性与权限。
+                // 不查 binlog 相关变量——TiDB 没有 binlog，增量由 TiCDC changefeed 承担。
+                String sourceVersion = getMySQLVersion(sourceDb);
+                String targetVersion = getMySQLVersion(targetDb);
+                checkTidbSourceVersion(sourceVersion, result);
+                if (needIncrement) {
+                    checkTicdcService(result);
+                }
+                checkStorageEngine(sourceDb, result);
+                checkForeignKeyConstraints(sourceDb, result);
+                checkSqlModeCompatibility(sourceDb, targetDb, result);
+                checkTidbSourcePermissions(sourceDb, migrationMode, result);
+                checkTargetPermissions(targetDb, targetVersion, result);
             }
 
             if (mysqlToPg) {
@@ -2071,6 +2101,96 @@ public class MetadataService {
         } else {
             result.addItem("源库版本号", "源库 MySQL 版本需不低于 5.6", true,
                     "源库版本为 " + sourceVersion + "，受支持", "info");
+        }
+    }
+
+    /**
+     * TiDB 源库版本检查。TiDB 的 {@code VERSION()} 形如 {@code 8.0.11-TiDB-v8.5.0}：
+     * 前半段是它兼容的 MySQL 协议版本，真正的内核版本在 {@code -TiDB-v} 之后。
+     * TiCDC 的 canal-json + enable-tidb-extension（本链路增量所依赖的消息格式）在 6.5 起才稳定。
+     */
+    private void checkTidbSourceVersion(String versionString, ValidationResult result) {
+        String desc = "源库需为 TiDB 6.5 及以上（TiCDC canal-json 增量前提）";
+        if (versionString == null || versionString.isEmpty() || "unknown".equalsIgnoreCase(versionString)) {
+            result.addItem("源库版本号", desc, true, "无法获取源库版本号，跳过版本检查", "warning");
+            return;
+        }
+        Matcher m = Pattern.compile("TiDB-v(\\d+\\.\\d+\\.\\d+)", Pattern.CASE_INSENSITIVE).matcher(versionString);
+        if (!m.find()) {
+            result.addItem("源库版本号", desc, false,
+                    "源库版本号 " + versionString + " 中未识别出 TiDB 版本，请确认所选源库类型与实际实例一致",
+                    "warning");
+            return;
+        }
+        String tidbVersion = m.group(1);
+        if (!isVersionAtLeast(tidbVersion, "6.5.0")) {
+            result.addItem("源库版本号", desc, false,
+                    "源库为 TiDB " + tidbVersion + "，低于 6.5，TiCDC canal-json 增量可能不可用", "error");
+        } else {
+            result.addItem("源库版本号", desc, true, "源库为 TiDB " + tidbVersion + "，受支持", "info");
+        }
+    }
+
+    /**
+     * TiCDC 服务可达性检查（仅增量任务）。TiDB 不提供 binlog dump，增量完全依赖 TiCDC changefeed；
+     * TiCDC 不可达时任务能建但增量永远没有数据，属于必须前置暴露的阻断项。
+     */
+    private void checkTicdcService(ValidationResult result) {
+        String desc = "增量同步需要 TiCDC 服务可用（TiDB 无 binlog，增量走 changefeed）";
+        String apiUrl = ticdcApiUrl == null ? "" : ticdcApiUrl.trim();
+        while (apiUrl.endsWith("/")) {
+            apiUrl = apiUrl.substring(0, apiUrl.length() - 1);
+        }
+        if (apiUrl.isEmpty()) {
+            result.addItem("TiCDC 服务", desc, false, "未配置 TiCDC 地址（sync.ticdc.api-url）", "error");
+            return;
+        }
+        java.net.HttpURLConnection conn = null;
+        try {
+            conn = (java.net.HttpURLConnection) new java.net.URL(apiUrl + "/api/v2/status").openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            int code = conn.getResponseCode();
+            if (code == 200) {
+                result.addItem("TiCDC 服务", desc, true, "TiCDC 服务可用: " + apiUrl, "info");
+            } else {
+                result.addItem("TiCDC 服务", desc, false,
+                        "TiCDC 服务返回 HTTP " + code + " (" + apiUrl + ")", "error");
+            }
+        } catch (Exception e) {
+            result.addItem("TiCDC 服务", desc, false,
+                    "无法连接 TiCDC 服务 " + apiUrl + ": " + e.getMessage(), "error");
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    /**
+     * TiDB 源库权限检查。与 MySQL 源的差别：增量不经复制协议，因此不要求
+     * REPLICATION SLAVE / REPLICATION CLIENT / LOCK TABLES——变更由 TiCDC 从 TiKV 直接拉取。
+     */
+    private void checkTidbSourcePermissions(Connection conn, String migrationMode, ValidationResult result) {
+        String mode = "fullAndIncre".equals(migrationMode) ? "全量+增量"
+                : "full".equals(migrationMode) ? "全量" : "增量";
+        String desc = mode + "同步需要 SELECT、SHOW VIEW 等读取权限";
+        try {
+            Set<String> granted = getGrantedPrivileges(conn);
+            Set<String> missing = new HashSet<>();
+            for (String priv : Arrays.asList("SELECT", "SHOW VIEW")) {
+                boolean has = granted.contains(priv) || granted.contains("ALL PRIVILEGES") || granted.contains("ALL");
+                if (!has) {
+                    missing.add(priv);
+                }
+            }
+            boolean passed = missing.isEmpty();
+            result.addItem("源数据库权限", desc, passed,
+                    passed ? mode + "同步所需权限已具备" : mode + "同步缺少权限: " + String.join(", ", missing),
+                    "error");
+        } catch (SQLException e) {
+            result.addItem("源数据库权限", desc, false, "检查失败: " + e.getMessage(), "error");
         }
     }
 

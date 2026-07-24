@@ -55,6 +55,12 @@ public class DbObjectsSyncService {
                 logger.info("[{}] 库级 trigger/event 同步仅支持 MySQL，跳过", taskId);
                 return;
             }
+            // TiDB 源虽然被归一成 mysql 走同一套链路，但它不支持 TRIGGER/EVENT，
+            // SHOW TRIGGERS / SHOW EVENTS 拿不到任何可复制的对象，直接跳过
+            if ("tidb".equalsIgnoreCase(props.getProperty("source.db.flavor", ""))) {
+                logger.info("[{}] TiDB 源不支持 TRIGGER/EVENT，跳过库级对象同步", taskId);
+                return;
+            }
 
             logger.info("[{}] 任务结束：开始同步库级同步范围内的 TRIGGER/EVENT: {}", taskId, dbsCsv);
             addWorkflowLog(taskId, "INFO", "任务结束：开始同步源库的 TRIGGER/EVENT 到目标库（范围: " + dbsCsv + "）");

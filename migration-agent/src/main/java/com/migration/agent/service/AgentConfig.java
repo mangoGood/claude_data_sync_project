@@ -49,10 +49,20 @@ public class AgentConfig {
         props.setProperty("jar.elastic.path", "migration-elastic/target/migration-elastic-1.0.0.jar");
         props.setProperty("jar.redis.path", "migration-redis/target/migration-redis-1.0.0.jar");
 
+        // TiDB 增量：TiCDC OpenAPI 地址 + changefeed 的 Kafka sink 地址。
+        // sink 地址是 TiCDC 容器视角的 broker（容器内解析 synctask-kafka），
+        // capture 进程消费时用的是 kafka.bootstrap.servers（宿主视角）。
+        props.setProperty("ticdc.api.url", "http://127.0.0.1:18300");
+        props.setProperty("ticdc.kafka.sink.bootstrap", "synctask-kafka:9092");
+
         props.setProperty("monitor.capture.interval.ms", "30000");
         props.setProperty("monitor.extract.interval.ms", "30000");
         props.setProperty("monitor.increment.interval.ms", "10000");
         props.setProperty("monitor.progress.interval.ms", "3000");
+        // 僵死看门狗：增量管线的活性文件（心跳驱动 rto_metric，健康时每 ~5s 刷新）超过该时长
+        // 未更新即判定管线僵死。取值须大于任一子进程崩溃后被 ProcessGuard 重启并追平心跳所需的
+        // 最坏时间（重启约 15~40s + 追平），90s 足以覆盖且不误伤，同时能在 1 分半内发现真正的冻结。
+        props.setProperty("monitor.stall.threshold.ms", "90000");
 
         props.setProperty("http.server.port", "8083");
 
@@ -170,6 +180,14 @@ public class AgentConfig {
         return props.getProperty("jar.redis.path");
     }
 
+    public String getTicdcApiUrl() {
+        return props.getProperty("ticdc.api.url");
+    }
+
+    public String getTicdcKafkaSinkBootstrap() {
+        return props.getProperty("ticdc.kafka.sink.bootstrap");
+    }
+
     public long getCaptureMonitorIntervalMs() {
         return Long.parseLong(props.getProperty("monitor.capture.interval.ms"));
     }
@@ -184,6 +202,10 @@ public class AgentConfig {
 
     public long getProgressMonitorIntervalMs() {
         return Long.parseLong(props.getProperty("monitor.progress.interval.ms"));
+    }
+
+    public long getStallThresholdMs() {
+        return Long.parseLong(props.getProperty("monitor.stall.threshold.ms", "90000"));
     }
 
     public int getHttpServerPort() {

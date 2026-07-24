@@ -45,7 +45,13 @@ public class FullMigrationTask extends AbstractTaskExecutor {
             return;
         }
 
-        if (!startCaptureProcess()) {
+        // TiDB 纯全量任务不起 capture：TiDB 的增量出口是 TiCDC changefeed，而 changefeed 一旦建立
+        // 就会持有源集群的 GC safepoint 并持续向 Kafka 投递——纯全量任务用不到它，建了只会白白
+        // 拖住源库 GC、堆积 Kafka 数据。其余源类型的 capture 是纯读取，保持原有行为不变。
+        boolean skipCapture = "tidb".equals(sourceType) && !"fullAndIncre".equals(migrationMode);
+        if (skipCapture) {
+            logger.info("[{}] TiDB 仅全量任务，跳过 capture（增量才需要 TiCDC changefeed）", threadName);
+        } else if (!startCaptureProcess()) {
             sendFailedStatus("E3001", "capture 进程启动失败");
             stopped.set(true);
             return;
@@ -78,6 +84,23 @@ public class FullMigrationTask extends AbstractTaskExecutor {
 
         lastSuccessfulStatus = "INCREMENT_RUNNING";
         logger.info("[{}] 增量同步任务启动完成，进入持续监控模式", threadName);
+    }
+
+    /**
+     * 僵死看门狗的活性文件：进入增量阶段后 capture/extract/increment 各自的活性文件才出现，
+     * 全量阶段它们尚不存在，checkPipelineStalled 会因文件缺失而跳过、不误判。
+     */
+    @Override
+    protected java.util.List<String> stallLivenessFiles() {
+        return incrementLivenessFiles();
+    }
+
+    /** 三个守护进程都 RUNNING 时才做僵死检查；有进程正在被 ProcessGuard 重启则跳过（交崩溃恢复处理）。 */
+    @Override
+    protected boolean guardsHealthyForStallCheck() {
+        return (captureGuard == null || captureGuard.isRunning())
+                && (extractGuard == null || extractGuard.isRunning())
+                && (incrementGuard == null || incrementGuard.isRunning());
     }
 
     @Override

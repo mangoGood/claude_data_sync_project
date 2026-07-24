@@ -42,6 +42,13 @@ public class DataMigration {
     private boolean shardEnabled;
     private long shardMinRows;
     private int shardCount;
+    /**
+     * 分片迁移写入进度时用的 lastMigratedId 哨兵值。分片有多个并发游标，各自搬运不同 id 区间，
+     * 无法归一成单一续传位点——若像串行那样记录某个游标的 id，崩溃续传会按该 id 做
+     * {@code WHERE id > lastId} 单游标扫描，从而跳过其它游标尚未搬运的低位区间而<b>丢数据</b>。
+     * 故分片进度一律记 -1：续传时据此识别“上次是未完成的分片迁移”，清空目标表后从头重搬。
+     */
+    private static final long SHARDED_LAST_ID_SENTINEL = -1L;
     // 列处理（仅表级同步、mysql→mysql）：SELECT 行过滤 + INSERT 列名映射；附加列由建表 DEFAULT 承载
     private com.migration.config.ColumnProcessingConfig columnProcessing;
 
@@ -158,6 +165,10 @@ public class DataMigration {
             return new int[]{0, 0};
         }
         
+        // 崩溃续传前的分片进度纠偏：上次是未完成的分片迁移（lastMigratedId 记为 -1 哨兵）时，
+        // 各分片游标的部分成果无法归一成单一续传点，必须清空目标表后从头重搬，否则会漏数据。
+        resetIfIncompleteShardedProgress(table);
+
         List<String> columns = getColumnNames(table);
         String columnList = String.join(", ", columns);
 
@@ -172,6 +183,39 @@ public class DataMigration {
         }
 
         return migrateDataBatch(table, columnList, totalRows, primaryKeyColumn);
+    }
+
+    /**
+     * 若上次是未完成的分片迁移（进度存在、非 COMPLETED、lastMigratedId 为分片哨兵 -1），
+     * 清空目标表并删除该表进度，使本次从头重搬。分片各游标的部分成果不可信：串行续传按
+     * 单一 id 扫描会漏搬其它游标未覆盖的低位区间，且全量 INSERT 非幂等、直接重搬会撞已存在的行，
+     * 故先 TRUNCATE 目标表再全新搬运。清表失败仅告警（最坏退回旧行为，不比不清更糟）。
+     */
+    private void resetIfIncompleteShardedProgress(TableInfo table) {
+        if (progressManager == null || !progressManager.isEnabled()) {
+            return;
+        }
+        String tableName = table.getTableName();
+        try {
+            MigrationProgress existing = progressManager.getProgress(tableName);
+            if (existing == null || "COMPLETED".equals(existing.getStatus())
+                    || existing.getLastMigratedId() != SHARDED_LAST_ID_SENTINEL) {
+                return;
+            }
+            logger.warn("表 {} 上次为未完成的分片迁移，分片进度不可续传：清空目标表后从头重搬", tableName);
+            String truncateSql = "TRUNCATE TABLE " + targetQuoteIdentifier(table.getTargetTableName());
+            try {
+                targetConnection.execute(truncateSql);
+            } catch (SQLException e) {
+                // 个别库/权限不支持 TRUNCATE 时退回 DELETE
+                logger.warn("TRUNCATE 失败（{}），改用 DELETE 清空目标表 {}", e.getMessage(), table.getTargetTableName());
+                targetConnection.execute("DELETE FROM " + targetQuoteIdentifier(table.getTargetTableName()));
+            }
+            progressManager.deleteProgress(tableName);
+            logger.info("表 {} 目标已清空、进度已重置，将从头重新迁移", tableName);
+        } catch (SQLException e) {
+            logger.error("表 {} 分片续传纠偏失败（继续按原逻辑，可能残留不一致）: {}", tableName, e.getMessage());
+        }
     }
 
     /**
@@ -266,7 +310,7 @@ public class DataMigration {
                 }
                 if (progressManager != null && progressManager.isEnabled()) {
                     try {
-                        progressManager.updateProgress(tableName, aggregateRows.get(), maxSeenId.get());
+                        progressManager.updateProgress(tableName, aggregateRows.get(), SHARDED_LAST_ID_SENTINEL);
                     } catch (SQLException e) {
                         logger.error("更新进度失败", e);
                     }
@@ -325,7 +369,7 @@ public class DataMigration {
         logger.info("表 {} 分片并行迁移完成，成功: {}, 失败: {}", tableName, successCount.get(), failCount.get());
         if (progressManager != null && progressManager.isEnabled()) {
             try {
-                progressManager.updateProgress(tableName, aggregateRows.get(), maxSeenId.get());
+                progressManager.updateProgress(tableName, aggregateRows.get(), SHARDED_LAST_ID_SENTINEL);
                 progressManager.completeMigration(tableName);
             } catch (SQLException e) { logger.error("标记迁移完成失败", e); }
         }

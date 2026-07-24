@@ -26,27 +26,29 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
     private String inputDir;
     private String outputDir;
-    private long seqno = 1;
+    // 下列成员对子类开放（TiCDCExtractor 复用同一套 seqno/管线/列元数据缓存，
+    // 只替换“把一条 capture 记录解析成 THLEvent”这一步）
+    protected long seqno = 1;
     private String seqnoFile;
 
     private String sourceHost;
     private int sourcePort;
     private String sourceUser;
     private String sourcePassword;
-    private Connection sourceConnection;
+    protected Connection sourceConnection;
 
     private Map<Long, Map<String, String>> tableMapCache = new HashMap<>();
     private Map<String, List<String>> tableSchemaCache = new HashMap<>();
     private Map<String, List<String>> tableColumnTypeCache = new HashMap<>();
-    private Map<String, List<String>> tableColumnFullTypeCache = new HashMap<>();
-    private Map<String, Map<String, List<String>>> enumSetValuesCache = new HashMap<>();
+    protected Map<String, List<String>> tableColumnFullTypeCache = new HashMap<>();
+    protected Map<String, Map<String, List<String>>> enumSetValuesCache = new HashMap<>();
     private Map<String, List<String>> primaryKeyCache = new HashMap<>();
 
-    private Pipeline pipeline;
+    protected Pipeline pipeline;
 
-    private String checkpointBinlogFile;
-    private long checkpointBinlogPosition;
-    private boolean skipBeforeCheckpoint = false;
+    protected String checkpointBinlogFile;
+    protected long checkpointBinlogPosition;
+    protected boolean skipBeforeCheckpoint = false;
 
     @Override
     protected void doInitialize() throws Exception {
@@ -614,7 +616,7 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return parts;
     }
 
-    private Map<String, List<String>> parseEnumSetValuesMap(String enumSetValuesStr) {
+    protected Map<String, List<String>> parseEnumSetValuesMap(String enumSetValuesStr) {
         Map<String, List<String>> map = new HashMap<>();
         if (enumSetValuesStr == null || enumSetValuesStr.isEmpty()) {
             return map;
@@ -936,25 +938,25 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return parts.toArray(new String[0]);
     }
 
-    private boolean isBinaryType(String type) {
+    protected boolean isBinaryType(String type) {
         if (type == null) return false;
         String lower = type.toLowerCase();
         return lower.equals("binary") || lower.equals("varbinary");
     }
 
-    private boolean isBlobType(String type) {
+    protected boolean isBlobType(String type) {
         if (type == null) return false;
         String lower = type.toLowerCase();
         return lower.equals("tinyblob") || lower.equals("blob") ||
                 lower.equals("mediumblob") || lower.equals("longblob");
     }
 
-    private boolean isBitType(String type) {
+    protected boolean isBitType(String type) {
         if (type == null) return false;
         return type.toLowerCase().equals("bit");
     }
 
-    private boolean isTextType(String type) {
+    protected boolean isTextType(String type) {
         if (type == null) return false;
         String lower = type.toLowerCase();
         return lower.equals("tinytext") || lower.equals("text") ||
@@ -962,7 +964,7 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                 lower.equals("char") || lower.equals("varchar");
     }
 
-    private boolean isJsonType(String type) {
+    protected boolean isJsonType(String type) {
         if (type == null) return false;
         return type.toLowerCase().equals("json");
     }
@@ -988,12 +990,12 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return data;
     }
 
-    private String escapeString(String value) {
+    protected String escapeString(String value) {
         if (value == null) return "";
         return value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "\\r");
     }
 
-    private boolean isDatetimeType(String type) {
+    protected boolean isDatetimeType(String type) {
         if (type == null) return false;
         String lower = type.toLowerCase();
         return lower.equals("datetime") || lower.equals("timestamp") || lower.equals("date") || lower.equals("time");
@@ -1067,7 +1069,7 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
      * 对表级 DDL 影响的每张表，移除全部按 {@code database.table} 键缓存的列元数据，
      * 使下一个数据事件重新查询 information_schema，拿到 DDL 后的最新列布局。
      */
-    private void invalidateColumnCachesForDdl(String sql, String defaultDatabase) {
+    protected void invalidateColumnCachesForDdl(String sql, String defaultDatabase) {
         for (String cacheKey : DdlDatabaseAnltrExtractor.extractAffectedTables(sql, defaultDatabase)) {
             boolean removed = false;
             removed |= tableSchemaCache.remove(cacheKey) != null;
@@ -1081,7 +1083,7 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         }
     }
 
-    private List<String> getTableColumns(String database, String table) {
+    protected List<String> getTableColumns(String database, String table) {
         String cacheKey = database + "." + table;
         if (tableSchemaCache.containsKey(cacheKey)) {
             return tableSchemaCache.get(cacheKey);
@@ -1107,7 +1109,7 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return columns;
     }
 
-    private List<String> getTableColumnTypes(String database, String table) {
+    protected List<String> getTableColumnTypes(String database, String table) {
         String cacheKey = database + "." + table;
         if (tableColumnTypeCache.containsKey(cacheKey)) {
             return tableColumnTypeCache.get(cacheKey);
@@ -1181,7 +1183,7 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return values;
     }
 
-    private List<String> getTablePrimaryKeys(String database, String table) {
+    protected List<String> getTablePrimaryKeys(String database, String table) {
         String cacheKey = database + "." + table;
         if (primaryKeyCache.containsKey(cacheKey)) {
             return primaryKeyCache.get(cacheKey);

@@ -6,8 +6,11 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class ConnectionStringParser {
-    private static final Pattern MYSQL_PATTERN = 
-        Pattern.compile("mysql://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+    // 口令部分用 * 而非 +：空口令实例（如默认安装的 TiDB root）连接串形如
+    // mysql://root:@host:port，用 + 会整体匹配失败并抛 IllegalArgumentException。
+    // 非空口令的匹配结果不受影响（[^@] 仍然贪婪吃到 @ 之前）。
+    private static final Pattern MYSQL_PATTERN =
+        Pattern.compile("mysql://([^:]+):([^@]*)@([^:]+):(\\d+)(?:/(.+))?");
     
     private static final Pattern PG_PATTERN = 
         Pattern.compile("postgresql://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");

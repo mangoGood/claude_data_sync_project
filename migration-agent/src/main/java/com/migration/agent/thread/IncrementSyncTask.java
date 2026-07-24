@@ -63,6 +63,20 @@ public class IncrementSyncTask extends AbstractTaskExecutor {
         logger.info("[{}] 增量同步任务恢复完成，进入持续监控模式", threadName);
     }
 
+    /** 仅增量恢复任务：全程都在增量阶段，capture/extract/increment 各自的活性文件即僵死看门狗信号。 */
+    @Override
+    protected java.util.List<String> stallLivenessFiles() {
+        return incrementLivenessFiles();
+    }
+
+    /** 三个守护进程都 RUNNING 时才做僵死检查；有进程正在被 ProcessGuard 重启则跳过（交崩溃恢复处理）。 */
+    @Override
+    protected boolean guardsHealthyForStallCheck() {
+        return (captureGuard == null || captureGuard.isRunning())
+                && (extractGuard == null || extractGuard.isRunning())
+                && (incrementGuard == null || incrementGuard.isRunning());
+    }
+
     @Override
     protected boolean checkProcessHealth() {
         String threadName = "IncrementSyncTask-" + taskId;

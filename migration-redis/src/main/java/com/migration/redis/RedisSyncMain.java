@@ -117,6 +117,10 @@ public final class RedisSyncMain {
     private volatile long currentDb;
     private volatile String error;
     private int sinceFlush;
+    /** 进度文件上次落盘的墙钟时刻，供增量阶段“按时间兜底刷新”判断，让空闲时进度文件也保持活性。 */
+    private volatile long lastProgressWriteMs;
+    /** 增量阶段进度文件最长刷新间隔：PSYNC 每 ~10s 的 PING 会驱动刷新，据此让 agent 僵死看门狗有信号。 */
+    private static final long PROGRESS_TIME_REFRESH_MS = 5000;
 
     private RedisSyncMain(String taskId, Properties props) {
         this.taskId = taskId;
@@ -188,6 +192,11 @@ public final class RedisSyncMain {
                 if (event instanceof PreRdbSyncEvent) {
                     phase = "FULL";
                     copiedKeys = 0;
+                    // 全量开始前清空目标选中库：RESTORE...REPLACE 只覆盖 RDB 里出现的键，绝不删除
+                    // RDB 中缺席的键。崩溃重启触发的全量重跑若不先清库，源库在中断窗口里删掉的键会
+                    // 作为“幽灵键”永久残留在目标，导致断点续传后目标多出这些键、数据不一致。
+                    // 清库 + 全量 RESTORE = 目标严格镜像源库当前快照，随后增量继续，最终一致。
+                    flushTargetSelectedDbs();
                     writeProgress();
                 } else if (event instanceof KeyValuePair) {
                     applyRdbKey((KeyValuePair<?, ?>) event);
@@ -272,6 +281,14 @@ public final class RedisSyncMain {
     // ==================== 增量（复制命令流 verbatim 转发） ====================
 
     private void applyCommand(DefaultCommand cmd) {
+        // 按时间兜底刷新进度文件：PSYNC 每 ~10s 发 PING（也会走到这里），据此即便源库空闲、
+        // 无数据命令，进度文件的 mtime 也会持续推进——agent 的僵死看门狗据此判活；引擎一旦冻结，
+        // 本方法不再被回调，进度文件立刻停更、被检出。
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastProgressWriteMs >= PROGRESS_TIME_REFRESH_MS) {
+            writeProgress();
+        }
+
         String name = new String(cmd.getCommand(), StandardCharsets.UTF_8).toUpperCase();
         byte[][] cargs = cmd.getArgs();
 
@@ -351,6 +368,28 @@ public final class RedisSyncMain {
         }
         if (password != null && !password.isEmpty()) {
             conf.setAuthPassword(password);
+        }
+    }
+
+    /**
+     * 全量开始前清空目标的同步范围：选中库集为空（整实例同步）则 FLUSHALL；否则逐个选中库 FLUSHDB。
+     * 只清同步范围内的库，不误伤目标上其它库。清库失败仅告警不中断——最坏退回“可能残留幽灵键”，
+     * 不比不清更差。
+     */
+    private void flushTargetSelectedDbs() {
+        try {
+            if (selectedDbs == null) {
+                target.flushAll();
+            } else {
+                for (Long db : selectedDbs) {
+                    target.select(db.intValue());
+                    target.flushDB();
+                }
+                targetSelectedDb = -1; // 强制下一次 selectTarget 重新 SELECT，避免复用被 flush 期间改动的库号
+            }
+            logger.info("全量前已清空目标同步范围: {}", selectedDbs == null ? "ALL" : selectedDbs);
+        } catch (Exception e) {
+            logger.warn("全量前清空目标失败（继续，可能残留已删除键）: {}", e.getMessage());
         }
     }
 
@@ -435,6 +474,7 @@ public final class RedisSyncMain {
     }
 
     private void writeProgress() {
+        lastProgressWriteMs = System.currentTimeMillis();
         try {
             Map<String, Object> p = new LinkedHashMap<>();
             p.put("phase", phase);
