@@ -57,9 +57,12 @@ public class MongoSyncTask extends AbstractTaskExecutor {
                 }, getRunningStatus());
 
         if (!mongoGuard.startAndGuard()) {
-            sendFailedStatus("E3001", "mongo 同步进程启动失败");
-            stopped.set(true);
-            return;
+            // 首次「就绪等待」窗口内进程夭折（启动即崩溃 / 早期被 kill）不再直接判死：此时 ProcessGuard
+            // 守护线程已启动，会按熔断+重试策略自动重启恢复（与增量阶段崩溃走同一恢复路径）。真正无法
+            // 启动时，guard 重试耗尽后 monitorLoop 的健康检查（!isGuarding() && !isRunning()）会上报
+            // FAILED。此前直接 sendFailedStatus+stopped 会让守护线程因 stopped=true 立即退出、
+            // 漏掉「启动窗口内崩溃」这一本可自愈的场景（全量拷贝极快时尤其容易命中）。
+            logger.warn("[{}] mongo 首次启动就绪等待未通过，转入 ProcessGuard 自愈恢复", threadName);
         }
 
         sendStatus("FULL_MIGRATING", "Mongo 全量同步中", 0);
@@ -100,6 +103,14 @@ public class MongoSyncTask extends AbstractTaskExecutor {
                                 lastSuccessfulStatus = "INCREMENT_RUNNING";
                                 sendStatus("INCREMENT_RUNNING", "Mongo 增量同步中（Change Streams）", 100,
                                         total, total, null, 100, copied, 0L);
+                            }
+                            // 僵死看门狗：增量阶段 mongo 引擎靠 Change Streams 每 ~5s 的兜底 flush
+                            // 刷新 mongo_progress.json；进程仍存活（isRunning=true）但进度文件长时间
+                            // 不刷新 = 引擎冻结/死锁，上报失败（与 RedisSyncTask 同构）。
+                            if (mongoGuard != null && mongoGuard.isRunning() && incrementProgressStalled()) {
+                                logger.error("[{}] Mongo 增量引擎僵死：进程存活但进度文件长时间未刷新，判定失败", threadName);
+                                sendFailedStatus("E3005", "Mongo 同步管线僵死：进程存活但长时间无进展（疑似死锁/阻塞/冻结）");
+                                stopped.set(true);
                             }
                             break;
                         }
@@ -172,6 +183,27 @@ public class MongoSyncTask extends AbstractTaskExecutor {
             }
         }
         super.stopAllProcesses();
+    }
+
+    /** mongo_progress.json 上次 mtime 及其推进时刻，用于增量阶段僵死判定。 */
+    private long lastProgressMtime = 0L;
+    private long lastProgressAdvanceTime = 0L;
+
+    /** 进度文件超过 {@link AgentConfig#getStallThresholdMs()} 未刷新则判僵死（文件缺失时重置基线、不误判）。 */
+    private boolean incrementProgressStalled() {
+        File f = new File("files/" + taskId + "/mongo_progress.json");
+        long now = System.currentTimeMillis();
+        if (!f.exists()) {
+            lastProgressAdvanceTime = 0L;
+            return false;
+        }
+        long mtime = f.lastModified();
+        if (lastProgressAdvanceTime == 0L || mtime != lastProgressMtime) {
+            lastProgressMtime = mtime;
+            lastProgressAdvanceTime = now;
+            return false;
+        }
+        return (now - lastProgressAdvanceTime) >= config.getStallThresholdMs();
     }
 
     private Map<String, Object> readProgress() {
