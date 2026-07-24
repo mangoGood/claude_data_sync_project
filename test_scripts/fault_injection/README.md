@@ -31,7 +31,19 @@ python3 fault_injection/hang_detect.py increment
 # Redis：崩溃自愈一致性 + 引擎僵死检测
 python3 fault_injection/redis_resume.py resume --minutes 5
 python3 fault_injection/redis_resume.py hang
+
+# 异构链路 pg2pg / mysql2pg / pg2mysql / mongo2mongo（dblib.py 引擎适配 + 跨引擎 Python 指纹）
+#   需 venv：python3 -m venv --system-site-packages v && v/bin/pip install psycopg2-binary pymongo
+python3 fault_injection/xdb_resume.py pg2pg       --minutes 5           # 全量+增量断点续传一致
+python3 fault_injection/xdb_resume.py mysql2pg    --minutes 5
+python3 fault_injection/xdb_resume.py pg2mysql    --mode full           # 仅全量：杀全量进程→retry→一致
+python3 fault_injection/xdb_resume.py mongo2mongo --mode full           # mongo 单进程受守护，早期崩溃自愈
+python3 fault_injection/xdb_hang.py   pg2pg    capture                  # 僵死检测（冻结 capture/extract/increment）
+python3 fault_injection/xdb_hang.py   mongo2mongo                       # mongo 冻结 → 进度文件停更 → FAILED
 ```
+
+> 覆盖 pg/mysql/mongo 异构链路。要点见 [[fault-injection-pg-mongo-2026-07]]：mysql→pg 目标表在「源库名」
+> schema（非 public）；mongo 同名库镜像（忽略 targetDbName）；PG 逻辑槽 `migration_slot_<taskId>` 按库隔离。
 
 退出码 0 = 全通过。
 
