@@ -59,6 +59,10 @@ public class AgentConfig {
         props.setProperty("monitor.extract.interval.ms", "30000");
         props.setProperty("monitor.increment.interval.ms", "10000");
         props.setProperty("monitor.progress.interval.ms", "3000");
+        // 僵死看门狗：增量管线的活性文件（心跳驱动 rto_metric，健康时每 ~5s 刷新）超过该时长
+        // 未更新即判定管线僵死。取值须大于任一子进程崩溃后被 ProcessGuard 重启并追平心跳所需的
+        // 最坏时间（重启约 15~40s + 追平），90s 足以覆盖且不误伤，同时能在 1 分半内发现真正的冻结。
+        props.setProperty("monitor.stall.threshold.ms", "90000");
 
         props.setProperty("http.server.port", "8083");
 
@@ -198,6 +202,10 @@ public class AgentConfig {
 
     public long getProgressMonitorIntervalMs() {
         return Long.parseLong(props.getProperty("monitor.progress.interval.ms"));
+    }
+
+    public long getStallThresholdMs() {
+        return Long.parseLong(props.getProperty("monitor.stall.threshold.ms", "90000"));
     }
 
     public int getHttpServerPort() {

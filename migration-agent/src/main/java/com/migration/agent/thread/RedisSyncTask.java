@@ -116,6 +116,13 @@ public class RedisSyncTask extends AbstractTaskExecutor {
                                 sendStatus("INCREMENT_RUNNING", "Redis 增量同步中（复制命令流）", 100,
                                         (int) total, (int) total, null, 100, copied, total);
                             }
+                            // 僵死看门狗：增量阶段 redis 引擎会靠 PSYNC 心跳按时间兜底刷新进度文件，
+                            // 进程仍存活（isRunning=true）但进度文件长时间不更新 = 引擎冻结/死锁，上报失败。
+                            if (redisGuard != null && redisGuard.isRunning() && incrementProgressStalled()) {
+                                logger.error("[{}] Redis 增量引擎僵死：进程存活但进度文件长时间未刷新，判定失败", threadName);
+                                sendFailedStatus("E3005", "Redis 同步管线僵死：进程存活但长时间无进展（疑似死锁/阻塞/冻结）");
+                                stopped.set(true);
+                            }
                             break;
                         }
                         case "DONE": {
@@ -185,6 +192,27 @@ public class RedisSyncTask extends AbstractTaskExecutor {
             }
         }
         super.stopAllProcesses();
+    }
+
+    /** redis_progress.json 上次 mtime 及其推进时刻，用于增量阶段僵死判定。 */
+    private long lastProgressMtime = 0L;
+    private long lastProgressAdvanceTime = 0L;
+
+    /** 进度文件超过 {@link AgentConfig#getStallThresholdMs()} 未刷新则判僵死（文件缺失时重置基线、不误判）。 */
+    private boolean incrementProgressStalled() {
+        File f = new File("files/" + taskId + "/redis_progress.json");
+        long now = System.currentTimeMillis();
+        if (!f.exists()) {
+            lastProgressAdvanceTime = 0L;
+            return false;
+        }
+        long mtime = f.lastModified();
+        if (lastProgressAdvanceTime == 0L || mtime != lastProgressMtime) {
+            lastProgressMtime = mtime;
+            lastProgressAdvanceTime = now;
+            return false;
+        }
+        return (now - lastProgressAdvanceTime) >= config.getStallThresholdMs();
     }
 
     private Map<String, Object> readProgress() {

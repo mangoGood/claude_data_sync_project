@@ -129,6 +129,16 @@ public abstract class AbstractTaskExecutor implements Runnable {
                     break;
                 }
 
+                // 僵死看门狗：进程仍存活（isAlive=true）但长时间无进展——线程死锁 / 阻塞 / 被冻结
+                // 时，进程崩溃检测（checkProcessHealth 只看 isAlive）永远发现不了。此处用心跳驱动的
+                // 活性文件是否持续刷新来识别“假活”，超阈值即上报失败。
+                if (checkPipelineStalled()) {
+                    logger.error("[{}] 检测到同步管线僵死（进程存活但长时间无进展），终止任务", threadName);
+                    sendFailedStatus("E3005", "同步管线僵死：进程存活但长时间无进展（疑似线程死锁/阻塞/冻结），已判定任务失败");
+                    stopped.set(true);
+                    break;
+                }
+
                 collectMetrics(taskMetrics);
                 sendPeriodicMetricsUpdate(taskMetrics);
                 persistMetrics(taskMetrics);
@@ -141,6 +151,82 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 break;
             }
         }
+    }
+
+    // ==================== 僵死看门狗 ====================
+
+    /** 每个活性文件各自的基线：mtime + 该 mtime 上次推进的墙钟时刻。 */
+    private final Map<String, long[]> livenessBaseline = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 子类返回一组“活性文件”——每个都由某个受守护子进程<b>自身的常在活动</b>持续刷新
+     * （健康时每几秒更新，进程僵死/冻结时立刻停更），返回空表示不启用僵死检测。
+     *
+     * <p>为什么要一进程一个文件、而不是只看一个下游信号：若只监控增量端 rto_metric，
+     * 上游 capture 冻结后，extract/increment 会继续把已有积压排空、rto_metric 仍在推进，
+     * 从而把上游冻结掩盖数分钟。改为每个进程各看自己直接写的文件，谁冻结谁的文件立刻停更。
+     */
+    protected java.util.List<String> stallLivenessFiles() {
+        return java.util.Collections.emptyList();
+    }
+
+    /**
+     * 僵死看门狗是否应在本轮执行。仅当所有受守护子进程都处于 RUNNING 时才检查——
+     * 子进程崩溃后被 ProcessGuard 重启的窗口内其活性文件本就会短暂停更，此时交给崩溃恢复路径
+     * 处理、跳过僵死判定，避免把“正在重启”误判成“僵死”。冻结（SIGSTOP）下进程 isAlive 仍为 true，
+     * 不受此门控影响，照常被检出。
+     */
+    protected boolean guardsHealthyForStallCheck() {
+        return true;
+    }
+
+    /**
+     * 任一活性文件超过 {@link AgentConfig#getStallThresholdMs()} 未刷新即判僵死。
+     * 文件尚不存在（对应进程还没起或还没写第一笔）时跳过该文件、不误判。
+     */
+    protected boolean checkPipelineStalled() {
+        java.util.List<String> files = stallLivenessFiles();
+        if (files.isEmpty() || !guardsHealthyForStallCheck()) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        long threshold = config.getStallThresholdMs();
+        for (String path : files) {
+            File f = new File(path);
+            if (!f.exists()) {
+                livenessBaseline.remove(path);
+                continue;
+            }
+            long mtime = f.lastModified();
+            long[] base = livenessBaseline.get(path);
+            if (base == null || mtime != base[0]) {
+                livenessBaseline.put(path, new long[]{mtime, now});
+                continue;
+            }
+            long stalledMs = now - base[1];
+            if (stalledMs >= threshold) {
+                logger.error("[{}] 活性文件 {} 已 {}ms 未刷新（阈值 {}ms），判定管线僵死",
+                        taskId, path, stalledMs, threshold);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * SQL 增量管线（capture+extract+increment）的一组活性文件，均落在 {@code binlog_output/}，
+     * 且每个都由对应进程<b>自身的常在循环活动</b>驱动、与源类型及业务心跳疏密无关——因此
+     * mysql / tidb / oracle / pg 各源一致适用，也不会因“大积压追平时长时间碰不到心跳事件”而误判：
+     * <ul>
+     *   <li>{@code capture_liveness} —— capture 基类活性线程每 ~3s 改写（AbstractCapture，源无关）；capture 冻结即停更；</li>
+     *   <li>{@code capture_queue_depth} —— extract 每个扫描循环（~1s）无条件改写；extract 冻结即停更；</li>
+     *   <li>{@code increment_liveness} —— increment 主循环空转 + 逐事件应用时每 ~2s 改写；increment 冻结即停更。</li>
+     * </ul>
+     */
+    protected java.util.List<String> incrementLivenessFiles() {
+        String dir = "./files/" + taskId + "/binlog_output/";
+        return java.util.Arrays.asList(
+                dir + "capture_liveness", dir + "capture_queue_depth", dir + "increment_liveness");
     }
 
     // ==================== 公共方法 ====================

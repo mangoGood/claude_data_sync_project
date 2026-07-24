@@ -331,6 +331,7 @@ public class ContinuousIncrementMain {
         try (DirectoryChangeWatcher watcher = new DirectoryChangeWatcher(thlDirectory)) {
             while (running.get()) {
                 try {
+                    touchLiveness();            // 空闲时也保持活性信号（主循环仍在调度）
                     scanAndProcessThlFiles();
                     // 阻塞到有新 THL 写入立即唤醒（Linux inotify ~ms），或兜底超时；返回值仅用于日志
                     watcher.awaitChange(watchFallbackMs);
@@ -354,6 +355,7 @@ public class ContinuousIncrementMain {
     private void startPolling() {
         while (running.get()) {
             try {
+                touchLiveness();
                 scanAndProcessThlFiles();
                 Thread.sleep(scanInterval);
             } catch (InterruptedException e) {
@@ -471,6 +473,7 @@ public class ContinuousIncrementMain {
             // 不反序列化，大幅加快增量进程重启时“从 seqno 跳到当前位点”；旧格式自动回退为逐条反序列化跳过。
             while ((event = reader.readEventAfter(lastExecutedSeqno)) != null) {
                 if (!running.get()) { aborted = true; break; }
+                touchLiveness();  // 逐事件刷新活性：单文件大积压追平（碰不到心跳事件）时也不误判僵死
 
                 if (event.getType() == THLEvent.HEARTBEAT_EVENT) {
                     lastExecutedSeqno = event.getSeqno();
@@ -525,7 +528,7 @@ public class ContinuousIncrementMain {
                 if (typedDmls != null && !typedDmls.isEmpty()) {
                     logger.info("为seqno={}生成了{}条参数化SQL（类型化值管道）", event.getSeqno(), typedDmls.size());
                 } else if (sqlStatements != null && !sqlStatements.isEmpty()) {
-                    logger.info("为seqno={}生成了{}条SQL语句", sqlStatements.size(), event.getSeqno());
+                    logger.info("为seqno={}生成了{}条SQL语句", event.getSeqno(), sqlStatements.size());
                 }
 
                 // 按事务批量执行SQL，确保同一THL事件内的SQL原子性
@@ -1047,6 +1050,32 @@ public class ContinuousIncrementMain {
         }
     }
 
+    /**
+     * 活性心跳：只要增量进程还在推进（主循环空转 or 逐事件应用积压），就每 ~2s 改写
+     * {@code binlog_output/increment_liveness}。与 rto_metric（仅心跳事件才刷）不同，它对<b>任意</b>
+     * 应用活动都刷新——大积压追平时即便长时间碰不到心跳事件，也不会被误判僵死；进程真冻结才停更。
+     * 源无关：不依赖各源心跳事件的疏密。
+     */
+    private volatile long lastLivenessWriteMs = 0;
+
+    private void touchLiveness() {
+        long now = System.currentTimeMillis();
+        if (now - lastLivenessWriteMs < 2000) {
+            return; // 限流，避免逐事件高频写盘
+        }
+        lastLivenessWriteMs = now;
+        File dir = new File("./files/" + taskId + "/binlog_output");
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        File f = new File(dir, "increment_liveness");
+        try (PrintWriter pw = new PrintWriter(new FileWriter(f, false))) {
+            pw.println(now);
+        } catch (IOException e) {
+            logger.debug("写 increment_liveness 失败: {}", e.getMessage());
+        }
+    }
+
     private void writeRtoMetric(long rtoMs) {
         String metricsDir = "./files/" + taskId + "/binlog_output";
         File dir = new File(metricsDir);
@@ -1241,6 +1270,7 @@ public class ContinuousIncrementMain {
             THLEvent event;
             while ((event = reader.readEventAfter(readCursor)) != null) {
                 if (!running.get()) { aborted = true; break; }
+                touchLiveness();  // 并行路径逐事件刷新活性，与串行路径一致
                 readCursor = event.getSeqno();
 
                 boolean isSkip = (!skipEventIds.isEmpty() && event.getEventId() != null && skipEventIds.contains(event.getEventId()))
