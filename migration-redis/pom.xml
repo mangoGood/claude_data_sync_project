@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>com.migration</groupId>
+        <artifactId>migration</artifactId>
+        <version>1.0.0</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>migration-redis</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Migration Redis</name>
+    <description>Redis to Redis sync: PSYNC full (RDB snapshot) + increment (replication command stream)</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.migration</groupId>
+            <artifactId>migration-common</artifactId>
+        </dependency>
+
+        <!-- 复制协议侧（源）：PSYNC 握手 + RDB 快照解析 + 增量命令流（redis-shake 同底座）。
+             DumpRdbVisitor 让全量 KeyValuePair 直接给出 RESTORE 可用的序列化字节，天然覆盖
+             string/list/set/hash/zset/stream 等所有类型，无需自实现 RDB/listpack/LZF 解析。 -->
+        <dependency>
+            <groupId>com.moilioncircle</groupId>
+            <artifactId>redis-replicator</artifactId>
+            <version>3.9.0</version>
+        </dependency>
+
+        <!-- 写入侧（目标）：全量 RESTORE、增量命令原样转发（sendCommand）。 -->
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>5.2.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.migration.redis.RedisSyncMain</mainClass>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

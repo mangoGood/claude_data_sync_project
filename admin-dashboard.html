@@ -786,7 +786,7 @@
 
     <!-- 创建任务模态框 -->
     <div class="modal" id="createTaskModal">
-        <div class="modal-content" style="width: 600px;">
+        <div class="modal-content" style="width: 680px;">
             <div class="modal-header">
                 <h3 class="modal-title">创建同步任务</h3>
                 <span class="modal-close" id="closeModal">&times;</span>
@@ -819,6 +819,11 @@
                             <div class="db-type-card-name">MongoDB</div>
                             <div class="db-type-card-desc">副本集 / 分片集群</div>
                         </div>
+                        <div class="db-type-card" id="sourceTypeRedis" onclick="selectSourceType('redis')">
+                            <div class="db-type-card-icon">🔴</div>
+                            <div class="db-type-card-name">Redis</div>
+                            <div class="db-type-card-desc">Redis 5+ / 6 / 7</div>
+                        </div>
                     </div>
                 </div>
                 <div class="db-type-section">
@@ -843,6 +848,11 @@
                             <div class="db-type-card-icon">🔎</div>
                             <div class="db-type-card-name">Elasticsearch</div>
                             <div class="db-type-card-desc">ES 7.x / 8.x（仅 MySQL 源）</div>
+                        </div>
+                        <div class="db-type-card" id="targetTypeRedis" onclick="selectTargetType('redis')">
+                            <div class="db-type-card-icon">🔴</div>
+                            <div class="db-type-card-name">Redis</div>
+                            <div class="db-type-card-desc">Redis 5+（仅 Redis 源）</div>
                         </div>
                     </div>
                 </div>

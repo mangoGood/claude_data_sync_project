@@ -23,6 +23,7 @@
         <module>migration-subscribe</module>
         <module>migration-mongo</module>
         <module>migration-elastic</module>
+        <module>migration-redis</module>
         <module>migration-agent</module>
     </modules>
 

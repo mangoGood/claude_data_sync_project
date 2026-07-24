@@ -1137,26 +1137,27 @@
         }
 
         .db-type-section {
-            margin-bottom: 28px;
+            margin-bottom: 20px;
         }
 
         .db-type-section-title {
             font-size: 14px;
             font-weight: 500;
             color: #333;
-            margin-bottom: 12px;
+            margin-bottom: 10px;
         }
 
+        /* 响应式网格：数据库类型较多时自动换行，每卡保持舒适的最小宽度，不再挤在一行 */
         .db-type-cards {
-            display: flex;
-            gap: 16px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+            gap: 10px;
         }
 
         .db-type-card {
-            flex: 1;
             border: 2px solid #e8e8e8;
             border-radius: 8px;
-            padding: 20px;
+            padding: 14px 8px;
             cursor: pointer;
             transition: all 0.2s;
             text-align: center;
@@ -1177,10 +1178,10 @@
         .db-type-card.selected::after {
             content: '✓';
             position: absolute;
-            top: 8px;
-            right: 12px;
+            top: 6px;
+            right: 8px;
             color: #1890ff;
-            font-size: 16px;
+            font-size: 14px;
             font-weight: bold;
         }
 
@@ -1206,20 +1207,21 @@
         }
 
         .db-type-card-icon {
-            font-size: 32px;
-            margin-bottom: 8px;
+            font-size: 26px;
+            margin-bottom: 6px;
         }
 
         .db-type-card-name {
-            font-size: 15px;
+            font-size: 14px;
             font-weight: 500;
             color: #333;
             margin-bottom: 4px;
         }
 
         .db-type-card-desc {
-            font-size: 12px;
+            font-size: 11px;
             color: #999;
+            line-height: 1.4;
         }
 
         /* 同步对象选择 */

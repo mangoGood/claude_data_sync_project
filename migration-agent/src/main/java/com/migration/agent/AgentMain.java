@@ -428,11 +428,11 @@ public class AgentMain {
             logger.info("Resuming task: {} with mode: {}, progress: {}, status: {}", 
                 taskId, migrationMode, progress, savedStatus);
             
-            if ("fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
-                boolean skipFullMigration = "FULL_COMPLETED".equals(savedStatus) || 
+            if (isSingleProcessEngine(taskMessage) || "fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
+                boolean skipFullMigration = "FULL_COMPLETED".equals(savedStatus) ||
                                            "INCREMENT_RUNNING".equals(savedStatus) ||
                                            "SUBSCRIBE_RUNNING".equals(savedStatus);
-                
+
                 MigrationAgentThread agentThread = new MigrationAgentThread(taskMessage, kafkaProducer, taskStateService, skipFullMigration);
                 migrationAgentThreads.put(taskId, agentThread);
                 
@@ -682,6 +682,18 @@ public class AgentMain {
         }
     }
     
+    /**
+     * 单进程引擎（mongodb 源 / elasticsearch 目标 / redis 源）：全量与增量都委派给
+     * {@link MigrationAgentThread} 内对应的 SyncTask（子进程自读 migration.mode 决定全量后
+     * 是否进入增量），不走 SQL 侧 legacy MigrationTaskManager（migration-full）——否则仅全量
+     * 模式会被误路由到 SQL 全量引擎，对 Redis/Mongo/ES 无意义且不产出数据。
+     */
+    private boolean isSingleProcessEngine(TaskMessage taskMessage) {
+        return "mongodb".equalsIgnoreCase(taskMessage.getSourceType())
+                || "elasticsearch".equalsIgnoreCase(taskMessage.getTargetType())
+                || "redis".equalsIgnoreCase(taskMessage.getSourceType());
+    }
+
     private void processTask(TaskMessage taskMessage, String taskId, String migrationMode) {
         try {
             sendStatus(taskId, "RECEIVED", "Task received, preparing migration", 0);
@@ -703,7 +715,7 @@ public class AgentMain {
                 logger.warn("Config file not found at: {}", configFile.getAbsolutePath());
             }
             
-            if ("fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
+            if (isSingleProcessEngine(taskMessage) || "fullAndIncre".equals(migrationMode) || "subscribe".equals(migrationMode)) {
                 // 双向灾备的反向影子通道（DR_SHADOW）只做增量：capture 从源库最新位点起步。
                 // 绝不能跑全量——反向全量会把灾备库反灌回主库，覆盖/冲突主库存量数据。
                 boolean skipFullMigration = "DR_SHADOW".equals(taskMessage.getTaskType());

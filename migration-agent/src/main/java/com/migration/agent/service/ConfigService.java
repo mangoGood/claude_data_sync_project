@@ -389,6 +389,14 @@ public class ConfigService {
             }
             logger.info("MongoDB source config: single-process mongo sync (non-JDBC), mode={}",
                 props.getProperty("migration.mode", "full"));
+        } else if ("redis".equalsIgnoreCase(sourceType)) {
+            // Redis 同步走 migration-redis 单进程（PSYNC 复制协议，非 JDBC）：不写 SQL 侧
+            // JDBC/capture 属性。redis 子进程自读 migration.mode 决定全量后是否进入复制命令流增量。
+            if (taskMessage.getMigrationMode() != null && !taskMessage.getMigrationMode().isEmpty()) {
+                props.setProperty("migration.mode", taskMessage.getMigrationMode());
+            }
+            logger.info("Redis source config: single-process redis sync (PSYNC, non-JDBC), mode={}",
+                props.getProperty("migration.mode", "full"));
         } else {
         // 源库连接：JDBC 驱动与 URL 由方言统一生成；capture.type 仍按源库类型决定（binlog/wal/redo）
         SqlDialect sourceDialect = SqlDialect.forType(sourceType);
@@ -409,6 +417,9 @@ public class ConfigService {
 
         if ("mongodb".equalsIgnoreCase(targetType)) {
             logger.info("MongoDB target config: no JDBC driver needed for mongo sync");
+        } else if ("redis".equalsIgnoreCase(targetType)) {
+            // Redis 目标走 migration-redis 单进程（Jedis 直写，非 JDBC）：不写 JDBC 属性。
+            logger.info("Redis target config: no JDBC driver needed for redis sync");
         } else if ("elasticsearch".equalsIgnoreCase(targetType)) {
             // MySQL → ES 走 migration-elastic 单进程（REST，非 JDBC）：目标不写 JDBC 属性；
             // 增量与否由 elastic 子进程自读 migration.mode 决定（SQL 管线由 agent 编排进程，无此需求）

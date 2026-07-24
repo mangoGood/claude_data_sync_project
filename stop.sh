@@ -13,6 +13,7 @@ PROJECT_DIR="$(pwd)"
 COMPOSE_FILE="docker-compose-synctask.yml"
 DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
 MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
+REDIS_COMPOSE_FILE="docker-compose-synctask-redis.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 
 echo "[stop] 停止后端 (spring-boot:run / 38080)..."
@@ -28,6 +29,7 @@ pkill -f 'migration-full/target/migration-full-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-capture/target/migration-capture-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-extract/target/migration-extract-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-increment/target/migration-increment-1.0.0.jar' 2>/dev/null || true
+pkill -f 'migration-redis/target/migration-redis-1.0.0.jar' 2>/dev/null || true
 if [ -f "$LOG_DIR/agent.pid" ]; then kill "$(cat "$LOG_DIR/agent.pid")" 2>/dev/null || true; fi
 
 echo "[stop] 停止 Docker 基础设施 (mysql / kafka / zookeeper)，不删除容器..."
@@ -41,6 +43,11 @@ fi
 if docker inspect synctask-es >/dev/null 2>&1; then
   echo "[stop] 停止 ES 基础设施 (es)，不删除容器..."
   docker compose -f "$DB_COMPOSE_FILE" stop
+fi
+
+if docker inspect synctask-redis-a >/dev/null 2>&1; then
+  echo "[stop] 停止 Redis (redis-a / redis-b)，不删除容器..."
+  docker compose -f "$REDIS_COMPOSE_FILE" stop
 fi
 
 rm -f "$LOG_DIR/agent.pid" "$LOG_DIR/backend.pid" 2>/dev/null || true

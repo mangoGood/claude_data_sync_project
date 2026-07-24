@@ -1,0 +1,47 @@
+# Dedicated Redis source + target instances for redis->redis sync (migration-redis).
+# Kept in its own compose file (like docker-compose-synctask-mongo.yml) so the redis stack can be
+# brought up/down independently and, crucially, so each container gets a FIXED IP that never drifts
+# across restarts — pinned on a dedicated /24 (synctask-redis-net).
+#
+# - synctask-redis-a : source, static IP 172.28.20.11, host port 6390
+# - synctask-redis-b : target, static IP 172.28.20.12, host port 6391
+#   both require password `syncredis` (requirepass). Clients (agent / migration-redis engine on the
+#   host) connect via localhost:639x; the engine speaks the replication protocol (PSYNC) to the
+#   source for full RDB + incremental command stream.
+#
+# 连接串（向导/测试）：redis://default:syncredis@127.0.0.1:6390 （源）/ :6391 （目标）
+# Brought up with: docker compose -f docker-compose-synctask-redis.yml up -d
+services:
+  synctask-redis-a:
+    image: docker.1ms.run/redis:7
+    container_name: synctask-redis-a
+    restart: unless-stopped
+    ports:
+      - "6390:6379"
+    networks:
+      synctask-redis-net:
+        ipv4_address: 172.28.20.11
+    # requirepass 使连接串符合现有 user:pass@host:port 契约（用户名填 default）；
+    # repl-diskless-sync 显式打开无盘全量，PSYNC 直接回传 RDB 流，无需落盘。
+    command: >
+      redis-server --requirepass syncredis --repl-diskless-sync yes --appendonly no
+
+  synctask-redis-b:
+    image: docker.1ms.run/redis:7
+    container_name: synctask-redis-b
+    restart: unless-stopped
+    ports:
+      - "6391:6379"
+    networks:
+      synctask-redis-net:
+        ipv4_address: 172.28.20.12
+    command: >
+      redis-server --requirepass syncredis --appendonly no
+
+networks:
+  synctask-redis-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.20.0/24
+          gateway: 172.28.20.1

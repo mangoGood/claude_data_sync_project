@@ -23,7 +23,7 @@ public class MetadataService {
     private static final Logger logger = LoggerFactory.getLogger(MetadataService.class);
 
     private static final Pattern CONNECTION_PATTERN = Pattern.compile(
-        "(?:mysql|postgresql|oracle|mongodb|elastic)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
+        "(?:mysql|postgresql|oracle|mongodb|elastic|redis)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
     );
 
     public static class ParsedConnection {
@@ -58,6 +58,10 @@ public class MetadataService {
         public boolean isElastic() {
             return "elasticsearch".equals(type);
         }
+
+        public boolean isRedis() {
+            return "redis".equals(type);
+        }
     }
 
     public ParsedConnection parseConnection(String connectionStr) {
@@ -74,6 +78,8 @@ public class MetadataService {
             dbType = "mongodb";
         } else if (connectionStr.startsWith("elastic://")) {
             dbType = "elasticsearch";
+        } else if (connectionStr.startsWith("redis://")) {
+            dbType = "redis";
         } else {
             dbType = "mysql";
         }
@@ -126,6 +132,21 @@ public class MetadataService {
         }
         if (isMongo) {
             return testMongoConnectionDetailed(conn);
+        }
+
+        // Redis 走 RESP（Jedis），类型互斥后单独处理
+        boolean isRedis = conn.isRedis();
+        boolean expectRedis = "redis".equalsIgnoreCase(expectedType);
+        if (expectRedis && !isRedis) {
+            return new ConnectionTestResult(false, "DB_TYPE_MISMATCH",
+                "期望Redis，但连接串格式不匹配", "连接串应以 redis:// 开头");
+        }
+        if (!expectRedis && isRedis) {
+            return new ConnectionTestResult(false, "DB_TYPE_MISMATCH",
+                "连接串为Redis格式，但所选数据库类型不是Redis", "请检查数据库类型是否正确");
+        }
+        if (isRedis) {
+            return testRedisConnectionDetailed(conn);
         }
 
         // Elasticsearch 走 HTTP REST，类型互斥后单独处理
@@ -357,6 +378,87 @@ public class MetadataService {
         }
     }
 
+    // ==================== Redis（RESP，走 Jedis，不走 JDBC） ====================
+
+    /**
+     * 构建一次性 Jedis。用户名为空或 "default" 时走单参 AUTH（兼容 requirepass，Redis 5/6 通用）；
+     * 真实 ACL 用户才走双参 AUTH。调用方负责 close。
+     */
+    private redis.clients.jedis.Jedis buildJedis(ParsedConnection conn) {
+        redis.clients.jedis.DefaultJedisClientConfig.Builder cfg =
+                redis.clients.jedis.DefaultJedisClientConfig.builder()
+                        .connectionTimeoutMillis(15000)
+                        .socketTimeoutMillis(15000);
+        if (conn.username != null && !conn.username.isEmpty() && !"default".equalsIgnoreCase(conn.username)) {
+            cfg.user(conn.username);
+        }
+        if (conn.password != null && !conn.password.isEmpty()) {
+            cfg.password(conn.password);
+        }
+        return new redis.clients.jedis.Jedis(
+                new redis.clients.jedis.HostAndPort(conn.host, conn.port), cfg.build());
+    }
+
+    private ConnectionTestResult testRedisConnectionDetailed(ParsedConnection conn) {
+        try (redis.clients.jedis.Jedis jedis = buildJedis(conn)) {
+            String pong = jedis.ping();
+            if (pong != null && "PONG".equalsIgnoreCase(pong)) {
+                String version = "";
+                try {
+                    for (String line : jedis.info("server").split("\\r?\\n")) {
+                        if (line.startsWith("redis_version:")) {
+                            version = line.substring("redis_version:".length()).trim();
+                            break;
+                        }
+                    }
+                } catch (Exception ignore) {
+                    // 版本解析失败不影响连通性结论
+                }
+                return new ConnectionTestResult(true, null,
+                    "Redis连接成功" + (version.isEmpty() ? "" : "（版本 " + version + "）"), null);
+            }
+            return new ConnectionTestResult(false, "CONNECTION_FAILED",
+                "连接验证失败（PING 未返回 PONG）", "请检查 Redis 服务状态");
+        } catch (redis.clients.jedis.exceptions.JedisDataException e) {
+            // NOAUTH / WRONGPASS / invalid username-password pair
+            return new ConnectionTestResult(false, "AUTH_FAILED",
+                "认证失败：" + e.getMessage(), "请检查用户名和密码是否正确（无密码 Redis 请留空密码）");
+        } catch (redis.clients.jedis.exceptions.JedisConnectionException e) {
+            return new ConnectionTestResult(false, "NETWORK_ERROR",
+                "网络连接失败：" + e.getMessage(), "请检查 Redis 地址和端口是否正确，以及网络是否可达");
+        } catch (Exception e) {
+            return new ConnectionTestResult(false, "CONNECTION_FAILED",
+                "连接失败：" + e.getMessage(), "请检查连接参数是否正确");
+        }
+    }
+
+    /** 枚举 Redis 有数据的逻辑库索引（INFO keyspace），并保证 db0 存在——供向导按整库勾选。 */
+    private List<String> listRedisDatabases(ParsedConnection conn) {
+        List<String> dbs = new ArrayList<>();
+        try (redis.clients.jedis.Jedis jedis = buildJedis(conn)) {
+            java.util.TreeSet<Integer> found = new java.util.TreeSet<>();
+            for (String line : jedis.info("keyspace").split("\\r?\\n")) {
+                // 形如 db0:keys=5,expires=0,avg_ttl=0
+                if (line.startsWith("db") && line.contains(":")) {
+                    try {
+                        found.add(Integer.parseInt(line.substring(2, line.indexOf(':'))));
+                    } catch (NumberFormatException ignore) {
+                        // 跳过异常行
+                    }
+                }
+            }
+            found.add(0); // db0 恒可选（即使当前为空，增量期也可能写入）
+            for (Integer db : found) {
+                dbs.add(String.valueOf(db));
+            }
+            logger.info("查询到 {} 个有数据的 Redis 逻辑库", dbs.size());
+        } catch (Exception e) {
+            logger.error("查询 Redis 逻辑库失败: {}", e.getMessage());
+            throw new RuntimeException("查询数据库列表失败: " + e.getMessage());
+        }
+        return dbs;
+    }
+
     public List<String> listSchemas(String connectionStr, String database) {
         ParsedConnection conn = parseConnection(connectionStr);
         if (!conn.isPostgresql() && !conn.isOracle()) {
@@ -528,6 +630,11 @@ public class MetadataService {
                 logger.error("查询MongoDB数据库列表失败: {}", e.getMessage());
                 throw new RuntimeException("查询数据库列表失败: " + e.getMessage());
             }
+        }
+
+        if (conn.isRedis()) {
+            // Redis 的“数据库”即逻辑库索引（db0..dbN）；向导按整库勾选，无表/集合层级。
+            return listRedisDatabases(conn);
         }
 
         try {
@@ -827,6 +934,11 @@ public class MetadataService {
             }
         }
 
+        if (conn.isRedis()) {
+            // Redis 无表/集合层级（同步对象为整个逻辑库），返回空列表。
+            return tables;
+        }
+
         try {
             if (conn.isPostgresql()) {
                 Class.forName("org.postgresql.Driver");
@@ -835,7 +947,7 @@ public class MetadataService {
             } else {
                 Class.forName("com.mysql.cj.jdbc.Driver");
             }
-            
+
             try (Connection connection = DataSourcePoolManager.getConnection(
                     buildJdbcUrl(conn, database),
                     conn.username, conn.password)) {
@@ -1218,6 +1330,13 @@ public class MetadataService {
                     sourceIsEs, sourceType, result);
         }
 
+        boolean sourceIsRedis = "redis".equalsIgnoreCase(sourceType);
+        boolean targetIsRedis = "redis".equalsIgnoreCase(targetType);
+        if (sourceIsRedis || targetIsRedis) {
+            return validateForRedisMigration(sourceConnection, targetConnection, migrationMode,
+                    sourceIsRedis, targetIsRedis, result);
+        }
+
         boolean sourceIsPg = "postgresql".equalsIgnoreCase(sourceType);
         boolean sourceIsOracle = "oracle".equalsIgnoreCase(sourceType);
         boolean targetIsPg = "postgresql".equalsIgnoreCase(targetType);
@@ -1471,6 +1590,83 @@ public class MetadataService {
 
         finalizeAllPassed(result);
         return result;
+    }
+
+    /**
+     * Redis → Redis 同步预校验。检查类型组合（仅 Redis↔Redis）、源/目标连接（PING），
+     * 增量说明（PSYNC 复制流，源库默认允许复制），以及目标可写（非只读副本）。
+     */
+    private ValidationResult validateForRedisMigration(String sourceConnection, String targetConnection,
+                                                       String migrationMode,
+                                                       boolean sourceIsRedis, boolean targetIsRedis,
+                                                       ValidationResult result) {
+        if (!sourceIsRedis || !targetIsRedis) {
+            result.addItem("类型组合", "Redis 仅支持 Redis 到 Redis 的同步", false,
+                    "Redis 只能与 Redis 互相同步，不支持与其它数据库类型组合", "error");
+            result.setAllPassed(false);
+            return result;
+        }
+
+        ParsedConnection sourceConn = parseConnection(sourceConnection);
+        ParsedConnection targetConn = parseConnection(targetConnection);
+        if (!sourceConn.isRedis() || !targetConn.isRedis()) {
+            result.addItem("连接串格式", "Redis 连接串格式检查", false,
+                    "连接串应以 redis:// 开头", "error");
+            result.setAllPassed(false);
+            return result;
+        }
+
+        boolean needIncrement = "fullAndIncre".equals(migrationMode) || "increment".equals(migrationMode);
+        checkRedisEndpoint(sourceConn, "源库", true, needIncrement, result);
+        checkRedisEndpoint(targetConn, "目标库", false, needIncrement, result);
+
+        finalizeAllPassed(result);
+        return result;
+    }
+
+    private void checkRedisEndpoint(ParsedConnection conn, String side, boolean isSource,
+                                    boolean needIncrement, ValidationResult result) {
+        try (redis.clients.jedis.Jedis jedis = buildJedis(conn)) {
+            String pong = jedis.ping();
+            if (pong == null || !"PONG".equalsIgnoreCase(pong)) {
+                result.addItem(side + "连接", side + "Redis连接检查", false,
+                        side + " PING 未返回 PONG", "error");
+                return;
+            }
+            result.addItem(side + "连接", side + "Redis连接检查", true,
+                    "Redis" + side + "连接成功", "info");
+
+            // 解析 INFO replication 的 role（master / slave）
+            String role = "master";
+            try {
+                for (String line : jedis.info("replication").split("\\r?\\n")) {
+                    if (line.startsWith("role:")) {
+                        role = line.substring("role:".length()).trim();
+                        break;
+                    }
+                }
+            } catch (Exception ignore) {
+                // role 解析失败不阻断（按 master 处理）
+            }
+
+            if (isSource) {
+                if (needIncrement) {
+                    result.addItem("增量方式", "Redis 增量走 PSYNC 复制流", true,
+                            "增量同步通过 PSYNC 复制协议实现（RDB 全量 + 命令流增量），源库默认允许复制，无需额外配置",
+                            "info");
+                }
+            } else {
+                // 目标需可写：目标若本身是某主库的只读副本，RESTORE/写入会被拒绝。
+                boolean writable = !"slave".equalsIgnoreCase(role) && !"replica".equalsIgnoreCase(role);
+                result.addItem("目标库可写", "目标 Redis 需为可写（非只读副本）", writable,
+                        writable ? "目标 Redis 可写入"
+                                : "目标 Redis 当前为副本（replica），只读，无法写入；请使用主库作为目标",
+                        writable ? "info" : "error");
+            }
+        } catch (Exception e) {
+            result.addItem(side + "连接", side + "Redis连接检查", false,
+                    side + "连接失败: " + e.getMessage(), "error");
+        }
     }
 
     private void checkMongoEndpoint(ParsedConnection conn, String side, boolean isSource,
