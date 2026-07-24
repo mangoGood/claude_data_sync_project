@@ -67,6 +67,9 @@ public class CaptureMain {
             capture = new PostgresWalCapture();
         } else if ("redo".equals(captureType) || "oracle".equals(captureType)) {
             capture = new OracleRedoCapture();
+        } else if ("ticdc".equals(captureType) || "tidb".equals(captureType)) {
+            // TiDB 不提供 binlog dump 协议，增量出口是 TiCDC changefeed
+            capture = new TiCDCCapture();
         } else {
             capture = new MySQLBinlogCapture();
         }

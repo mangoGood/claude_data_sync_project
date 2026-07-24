@@ -363,11 +363,19 @@ public class ConfigService {
             }
         }
 
-        String sourceType = taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql";
+        String rawSourceType = taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql";
         String targetType = taskMessage.getTargetType() != null ? taskMessage.getTargetType() : "mysql";
+        // TiDB 讲 MySQL 协议：驱动、方言、类型映射、全量迁移、增量应用全部与 mysql→mysql 同构，
+        // 因此引擎侧的 source.db.type 归一成 mysql，避免每一处 "mysql".equals(...) 分支都要加 tidb。
+        // 真正需要区分 TiDB 的只有增量捕获方式（TiDB 不提供 binlog dump，走 TiCDC），
+        // 由 source.db.flavor + capture.type 承载。
+        boolean sourceIsTidb = "tidb".equalsIgnoreCase(rawSourceType);
+        String sourceType = sourceIsTidb ? "mysql" : rawSourceType;
         props.setProperty("source.db.type", sourceType);
+        props.setProperty("source.db.flavor", sourceIsTidb ? "tidb" : sourceType);
         props.setProperty("target.db.type", targetType);
-        logger.info("Source database type: {}, Target database type: {}", sourceType, targetType);
+        logger.info("Source database type: {} (flavor={}), Target database type: {}",
+                sourceType, props.getProperty("source.db.flavor"), targetType);
 
         // 账号同步（仅 mysql→mysql）：sync.account.enabled 打开后，全量阶段同步存量账号、
         // 增量阶段同步账号管理语句；sync.account.super 决定是否连同超级/管理权限。
@@ -409,6 +417,10 @@ public class ConfigService {
         } else if ("oracle".equals(sourceType)) {
             props.setProperty("capture.type", "redo");
             logger.info("Oracle source config: using LogMiner redo capture, JDBC driver: {}", sourceDialect.jdbcDriverClass());
+        } else if (sourceIsTidb) {
+            props.setProperty("capture.type", "ticdc");
+            applyTicdcConfig(props, taskId);
+            logger.info("TiDB source config: using TiCDC changefeed capture, JDBC driver: {}", sourceDialect.jdbcDriverClass());
         } else {
             props.setProperty("capture.type", "binlog");
             logger.info("MySQL source config: using binlog capture, JDBC driver: {}", sourceDialect.jdbcDriverClass());
@@ -580,6 +592,42 @@ public class ConfigService {
         createLogbackConfig(taskDir, taskId);
         
         logger.info("Config file updated successfully for task: {}", taskId);
+    }
+
+    /**
+     * TiDB 增量所需的 TiCDC 参数。capture 进程据此确保任务专属 changefeed 存在并消费其变更流：
+     * <ul>
+     *   <li>{@code capture.ticdc.api.url}：TiCDC OpenAPI（agent/capture 所在宿主视角）；</li>
+     *   <li>{@code capture.ticdc.kafka.sink.bootstrap}：changefeed 投递用的 broker（TiCDC 容器视角）；</li>
+     *   <li>{@code capture.ticdc.kafka.bootstrap}：capture 消费用的 broker（宿主视角，与 agent 同一套）；</li>
+     *   <li>{@code capture.ticdc.changefeed.id} / {@code capture.ticdc.topic}：按任务 id 派生，任务间互不干扰。</li>
+     * </ul>
+     * 起点 TSO 不在这里写：由 AbstractTaskExecutor 的 checkpoint 流程写入 capture.binlog.position
+     * （TiDB 的 SHOW MASTER STATUS 返回的就是 TSO），capture 读不到专属 start.ts 时回退到它。
+     */
+    private void applyTicdcConfig(Properties props, String taskId) {
+        String apiUrl = agentConfig != null ? agentConfig.getTicdcApiUrl() : null;
+        String sinkBootstrap = agentConfig != null ? agentConfig.getTicdcKafkaSinkBootstrap() : null;
+        String consumeBootstrap = agentConfig != null ? agentConfig.getKafkaBootstrapServers() : null;
+
+        props.setProperty("capture.ticdc.api.url",
+                apiUrl != null && !apiUrl.isEmpty() ? apiUrl : "http://127.0.0.1:18300");
+        props.setProperty("capture.ticdc.kafka.sink.bootstrap",
+                sinkBootstrap != null && !sinkBootstrap.isEmpty() ? sinkBootstrap : "synctask-kafka:9092");
+        props.setProperty("capture.ticdc.kafka.bootstrap",
+                consumeBootstrap != null && !consumeBootstrap.isEmpty() ? consumeBootstrap : "localhost:29092");
+
+        String sanitized = taskId == null ? "" : taskId.replaceAll("[^a-zA-Z0-9]+", "-")
+                .replaceAll("^-+", "").replaceAll("-+$", "");
+        if (sanitized.isEmpty()) {
+            sanitized = "unknown";
+        }
+        props.setProperty("capture.ticdc.changefeed.id", "sync-" + sanitized);
+        props.setProperty("capture.ticdc.topic", "ticdc-" + sanitized);
+        logger.info("TiCDC config: api={}, sinkBootstrap={}, consumeBootstrap={}, changefeed=sync-{}",
+                props.getProperty("capture.ticdc.api.url"),
+                props.getProperty("capture.ticdc.kafka.sink.bootstrap"),
+                props.getProperty("capture.ticdc.kafka.bootstrap"), sanitized);
     }
 
     /** 从环境变量/系统属性读取整数写入 props（未设或非法则不写，保持子进程默认）。 */

@@ -786,7 +786,7 @@
 
     <!-- 创建任务模态框 -->
     <div class="modal" id="createTaskModal">
-        <div class="modal-content" style="width: 680px;">
+        <div class="modal-content" style="width: 720px;">
             <div class="modal-header">
                 <h3 class="modal-title">创建同步任务</h3>
                 <span class="modal-close" id="closeModal">&times;</span>
@@ -823,6 +823,11 @@
                             <div class="db-type-card-icon">🔴</div>
                             <div class="db-type-card-name">Redis</div>
                             <div class="db-type-card-desc">Redis 5+ / 6 / 7</div>
+                        </div>
+                        <div class="db-type-card" id="sourceTypeTidb" onclick="selectSourceType('tidb')">
+                            <div class="db-type-card-icon">⛰️</div>
+                            <div class="db-type-card-name">TiDB</div>
+                            <div class="db-type-card-desc">TiDB 6.5+（仅 MySQL 目标）</div>
                         </div>
                     </div>
                 </div>

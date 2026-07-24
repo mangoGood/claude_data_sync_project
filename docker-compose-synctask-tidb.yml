@@ -1,0 +1,180 @@
+# 独立的 TiDB 源端集群（tidb -> mysql 同步链路的源）。
+#
+# 与 docker-compose-synctask-mongo.yml / -redis.yml 同样的思路：单独一个 compose 文件，
+# 独占一个 /24 网段，每个容器**固定 IP**（重启/宿主重启后不漂移）——TiDB 集群里 PD/TiKV/TiCDC
+# 都要把自己的地址注册到 PD（advertise-addr），IP 一旦漂移集群就自我失联，所以固定 IP 是必需项
+# 而不是锦上添花。
+#
+#   synctask-tidb-pd    : PD           172.28.30.11   host 12379 (client)
+#   synctask-tidb-tikv  : TiKV         172.28.30.12
+#   synctask-tidb       : TiDB server  172.28.30.13   host 14000 (MySQL 协议) / 11080 (status)
+#   synctask-tidb-cdc   : TiCDC        172.28.30.14   host 18300 (OpenAPI)
+#
+# TiCDC 额外接入已有的 synctask-net（docker-compose-synctask.yml 建的网络），
+# 这样 changefeed 可以直接把变更投递到 `synctask-kafka:9092`（该 broker 的内部 advertised
+# listener），而宿主上的 capture 进程照旧从 localhost:29092 消费同一个 topic。
+# 因此本文件依赖 docker-compose-synctask.yml 已经起过（Kafka 本来就是整个系统的前置依赖）。
+#
+# 连接串（向导/测试）：mysql://root:tidbpassword@127.0.0.1:14000
+#   —— TiDB 讲 MySQL 协议，连接串协议名就是 mysql://，源库类型在向导里选 TiDB。
+#   口令由 synctask-tidb-init 一次性设置（TiDB 默认 root 无口令）。
+# 拉起：docker compose -f docker-compose-synctask-tidb.yml up -d
+# 销毁：docker compose -f docker-compose-synctask-tidb.yml down -v
+services:
+  synctask-tidb-pd:
+    image: docker.1ms.run/pingcap/pd:v8.5.0
+    container_name: synctask-tidb-pd
+    restart: unless-stopped
+    ports:
+      - "12379:2379"
+    volumes:
+      - tidb-pd-data:/data
+    command:
+      - --name=pd0
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://172.28.30.11:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://172.28.30.11:2380
+      - --initial-cluster=pd0=http://172.28.30.11:2380
+    healthcheck:
+      test: ["CMD", "/pd-ctl", "-u", "http://127.0.0.1:2379", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      synctask-tidb-net:
+        ipv4_address: 172.28.30.11
+
+  synctask-tidb-tikv:
+    image: docker.1ms.run/pingcap/tikv:v8.5.0
+    container_name: synctask-tidb-tikv
+    restart: unless-stopped
+    depends_on:
+      synctask-tidb-pd:
+        condition: service_healthy
+    volumes:
+      - tidb-tikv-data:/data
+    configs:
+      - source: tikv-conf
+        target: /tikv.toml
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=172.28.30.12:20160
+      - --status-addr=0.0.0.0:20180
+      - --advertise-status-addr=172.28.30.12:20180
+      - --data-dir=/data/tikv
+      - --pd=http://172.28.30.11:2379
+      - --config=/tikv.toml
+    networks:
+      synctask-tidb-net:
+        ipv4_address: 172.28.30.12
+
+  synctask-tidb:
+    image: docker.1ms.run/pingcap/tidb:v8.5.0
+    container_name: synctask-tidb
+    restart: unless-stopped
+    depends_on:
+      - synctask-tidb-tikv
+    ports:
+      - "14000:4000"
+      - "11080:10080"
+    # 全链路统一 UTC：全量走 JDBC serverTimezone=UTC，增量的 TIMESTAMP 由 TiCDC 按其本地时区
+    # 渲染成字符串，两端时区不一致会让同一行在全量与增量下得到差一个时区偏移的值
+    environment:
+      TZ: UTC
+    command:
+      - --store=tikv
+      - --path=172.28.30.11:2379
+      - --host=0.0.0.0
+      - --advertise-address=172.28.30.13
+      - --status=10080
+    healthcheck:
+      # TiDB 镜像里没有 mysql 客户端，用 status 端口的健康检查接口
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:10080/status || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    networks:
+      synctask-tidb-net:
+        ipv4_address: 172.28.30.13
+
+  # TiDB 默认 root 无口令，而本机把 4000 发布到了宿主端口；起来后立刻设一个口令，
+  # 与 mongo/redis 两套 compose 的口径一致。跑完即退出（restart: "no"），可重复执行。
+  synctask-tidb-init:
+    image: docker.1ms.run/mysql:8.0
+    container_name: synctask-tidb-init
+    restart: "no"
+    depends_on:
+      synctask-tidb:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          mysql -h 172.28.30.13 -P 4000 -uroot -e "SELECT 1" >/dev/null 2>&1 && break
+          mysql -h 172.28.30.13 -P 4000 -uroot -ptidbpassword -e "SELECT 1" >/dev/null 2>&1 && exit 0
+          sleep 2
+        done
+        mysql -h 172.28.30.13 -P 4000 -uroot -e "ALTER USER 'root'@'%' IDENTIFIED BY 'tidbpassword';"
+    networks:
+      synctask-tidb-net:
+        ipv4_address: 172.28.30.15
+
+  synctask-tidb-cdc:
+    image: docker.1ms.run/pingcap/ticdc:v8.5.0
+    container_name: synctask-tidb-cdc
+    restart: unless-stopped
+    depends_on:
+      synctask-tidb:
+        condition: service_healthy
+    ports:
+      - "18300:8300"
+    environment:
+      TZ: UTC
+    volumes:
+      - tidb-cdc-data:/data
+    command:
+      - /cdc
+      - server
+      - --addr=0.0.0.0:8300
+      - --advertise-addr=172.28.30.14:8300
+      - --pd=http://172.28.30.11:2379
+      - --data-dir=/data/cdc
+    networks:
+      synctask-tidb-net:
+        ipv4_address: 172.28.30.14
+      # changefeed 的 Kafka sink 走这里：容器内按服务名解析到 synctask-kafka:9092。
+      # 这一侧不钉 IP——synctask-net 是别处创建的外部网络，其实际网段可能与
+      # docker-compose-synctask.yml 里声明的不一致（旧网络先于该声明创建时就会这样），
+      # 钉死 IP 会让本 compose 直接起不来；固定 IP 的需求在 tidb 自己的网段里已满足。
+      synctask-net: {}
+
+configs:
+  tikv-conf:
+    # 单机开发环境：默认 block-cache 会按宿主内存的 45% 预留，本地跑没必要
+    content: |
+      [storage.block-cache]
+      capacity = "512MB"
+      [rocksdb]
+      max-open-files = 1024
+      [raftdb]
+      max-open-files = 1024
+
+volumes:
+  tidb-pd-data:
+  tidb-tikv-data:
+  tidb-cdc-data:
+
+networks:
+  synctask-tidb-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.30.0/24
+          gateway: 172.28.30.1
+  # docker-compose-synctask.yml 建的网络（Kafka 所在），此处只接入不创建
+  synctask-net:
+    external: true
+    name: test_git_synctask-net

@@ -57,6 +57,7 @@ public class WorkflowService {
         boolean tgtMongo = "mongodb".equalsIgnoreCase(targetType);
         boolean srcEs = "elasticsearch".equalsIgnoreCase(sourceType);
         boolean tgtEs = "elasticsearch".equalsIgnoreCase(targetType);
+        validateTidbTypePairing(sourceType, targetType, taskType);
         if (!srcMongo && !tgtMongo && !srcEs && !tgtEs) {
             return;
         }
@@ -71,6 +72,31 @@ public class WorkflowService {
         }
         if (taskType != null && !"SYNC".equals(taskType)) {
             throw new RuntimeException("MongoDB/Elasticsearch 同步目前仅支持实时同步任务，不支持灾备/订阅");
+        }
+    }
+
+    /**
+     * TiDB 配对约束：只支持 TiDB→MySQL 的实时同步。
+     * <ul>
+     *   <li>TiDB 只能作为源：反向（MySQL→TiDB）需要在 TiDB 侧建表/写入的整套适配，尚未支持；</li>
+     *   <li>目标只能是 MySQL；</li>
+     *   <li>仅 SYNC 任务：灾备的反向影子通道正是 MySQL→TiDB，订阅链路也未适配 TiCDC 位点语义。</li>
+     * </ul>
+     */
+    private void validateTidbTypePairing(String sourceType, String targetType, String taskType) {
+        boolean srcTidb = "tidb".equalsIgnoreCase(sourceType);
+        boolean tgtTidb = "tidb".equalsIgnoreCase(targetType);
+        if (tgtTidb) {
+            throw new RuntimeException("TiDB 目前仅支持作为同步源，不支持作为同步目标");
+        }
+        if (!srcTidb) {
+            return;
+        }
+        if (!"mysql".equalsIgnoreCase(targetType)) {
+            throw new RuntimeException("TiDB 源目前仅支持同步到 MySQL");
+        }
+        if (taskType != null && !"SYNC".equals(taskType)) {
+            throw new RuntimeException("TiDB 同步目前仅支持实时同步任务，不支持灾备/订阅");
         }
     }
 

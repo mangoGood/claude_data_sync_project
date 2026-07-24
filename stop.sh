@@ -14,6 +14,7 @@ COMPOSE_FILE="docker-compose-synctask.yml"
 DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
 MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
 REDIS_COMPOSE_FILE="docker-compose-synctask-redis.yml"
+TIDB_COMPOSE_FILE="docker-compose-synctask-tidb.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 
 echo "[stop] 停止后端 (spring-boot:run / 38080)..."
@@ -48,6 +49,11 @@ fi
 if docker inspect synctask-redis-a >/dev/null 2>&1; then
   echo "[stop] 停止 Redis (redis-a / redis-b)，不删除容器..."
   docker compose -f "$REDIS_COMPOSE_FILE" stop
+fi
+
+if docker inspect synctask-tidb >/dev/null 2>&1; then
+  echo "[stop] 停止 TiDB 集群 (tidb / tikv / pd / ticdc)，不删除容器..."
+  docker compose -f "$TIDB_COMPOSE_FILE" stop
 fi
 
 rm -f "$LOG_DIR/agent.pid" "$LOG_DIR/backend.pid" 2>/dev/null || true

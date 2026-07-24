@@ -1147,17 +1147,19 @@
             margin-bottom: 10px;
         }
 
-        /* 响应式网格：数据库类型较多时自动换行，每卡保持舒适的最小宽度，不再挤在一行 */
+        /* 固定 3 列网格：类型数量增长后 auto-fit 会把最后一行挤成孤零零一张卡，
+           且每卡被压到 100px 出头、说明文字频繁折行。3 列在 720px 弹窗里每卡约 210px，
+           源端 6 种正好两行满排，目标端 5 种为 3+2，版面整齐不拥挤。 */
         .db-type-cards {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 10px;
         }
 
         .db-type-card {
             border: 2px solid #e8e8e8;
             border-radius: 8px;
-            padding: 14px 8px;
+            padding: 14px 10px;
             cursor: pointer;
             transition: all 0.2s;
             text-align: center;

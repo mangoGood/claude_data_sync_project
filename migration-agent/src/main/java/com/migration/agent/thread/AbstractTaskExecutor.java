@@ -496,6 +496,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
             captureType = "WAL";
         } else if ("oracle".equals(sourceType)) {
             captureType = "REDO";
+        } else if ("tidb".equals(sourceType)) {
+            captureType = "TiCDC changefeed";
         } else {
             captureType = "binlog";
         }

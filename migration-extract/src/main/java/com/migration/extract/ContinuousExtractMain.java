@@ -151,6 +151,12 @@ public class ContinuousExtractMain {
             oracleExtractor = new OracleRedoExtractor();
             this.extractor = (com.migration.common.Extractor<byte[], THLEvent>) oracleExtractor;
             logger.info("Using Oracle Redo Extractor");
+        } else if ("ticdc".equals(captureType) || "tidb".equals(captureType)) {
+            // TiCDCExtractor 继承 MySQLBinlogExtractor：seqno/心跳/关闭等编排沿用 mysql 分支，
+            // 只有“capture 记录 → THLEvent”的解析换成 canal-json
+            mysqlExtractor = new TiCDCExtractor();
+            this.extractor = (com.migration.common.Extractor<byte[], THLEvent>) mysqlExtractor;
+            logger.info("Using TiDB TiCDC Extractor");
         } else {
             mysqlExtractor = new MySQLBinlogExtractor();
             this.extractor = (com.migration.common.Extractor<byte[], THLEvent>) mysqlExtractor;

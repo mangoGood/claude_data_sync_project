@@ -45,7 +45,13 @@ public class FullMigrationTask extends AbstractTaskExecutor {
             return;
         }
 
-        if (!startCaptureProcess()) {
+        // TiDB 纯全量任务不起 capture：TiDB 的增量出口是 TiCDC changefeed，而 changefeed 一旦建立
+        // 就会持有源集群的 GC safepoint 并持续向 Kafka 投递——纯全量任务用不到它，建了只会白白
+        // 拖住源库 GC、堆积 Kafka 数据。其余源类型的 capture 是纯读取，保持原有行为不变。
+        boolean skipCapture = "tidb".equals(sourceType) && !"fullAndIncre".equals(migrationMode);
+        if (skipCapture) {
+            logger.info("[{}] TiDB 仅全量任务，跳过 capture（增量才需要 TiCDC changefeed）", threadName);
+        } else if (!startCaptureProcess()) {
             sendFailedStatus("E3001", "capture 进程启动失败");
             stopped.set(true);
             return;

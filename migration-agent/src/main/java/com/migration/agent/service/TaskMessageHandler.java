@@ -20,6 +20,8 @@ public class TaskMessageHandler {
     private final TaskRecoveryService taskRecoveryService;
     private final FailoverService failoverService;
     private final KafkaProducerService kafkaProducer;
+    /** TiDB 源任务终结时清理 changefeed（暂停不清理，恢复还要靠它续传）。 */
+    private final TicdcChangefeedService ticdcChangefeedService = new TicdcChangefeedService();
 
     public TaskMessageHandler(ExecutorService taskExecutor, TaskProcessService taskProcessService,
                               ConfigService configService, TaskStateService taskStateService,
@@ -62,6 +64,7 @@ public class TaskMessageHandler {
         taskProcessService.removePausedTask(taskId);
         taskProcessService.stopTaskById(taskId);
         taskProcessService.stopMigrationAgentThread(taskId);
+        ticdcChangefeedService.removeChangefeedIfTidb(taskId);
 
         logger.info("Task {} deleted, all processes stopped", taskId);
     }
@@ -119,6 +122,7 @@ public class TaskMessageHandler {
         try {
             taskProcessService.stopTaskById(taskId);
             taskProcessService.stopMigrationAgentThread(taskId);
+            ticdcChangefeedService.removeChangefeedIfTidb(taskId);
 
             logger.info("Task {} terminated, all processes stopped", taskId);
 

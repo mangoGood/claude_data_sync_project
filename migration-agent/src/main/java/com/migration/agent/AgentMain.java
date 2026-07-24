@@ -32,6 +32,10 @@ import java.util.concurrent.*;
 
 public class AgentMain {
     private static final Logger logger = LoggerFactory.getLogger(AgentMain.class);
+
+    /** TiDB 源任务终结/删除时清理 TiCDC changefeed（暂停不清，恢复要靠它续传）。 */
+    private static final com.migration.agent.service.TicdcChangefeedService TICDC_CHANGEFEED_SERVICE =
+            new com.migration.agent.service.TicdcChangefeedService();
     
     // 默认值统一为本机地址（可被环境变量/agent.properties 覆盖）；不再硬编码内网 IP。
     private static final String KAFKA_BOOTSTRAP_SERVERS = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092");
@@ -300,9 +304,11 @@ public class AgentMain {
         pausedTasks.remove(taskId);
         
         stopTaskById(taskId);
-        
+
         stopMigrationAgentThread(taskId);
-        
+
+        TICDC_CHANGEFEED_SERVICE.removeChangefeedIfTidb(taskId);
+
         logger.info("Task {} deleted, all processes stopped", taskId);
     }
     
@@ -360,6 +366,11 @@ public class AgentMain {
         try {
             stopTaskById(taskId);
             stopMigrationAgentThread(taskId);
+
+            // TiDB 源：任务已终结，清掉 changefeed。留着它会一直持有源集群的 GC safepoint
+            // （旧版本数据无法回收）并继续往 Kafka 投递，而已经没有人消费了。
+            // 只在终态做——暂停(stop)必须保留，恢复正是靠 changefeed 自己的 checkpoint 续传。
+            TICDC_CHANGEFEED_SERVICE.removeChangefeedIfTidb(taskId);
 
             logger.info("Task {} terminated, all processes stopped", taskId);
 

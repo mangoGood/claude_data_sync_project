@@ -49,6 +49,12 @@ public class AgentConfig {
         props.setProperty("jar.elastic.path", "migration-elastic/target/migration-elastic-1.0.0.jar");
         props.setProperty("jar.redis.path", "migration-redis/target/migration-redis-1.0.0.jar");
 
+        // TiDB 增量：TiCDC OpenAPI 地址 + changefeed 的 Kafka sink 地址。
+        // sink 地址是 TiCDC 容器视角的 broker（容器内解析 synctask-kafka），
+        // capture 进程消费时用的是 kafka.bootstrap.servers（宿主视角）。
+        props.setProperty("ticdc.api.url", "http://127.0.0.1:18300");
+        props.setProperty("ticdc.kafka.sink.bootstrap", "synctask-kafka:9092");
+
         props.setProperty("monitor.capture.interval.ms", "30000");
         props.setProperty("monitor.extract.interval.ms", "30000");
         props.setProperty("monitor.increment.interval.ms", "10000");
@@ -168,6 +174,14 @@ public class AgentConfig {
 
     public String getRedisJarPath() {
         return props.getProperty("jar.redis.path");
+    }
+
+    public String getTicdcApiUrl() {
+        return props.getProperty("ticdc.api.url");
+    }
+
+    public String getTicdcKafkaSinkBootstrap() {
+        return props.getProperty("ticdc.kafka.sink.bootstrap");
     }
 
     public long getCaptureMonitorIntervalMs() {
