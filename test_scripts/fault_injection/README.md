@@ -76,7 +76,35 @@ python3 fault_injection/dr_failover.py mysql2mysql --inject during
 python3 fault_injection/dr_failover.py pg2pg       --inject after --switch-back
 ```
 
-### 订阅（SUBSCRIBE）：mysql / pg / oracle 三种源 → Kafka
+#### MongoDB 副本集灾备（mongo2mongo）
+
+前置：`docker compose -f docker-compose-synctask-mongo.yml up -d`（mongo-a/b = 27117/27118，
+两个**独立副本集** rsA/rsB —— 灾备要求源目标不同实例，且防回环用的多文档事务与 Change Streams
+都只在副本集/分片集群可用）。
+
+Mongo 灾备是**单进程引擎**（migration-mongo，全量 + Change Streams），没有 capture/extract/increment
+三段管线，所以 `engines` 只有 `mongo` 一个，且它受 ProcessGuard 守护 —— 连全量阶段崩溃都会自愈，
+不像 migration-full 那样崩了就判 FAILED 等 retry。
+
+```bash
+python3 fault_injection/dr_resume.py   mongo2mongo --phase both --minutes 3   # 全量+增量崩溃自愈一致
+python3 fault_injection/dr_resume.py   mongo2mongo --mode bidi  --minutes 3   # 双向：两端写 + 收敛不回环
+python3 fault_injection/dr_hang.py     mongo2mongo                            # 冻结引擎 → 90s 上报 FAILED
+python3 fault_injection/dr_failover.py mongo2mongo --inject during            # 倒换窗口内崩溃仍精确一致
+python3 fault_injection/dr_failover.py mongo2mongo --inject after --switch-back
+
+# 全 BSON 类型保真 + 「防回环真的生效」的证据（单独一套判定，见脚本头注释）
+python3 fault_injection/dr_mongo_types.py --mode uni
+python3 fault_injection/dr_mongo_types.py --mode bidi --minutes 1
+```
+
+`dr_mongo_types.py` 存在的理由：`dr_resume.py` 的指纹只覆盖 5 个标量字段，
+既证明不了 Decimal128 / Binary / 正则 / 嵌套数组能原样落到对端，也证明不了双向防回环真在工作
+——两端写的是同一份文档，回环回来是同值覆盖，**最终指纹照样相等**，光看"收敛了"完全掩盖得住
+无限 ping-pong。它因此另加两把尺子：canonical 扩展 JSON 逐字段比（带类型标签），
+以及"停写沉降后事件计数必须完全不动"（回环唯一无法伪装的特征）。
+
+### 订阅（SUBSCRIBE）：mysql / pg / oracle / tidb / mongo 五种源 → Kafka
 
 订阅任务的目标端是 Kafka 而不是数据库，判定方式与前面都不同，因此另起 `sublib.py` + `sub_*.py`。
 
@@ -94,14 +122,34 @@ docker compose -f docker-compose-synctask-kafka-sub.yml up -d      # localhost:3
 python3 fault_injection/sub_resume.py mysql  --minutes 3
 python3 fault_injection/sub_resume.py pg     --minutes 3
 python3 fault_injection/sub_resume.py oracle --minutes 3
+python3 fault_injection/sub_resume.py tidb   --minutes 3    # 增量走 TiCDC changefeed
+python3 fault_injection/sub_resume.py mongo  --minutes 3    # Change Streams 单进程直投
 python3 fault_injection/sub_resume.py mysql  --minutes 3 --no-inject   # 不注入故障的基线对照
 python3 fault_injection/sub_resume.py mysql  --minutes 3 --keep        # 跑完保留任务不删
 
-# 僵死检测：冻结三段中任一段，验证监控上报 FAILED
+# 僵死检测：冻结管线中任一段，验证监控上报 FAILED
 python3 fault_injection/sub_hang.py mysql  subscribe
 python3 fault_injection/sub_hang.py pg     capture
 python3 fault_injection/sub_hang.py oracle extract
+python3 fault_injection/sub_hang.py tidb   capture
+python3 fault_injection/sub_hang.py mongo               # 单进程引擎，只有 mongo 一个可冻结
+
+# 全类型保真：TiDB 全 31 个 MySQL 列类型 / Mongo 全 BSON 类型，逐列(逐字段)比对 INSERT/UPDATE/DELETE
+python3 fault_injection/sub_types.py tidb
+python3 fault_injection/sub_types.py mongo
 ```
+
+**TiDB 与 MongoDB 两条链路的形态差异**：TiDB 讲 MySQL 协议，走的还是 capture→extract→subscribe
+三段管线（只是 capture 换成消费 TiCDC changefeed），因此三个进程都能注入；MongoDB 没有可落成 THL
+的物理日志，订阅出口就是 Change Streams，由**单个** migration-mongo 进程直投 Kafka，
+`SUB_ENGINES` 里只有 `mongo` 一项。
+
+**Mongo 订阅的 UPDATE 为什么必须看 `updateDescription`**：change stream 的 `fullDocument`
+（UPDATE_LOOKUP）是"事件读出时再查一次"的结果，不是这次更新当时的后像 —— 同一文档被连续快速更新
+两次时，第一条事件查到的往往已是第二次的值，中间那次更新的取值在整条流里再也找不到
+（实测 2 分钟高频写入丢 22 条）。因此消息里额外带 `updateDescription.updatedFields`
+（这次到底改了哪些字段成什么值，与查询时机无关），`sublib.parse_events` 会把
+`documentKey ⊕ updatedFields` 合成等价后像参与「不丢」判定。
 
 ### 实时监控指标可见性（灾备 / 同步 / 订阅）
 

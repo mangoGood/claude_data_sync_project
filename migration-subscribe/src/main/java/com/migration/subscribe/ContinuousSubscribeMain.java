@@ -40,7 +40,13 @@ public class ContinuousSubscribeMain {
     private long scanInterval;
 
     private KafkaProducer<String, String> kafkaProducer;
-    private final Gson gson = new Gson();
+    /**
+     * serializeNulls：值为 NULL 的列必须以 {@code "col": null} 出现在消息里。
+     *
+     * <p>Gson 默认丢弃 null 值，于是源库里 NULL 的列到了下游变成"这个列不存在"——
+     * 下游无从区分"该列是 NULL"与"该列没参与本次变更"，按后者做增量合并就会把 NULL 丢掉。
+     */
+    private final Gson gson = new com.google.gson.GsonBuilder().serializeNulls().create();
     private final AtomicBoolean running = new AtomicBoolean(true);
 
     /**
@@ -449,6 +455,10 @@ public class ContinuousSubscribeMain {
         // 主键 ID 被写成了 VAL 的值，真正的主键干脆丢了，下游拿到的是废数据。
         // 增量应用侧（TypedDmlConverter/THLToSqlConverter）早就按 *_column_names 对齐，
         // 订阅侧此前一直没跟上。
+        // 列类型与 ENUM/SET 取值表按事件刷新：mapRowToColumns 据此还原标签、决定数字/字符串
+        currentColumnTypes = splitColumns(metadata.get("mysql_column_types"));
+        currentEnumSetValues = parseEnumSetValues(metadata.get("enum_set_values"));
+
         String[] allColumns = splitColumns(metadata.get("column_names"));
         String[] afterColumns = splitColumns(metadata.get(
                 "INSERT".equals(operation) ? "insert_column_names" : "update_column_names"));
@@ -525,17 +535,24 @@ public class ContinuousSubscribeMain {
         return cdcEvent;
     }
 
-    /** 前像 ⊕ 后像（后像覆盖同名列）→ 完整后像 JSON；任一不是 JSON 对象时返回 null（不动原值）。 */
+    /**
+     * 前像 ⊕ 后像（后像覆盖同名列）→ 完整后像 JSON；任一不是 JSON 对象时返回 null（不动原值）。
+     *
+     * <p>走 JsonParser 而不是 Map：Gson 读 Map 会把数字全变成 Double，合并这一步就会把
+     * BIGINT/DECIMAL 的精度磨掉（见 {@link #parseDataToMap}）。
+     */
     private String mergeBeforeIntoAfter(String beforeJson, String afterJson) {
         if (beforeJson == null || afterJson == null) return null;
         if (!beforeJson.trim().startsWith("{") || !afterJson.trim().startsWith("{")) return null;
         try {
-            Type t = new TypeToken<Map<String, Object>>() {}.getType();
-            Map<String, Object> before = gson.fromJson(beforeJson, t);
-            Map<String, Object> after = gson.fromJson(afterJson, t);
-            if (before == null || after == null) return null;
-            Map<String, Object> merged = new LinkedHashMap<>(before);
-            merged.putAll(after);
+            com.google.gson.JsonObject before =
+                    com.google.gson.JsonParser.parseString(beforeJson).getAsJsonObject();
+            com.google.gson.JsonObject after =
+                    com.google.gson.JsonParser.parseString(afterJson).getAsJsonObject();
+            com.google.gson.JsonObject merged = before.deepCopy();
+            for (Map.Entry<String, com.google.gson.JsonElement> e : after.entrySet()) {
+                merged.add(e.getKey(), e.getValue());
+            }
             return gson.toJson(merged);
         } catch (Exception e) {
             logger.debug("合并 UPDATE 前后像失败: {}", e.getMessage());
@@ -630,29 +647,33 @@ public class ContinuousSubscribeMain {
         return prefix + cdcEvent.seqno;
     }
 
-    /** 从已映射成 JSON 的行里取主键列的值拼成 key 片段；缺任一主键列返回 null。 */
+    /**
+     * 从已映射成 JSON 的行里取主键列的值拼成 key 片段；缺任一主键列返回 null。
+     *
+     * <p>同样走 JsonParser：主键若是大 BIGINT，用 Map 读会被压成 double，
+     * 同一行的不同事件算出来的 key 可能不一致，多分区下顺序就乱了。
+     */
     private String pkValues(String jsonRow, String[] pkCols) {
         if (jsonRow == null || !jsonRow.trim().startsWith("{")) return null;
-        Map<String, Object> row;
+        com.google.gson.JsonObject row;
         try {
-            row = gson.fromJson(jsonRow, new TypeToken<Map<String, Object>>() {}.getType());
+            row = com.google.gson.JsonParser.parseString(jsonRow).getAsJsonObject();
         } catch (Exception e) {
             return null;
         }
-        if (row == null) return null;
         StringBuilder sb = new StringBuilder();
         for (String pk : pkCols) {
             String col = pk.trim();
-            Object v = row.containsKey(col) ? row.get(col) : caseInsensitiveGet(row, col);
-            if (v == null) return null;
+            com.google.gson.JsonElement v = row.has(col) ? row.get(col) : caseInsensitiveGet(row, col);
+            if (v == null || v.isJsonNull()) return null;
             if (sb.length() > 0) sb.append('_');
-            sb.append(v);
+            sb.append(v.isJsonPrimitive() ? v.getAsString() : v.toString());
         }
         return sb.length() > 0 ? sb.toString() : null;
     }
 
-    private Object caseInsensitiveGet(Map<String, Object> row, String col) {
-        for (Map.Entry<String, Object> e : row.entrySet()) {
+    private com.google.gson.JsonElement caseInsensitiveGet(com.google.gson.JsonObject row, String col) {
+        for (Map.Entry<String, com.google.gson.JsonElement> e : row.entrySet()) {
             if (e.getKey().equalsIgnoreCase(col)) return e.getValue();
         }
         return null;
@@ -768,12 +789,28 @@ public class ContinuousSubscribeMain {
         return gson.toJson(message);
     }
 
+    /**
+     * 行 JSON → 列名到值的映射，**保留数字字面量**。
+     *
+     * <p>不能用 {@code gson.fromJson(data, Map.class)}：Gson 把 JSON 里所有数字都读成
+     * {@code Double}，再序列化出去就成了 {@code "id": 1.0}；超过 2^53 的更直接错掉——
+     * BIGINT 的 9223372036854775807 变成 9.223372036854776E18，DECIMAL(30,10) 的
+     * -12345678901234567890.1234567890 变成 -1.2345678901234567E19。主键、金额、雪花 ID
+     * 到了下游全是错的，而且错得静悄悄。
+     *
+     * <p>JsonParser 产出的数字是 LazilyParsedNumber（保留原始字面量），原样写出去。
+     */
     private Map<String, Object> parseDataToMap(String data) {
         if (data == null || data.isEmpty()) return null;
         // If data is JSON format, parse it directly
         if (data.trim().startsWith("{")) {
             try {
-                return gson.fromJson(data, new TypeToken<Map<String, Object>>() {}.getType());
+                com.google.gson.JsonObject obj = com.google.gson.JsonParser.parseString(data).getAsJsonObject();
+                Map<String, Object> out = new LinkedHashMap<>();
+                for (Map.Entry<String, com.google.gson.JsonElement> e : obj.entrySet()) {
+                    out.put(e.getKey(), e.getValue().isJsonNull() ? null : e.getValue());
+                }
+                return out;
             } catch (Exception e) {
                 logger.debug("JSON解析失败: {}", data.substring(0, Math.min(100, data.length())));
             }
@@ -813,6 +850,77 @@ public class ContinuousSubscribeMain {
     }
 
     /**
+     * 数字字面量的原样透传载体：Gson 写 Number 时用的就是 {@code toString()}，
+     * 因此把原始文本包一层就能既是 JSON 数字、又一位不差。
+     *
+     * <p>存在的理由：{@code Long.parseLong} / {@code Double.parseDouble} 会把
+     * DECIMAL(30,10) 压成 double（精度当场丢失），把整数写成 {@code 1.0}；
+     * 超出 long 范围的 BIGINT UNSIGNED 还会抛异常退化成字符串。原样透传三者都没有。
+     */
+    private static final class RawNumber extends Number {
+        private final String literal;
+
+        RawNumber(String literal) {
+            this.literal = literal;
+        }
+
+        @Override public int intValue() { return (int) doubleValue(); }
+        @Override public long longValue() { return (long) doubleValue(); }
+        @Override public float floatValue() { return (float) doubleValue(); }
+        @Override public double doubleValue() { return Double.parseDouble(literal); }
+        @Override public String toString() { return literal; }
+    }
+
+    /** 纯数字字面量（含符号/小数/指数），据此决定写成 JSON 数字还是字符串。 */
+    private static final java.util.regex.Pattern NUMERIC_LITERAL =
+            java.util.regex.Pattern.compile("[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?");
+
+    /**
+     * ENUM / SET 的取值表：{@code col=v1,v2,v3;col2=a,b}（各 extractor 统一格式）。
+     * 增量应用侧一直按它把数值还原成标签，订阅侧此前没跟上，下游拿到的是 {@code 3} 而不是 {@code "c"}。
+     */
+    private Map<String, String[]> parseEnumSetValues(Object metaValue) {
+        Map<String, String[]> out = new LinkedHashMap<>();
+        if (metaValue == null) return out;
+        for (String entry : metaValue.toString().split(";")) {
+            int eq = entry.indexOf('=');
+            if (eq <= 0) continue;
+            out.put(entry.substring(0, eq).trim(), entry.substring(eq + 1).split(","));
+        }
+        return out;
+    }
+
+    /**
+     * ENUM 存的是 1 起的序号、SET 存的是位掩码，还原成标签需要知道到底是哪一种，
+     * 因此必须结合 {@code mysql_column_types}（"enum" / "set"）判断——只看取值表会把
+     * ENUM 的 3 和 SET 的 3 混为一谈（前者是第 3 个标签，后者是前两个标签的组合）。
+     */
+    private String decodeEnumSet(String value, String columnType, String[] labels) {
+        if (value == null || labels == null || labels.length == 0) return null;
+        long n;
+        try {
+            n = Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            return null; // 已经是标签文本（部分 extractor 直接给标签），原样使用
+        }
+        if ("enum".equalsIgnoreCase(columnType)) {
+            if (n == 0) return "";
+            return (n >= 1 && n <= labels.length) ? labels[(int) n - 1] : null;
+        }
+        if ("set".equalsIgnoreCase(columnType)) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < labels.length && i < 64; i++) {
+                if ((n & (1L << i)) != 0) {
+                    if (sb.length() > 0) sb.append(',');
+                    sb.append(labels[i]);
+                }
+            }
+            return sb.toString();
+        }
+        return null;
+    }
+
+    /**
      * Maps SQL value list (e.g., 'value1',123,'value2') to column names,
      * producing a JSON string like {"col1":"value1","col2":123,"col3":"value2"}
      *
@@ -832,23 +940,42 @@ public class ContinuousSubscribeMain {
         for (int i = 0; i < Math.min(columnNames.length, values.size()); i++) {
             String colName = columnNames[i].trim();
             String value = values.get(i);
-            // Try to parse as number
-            if (value != null && !value.equals("null")) {
-                try {
-                    if (value.contains(".")) {
-                        map.put(colName, Double.parseDouble(value));
-                    } else {
-                        map.put(colName, Long.parseLong(value));
-                    }
-                } catch (NumberFormatException e) {
-                    map.put(colName, value);
-                }
-            } else {
+            if (value == null || value.equals("null")) {
                 map.put(colName, null);
+                continue;
             }
+            // ENUM/SET 先还原标签：它们在行数据里是序号/位掩码，直接当数字给下游没有意义
+            String[] labels = currentEnumSetValues.get(colName);
+            if (labels != null) {
+                String decoded = decodeEnumSet(value, columnTypeOf(colName, columnNames), labels);
+                if (decoded != null) {
+                    map.put(colName, decoded);
+                    continue;
+                }
+            }
+            // 数字原样透传（不经 Long/Double，避免精度丢失与 1 → 1.0）。
+            // 必须包成 JsonPrimitive：直接放裸 Number，Gson 会按运行时类型走反射适配器，
+            // 把 RawNumber 序列化成 {"literal":"1"} 这样的对象。
+            map.put(colName, NUMERIC_LITERAL.matcher(value).matches()
+                    ? new com.google.gson.JsonPrimitive(new RawNumber(value)) : value);
         }
         return gson.toJson(map);
     }
+
+    /** 当前事件的列类型（与 column_names 同序）；缺失时返回 null。 */
+    private String columnTypeOf(String colName, String[] columnNames) {
+        if (currentColumnTypes == null) return null;
+        for (int i = 0; i < columnNames.length && i < currentColumnTypes.length; i++) {
+            if (columnNames[i].trim().equalsIgnoreCase(colName)) {
+                return currentColumnTypes[i].trim();
+            }
+        }
+        return null;
+    }
+
+    /** 当前事件的 ENUM/SET 取值表与列类型（convertToCdcEvent 每条事件开始时刷新）。 */
+    private Map<String, String[]> currentEnumSetValues = new LinkedHashMap<>();
+    private String[] currentColumnTypes;
 
     /**
      * Parses SQL value list like 'value1',123,'value2' into individual values

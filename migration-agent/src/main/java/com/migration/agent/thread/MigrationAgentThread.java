@@ -49,7 +49,7 @@ public class MigrationAgentThread implements Runnable {
      *
      * <p>选择策略：
      * <ul>
-     *   <li>taskType=SUBSCRIBE → {@link SubscribeTask}</li>
+     *   <li>taskType=SUBSCRIBE → {@link SubscribeTask}（MongoDB 源走 {@link MongoSubscribeTask}）</li>
      *   <li>skipFullMigration=true → {@link IncrementSyncTask}（从增量阶段恢复）</li>
      *   <li>其它 → {@link FullMigrationTask}（全量迁移，可能含增量）</li>
      * </ul>
@@ -64,6 +64,11 @@ public class MigrationAgentThread implements Runnable {
                 taskMessage.getTaskId(), taskType, skipFullMigration);
 
         if ("SUBSCRIBE".equals(taskType)) {
+            // MongoDB 源没有可落成 THL 的物理日志，订阅出口就是 Change Streams：走单进程
+            // MongoSubscribeTask，而不是 capture/extract/subscribe 三进程的 SQL 管线。
+            if ("mongodb".equalsIgnoreCase(taskMessage.getSourceType())) {
+                return new MongoSubscribeTask(taskMessage, kafkaProducer, taskStateService, config);
+            }
             return new SubscribeTask(taskMessage, kafkaProducer, taskStateService, config);
         }
         // MongoDB 副本集同步：独立单进程管线（全量+Change Streams 增量），

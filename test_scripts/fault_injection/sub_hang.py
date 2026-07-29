@@ -23,13 +23,20 @@ import sublib as S  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["mysql", "pg", "oracle"])
-    ap.add_argument("engine", nargs="?", default="subscribe",
-                    choices=["capture", "extract", "subscribe"])
+    ap.add_argument("kind", choices=list(S.SOURCES.keys()))
+    # mongo 订阅是单进程引擎，唯一可冻结的就是 mongo 本身
+    ap.add_argument("engine", nargs="?", default=None,
+                    choices=["capture", "extract", "subscribe", "mongo"])
     ap.add_argument("--seed-rows", type=int, default=2000)
     ap.add_argument("--rate", type=int, default=20)
     ap.add_argument("--wait", type=int, default=420, help="等待上报 FAILED 的秒数")
     args = ap.parse_args()
+    engines = S.SUB_ENGINES[args.kind]
+    if args.engine is None:
+        args.engine = engines[0]
+    if args.engine not in engines:
+        print(f"源 {args.kind} 的订阅链路没有 {args.engine} 进程，可选: {engines}")
+        return 2
 
     src = S.SOURCES[args.kind]()
     prefix = f"fihang{args.kind}"

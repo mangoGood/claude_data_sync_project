@@ -1328,7 +1328,7 @@ public class MetadataService {
         boolean targetIsMongo = "mongodb".equalsIgnoreCase(targetType);
         if (sourceIsMongo || targetIsMongo) {
             return validateForMongoMigration(sourceConnection, targetConnection, migrationMode,
-                    sourceIsMongo, targetIsMongo, result);
+                    sourceIsMongo, targetIsMongo, drMode, result);
         }
 
         boolean sourceIsEs = "elasticsearch".equalsIgnoreCase(sourceType);
@@ -1598,7 +1598,7 @@ public class MetadataService {
     private ValidationResult validateForMongoMigration(String sourceConnection, String targetConnection,
                                                        String migrationMode,
                                                        boolean sourceIsMongo, boolean targetIsMongo,
-                                                       ValidationResult result) {
+                                                       String drMode, ValidationResult result) {
         if (!sourceIsMongo || !targetIsMongo) {
             result.addItem("类型组合", "MongoDB 仅支持 MongoDB 到 MongoDB 的同步", false,
                     "MongoDB 只能与 MongoDB 互相同步，不支持与其它数据库类型组合", "error");
@@ -1615,11 +1615,49 @@ public class MetadataService {
             return result;
         }
 
+        boolean bidirectional = "BIDIRECTIONAL".equalsIgnoreCase(drMode);
+        boolean isDr = bidirectional || "UNIDIRECTIONAL".equalsIgnoreCase(drMode);
+
+        // 与 MySQL/PG 灾备同一条铁律：源与目标必须是不同实例，否则实例故障时两端一起丢。
+        if (isDr && sameInstance(sourceConn, targetConn)) {
+            result.addItem("灾备源目标隔离", "灾备任务源库与目标库必须是不同的数据库实例", false,
+                    "源库与目标库指向同一实例（" + sourceConn.host + ":" + sourceConn.port
+                            + "），灾备任务要求源库与目标库为不同的 MongoDB 副本集实例", "error");
+        }
+
         checkMongoEndpoint(sourceConn, "源库", true, migrationMode, result);
         checkMongoEndpoint(targetConn, "目标库", false, migrationMode, result);
 
+        // 双向灾备：反向通道 B→A 把 A 当写入目标，A 必须是可写 Primary；
+        // 同时防回环依赖多文档事务写 origin 标记，两端都必须是副本集/分片集群（4.0+）。
+        if (bidirectional) {
+            checkMongoBidirectionalSourceWritable(sourceConn, result);
+        }
+
         finalizeAllPassed(result);
         return result;
+    }
+
+    /**
+     * 双向灾备补充项：源库 A 也会被反向通道写入，必须是可写 Primary。
+     * 单向灾备下 A 只读不写，故此项仅在 BIDIRECTIONAL 时检查。
+     */
+    private void checkMongoBidirectionalSourceWritable(ParsedConnection conn, ValidationResult result) {
+        try (com.mongodb.client.MongoClient client = buildMongoClient(conn)) {
+            org.bson.Document hello = mongoHello(client);
+            Boolean writable = hello.getBoolean("isWritablePrimary");
+            if (writable == null) {
+                writable = hello.getBoolean("ismaster");
+            }
+            boolean isWritable = Boolean.TRUE.equals(writable);
+            result.addItem("源库可写（双向）", "双向灾备下源库同时是反向通道的写入目标", isWritable,
+                    isWritable ? "源节点为 Primary，可接收反向通道写入"
+                            : "源节点不可写（非 Primary）；双向灾备两端都会被写入，请连接副本集 Primary 节点",
+                    isWritable ? "info" : "error");
+        } catch (Exception e) {
+            result.addItem("源库可写（双向）", "双向灾备下源库同时是反向通道的写入目标", false,
+                    "检查失败: " + e.getMessage(), "error");
+        }
     }
 
     /**

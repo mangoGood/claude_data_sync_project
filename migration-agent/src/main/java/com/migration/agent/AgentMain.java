@@ -593,6 +593,20 @@ public class AgentMain {
                 logger.info("Deleted checkpoint file: {}, success: {}", f.getAbsolutePath(), f.delete());
             }
         }
+
+        // 单进程引擎（Mongo）的位点同样是旧源专属：resume token 里编码的是旧副本集的时间戳与 UUID，
+        // 拿去 resumeAfter 新源的 oplog 要么报 ChangeStreamHistoryLost、要么落到毫无关系的位置。
+        // 进度文件一并清掉，否则 MongoSyncTask 会读到倒换前残留的 phase 误判任务状态。
+        String[] singleProcessEngineFiles = {
+            "files/" + taskId + "/checkpoint/mongo_resume_token.json",
+            "files/" + taskId + "/mongo_progress.json"
+        };
+        for (String path : singleProcessEngineFiles) {
+            java.io.File f = new java.io.File(path);
+            if (f.exists()) {
+                logger.info("Deleted single-process engine checkpoint: {}, success: {}", f.getAbsolutePath(), f.delete());
+            }
+        }
         logger.info("All checkpoint DB files deleted before config update for failover task: {}", taskId);
     }
 
@@ -634,6 +648,9 @@ public class AgentMain {
             for (String key : STALE_POSITION_KEYS_ON_FAILOVER) {
                 configProps.remove(key);
             }
+            // 倒换后新源就是原目标实例，再跑一次全量等于把备库整个灌回原主库。SQL 管线靠编排层的
+            // skipFullMigration 跳过；单进程引擎（Mongo）在进程内自行决定全量与否，只能靠配置项传达。
+            configProps.setProperty("migration.increment.only", "true");
             try (java.io.OutputStream cos = new java.io.FileOutputStream(configFile)) {
                 configProps.store(cos, "Updated for failover - binlog position cleared");
             }

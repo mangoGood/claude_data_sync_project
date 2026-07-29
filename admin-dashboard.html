@@ -1295,6 +1295,16 @@
                             <div class="db-type-card-name">Oracle</div>
                             <div class="db-type-card-desc">Oracle 19c+</div>
                         </div>
+                        <div class="db-type-card" id="subEntryTypeTidb" onclick="subEntrySelectSourceType('tidb')">
+                            <div class="db-type-card-icon">⚡</div>
+                            <div class="db-type-card-name">TiDB</div>
+                            <div class="db-type-card-desc">TiDB 6.5+（TiCDC）</div>
+                        </div>
+                        <div class="db-type-card" id="subEntryTypeMongo" onclick="subEntrySelectSourceType('mongodb')">
+                            <div class="db-type-card-icon">🍃</div>
+                            <div class="db-type-card-name">MongoDB</div>
+                            <div class="db-type-card-desc">副本集 / 分片集群</div>
+                        </div>
                     </div>
                     <div style="margin-top: 8px; font-size: 12px; color: #999;">创建任务后源库类型将不可修改，请谨慎选择</div>
                 </div>
@@ -1383,8 +1393,12 @@
                             <input type="radio" name="drDbType" value="postgresql" style="margin: 0;">
                             <span style="font-size: 14px; font-weight: 500;">PostgreSQL</span>
                         </label>
+                        <label class="dr-dbtype-option" style="display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 10px 16px; border: 2px solid #d9d9d9; border-radius: 6px;" onclick="selectDrDbType('mongodb')">
+                            <input type="radio" name="drDbType" value="mongodb" style="margin: 0;">
+                            <span style="font-size: 14px; font-weight: 500;">MongoDB</span>
+                        </label>
                     </div>
-                    <div style="margin-top: 8px; font-size: 12px; color: #999;">灾备任务的源库和目标库类型必须一致</div>
+                    <div style="margin-top: 8px; font-size: 12px; color: #999;">灾备任务的源库和目标库类型必须一致；MongoDB 需为副本集或分片集群（Change Streams 依赖）</div>
                 </div>
                 <div style="margin-bottom: 20px;">
                     <label style="display: block; margin-bottom: 8px; font-size: 13px; color: #333; font-weight: 500;">灾备方向</label>

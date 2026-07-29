@@ -65,9 +65,35 @@ public class MongoSyncTask extends AbstractTaskExecutor {
             logger.warn("[{}] mongo 首次启动就绪等待未通过，转入 ProcessGuard 自愈恢复", threadName);
         }
 
-        sendStatus("FULL_MIGRATING", "Mongo 全量同步中", 0);
-        lastSuccessfulStatus = "FULL_MIGRATING";
-        logger.info("[{}] mongo 同步进程已启动，进入进度监控", threadName);
+        // 仅增量（灾备反向影子通道 / 主备倒换后重启）压根不跑全量，别谎报"全量同步中"——
+        // 那会让灾备详情页显示一个永远不会推进的全量进度。
+        if (isIncrementOnly()) {
+            sendStatus("INCREMENT_RUNNING", "Mongo 增量同步中（Change Streams）", 100);
+            lastSuccessfulStatus = "INCREMENT_RUNNING";
+        } else {
+            sendStatus("FULL_MIGRATING", "Mongo 全量同步中", 0);
+            lastSuccessfulStatus = "FULL_MIGRATING";
+        }
+        logger.info("[{}] mongo 同步进程已启动，进入进度监控 (incrementOnly={})", threadName, isIncrementOnly());
+    }
+
+    /**
+     * 是否是"禁止全量"的通道。取自 config.properties 而不是 taskMessage：DR_SHADOW（ConfigService 写入）
+     * 与主备倒换后重启（AgentMain 倒换时写入）两条路径都只在配置里留下这个标记。
+     */
+    private boolean isIncrementOnly() {
+        java.util.Properties props = new java.util.Properties();
+        File configFile = new File("files/" + taskId + "/config.properties");
+        if (!configFile.exists()) {
+            return false;
+        }
+        try (java.io.InputStream in = new java.io.FileInputStream(configFile)) {
+            props.load(in);
+        } catch (Exception e) {
+            logger.debug("[{}] 读取 config.properties 失败: {}", taskId, e.getMessage());
+            return false;
+        }
+        return Boolean.parseBoolean(props.getProperty("migration.increment.only", "false"));
     }
 
     /** 自定义监控循环：轮询 mongo_progress.json 映射任务状态，替代基类的 SQL 管线健康检查。 */

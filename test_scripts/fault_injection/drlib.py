@@ -26,6 +26,11 @@ MY_A = dict(kind="mysql", host="127.0.0.1", port=33320, user="root", password="r
 MY_B = dict(kind="mysql", host="127.0.0.1", port=33321, user="root", password="rootpassword")
 PG_A = dict(kind="pg", host="127.0.0.1", port=55432, user="postgres", password="rootpassword")
 PG_B = dict(kind="pg", host="127.0.0.1", port=55433, user="postgres", password="rootpassword")
+# Mongo 灾备两端用 docker-compose-synctask-mongo.yml 起的两个**独立副本集**
+# （rsA/rsB，固定 IP、各自 keyFile）：灾备要求源目标不同实例，且倒换后原目标要能当新源，
+# 两侧都必须是副本集（Change Streams 与多文档事务都只在副本集/分片集群可用）。
+MO_A = dict(kind="mongo", host="127.0.0.1", port=27117, user="root", password="rootpassword")
+MO_B = dict(kind="mongo", host="127.0.0.1", port=27118, user="root", password="rootpassword")
 
 DB = "drtest"
 
@@ -47,7 +52,23 @@ DR_LINKS = {
         sync_objects='{"%s": ["public.%s"]}' % (DB, D.TABLE),
         engines=["capture", "extract", "increment"],
     ),
+    # Mongo 灾备是**单进程引擎**（migration-mongo：全量 + Change Streams），
+    # 没有 capture/extract/increment 三段管线，故障注入的目标只有 mongo 这一个进程；
+    # 且该进程受 ProcessGuard 守护 —— 连全量阶段崩溃都会自愈，不像 migration-full 那样判 FAILED。
+    "mongo2mongo": dict(
+        source_type="mongodb", target_type="mongodb",
+        a={**MO_A, "db": DB}, b={**MO_B, "db": DB},
+        a_conn="mongodb://root:rootpassword@127.0.0.1:27117",
+        b_conn="mongodb://root:rootpassword@127.0.0.1:27118",
+        sync_objects='{"%s": {"tables": ["%s"]}}' % (DB, D.TABLE),
+        engines=["mongo"],
+        single_process=True,
+    ),
 }
+
+
+def is_mongo(link):
+    return DR_LINKS[link]["source_type"] == "mongodb"
 
 
 def endpoints(link):
@@ -116,8 +137,57 @@ class DrWriter(threading.Thread):
             self.error = e
 
 
+class DrMongoWriter(threading.Thread):
+    """Mongo 端持续写入（显式 _id）：INSERT 为主，穿插对自己 id 段的 UPDATE/DELETE。
+
+    与 SQL 版同样按端划分 id 段——双向灾备两端同时写时，若由引擎生成 id 会撞车产生
+    写写冲突（active-active 本就无法消解），两端永远收敛不到同一指纹。
+    """
+
+    def __init__(self, ep, interval, id_base):
+        super().__init__(daemon=True)
+        self.ep = ep
+        self.interval = interval
+        self.id_base = id_base
+        self.stop = threading.Event()
+        self.inserts = self.updates = self.deletes = 0
+        self.error = None
+        self.ids = []
+
+    def run(self):
+        try:
+            cl = self.ep._client()
+            coll = cl[self.ep.db][D.TABLE]
+            mx = coll.find_one({"_id": {"$gte": self.id_base}}, sort=[("_id", -1)])
+            nxt = (mx["_id"] + 1) if mx else self.id_base + 1
+            seq = 0
+            while not self.stop.is_set():
+                seq += 1
+                rid = nxt
+                nxt += 1
+                coll.insert_one({"_id": rid, "grp": seq % 100, "val": f"live-{self.id_base}-{seq}",
+                                 "payload": "y" * 200, "n": 1000000 + seq})
+                self.ids.append(rid)
+                self.inserts += 1
+                if seq % 5 == 0 and self.ids:
+                    uid = random.choice(self.ids)
+                    coll.update_one({"_id": uid}, {"$set": {"val": f"upd-{seq}"}, "$inc": {"n": 1}})
+                    self.updates += 1
+                if seq % 23 == 0 and len(self.ids) > 10:
+                    did = self.ids.pop(0)
+                    coll.delete_one({"_id": did})
+                    self.deletes += 1
+                time.sleep(self.interval)
+            cl.close()
+        except Exception as e:  # noqa: BLE001
+            self.error = e
+
+
 def make_writer(ep, interval, side="a"):
-    return DrWriter(ep, interval, A_ID_BASE if side == "a" else B_ID_BASE)
+    base = A_ID_BASE if side == "a" else B_ID_BASE
+    if getattr(ep, "kind", "") == "mongo":
+        return DrMongoWriter(ep, interval, base)
+    return DrWriter(ep, interval, base)
 
 
 def fmt(fp):
@@ -140,6 +210,13 @@ _FP_SQL = {
 
 def fingerprint(ep):
     """库内聚合指纹 (count, xor)。表不存在/查询失败返回 (-1,-1)（永不与真实指纹相等）。"""
+    if getattr(ep, "kind", "") == "mongo":
+        # Mongo 没有 BIT_XOR 那样的聚合指纹，走 dblib 的 Python 版（顺序无关 XOR）。
+        # 灾备用例的数据量按此选型控制在几万行级别，内存与耗时都可接受。
+        try:
+            return ep.fingerprint()
+        except Exception:
+            return (-1, -1)
     try:
         c = ep._conn(ep.db)
         cur = c.cursor()
@@ -155,8 +232,11 @@ def fingerprint(ep):
 
 # ------------------------------------------------------------------ 灾备任务 API
 
-def create_dr_task(token, name, link, dr_mode="UNIDIRECTIONAL", swap=False):
-    """创建并启动一个灾备任务。swap=True 时以 B 为源、A 为目标（倒换后重建场景用）。"""
+def create_dr_task(token, name, link, dr_mode="UNIDIRECTIONAL", swap=False, sync_objects=None):
+    """创建并启动一个灾备任务。swap=True 时以 B 为源、A 为目标（倒换后重建场景用）。
+
+    sync_objects 可覆盖链路默认的对象集（例如全类型用例要整库同步，而不只是 fi_load 一张表）。
+    """
     L = DR_LINKS[link]
     src_conn, tgt_conn = (L["b_conn"], L["a_conn"]) if swap else (L["a_conn"], L["b_conn"])
     r = F.api("POST", "/api/workflows", token,
@@ -171,7 +251,7 @@ def create_dr_task(token, name, link, dr_mode="UNIDIRECTIONAL", swap=False):
         "targetConnection": tgt_conn,
         # 后端对 DR 强制 fullAndIncre，这里显式传保持一致
         "migrationMode": "fullAndIncre",
-        "syncObjects": L["sync_objects"],
+        "syncObjects": sync_objects if sync_objects is not None else L["sync_objects"],
         "sourceDbName": DB,
         "targetDbName": DB,
         "sourceType": L["source_type"],

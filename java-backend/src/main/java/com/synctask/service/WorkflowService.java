@@ -47,10 +47,20 @@ public class WorkflowService {
     }
 
     /**
-     * 非 SQL 管线类型的配对约束（均仅限实时同步任务，灾备/订阅链路走 SQL 管线不适用）：
+     * 订阅任务的出口恒为 Kafka，与"目标库类型"无关——前端为了复用配置表单会把 targetType
+     * 填成与 sourceType 相同的值。因此配对校验对订阅任务只看源类型，不看目标类型，
+     * 否则 tidb 源的订阅会被"TiDB 不支持作为同步目标"误拦。
+     */
+    private static boolean isSubscribeTaskType(String taskType) {
+        return "SUBSCRIBE".equals(taskType);
+    }
+
+    /**
+     * 非 SQL 管线类型的配对约束：
      * <ul>
-     *   <li>MongoDB 只支持 mongodb→mongodb（副本集到副本集）；</li>
-     *   <li>Elasticsearch 只能作为目标，且源必须是 MySQL（binlog 增量捕获）。</li>
+     *   <li>MongoDB 只支持 mongodb→mongodb（副本集到副本集），实时同步与灾备（单向/双向）均可，
+     *       订阅任务则是 mongodb→Kafka；</li>
+     *   <li>Elasticsearch 只能作为目标，且源必须是 MySQL（binlog 增量捕获），仅实时同步。</li>
      * </ul>
      */
     private void validateMongoTypePairing(String sourceType, String targetType, String taskType) {
@@ -62,31 +72,40 @@ public class WorkflowService {
         if (!srcMongo && !tgtMongo && !srcEs && !tgtEs) {
             return;
         }
-        if (srcMongo != tgtMongo) {
-            throw new RuntimeException("MongoDB 只能与 MongoDB 互相同步，不支持与其它数据库类型组合");
-        }
         if (srcEs) {
             throw new RuntimeException("Elasticsearch 不支持作为同步源，仅支持 MySQL 到 Elasticsearch");
+        }
+        if (srcMongo && isSubscribeTaskType(taskType)) {
+            // 订阅：mongodb → Kafka（Change Streams 直投），目标类型不参与校验
+            return;
+        }
+        if (srcMongo != tgtMongo) {
+            throw new RuntimeException("MongoDB 只能与 MongoDB 互相同步，不支持与其它数据库类型组合");
         }
         if (tgtEs && !"mysql".equalsIgnoreCase(sourceType)) {
             throw new RuntimeException("到 Elasticsearch 的同步目前仅支持 MySQL 源");
         }
-        if (taskType != null && !"SYNC".equals(taskType)) {
-            throw new RuntimeException("MongoDB/Elasticsearch 同步目前仅支持实时同步任务，不支持灾备/订阅");
+        if (tgtEs && taskType != null && !"SYNC".equals(taskType)) {
+            throw new RuntimeException("Elasticsearch 同步目前仅支持实时同步任务，不支持灾备/订阅");
         }
     }
 
     /**
-     * TiDB 配对约束：只支持 TiDB→MySQL 的实时同步。
+     * TiDB 配对约束：TiDB 只能作为源。
      * <ul>
-     *   <li>TiDB 只能作为源：反向（MySQL→TiDB）需要在 TiDB 侧建表/写入的整套适配，尚未支持；</li>
-     *   <li>目标只能是 MySQL；</li>
-     *   <li>仅 SYNC 任务：灾备的反向影子通道正是 MySQL→TiDB，订阅链路也未适配 TiCDC 位点语义。</li>
+     *   <li>反向（MySQL→TiDB）需要在 TiDB 侧建表/写入的整套适配，尚未支持，故不能作目标；</li>
+     *   <li>实时同步的目标只能是 MySQL；</li>
+     *   <li>订阅任务出口是 Kafka（增量走 TiCDC changefeed），不受目标类型约束；</li>
+     *   <li>灾备仍不支持：单向灾备的主备倒换会把 TiDB 变成写入目标，双向灾备的反向通道
+     *       同样是 MySQL→TiDB，而 TiDB 作目标的建表/写入适配尚未支持。</li>
      * </ul>
      */
     private void validateTidbTypePairing(String sourceType, String targetType, String taskType) {
         boolean srcTidb = "tidb".equalsIgnoreCase(sourceType);
         boolean tgtTidb = "tidb".equalsIgnoreCase(targetType);
+        if (srcTidb && isSubscribeTaskType(taskType)) {
+            return;
+        }
         if (tgtTidb) {
             throw new RuntimeException("TiDB 目前仅支持作为同步源，不支持作为同步目标");
         }
@@ -97,7 +116,7 @@ public class WorkflowService {
             throw new RuntimeException("TiDB 源目前仅支持同步到 MySQL");
         }
         if (taskType != null && !"SYNC".equals(taskType)) {
-            throw new RuntimeException("TiDB 同步目前仅支持实时同步任务，不支持灾备/订阅");
+            throw new RuntimeException("TiDB 目前支持实时同步与数据订阅，不支持灾备任务");
         }
     }
 
@@ -143,17 +162,18 @@ public class WorkflowService {
         if ("DR".equals(taskType)) {
             workflow.setMigrationMode("fullAndIncre");
             workflow.setDrStatus("DR_CONFIGURING");
-            // 灾备方向：默认单向。双向（active-active 防回环）依赖 capture 侧的 origin 标记跳过，
-            // 目前 MySQL binlog 与 PostgreSQL WAL 两条 capture 均已实现，故支持 mysql↔mysql 与 pg↔pg；
-            // 其它类型（Oracle/Mongo/ES）capture 侧未实现防回环，暂不支持双向。
+            // 灾备方向：默认单向。双向（active-active 防回环）依赖捕获侧的 origin 标记跳过，
+            // 目前 MySQL binlog、PostgreSQL WAL、MongoDB Change Streams 三条捕获链路均已实现，
+            // 故支持 mysql↔mysql、pg↔pg 与 mongodb↔mongodb；其它类型（Oracle/ES）暂不支持双向。
             String effectiveDrMode = "BIDIRECTIONAL".equalsIgnoreCase(drMode) ? "BIDIRECTIONAL" : "UNIDIRECTIONAL";
             if ("BIDIRECTIONAL".equals(effectiveDrMode)) {
                 String st = workflow.getSourceType();
                 String tt = workflow.getTargetType();
                 boolean bothMysql = "mysql".equalsIgnoreCase(st) && "mysql".equalsIgnoreCase(tt);
                 boolean bothPg = "postgresql".equalsIgnoreCase(st) && "postgresql".equalsIgnoreCase(tt);
-                if (!bothMysql && !bothPg) {
-                    throw new RuntimeException("双向灾备目前仅支持 MySQL↔MySQL 或 PostgreSQL↔PostgreSQL");
+                boolean bothMongo = "mongodb".equalsIgnoreCase(st) && "mongodb".equalsIgnoreCase(tt);
+                if (!bothMysql && !bothPg && !bothMongo) {
+                    throw new RuntimeException("双向灾备目前仅支持 MySQL↔MySQL、PostgreSQL↔PostgreSQL 或 MongoDB↔MongoDB");
                 }
             }
             workflow.setDrMode(effectiveDrMode);

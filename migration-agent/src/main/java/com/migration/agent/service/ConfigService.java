@@ -478,6 +478,13 @@ public class ConfigService {
             props.setProperty("migration.mode", "fullAndIncre");
             logger.info("DR task detected (taskType={}), setting task.type=DR, migration.mode=fullAndIncre", taskType);
         }
+        if ("DR_SHADOW".equals(taskType)) {
+            // 反向影子通道绝不能跑全量——那会把灾备库整个搬回主库。SQL 管线靠 agent 编排层的
+            // skipFullMigration 达成（IncrementSyncTask），单进程引擎（Mongo）在进程内自行决定
+            // 全量与否，只能靠配置项传达。
+            props.setProperty("migration.increment.only", "true");
+            logger.info("DR_SHADOW 反向通道: migration.increment.only=true（禁止反向全量）");
+        }
 
         if ("SUBSCRIBE".equals(taskType)) {
             props.setProperty("task.type", "SUBSCRIBE");

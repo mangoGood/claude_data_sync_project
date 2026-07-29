@@ -143,6 +143,11 @@ public class FailoverService {
     private void cleanFailoverFiles(String taskId) {
         deleteFileIfExists("files/" + taskId + "/checkpoint/checkpoint");
         deleteFileIfExists("files/" + taskId + "/checkpoint/seqno_checkpoint.json");
+        // 单进程引擎的位点同样是"旧源专属"：Mongo 的 resume token 编码了旧副本集的时间戳/UUID，
+        // 拿去 resumeAfter 新源的 oplog 要么直接报错、要么落到完全无关的位置。进度文件一并清掉，
+        // 否则 MongoSyncTask 会读到倒换前残留的 phase 误判任务状态。
+        deleteFileIfExists("files/" + taskId + "/checkpoint/mongo_resume_token.json");
+        deleteFileIfExists("files/" + taskId + "/mongo_progress.json");
 
         cleanDirectory("files/" + taskId + "/thl_output");
         cleanDirectory("files/" + taskId + "/binlog_output");
@@ -182,6 +187,9 @@ public class FailoverService {
             for (String key : com.migration.agent.AgentMain.STALE_POSITION_KEYS_ON_FAILOVER) {
                 configProps.remove(key);
             }
+            // 倒换后新源就是原目标，全量等于把备库整个灌回原主库。SQL 管线靠 skipFullMigration
+            // 跳过，单进程引擎（Mongo）在进程内决定，只能靠配置项传达。
+            configProps.setProperty("migration.increment.only", "true");
             try (OutputStream cos = new FileOutputStream(configFile)) {
                 configProps.store(cos, "Updated for failover - binlog position cleared");
             }

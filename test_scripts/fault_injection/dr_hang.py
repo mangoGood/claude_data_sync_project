@@ -34,11 +34,17 @@ def _alive(pids):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("link", choices=list(DR.DR_LINKS.keys()))
-    ap.add_argument("engine", nargs="?", default="increment",
-                    choices=["capture", "extract", "increment"])
+    # mongo 灾备是单进程引擎，唯一可冻结的进程就是 mongo 本身
+    ap.add_argument("engine", nargs="?", default=None,
+                    choices=["capture", "extract", "increment", "mongo"])
     ap.add_argument("--bidi", action="store_true", help="双向灾备")
     ap.add_argument("--shadow", action="store_true", help="冻结反向影子通道的子进程（隐含 --bidi）")
     args = ap.parse_args()
+    if args.engine is None:
+        args.engine = DR.DR_LINKS[args.link]["engines"][-1]
+    if args.engine not in DR.DR_LINKS[args.link]["engines"]:
+        print(f"链路 {args.link} 没有 {args.engine} 进程，可选: {DR.DR_LINKS[args.link]['engines']}")
+        return 2
     bidi = args.bidi or args.shadow
     wait_s = int(os.environ.get("FI_HANG_WAIT", "220"))
 

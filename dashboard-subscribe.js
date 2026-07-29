@@ -195,20 +195,27 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
 
         let subEntrySelectedSourceType = 'mysql';
 
+        /** 订阅入口的源库类型卡片：类型 → 卡片元素 id。新增类型只需在此登记一处。 */
+        const SUB_ENTRY_TYPE_CARDS = {
+            mysql: 'subEntryTypeMysql',
+            postgresql: 'subEntryTypePg',
+            oracle: 'subEntryTypeOracle',
+            tidb: 'subEntryTypeTidb',
+            mongodb: 'subEntryTypeMongo'
+        };
+
         function openSubscribeModal() {
-            subEntrySelectedSourceType = 'mysql';
             document.getElementById('subscribeEntryTaskName').value = '';
-            document.getElementById('subEntryTypeMysql').classList.add('selected');
-            document.getElementById('subEntryTypePg').classList.remove('selected');
-            document.getElementById('subEntryTypeOracle').classList.remove('selected');
+            subEntrySelectSourceType('mysql');
             document.getElementById('createSubscribeEntryModal').classList.add('show');
         }
 
         function subEntrySelectSourceType(type) {
             subEntrySelectedSourceType = type;
-            document.getElementById('subEntryTypeMysql').classList.toggle('selected', type === 'mysql');
-            document.getElementById('subEntryTypePg').classList.toggle('selected', type === 'postgresql');
-            document.getElementById('subEntryTypeOracle').classList.toggle('selected', type === 'oracle');
+            Object.entries(SUB_ENTRY_TYPE_CARDS).forEach(([t, id]) => {
+                const card = document.getElementById(id);
+                if (card) card.classList.toggle('selected', type === t);
+            });
         }
 
         function closeSubscribeEntryModal() {
@@ -265,8 +272,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             document.getElementById('subscribeSourceType').value = sourceType || 'mysql';
             document.getElementById('subscribeConfigTitle').textContent = '订阅任务配置' + (taskName ? ' - ' + taskName : '');
 
-            const typeLabelMap = { mysql: 'MySQL', postgresql: 'PostgreSQL', oracle: 'Oracle' };
-            document.getElementById('subSourceTypeDisplay').textContent = typeLabelMap[sourceType] || 'MySQL';
+            document.getElementById('subSourceTypeDisplay').textContent = formatDbTypeLabel(sourceType);
 
             // 根据源库类型初始化端口和数据库名输入行
             const dbNameRow = document.getElementById('subSourceDbNameRow');
@@ -283,7 +289,8 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 dbNameInput.placeholder = '服务名/SID（如 FREEPDB1、ORCL）';
                 if (hintDiv) hintDiv.textContent = 'Oracle 请指定服务名或 SID，用于建立连接和 LogMiner 会话';
             } else {
-                document.getElementById('subSourcePort').value = '3306';
+                // TiDB 讲 MySQL 协议但默认端口是 4000；MongoDB 走 mongodb:// 直连副本集 Primary
+                document.getElementById('subSourcePort').value = subDefaultPort(sourceType);
                 dbNameRow.style.display = 'none';
             }
 
@@ -347,9 +354,27 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             }
         }
 
+        /**
+         * 源库类型 → 连接串协议。TiDB 讲 MySQL 协议，连接串仍是 mysql://（源库类型另行记录在
+         * workflow.source_type 上，后端据此决定走 TiCDC 而不是 binlog）；MongoDB 走 mongodb://。
+         */
+        function subProtocol(type) {
+            if (type === 'postgresql') return 'postgresql';
+            if (type === 'oracle') return 'oracle';
+            if (type === 'mongodb') return 'mongodb';
+            return 'mysql';
+        }
+        function subDefaultPort(type) {
+            if (type === 'postgresql') return '5432';
+            if (type === 'oracle') return '1521';
+            if (type === 'tidb') return '4000';
+            if (type === 'mongodb') return '27017';
+            return '3306';
+        }
+
         function subParseConnectionString(connStr) {
             if (!connStr) return;
-            const match = connStr.match(/^(?:mysql|postgresql|oracle):\/\/([^:]+):([^@]+)@([^:]+):(\d+)(?:\/(.*))?$/);
+            const match = connStr.match(/^(?:mysql|postgresql|oracle|mongodb):\/\/([^:]+):([^@]+)@([^:]+):(\d+)(?:\/(.*))?$/);
             if (!match) return;
             document.getElementById('subSourceUsername').value = match[1];
             document.getElementById('subSourcePassword').value = match[2];
@@ -388,7 +413,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 dbNameInput.placeholder = '服务名/SID（如 ORCL、ORCLPDB1）';
                 hintDiv.textContent = 'Oracle 请指定服务名或 SID，用于建立连接和 LogMiner 会话';
             } else {
-                document.getElementById('subSourcePort').value = '3306';
+                document.getElementById('subSourcePort').value = subDefaultPort(sourceType);
                 dbNameRow.style.display = 'none';
             }
             subSourceTested = false;
@@ -408,15 +433,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             const username = document.getElementById('subSourceUsername').value.trim();
             const password = document.getElementById('subSourcePassword').value.trim();
             if (!host || !port || !username) return null;
-            let protocol;
-            if (sourceType === 'postgresql') {
-                protocol = 'postgresql';
-            } else if (sourceType === 'oracle') {
-                protocol = 'oracle';
-            } else {
-                protocol = 'mysql';
-            }
-            let conn = `${protocol}://${username}:${password}@${host}:${port}`;
+            let conn = `${subProtocol(sourceType)}://${username}:${password}@${host}:${port}`;
             const dbName = document.getElementById('subSourceDbNameInput').value.trim();
             if (dbName) conn += `/${dbName}`;
             return conn;
@@ -657,14 +674,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
 
         async function subLoadTables(db) {
             const sourceType = document.getElementById('subscribeSourceType').value;
-            let protocol;
-            if (sourceType === 'postgresql') {
-                protocol = 'postgresql';
-            } else if (sourceType === 'oracle') {
-                protocol = 'oracle';
-            } else {
-                protocol = 'mysql';
-            }
+            const protocol = subProtocol(sourceType);
             const host = document.getElementById('subSourceHost').value.trim();
             const port = document.getElementById('subSourcePort').value.trim();
             const username = document.getElementById('subSourceUsername').value.trim();
