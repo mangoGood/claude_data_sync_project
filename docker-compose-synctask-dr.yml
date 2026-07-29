@@ -1,0 +1,103 @@
+# 灾备（DR）专用测试实例：两对互相独立的实例（主/备），用于单向/双向灾备与主备倒换测试。
+# 灾备预校验要求源实例与目标实例隔离（不能同实例），且倒换后原目标要变成新源，
+# 因此**两侧都必须开启变更日志**（MySQL binlog ROW/FULL、PostgreSQL wal_level=logical）。
+#   - dr-mysql-a : 主，host 33320，server-id 201
+#   - dr-mysql-b : 备，host 33321，server-id 202
+#   - dr-pg-a    : 主，host 55432
+#   - dr-pg-b    : 备，host 55433
+# 起停：docker compose -f docker-compose-synctask-dr.yml up -d / stop
+services:
+  dr-mysql-a:
+    image: docker.1ms.run/mysql:8.0
+    container_name: dr-mysql-a
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: drtest
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --server-id=201 --log-bin=mysql-bin --binlog-format=ROW
+      --binlog-row-metadata=FULL --binlog-row-image=FULL
+      --gtid-mode=ON --enforce-gtid-consistency=ON
+      --max-connections=500
+    ports:
+      - "33320:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      synctask-dr-net:
+        ipv4_address: 192.168.160.11
+
+  dr-mysql-b:
+    image: docker.1ms.run/mysql:8.0
+    container_name: dr-mysql-b
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: drtest
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --server-id=202 --log-bin=mysql-bin --binlog-format=ROW
+      --binlog-row-metadata=FULL --binlog-row-image=FULL
+      --gtid-mode=ON --enforce-gtid-consistency=ON
+      --max-connections=500
+    ports:
+      - "33321:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      synctask-dr-net:
+        ipv4_address: 192.168.160.12
+
+  dr-pg-a:
+    image: docker.1ms.run/postgres:16
+    container_name: dr-pg-a
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: drtest
+    command: >
+      postgres -c wal_level=logical -c max_replication_slots=20
+      -c max_wal_senders=20 -c max_connections=300
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      synctask-dr-net:
+        ipv4_address: 192.168.160.13
+
+  dr-pg-b:
+    image: docker.1ms.run/postgres:16
+    container_name: dr-pg-b
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: drtest
+    command: >
+      postgres -c wal_level=logical -c max_replication_slots=20
+      -c max_wal_senders=20 -c max_connections=300
+    ports:
+      - "55433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      synctask-dr-net:
+        ipv4_address: 192.168.160.14
+
+networks:
+  synctask-dr-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.160.0/24

@@ -39,6 +39,18 @@ public class IncrementSyncTask extends AbstractTaskExecutor {
         String threadName = "IncrementSyncTask-" + taskId;
 
         Thread.interrupted(); // 清除中断标志
+
+        // 没有已落盘的起始位点时（双向灾备的反向影子通道、主备倒换后的新方向都属此列），
+        // 必须先把源库**当前**位点记成 checkpoint 并写进 config：
+        // 否则 capture 起来是"从最新位点开始"，一旦被 ProcessGuard 重启又取一次"最新"，
+        // 崩溃到重启这段窗口内源库的全部变更会被静默跳过（实测双向灾备反向通道崩溃一次丢 254 行）。
+        // 已有位点的场景（普通任务 resume/恢复）不动，保持原有行为。
+        if (!hasPersistedCapturePosition() && !initCheckpoint()) {
+            logger.error("[{}] 增量起始位点初始化失败，增量同步无法安全开始", threadName);
+            stopped.set(true);
+            return;
+        }
+
         lastSuccessfulStatus = "INCREMENT_RUNNING";
         sendStatus("INCREMENT_RUNNING", "从增量同步阶段恢复", 100);
 

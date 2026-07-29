@@ -45,6 +45,48 @@ python3 fault_injection/xdb_hang.py   mongo2mongo                       # mongo 
 > 覆盖 pg/mysql/mongo 异构链路。要点见 [[fault-injection-pg-mongo-2026-07]]：mysql→pg 目标表在「源库名」
 > schema（非 public）；mongo 同名库镜像（忽略 targetDbName）；PG 逻辑槽 `migration_slot_<taskId>` 按库隔离。
 
+### 灾备（DR）：单向 / 双向 / 主备倒换
+
+灾备任务另起一套脚本（`drlib.py` + `dr_*.py`），因为它与普通同步任务差别很大：
+`taskType=DR`（后端强制 fullAndIncre）、源/目标必须是**不同实例**、双向灾备还有一条隐藏的
+反向影子通道（`DR_SHADOW`）、以及独有的主备倒换（failover）流程。
+
+前置：`docker compose -f docker-compose-synctask-dr.yml up -d` 起两对独立实例
+（dr-mysql-a/b = 33320/33321，dr-pg-a/b = 55432/55433；两侧都开 binlog / wal_level=logical，
+因为倒换后原目标要当新源）。
+
+```bash
+# 单向灾备：全量阶段注入崩溃(杀 migration-full→retry 续传) + 增量阶段注入崩溃(受守护自愈)
+python3 fault_injection/dr_resume.py mysql2mysql --phase both  --minutes 5 --seed-rows 200000
+python3 fault_injection/dr_resume.py pg2pg       --phase full  --seed-rows 8000000   # 全量 >3 分钟的数据量
+python3 fault_injection/dr_resume.py pg2pg       --phase incre --minutes 5
+
+# 双向灾备：两端同时写 + 正/反两条通道都注入崩溃，验证收敛一致且不回环放大
+python3 fault_injection/dr_resume.py mysql2mysql --mode bidi --minutes 4
+python3 fault_injection/dr_resume.py pg2pg       --mode bidi --minutes 4
+
+# 灾备任务僵死检测（冻结正向通道；--shadow 冻结双向的反向通道）
+python3 fault_injection/dr_hang.py mysql2mysql capture
+python3 fault_injection/dr_hang.py pg2pg       increment
+python3 fault_injection/dr_hang.py mysql2mysql capture --shadow
+
+# 主备倒换 + 倒换前/中/后注入崩溃，验证倒换后两端仍精确一致
+python3 fault_injection/dr_failover.py mysql2mysql --inject before
+python3 fault_injection/dr_failover.py mysql2mysql --inject during
+python3 fault_injection/dr_failover.py pg2pg       --inject after --switch-back
+```
+
+灾备用例的要点：
+
+- **一致性判定改为库内聚合指纹**（`drlib.fingerprint`，MySQL `BIT_XOR(CRC32(...))` / PG
+  `bit_xor(hashtext(...))`）。灾备两端恒为同引擎，不需要 dblib 那种跨引擎 Python 指纹，
+  库内算才跑得动百万级数据量（8,000,000 行的指纹 0.2s，Python 版要几 GB 内存）。
+- **写入线程显式指定主键**（A 段 1000 万起、B 段 2000 万起）。双向灾备两端各自的自增序列
+  会生成相同 id，那是测试制造的写写冲突（active-active 本就无法消解），不是产品缺陷；
+  倒换后新主库的自增/identity 序列也未必随全量数据推进。
+- **倒换点必须先静默并等两端收敛**：倒换后新方向的 capture 从新源的最新位点起步，
+  这是计划内切换的语义；未收敛就切换属于 RPO 窗口内的数据丢失，是灾备的固有语义而非缺陷。
+
 退出码 0 = 全通过。
 
 ## 机制说明

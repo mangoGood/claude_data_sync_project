@@ -8,3 +8,4 @@ files/
 .synctask_jwt_secret
 .synctask_agent_token
 __pycache__/
+.venv_fi/

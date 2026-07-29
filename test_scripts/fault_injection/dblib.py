@@ -139,8 +139,22 @@ class SqlEndpoint:
     def seed(self, rows):
         c = self._conn(self.db)
         cur = c.cursor()
-        ph = "%s"
-        ins = f"INSERT INTO {self._t()} (grp,val,payload,n) VALUES ({ph},{ph},{ph},{ph})"
+        ins = f"INSERT INTO {self._t()} (grp,val,payload,n) VALUES (%s,%s,%s,%s)"
+        # PG 的 executemany 是逐条往返，播种 10 万行以上会慢到分钟级——用 execute_values
+        # 单语句多值批量插入（同样的行内容，只是灌数快 1~2 个数量级）。
+        if self.kind == "pg":
+            from psycopg2.extras import execute_values
+            ins_pg = f"INSERT INTO {self._t()} (grp,val,payload,n) VALUES %s"
+            batch = []
+            for i in range(rows):
+                batch.append((i % 100, f"seed-{i}", "x" * 200, i))
+                if len(batch) >= 5000:
+                    execute_values(cur, ins_pg, batch, page_size=5000); batch = []
+            if batch:
+                execute_values(cur, ins_pg, batch, page_size=5000)
+            c.commit()
+            cur.close(); c.close()
+            return
         batch = []
         for i in range(rows):
             batch.append((i % 100, f"seed-{i}", "x" * 200, i))
@@ -148,8 +162,6 @@ class SqlEndpoint:
                 cur.executemany(ins, batch); batch = []
         if batch:
             cur.executemany(ins, batch)
-        if self.kind == "pg":
-            c.commit()
         cur.close(); c.close()
 
     def _t(self):
