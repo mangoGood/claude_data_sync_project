@@ -62,6 +62,22 @@ public class SchemaMigration {
     public void migrateAllTables(List<TableInfo> tables) throws SQLException {
         logger.info("开始迁移表结构，共 {} 个表", tables.size());
 
+        // PG 目标：先确保目标 schema 存在。异构迁移（如 MySQL→PG 用源库名作 schema）落到全新目标库
+        // 时，该 schema 尚不存在，建表会报 "no schema has been selected to create in" 而全表失败。
+        // currentSchema 已在 JDBC URL 指定，这里按同一 schema 幂等建好；同构 pg→pg 默认 public 也安全。
+        if ("postgresql".equalsIgnoreCase(targetConnection.getConfig().getDbType())) {
+            String schema = targetConnection.getConfig().getSchema();
+            if (schema == null || schema.isEmpty()) {
+                schema = "public";
+            }
+            try {
+                targetConnection.execute("CREATE SCHEMA IF NOT EXISTS " + quoteIdentifier(schema));
+                logger.info("已确保目标 schema 存在: {}", schema);
+            } catch (SQLException e) {
+                logger.warn("创建目标 schema {} 失败（继续执行）: {}", schema, e.getMessage());
+            }
+        }
+
         // MySQL 目标关闭本会话外键检查：带 FK 的建表语句若父表尚未创建会直接失败导致表缺失
         // （建表顺序不保证父先子后）。DatabaseConnection 缓存单连接，一次设置覆盖整个建表阶段。
         if ("mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType())) {

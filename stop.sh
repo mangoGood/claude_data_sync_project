@@ -15,6 +15,7 @@ DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
 MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
 REDIS_COMPOSE_FILE="docker-compose-synctask-redis.yml"
 TIDB_COMPOSE_FILE="docker-compose-synctask-tidb.yml"
+KAFKA_SUB_COMPOSE_FILE="docker-compose-synctask-kafka-sub.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 
 echo "[stop] 停止后端 (spring-boot:run / 38080)..."
@@ -31,6 +32,9 @@ pkill -f 'migration-capture/target/migration-capture-1.0.0.jar' 2>/dev/null || t
 pkill -f 'migration-extract/target/migration-extract-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-increment/target/migration-increment-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-redis/target/migration-redis-1.0.0.jar' 2>/dev/null || true
+pkill -f 'migration-subscribe/target/migration-subscribe-1.0.0.jar' 2>/dev/null || true
+pkill -f 'migration-mongo/target/migration-mongo-1.0.0.jar' 2>/dev/null || true
+pkill -f 'migration-elastic/target/migration-elastic-1.0.0.jar' 2>/dev/null || true
 if [ -f "$LOG_DIR/agent.pid" ]; then kill "$(cat "$LOG_DIR/agent.pid")" 2>/dev/null || true; fi
 
 echo "[stop] 停止 Docker 基础设施 (mysql / kafka / zookeeper)，不删除容器..."
@@ -54,6 +58,11 @@ fi
 if docker inspect synctask-tidb >/dev/null 2>&1; then
   echo "[stop] 停止 TiDB 集群 (tidb / tikv / pd / ticdc)，不删除容器..."
   docker compose -f "$TIDB_COMPOSE_FILE" stop
+fi
+
+if docker inspect synctask-kafka-sub >/dev/null 2>&1; then
+  echo "[stop] 停止订阅下游 Kafka (kafka-sub / zk-sub)，不删除容器..."
+  docker compose -f "$KAFKA_SUB_COMPOSE_FILE" stop
 fi
 
 rm -f "$LOG_DIR/agent.pid" "$LOG_DIR/backend.pid" 2>/dev/null || true

@@ -22,6 +22,7 @@ import jakarta.persistence.criteria.Predicate;
 import java.lang.reflect.Type;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -783,6 +784,114 @@ public class WorkflowService {
     public Map<String, Object> getCheckpointVisualization(String id, Long userId) {
         getWorkflowById(id, userId);
         return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）");
+    }
+
+    // ==================== 实时监控指标：代理 agent 的只读监控接口 ====================
+    //
+    // 为什么必须由后端代理，而不是让页面直连 agent:8083：
+    // agent 的监控端点在配置了 AGENT_API_TOKEN 时要求 Bearer <AGENT_API_TOKEN>，而这个 token 是
+    // 服务端密钥，绝不能下发给浏览器。页面此前直连 agent（要么不带头、要么错带用户 JWT），
+    // 于是所有监控接口一律 401——同步/订阅/灾备任务的指标卡片全是"--"。
+    // 改由后端转发：用户侧用 JWT 鉴权 + 属主校验，服务端再拿 AGENT_API_TOKEN 去问 agent。
+
+    /** 单任务实时指标：代理 agent 的 /api/metrics/{taskId}（先做属主校验）。 */
+    public Map<String, Object> getTaskMetrics(String id, Long userId) {
+        getWorkflowById(id, userId);
+        return callAgentJson("/api/metrics/" + id, "查询任务实时指标失败（agent 不可达或未运行）");
+    }
+
+    /** 单任务历史指标：代理 agent 的 /api/metrics/{taskId}/history（先做属主校验）。 */
+    public Map<String, Object> getTaskMetricsHistory(String id, Long userId, String query) {
+        getWorkflowById(id, userId);
+        String path = "/api/metrics/" + id + "/history" + (query != null && !query.isEmpty() ? "?" + query : "");
+        return callAgentJson(path, "查询任务历史指标失败（agent 不可达或未运行）");
+    }
+
+    /** 表级延迟热力图：代理 agent 的 /api/table-latency/{taskId}（先做属主校验）。 */
+    public Map<String, Object> getTableLatency(String id, Long userId) {
+        getWorkflowById(id, userId);
+        return callAgentJson("/api/table-latency/" + id, "查询表级延迟失败（agent 不可达或未运行）");
+    }
+
+    /** 一对多分发状态：代理 agent 的 /api/fanout/{taskId}（先做属主校验）。 */
+    public Map<String, Object> getFanoutStatus(String id, Long userId) {
+        getWorkflowById(id, userId);
+        return callAgentJson("/api/fanout/" + id, "查询分发状态失败（agent 不可达或未运行）");
+    }
+
+    /**
+     * agent 上所有任务的实时指标，只保留当前用户自己的任务。
+     *
+     * <p>agent 不认识"用户"，返回的是本机全部任务；这里按属主过滤，避免把别人的任务指标
+     * 透给当前登录用户。
+     */
+    public Map<String, Object> getAllTaskMetrics(Long userId) {
+        Map<String, Object> raw = callAgentJson("/api/metrics", "查询实时指标失败（agent 不可达或未运行）");
+        return Map.of("tasks", filterOwnedByUser(raw.get("tasks"), userId, "taskId"));
+    }
+
+    /** agent 运行态（活跃任务列表），同样按属主过滤。 */
+    public Map<String, Object> getAgentStatus(Long userId) {
+        Map<String, Object> raw = callAgentJson("/api/agent/status", "查询 agent 状态失败（agent 不可达或未运行）");
+        Map<String, Object> out = new HashMap<>(raw);
+        out.put("tasks", filterOwnedByUser(raw.get("tasks"), userId, "taskId"));
+        return out;
+    }
+
+    /**
+     * 排障压缩包：代理 agent 的 /api/diagnostics/{taskId}，返回原始 zip 字节。
+     * 与上面几个 JSON 接口同因——页面直连 agent 会 401，必须由后端持 AGENT_API_TOKEN 转发。
+     */
+    public byte[] getDiagnosticsBundle(String id, Long userId) {
+        getWorkflowById(id, userId);
+        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentToken = System.getenv("AGENT_API_TOKEN");
+        try {
+            java.net.URL url = new java.net.URL(agentBase + "/api/diagnostics/" + id);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            if (agentToken != null && !agentToken.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + agentToken);
+            }
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(60000);
+            if (conn.getResponseCode() != 200) {
+                throw new RuntimeException("agent 返回状态 " + conn.getResponseCode());
+            }
+            try (java.io.InputStream is = conn.getInputStream()) {
+                return is.readAllBytes();
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("下载排障包失败（agent 不可达或未运行）: " + e.getMessage());
+        }
+    }
+
+    /** 从 agent 返回的任务数组中筛出属于该用户的条目，并补上后端才知道的 taskType/name。 */
+    private List<Map<String, Object>> filterOwnedByUser(Object tasksObj, Long userId, String idKey) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (!(tasksObj instanceof List<?> list)) {
+            return result;
+        }
+        for (Object o : list) {
+            if (!(o instanceof Map<?, ?> m)) continue;
+            Object idVal = m.get(idKey);
+            if (idVal == null) continue;
+            Workflow w = workflowRepository.findById(idVal.toString()).orElse(null);
+            if (w == null || !userId.equals(w.getUserId()) || Boolean.TRUE.equals(w.getIsDeleted())) {
+                continue;
+            }
+            Map<String, Object> entry = new HashMap<>();
+            for (Map.Entry<?, ?> e : m.entrySet()) {
+                entry.put(String.valueOf(e.getKey()), e.getValue());
+            }
+            // agent 只知道 taskId，任务类型/名称由后端补齐，前端才能区分同步/订阅/灾备
+            entry.put("taskType", w.getTaskType());
+            entry.put("name", w.getName());
+            entry.put("status", w.getStatus() != null ? w.getStatus().name() : null);
+            entry.put("drStatus", w.getDrStatus());
+            result.add(entry);
+        }
+        return result;
     }
 
     /** GET agent HTTP 接口并解析 JSON（带可选 Bearer token）。 */

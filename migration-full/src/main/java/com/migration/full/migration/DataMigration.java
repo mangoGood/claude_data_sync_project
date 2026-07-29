@@ -165,9 +165,11 @@ public class DataMigration {
             return new int[]{0, 0};
         }
         
-        // 崩溃续传前的分片进度纠偏：上次是未完成的分片迁移（lastMigratedId 记为 -1 哨兵）时，
-        // 各分片游标的部分成果无法归一成单一续传点，必须清空目标表后从头重搬，否则会漏数据。
-        resetIfIncompleteShardedProgress(table);
+        // 崩溃续传前的进度纠偏：上次未完成（分片或非分片）都清空目标表后从头重搬。
+        // 全量 INSERT 非幂等，任何"从中断点增量续搬"都不安全：SIGKILL 可能使进度 lastMigratedId
+        // 领先于实际已提交行（被杀批次未落库），续搬 WHERE id>lastId 会整段跳过这些行而漏数据
+        // （实测 pg 目标续搬后目标缺失一整段 id）。唯一安全做法是清表 + 全新重搬。
+        resetIfIncompleteProgress(table);
 
         List<String> columns = getColumnNames(table);
         String columnList = String.join(", ", columns);
@@ -186,23 +188,23 @@ public class DataMigration {
     }
 
     /**
-     * 若上次是未完成的分片迁移（进度存在、非 COMPLETED、lastMigratedId 为分片哨兵 -1），
-     * 清空目标表并删除该表进度，使本次从头重搬。分片各游标的部分成果不可信：串行续传按
-     * 单一 id 扫描会漏搬其它游标未覆盖的低位区间，且全量 INSERT 非幂等、直接重搬会撞已存在的行，
-     * 故先 TRUNCATE 目标表再全新搬运。清表失败仅告警（最坏退回旧行为，不比不清更糟）。
+     * 若上次是未完成的全量迁移（进度存在且非 COMPLETED，无论分片与否），清空目标表并删除该表进度，
+     * 使本次从头重搬。原因：全量 INSERT 非幂等，增量续搬不安全——
+     *  - 分片：各游标部分成果无法归一成单一续搬点，串行续搬按单 id 扫描会漏搬其它游标未覆盖区间；
+     *  - 非分片：SIGKILL 可能使进度 lastMigratedId 领先于实际已提交行，续搬 WHERE id>lastId 会整段跳过。
+     * 两者都会漏数据。先 TRUNCATE 目标表再全新搬运是唯一安全做法。清表失败仅告警（最坏退回旧行为）。
      */
-    private void resetIfIncompleteShardedProgress(TableInfo table) {
+    private void resetIfIncompleteProgress(TableInfo table) {
         if (progressManager == null || !progressManager.isEnabled()) {
             return;
         }
         String tableName = table.getTableName();
         try {
             MigrationProgress existing = progressManager.getProgress(tableName);
-            if (existing == null || "COMPLETED".equals(existing.getStatus())
-                    || existing.getLastMigratedId() != SHARDED_LAST_ID_SENTINEL) {
+            if (existing == null || "COMPLETED".equals(existing.getStatus())) {
                 return;
             }
-            logger.warn("表 {} 上次为未完成的分片迁移，分片进度不可续传：清空目标表后从头重搬", tableName);
+            logger.warn("表 {} 上次为未完成的全量迁移，续搬不安全（非幂等 INSERT）：清空目标表后从头重搬", tableName);
             String truncateSql = "TRUNCATE TABLE " + targetQuoteIdentifier(table.getTargetTableName());
             try {
                 targetConnection.execute(truncateSql);
@@ -412,7 +414,9 @@ public class DataMigration {
                 int columnCount = metaData.getColumnCount();
                 int batchCount = 0;
                 int pageRows = 0;
+                int pageFetched = 0;   // 本页从源取到的行数（含冲突跳过的），用于判末页
                 while (rs.next()) {
+                    pageFetched++;
                     try {
                         if (targetConn.isClosed()) {
                             targetConn = acquireTargetConnection(shardTgt);
@@ -477,7 +481,8 @@ public class DataMigration {
                 final long pageLastId = currentLastId;
                 maxSeenId.updateAndGet(prev -> Math.max(prev, pageLastId));
 
-                if (pageRows < pageSize) break;
+                // 末页判断按「取到的行数」而非「成功插入数」，避免主键冲突跳过导致 pageRows<pageSize 时漏搬后续页
+                if (pageFetched < pageSize) break;
             }
         } finally {
             try { insertStmt.close(); } catch (SQLException e) { /* ignore */ }
@@ -546,7 +551,9 @@ public class DataMigration {
                     int columnCount = metaData.getColumnCount();
                     int batchCount = 0;
                     int pageRows = 0;
+                    int pageFetched = 0;   // 本页从源取到的行数（含冲突跳过的），用于判末页
                     while (rs.next()) {
+                        pageFetched++;
                         try {
                             if (targetConn.isClosed()) {
                                 logger.warn("目标数据库连接已关闭，重新建立连接");
@@ -617,7 +624,10 @@ public class DataMigration {
                     // 关闭源连接，强制释放 Oracle 会话 PGA，避免 ORA-04036
                     try { pageConn.close(); } catch (SQLException e) { /* ignore */ }
                     logger.info("表 {} 分页迁移一页完成，本页 {} 行，累计 {}/{}", tableName, pageRows, processedRows, totalRows);
-                    if (pageRows < pageSize) break;
+                    // 是否末页必须按「从源取到的行数」判断，而非「成功插入数」：断点续传从
+                    // lastMigratedId 续扫时会与已插入区间重叠、触发主键冲突被跳过，pageRows 因此
+                    // 小于 pageSize；若据此判末页会 break 掉后续所有页，任务却标 COMPLETED → 丢数据。
+                    if (pageFetched < pageSize) break;
                 }
             } else {
                 // ===== 无主键 fallback：单次全表查询 =====

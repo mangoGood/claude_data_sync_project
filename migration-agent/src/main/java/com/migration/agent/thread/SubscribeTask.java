@@ -3,6 +3,7 @@ package com.migration.agent.thread;
 import com.migration.agent.manager.ProcessManager;
 import com.migration.agent.model.TaskMessage;
 import com.migration.agent.model.TaskStatusMessage;
+import com.migration.agent.resilience.ProcessGuard;
 import com.migration.agent.service.AgentConfig;
 import com.migration.agent.service.KafkaProducerService;
 import com.migration.agent.service.MetricsService;
@@ -27,7 +28,14 @@ import org.slf4j.LoggerFactory;
 public class SubscribeTask extends AbstractTaskExecutor {
     private static final Logger logger = LoggerFactory.getLogger(SubscribeTask.class);
 
-    private ProcessManager subscribeProcess;
+    /**
+     * subscribe 子进程同样交给 ProcessGuard 守护。
+     *
+     * <p>此前它是裸的 ProcessManager：进程一崩就再也没人拉起，而 capture/extract 还活着，
+     * {@link #checkProcessHealth()} 于是继续返回 true，任务一直显示"数据订阅中"，
+     * 实际上一条数据都不再进 Kafka，也永远不会上报失败。
+     */
+    private ProcessGuard subscribeGuard;
 
     public SubscribeTask(TaskMessage taskMessage, KafkaProducerService kafkaProducer,
                          TaskStateService taskStateService, AgentConfig config) {
@@ -81,19 +89,50 @@ public class SubscribeTask extends AbstractTaskExecutor {
             logger.error("[{}] extract 进程已停止且 ProcessGuard 已放弃守护", threadName);
             return false;
         }
-        if (subscribeProcess != null && !subscribeProcess.isRunning()) {
-            logger.warn("[{}] subscribe 进程已停止", threadName);
-        }
-
-        boolean captureAlive = captureGuard == null || captureGuard.isRunning();
-        boolean extractAlive = extractGuard == null || extractGuard.isRunning();
-        boolean subscribeAlive = subscribeProcess == null || subscribeProcess.isRunning();
-
-        if (!captureAlive && !extractAlive && !subscribeAlive) {
-            logger.error("[{}] 所有进程均不运行，数据流完全中断", threadName);
+        // subscribe 是订阅链路唯一的出口：它不工作 = Kafka 收不到任何数据。
+        // 因此和 capture/extract 一样，守护放弃即判任务失败，不能只打条 warn 就当无事发生。
+        if (subscribeGuard != null && !subscribeGuard.isGuarding() && !subscribeGuard.isRunning()) {
+            logger.error("[{}] subscribe 进程已停止且 ProcessGuard 已放弃守护", threadName);
             return false;
         }
         return true;
+    }
+
+    /**
+     * 订阅链路的活性文件：capture / extract / subscribe 各看自己直接刷的那个文件。
+     *
+     * <ul>
+     *   <li>{@code capture_liveness} —— capture 基类活性线程每 ~3s 改写（源无关）；</li>
+     *   <li>{@code capture_queue_depth} —— extract 每轮扫描（~1s）无条件改写；</li>
+     *   <li>{@code subscribe_liveness} —— subscribe 主循环每轮 + 处理大文件时每 ~2s 改写。</li>
+     * </ul>
+     *
+     * <p>不能只看 {@code subscribe_rto_ms}：它只在碰到带源时间戳的事件时才写，空闲时段本就不更新，
+     * 拿它判僵死会误杀；而且上游 capture 冻结后 subscribe 还会把积压排空、rto 继续推进，
+     * 会把上游冻结掩盖掉。
+     */
+    @Override
+    protected java.util.List<String> stallLivenessFiles() {
+        String dir = "./files/" + taskId + "/binlog_output/";
+        return java.util.Arrays.asList(
+                dir + "capture_liveness", dir + "capture_queue_depth", dir + "subscribe_liveness");
+    }
+
+    /** 三个受守护进程都在 RUNNING 时才做僵死判定，避免把 ProcessGuard 的重启窗口误判成僵死。 */
+    @Override
+    protected boolean guardsHealthyForStallCheck() {
+        return captureGuard != null && captureGuard.isRunning()
+                && extractGuard != null && extractGuard.isRunning()
+                && subscribeGuard != null && subscribeGuard.isRunning();
+    }
+
+    /** subscribe_liveness 缺失只有在 subscribe 进程确实活着时才算僵死信号（启动即冻结也能检出）。 */
+    @Override
+    protected boolean livenessFileExpected(String path) {
+        if (path.endsWith("subscribe_liveness")) {
+            return subscribeGuard != null && subscribeGuard.isRunning();
+        }
+        return super.livenessFileExpected(path);
     }
 
     @Override
@@ -124,9 +163,19 @@ public class SubscribeTask extends AbstractTaskExecutor {
         logger.info("[{}] 启动 subscribe 进程", threadName);
 
         try {
-            subscribeProcess = new ProcessManager(config.getSubscribeJarPath(), "ContinuousSubscribeMain-" + taskId, taskId);
-            subscribeProcess.start();
-            logger.info("[{}] subscribe 进程已启动", threadName);
+            subscribeGuard = new ProcessGuard("subscribe", taskId, config, kafkaProducer,
+                    () -> new ProcessManager(config.getSubscribeJarPath(),
+                            "ContinuousSubscribeMain-" + taskId, taskId),
+                    getRunningStatus());
+
+            boolean started = subscribeGuard.startAndGuard();
+            if (!started) {
+                // 同 capture/extract：启动窗口内没就绪不等于起不来，守护线程会继续按退避重启，
+                // 此处不能把任务判死（判死会 stopped=true，守护线程随即退出、进程永不再拉起）。
+                logger.warn("[{}] subscribe 进程未在启动窗口内就绪，交由 ProcessGuard 继续重启", threadName);
+                return subscribeGuard.isGuarding();
+            }
+            logger.info("[{}] subscribe 进程启动成功", threadName);
             return true;
         } catch (Exception e) {
             logger.error("[{}] 启动 subscribe 进程失败", threadName, e);
@@ -136,9 +185,9 @@ public class SubscribeTask extends AbstractTaskExecutor {
 
     @Override
     protected void stopExtraProcesses(String threadName) {
-        if (subscribeProcess != null) {
+        if (subscribeGuard != null) {
             try {
-                subscribeProcess.stop();
+                subscribeGuard.stop();
                 logger.info("[{}] subscribe 进程已停止", threadName);
             } catch (Exception e) {
                 logger.error("[{}] 停止 subscribe 进程失败", threadName, e);

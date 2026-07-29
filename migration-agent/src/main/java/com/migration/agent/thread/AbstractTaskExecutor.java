@@ -181,8 +181,34 @@ public abstract class AbstractTaskExecutor implements Runnable {
     }
 
     /**
-     * 任一活性文件超过 {@link AgentConfig#getStallThresholdMs()} 未刷新即判僵死。
-     * 文件尚不存在（对应进程还没起或还没写第一笔）时跳过该文件、不误判。
+     * 活性文件"缺失"是否也该算僵死信号：仅当写它的那个子进程**已启动且存活**时才算。
+     *
+     * <p>否则会误杀正常流程——全量阶段 extract/increment 根本还没起，它们的活性文件本就不存在。
+     * 反过来，进程起来了却从没写出第一笔活性信号（启动即冻结/死锁），旧逻辑"文件不存在就跳过"
+     * 会让它永远检不出来：任务显示同步中、实际一条数据不动（实测双向灾备反向通道
+     * increment 刚拉起就冻结，220s 无任何告警）。
+     *
+     * <p>返回 false 表示"该文件缺失属正常"，维持原行为跳过（mongo/redis 单进程引擎的进度文件走这里）。
+     */
+    protected boolean livenessFileExpected(String path) {
+        if (path.endsWith("capture_liveness")) {
+            return captureGuard != null && captureGuard.isRunning();
+        }
+        if (path.endsWith("capture_queue_depth")) {
+            return extractGuard != null && extractGuard.isRunning();
+        }
+        if (path.endsWith("increment_liveness")) {
+            return incrementGuard != null && incrementGuard.isRunning();
+        }
+        return false;
+    }
+
+    /** {@link #livenessBaseline} 中表示"文件当前缺失"的哨兵 mtime（真实 mtime 不会是 0）。 */
+    private static final long LIVENESS_MISSING = 0L;
+
+    /**
+     * 任一活性文件超过 {@link AgentConfig#getStallThresholdMs()} 未刷新即判僵死；
+     * 对应进程已存活却迟迟不生成活性文件（启动即僵死）同样按超阈值判僵死。
      */
     protected boolean checkPipelineStalled() {
         java.util.List<String> files = stallLivenessFiles();
@@ -194,7 +220,21 @@ public abstract class AbstractTaskExecutor implements Runnable {
         for (String path : files) {
             File f = new File(path);
             if (!f.exists()) {
-                livenessBaseline.remove(path);
+                if (!livenessFileExpected(path)) {
+                    livenessBaseline.remove(path);
+                    continue;
+                }
+                long[] miss = livenessBaseline.get(path);
+                if (miss == null || miss[0] != LIVENESS_MISSING) {
+                    livenessBaseline.put(path, new long[]{LIVENESS_MISSING, now});
+                    continue;
+                }
+                long missingMs = now - miss[1];
+                if (missingMs >= threshold) {
+                    logger.error("[{}] 活性文件 {} 在进程存活的情况下已 {}ms 未生成（阈值 {}ms），判定管线僵死",
+                            taskId, path, missingMs, threshold);
+                    return true;
+                }
                 continue;
             }
             long mtime = f.lastModified();
@@ -418,6 +458,30 @@ public abstract class AbstractTaskExecutor implements Runnable {
         return "ORCL";
     }
 
+    /**
+     * config.properties 里是否已有可用的 capture 起始位点（各源类型任一即可）。
+     *
+     * <p>没有位点时 capture 会"从最新位点开始"——对**首次**启动是对的，但一旦进程崩溃重启，
+     * 又会取一次"最新"，停机窗口内的变更就被永久跳过（丢数据）。因此仅增量任务在没有位点时
+     * 必须先把当前位点记成 checkpoint 落盘。
+     */
+    protected boolean hasPersistedCapturePosition() {
+        java.io.File configFile = new java.io.File("./files/" + taskId + "/config.properties");
+        if (!configFile.exists()) return false;
+        java.util.Properties props = new java.util.Properties();
+        try (java.io.InputStream input = new java.io.FileInputStream(configFile)) {
+            props.load(input);
+        } catch (Exception e) {
+            return false;
+        }
+        for (String key : new String[]{"capture.binlog.file", "capture.gtid.set",
+                                        "capture.wal.lsn", "capture.redo.scn"}) {
+            String v = props.getProperty(key);
+            if (v != null && !v.trim().isEmpty()) return true;
+        }
+        return false;
+    }
+
     /** 返回 [host, port, user, password] */
     protected String[] getSourceCredentials(String threadName) {
         String sourceHost = null;
@@ -599,9 +663,12 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
             boolean started = captureGuard.startAndGuard();
             if (!started) {
-                logger.error("[{}] capture 进程启动失败", threadName);
-                sendStatus("FAILED", "capture 进程启动失败", 0);
-                return false;
+                // 只是没在"启动就绪窗口"(6×5s)内起来——ProcessGuard 的守护线程此刻已经在跑，
+                // 会按退避策略持续重启。这里**不能**把任务判死：调用方判死会 stopped=true，
+                // 守护线程随即退出，进程永久不再拉起（主备倒换/崩溃恰好落在这个窗口时就是如此）。
+                // 真正起不来的场景由守护线程重试耗尽 + monitorLoop 的 checkProcessHealth 上报失败。
+                logger.warn("[{}] capture 进程未在启动窗口内就绪，交由 ProcessGuard 继续重启", threadName);
+                return captureGuard.isGuarding();
             }
             logger.info("[{}] capture 进程启动成功", threadName);
             return true;
@@ -626,8 +693,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
             boolean started = extractGuard.startAndGuard();
             if (!started) {
-                logger.error("[{}] extract 进程启动失败", threadName);
-                return false;
+                // 同 capture：启动窗口内没就绪不等于起不来，守护线程会继续重启，别把任务判死
+                logger.warn("[{}] extract 进程未在启动窗口内就绪，交由 ProcessGuard 继续重启", threadName);
+                return extractGuard.isGuarding();
             }
             logger.info("[{}] extract 进程启动成功", threadName);
             return true;
@@ -651,8 +719,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
             boolean started = incrementGuard.startAndGuard();
             if (!started) {
-                logger.warn("[{}] 增量同步进程启动失败，ProcessGuard将负责重试", threadName);
-                return false;
+                logger.warn("[{}] 增量同步进程未在启动窗口内就绪，ProcessGuard 将负责重试", threadName);
+                return incrementGuard.isGuarding();
             }
             sendStatus(runningStatus, "增量同步中", 100);
             logger.info("[{}] 增量同步进程启动成功", threadName);

@@ -2205,9 +2205,8 @@
         // 下载排障压缩包：日志尾部 + 脱敏 config + checkpoint + THL 尾部
         async function downloadDiagnosticsBundle(taskId) {
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/diagnostics/${taskId}`, {
-                    headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token') }
-                });
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/diagnostics`);
+                if (!resp) return;
                 if (!resp.ok) {
                     let msg = '下载排障包失败';
                     try { const err = await resp.json(); msg = err.message || msg; } catch (e) {}
@@ -2234,9 +2233,8 @@
         async function loadCheckpoint(taskId) {
             const el = document.getElementById('advTab-checkpoint');
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/checkpoint/${taskId}`, {
-                    headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token') }
-                });
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/checkpoint`);
+                if (!resp) return;
                 const data = await resp.json();
                 renderCheckpoint(data);
             } catch (e) {
@@ -2325,9 +2323,8 @@
         async function loadLatency(taskId) {
             const el = document.getElementById('advTab-latency');
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/table-latency/${taskId}`, {
-                    headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token') }
-                });
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/table-latency`);
+                if (!resp) return;
                 const data = await resp.json();
                 _latencyData = data;
                 _latencyExpandedTable = null;
@@ -2511,9 +2508,8 @@
         async function loadFanout(taskId) {
             const el = document.getElementById('advTab-fanout');
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/fanout/${taskId}`, {
-                    headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token') }
-                });
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/fanout`);
+                if (!resp) return;
                 const data = await resp.json();
                 renderFanout(data);
             } catch (e) {
@@ -5551,7 +5547,9 @@
         const _metricsTaskTypeMap = {
             'SYNC': '同步',
             'SUBSCRIBE': '订阅',
-            'DR': '容灾'
+            'DR': '容灾',
+            // 双向灾备的反向影子通道：不在任务列表里露面，但监控页能选到它时得有个看得懂的名字
+            'DR_SHADOW': '容灾反向'
         };
 
         function _getMetricsTaskLabel(task) {
@@ -5570,9 +5568,11 @@
                     const id = (t.id || '').toLowerCase();
                     return label.includes(keyword) || id.includes(keyword);
                 });
-            } else {
-                filtered = _metricsTaskList.slice(0, 5);
             }
+            // 不搜索时不再只截前 5 条。列表已按"运行中"过滤、通常就几条，而下拉本身
+            // max-height + overflow-y:auto 可滚动。此前截 5 条是按 created_at 倒序截的，
+            // 只要新建几个同步任务，早先创建的灾备任务就被挤出可见范围——表现就是
+            // "监控里看不到灾备任务"，必须手动搜名字才找得到。
             if (filtered.length === 0) {
                 dropdown.innerHTML = '<div style="padding: 10px 12px; color: #999; font-size: 13px;">无匹配任务</div>';
             } else {
@@ -5635,17 +5635,17 @@
                 console.warn('Admin API not available for task list');
             }
 
-            // 从 Agent status API 获取运行中的任务
+            // 从 Agent status（经后端代理）获取运行中的任务
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/agent/status`);
-                if (resp.ok) {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/agent-status`);
+                if (resp && resp.ok) {
                     const data = await resp.json();
                     if (data.tasks && Array.isArray(data.tasks)) {
                         data.tasks.forEach(task => {
                             if (!taskMap.has(task.taskId)) {
                                 taskMap.set(task.taskId, {
                                     id: task.taskId,
-                                    name: task.taskId,
+                                    name: task.name || task.taskId,
                                     taskType: task.taskType || 'SYNC',
                                     status: task.status || 'RUNNING'
                                 });
@@ -5657,10 +5657,10 @@
                 console.warn('Agent status API not available for task list');
             }
 
-            // 从 Metrics API 获取有监控数据的任务
+            // 从 Metrics API（经后端代理）获取有监控数据的任务
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/metrics`);
-                if (resp.ok) {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/metrics/all`);
+                if (resp && resp.ok) {
                     const data = await resp.json();
                     if (data.tasks && Array.isArray(data.tasks)) {
                         data.tasks.forEach(task => {
@@ -5668,9 +5668,9 @@
                             if (tid && !taskMap.has(tid)) {
                                 taskMap.set(tid, {
                                     id: tid,
-                                    name: tid,
+                                    name: task.name || tid,
                                     taskType: task.taskType || 'SYNC',
-                                    status: 'RUNNING'
+                                    status: task.status || 'RUNNING'
                                 });
                             }
                         });
@@ -5680,11 +5680,18 @@
                 console.warn('Metrics API not available for task list');
             }
 
-            // 只保留有监控数据的任务（运行中的任务）
-            _metricsTaskList = Array.from(taskMap.values()).filter(t => {
-                const s = (t.status || '').toUpperCase();
-                return s === 'INCREMENT_RUNNING' || s === 'SUBSCRIBE_RUNNING' || s === 'FULL_MIGRATING' || s === 'RUNNING' || s === 'STARTING' || s === 'PENDING';
-            });
+            // 只保留"正在跑"的任务（这些才有实时指标）。
+            // 三类任务都要覆盖：同步(FULL_MIGRATING/INCREMENT_RUNNING)、订阅(SUBSCRIBE_RUNNING)、
+            // 灾备(taskType=DR，状态同样走 FULL_MIGRATING→INCREMENT_RUNNING，倒换时为 SWITCHING)。
+            // FULL_COMPLETED 对 fullAndIncre/灾备是"全量完了正在转增量"的中间态，也在跑；
+            // RECEIVED 是 agent 已接单还没起进程，同样应可见。
+            const RUNNING_STATES = new Set([
+                'PENDING', 'RECEIVED', 'STARTING', 'RUNNING',
+                'FULL_MIGRATING', 'FULL_COMPLETED', 'INCREMENT_RUNNING',
+                'SUBSCRIBE_RUNNING', 'SWITCHING'
+            ]);
+            _metricsTaskList = Array.from(taskMap.values())
+                .filter(t => RUNNING_STATES.has((t.status || '').toUpperCase()));
 
             // 恢复之前选中的值
             if (currentVal) {
@@ -5738,18 +5745,12 @@
             });
         }
 
-        // agent HTTP 地址：不再硬编码 localhost。默认取"当前页面主机名 + agent 端口"，
-        // 使跨机部署（前端与 agent 同主机不同端口的常见形态）自动可用；
-        // 若 agent 独立部署在别处，可在 URL 上带 ?agentBase=http://host:8083 覆盖，
-        // 或部署时把这里改成后端反代地址（如 window.location.origin + '/agent'）。
-        const AGENT_BASE_URL = (function() {
-            try {
-                const override = new URLSearchParams(window.location.search).get('agentBase');
-                if (override) return override.replace(/\/$/, '');
-            } catch (e) {}
-            const host = window.location.hostname || 'localhost';
-            return `${window.location.protocol}//${host}:8083`;
-        })();
+        // 页面不再直连 agent:8083。agent 的监控端点在配置了 AGENT_API_TOKEN 后要求
+        // Bearer <AGENT_API_TOKEN>，而那是服务端密钥、不能下发到浏览器；此前这里直连
+        // （不带头或错带用户 JWT）导致实时监控指标/位点/延迟/分发/排障包一律 401，
+        // 同步、订阅、灾备三类任务的指标卡片全是 "--"。
+        // 现在统一走后端代理 /api/workflows/...（用户 JWT 鉴权 + 属主校验，后端再持
+        // AGENT_API_TOKEN 转发），顺带解决 agent 与前端不同机时浏览器直连不到 8083 的问题。
 
         function onMetricsTimeRangeChange() {
             const taskId = document.getElementById('metricsTaskSelect').value;
@@ -5779,7 +5780,8 @@
 
         async function loadMetricsHistory(taskId) {
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/metrics/${taskId}/history?${_buildMetricsHistoryQuery(taskId)}`);
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/metrics/history?${_buildMetricsHistoryQuery(taskId)}`);
+                if (!resp) return;
                 if (resp.ok) {
                     const data = await resp.json();
                     if (data.success && data.metrics && data.metrics.length > 0) {
@@ -5811,11 +5813,12 @@
             const taskId = document.getElementById('metricsTaskSelect').value;
             if (!taskId) return;
             try {
-                const resp = await fetch(`${AGENT_BASE_URL}/api/metrics/${taskId}`);
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/metrics`);
+                if (!resp) return;
                 if (resp.ok) {
                     const data = await resp.json();
                     renderMetrics(data);
-                } else if (resp.status === 404) {
+                } else if (resp.status === 404 || resp.status === 400) {
                     renderMetrics({
                         captureRate: 0, e2eLatency: 0, queueDepth: 0, checkpointLag: 0,
                         captureQueueDepth: 0, extractQueueDepth: 0, applyQueueDepth: 0,

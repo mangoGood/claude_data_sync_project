@@ -608,7 +608,21 @@ public class AgentMain {
         }
     }
 
-    /** 清除 config.properties 里的旧 binlog 位点，使切换后从新库当前位点开始增量。 */
+    /**
+     * 清除 config.properties 里的旧位点，使切换后从新源库的**当前**位点开始增量。
+     *
+     * <p>倒换后源库已换成原目标实例，旧源实例上的任何位点在新源上都无意义，必须全部清掉：
+     * <ul>
+     *   <li>MySQL：binlog file+pos 之外，<b>capture.gtid.set / checkpoint.gtid.set 尤其致命</b>——
+     *       GTID 集里全是旧源 server_uuid 的事务，新源一条都不认识，
+     *       服务端按"客户端缺这些事务"的语义从新源 binlog 的**最开头**重放整段历史
+     *       （含历史 DDL 与全量导入），把新备库的数据冲垮；</li>
+     *   <li>PostgreSQL：LSN 是实例内部编号，跨实例无意义（capture.wal.lsn 会让新槽从错误位置起步）；</li>
+     *   <li>Oracle：SCN 同理。</li>
+     * </ul>
+     * 全部清空后 capture 走"从最新位点开始"，这正是主备倒换要的语义。
+     * （{@code service/FailoverService} 里有一份等价实现，实际生效的是本方法，两处需保持一致。）
+     */
     private void clearBinlogPositionInConfig(String taskId) {
         java.io.File configFile = new java.io.File("files/" + taskId + "/config.properties");
         if (!configFile.exists()) return;
@@ -617,18 +631,28 @@ public class AgentMain {
             try (java.io.InputStream cis = new java.io.FileInputStream(configFile)) {
                 configProps.load(cis);
             }
-            configProps.remove("capture.binlog.file");
-            configProps.remove("capture.binlog.position");
-            configProps.remove("checkpoint.binlog.file");
-            configProps.remove("checkpoint.binlog.position");
+            for (String key : STALE_POSITION_KEYS_ON_FAILOVER) {
+                configProps.remove(key);
+            }
             try (java.io.OutputStream cos = new java.io.FileOutputStream(configFile)) {
                 configProps.store(cos, "Updated for failover - binlog position cleared");
             }
-            logger.info("Cleared old binlog position in config for failover task: {}", taskId);
+            logger.info("Cleared old capture position (binlog/gtid/lsn/scn) in config for failover task: {}", taskId);
         } catch (Exception e) {
             logger.warn("Failed to clear binlog position in config for failover task {}: {}", taskId, e.getMessage());
         }
     }
+
+    /** 主备倒换后必须从 config.properties 清除的旧源位点键（三种源类型的并集，删不存在的键是 no-op）。 */
+    public static final String[] STALE_POSITION_KEYS_ON_FAILOVER = {
+        "capture.binlog.file", "capture.binlog.position",
+        "checkpoint.binlog.file", "checkpoint.binlog.position",
+        "capture.gtid.set", "checkpoint.gtid.set",
+        "capture.wal.lsn", "capture.wal.position",
+        "checkpoint.wal.lsn", "checkpoint.wal.position",
+        "capture.redo.scn", "capture.redo.position",
+        "checkpoint.redo.scn", "checkpoint.redo.position",
+    };
 
     private void stopMigrationAgentThread(String taskId) {
         MigrationAgentThread agentThread = migrationAgentThreads.remove(taskId);

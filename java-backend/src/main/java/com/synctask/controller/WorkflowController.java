@@ -323,6 +323,110 @@ public class WorkflowController {
         }
     }
 
+    /** 单任务实时监控指标（代理 agent，服务端持 AGENT_API_TOKEN）。 */
+    @GetMapping("/{id}/metrics")
+    public ResponseEntity<?> getTaskMetrics(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getTaskMetrics(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** 单任务历史监控指标（代理 agent）。查询串 last/start/interval 原样透传。 */
+    @GetMapping("/{id}/metrics/history")
+    public ResponseEntity<?> getTaskMetricsHistory(
+            @PathVariable String id,
+            @RequestParam(required = false) String last,
+            @RequestParam(required = false) String start,
+            @RequestParam(required = false) String interval,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            StringBuilder q = new StringBuilder();
+            if (last != null && !last.isEmpty()) q.append("last=").append(last);
+            if (start != null && !start.isEmpty()) {
+                if (q.length() > 0) q.append('&');
+                q.append("start=").append(start);
+            }
+            if (interval != null && !interval.isEmpty()) {
+                if (q.length() > 0) q.append('&');
+                q.append("interval=").append(interval);
+            }
+            return ResponseEntity.ok(workflowService.getTaskMetricsHistory(id, userPrincipal.getId(), q.toString()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** 表级延迟热力图（代理 agent）。 */
+    @GetMapping("/{id}/table-latency")
+    public ResponseEntity<?> getTableLatency(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getTableLatency(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** 一对多分发状态（代理 agent）。 */
+    @GetMapping("/{id}/fanout")
+    public ResponseEntity<?> getFanoutStatus(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getFanoutStatus(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** agent 上所有（本用户的）任务的实时指标 —— 监控页用来判断哪些任务有实时数据。 */
+    @GetMapping("/metrics/all")
+    public ResponseEntity<?> getAllTaskMetrics(Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getAllTaskMetrics(userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** agent 运行态（本用户的活跃任务列表）。 */
+    @GetMapping("/agent-status")
+    public ResponseEntity<?> getAgentStatus(Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getAgentStatus(userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** 排障压缩包下载（代理 agent）：日志尾部 + 脱敏 config + checkpoint + THL 尾部。 */
+    @GetMapping("/{id}/diagnostics")
+    public ResponseEntity<?> getDiagnosticsBundle(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            byte[] zip = workflowService.getDiagnosticsBundle(id, userPrincipal.getId());
+            return ResponseEntity.ok()
+                    .header("Content-Type", "application/zip")
+                    .header("Content-Disposition", "attachment; filename=\"diagnostics-" + id + ".zip\"")
+                    .body(zip);
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     /** 死信记录：人工裁决跳过的增量事件清单（代理 agent）。 */
     @GetMapping("/{id}/deadletter")
     public ResponseEntity<?> getDeadletterRecords(

@@ -31,7 +31,110 @@ python3 fault_injection/hang_detect.py increment
 # Redis：崩溃自愈一致性 + 引擎僵死检测
 python3 fault_injection/redis_resume.py resume --minutes 5
 python3 fault_injection/redis_resume.py hang
+
+# 异构链路 pg2pg / mysql2pg / pg2mysql / mongo2mongo（dblib.py 引擎适配 + 跨引擎 Python 指纹）
+#   需 venv：python3 -m venv --system-site-packages v && v/bin/pip install psycopg2-binary pymongo
+python3 fault_injection/xdb_resume.py pg2pg       --minutes 5           # 全量+增量断点续传一致
+python3 fault_injection/xdb_resume.py mysql2pg    --minutes 5
+python3 fault_injection/xdb_resume.py pg2mysql    --mode full           # 仅全量：杀全量进程→retry→一致
+python3 fault_injection/xdb_resume.py mongo2mongo --mode full           # mongo 单进程受守护，早期崩溃自愈
+python3 fault_injection/xdb_hang.py   pg2pg    capture                  # 僵死检测（冻结 capture/extract/increment）
+python3 fault_injection/xdb_hang.py   mongo2mongo                       # mongo 冻结 → 进度文件停更 → FAILED
 ```
+
+> 覆盖 pg/mysql/mongo 异构链路。要点见 [[fault-injection-pg-mongo-2026-07]]：mysql→pg 目标表在「源库名」
+> schema（非 public）；mongo 同名库镜像（忽略 targetDbName）；PG 逻辑槽 `migration_slot_<taskId>` 按库隔离。
+
+### 灾备（DR）：单向 / 双向 / 主备倒换
+
+灾备任务另起一套脚本（`drlib.py` + `dr_*.py`），因为它与普通同步任务差别很大：
+`taskType=DR`（后端强制 fullAndIncre）、源/目标必须是**不同实例**、双向灾备还有一条隐藏的
+反向影子通道（`DR_SHADOW`）、以及独有的主备倒换（failover）流程。
+
+前置：`docker compose -f docker-compose-synctask-dr.yml up -d` 起两对独立实例
+（dr-mysql-a/b = 33320/33321，dr-pg-a/b = 55432/55433；两侧都开 binlog / wal_level=logical，
+因为倒换后原目标要当新源）。
+
+```bash
+# 单向灾备：全量阶段注入崩溃(杀 migration-full→retry 续传) + 增量阶段注入崩溃(受守护自愈)
+python3 fault_injection/dr_resume.py mysql2mysql --phase both  --minutes 5 --seed-rows 200000
+python3 fault_injection/dr_resume.py pg2pg       --phase full  --seed-rows 8000000   # 全量 >3 分钟的数据量
+python3 fault_injection/dr_resume.py pg2pg       --phase incre --minutes 5
+
+# 双向灾备：两端同时写 + 正/反两条通道都注入崩溃，验证收敛一致且不回环放大
+python3 fault_injection/dr_resume.py mysql2mysql --mode bidi --minutes 4
+python3 fault_injection/dr_resume.py pg2pg       --mode bidi --minutes 4
+
+# 灾备任务僵死检测（冻结正向通道；--shadow 冻结双向的反向通道）
+python3 fault_injection/dr_hang.py mysql2mysql capture
+python3 fault_injection/dr_hang.py pg2pg       increment
+python3 fault_injection/dr_hang.py mysql2mysql capture --shadow
+
+# 主备倒换 + 倒换前/中/后注入崩溃，验证倒换后两端仍精确一致
+python3 fault_injection/dr_failover.py mysql2mysql --inject before
+python3 fault_injection/dr_failover.py mysql2mysql --inject during
+python3 fault_injection/dr_failover.py pg2pg       --inject after --switch-back
+```
+
+### 订阅（SUBSCRIBE）：mysql / pg / oracle 三种源 → Kafka
+
+订阅任务的目标端是 Kafka 而不是数据库，判定方式与前面都不同，因此另起 `sublib.py` + `sub_*.py`。
+
+前置：**必须先起下游专用 Kafka**（与控制面 29092 那套隔离，否则几十万条 CDC 消息会挤占
+任务下发/状态上报，测试结论不可信）：
+
+```bash
+docker compose -f docker-compose-synctask-kafka-sub.yml up -d      # localhost:39092
+.venv_fi/bin/pip install python-snappy oracledb                    # 消费端解 snappy / oracle 源
+```
+
+```bash
+# 断点续传 + 一致性：播种 20 万行大表存量 → 起订阅 → 持续 3 分钟增删改 →
+# 轮流 SIGKILL subscribe/capture/extract → 停写后比对
+python3 fault_injection/sub_resume.py mysql  --minutes 3
+python3 fault_injection/sub_resume.py pg     --minutes 3
+python3 fault_injection/sub_resume.py oracle --minutes 3
+python3 fault_injection/sub_resume.py mysql  --minutes 3 --no-inject   # 不注入故障的基线对照
+python3 fault_injection/sub_resume.py mysql  --minutes 3 --keep        # 跑完保留任务不删
+
+# 僵死检测：冻结三段中任一段，验证监控上报 FAILED
+python3 fault_injection/sub_hang.py mysql  subscribe
+python3 fault_injection/sub_hang.py pg     capture
+python3 fault_injection/sub_hang.py oracle extract
+```
+
+### 实时监控指标可见性（灾备 / 同步 / 订阅）
+
+`monitoring_visibility.py` 按监控页的真实取数路径，验证三类任务都能在下拉里出现、
+且能取到真实指标（含进程健康 N/N）：
+
+```bash
+python3 fault_injection/monitoring_visibility.py                          # 只看当前在跑的
+python3 fault_injection/monitoring_visibility.py --create-dr --create-sync --keep
+```
+
+订阅一致性用**两把尺子**，缺一不可：
+
+1. **不丢** —— 写入线程给每次 INSERT/UPDATE 打唯一 `opseq`（写进 `val`/`n`），这些真值三元组
+   必须都能在 Kafka 事件里找到。只比最终状态会漏掉"中间某次更新丢了但后来又被覆盖"的情况。
+2. **可收敛** —— 按 Kafka 投递顺序（单分区即 offset 顺序）回放 `c/u/d`、last-write-wins，
+   得到的最终状态必须与源表逐行相等。崩溃重启后重投的是"刚发过的那一段"（回退重放，
+   不是乱序补发），因此按投递顺序回放仍应收敛；若不收敛说明重投顺序真的错乱了，
+   下游拿到的就是脏数据。
+
+存量播种发生在建任务**之前**，不进 CDC 流——这样既有"大表"，又能让 Kafka 里的事件与
+写入线程记录的真值一一对应。
+
+灾备用例的要点：
+
+- **一致性判定改为库内聚合指纹**（`drlib.fingerprint`，MySQL `BIT_XOR(CRC32(...))` / PG
+  `bit_xor(hashtext(...))`）。灾备两端恒为同引擎，不需要 dblib 那种跨引擎 Python 指纹，
+  库内算才跑得动百万级数据量（8,000,000 行的指纹 0.2s，Python 版要几 GB 内存）。
+- **写入线程显式指定主键**（A 段 1000 万起、B 段 2000 万起）。双向灾备两端各自的自增序列
+  会生成相同 id，那是测试制造的写写冲突（active-active 本就无法消解），不是产品缺陷；
+  倒换后新主库的自增/identity 序列也未必随全量数据推进。
+- **倒换点必须先静默并等两端收敛**：倒换后新方向的 capture 从新源的最新位点起步，
+  这是计划内切换的语义；未收敛就切换属于 RPO 窗口内的数据丢失，是灾备的固有语义而非缺陷。
 
 退出码 0 = 全通过。
 
@@ -64,3 +167,7 @@ python3 fault_injection/redis_resume.py hang
   进程 isAlive 仍为 true，不受此门控影响，照常检出。
 - Redis 引擎（`RedisSyncTask`）同理监控 `redis_progress.json`：增量阶段引擎靠 PSYNC 每 ~10s
   的 PING 按时间兜底刷新该文件，冻结即停更被检出。
+- 订阅链路（`SubscribeTask`）监控 `capture_liveness`、`capture_queue_depth`、
+  `subscribe_liveness` 三个文件（subscribe 主循环每轮 + 处理大文件时每 ~2s 改写第三个）。
+  实测冻结 subscribe 进程后 95s 上报 FAILED（阈值 90s + 监控轮询 5s）。
+  注意不能拿 `subscribe_rto_ms` 当活性信号：它只在碰到带源时间戳的事件时才写，空闲即停更。

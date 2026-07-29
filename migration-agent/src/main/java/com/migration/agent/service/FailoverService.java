@@ -176,13 +176,12 @@ public class FailoverService {
             try (InputStream cis = new FileInputStream(configFile)) {
                 configProps.load(cis);
             }
-            configProps.remove("capture.binlog.file");
-            configProps.remove("capture.binlog.position");
-            configProps.remove("checkpoint.binlog.file");
-            configProps.remove("checkpoint.binlog.position");
-            // 主备倒换后源库已是原目标库，旧源的 GTID 集在新源上无意义，残留会导致按错误历史自动定位
-            configProps.remove("capture.gtid.set");
-            configProps.remove("checkpoint.gtid.set");
+            // 主备倒换后源库已是原目标实例，旧源的位点（binlog/GTID/LSN/SCN）在新源上一律无意义，
+            // 残留会导致按错误历史自动定位（GTID 残留会让新源从 binlog 最开头重放整段历史）。
+            // 与 AgentMain.clearBinlogPositionInConfig 保持一致（实际生效的是 AgentMain 那份）。
+            for (String key : com.migration.agent.AgentMain.STALE_POSITION_KEYS_ON_FAILOVER) {
+                configProps.remove(key);
+            }
             try (OutputStream cos = new FileOutputStream(configFile)) {
                 configProps.store(cos, "Updated for failover - binlog position cleared");
             }
