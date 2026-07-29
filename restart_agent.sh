@@ -29,7 +29,7 @@ export AGENT_API_TOKEN="$(cat "$PROJECT_DIR/.synctask_agent_token")"
 echo "[restart-agent] 停止旧 agent ..."
 pkill -f 'migration-agent/target/migration-agent-1.0.0.jar' 2>/dev/null || true
 # 子进程（capture/extract/increment/full）随 agent 退出不会自动收敛，一并清理
-pkill -f 'migration-(capture|extract|increment|full|mongo|redis|elastic)/target' 2>/dev/null || true
+pkill -f 'migration-(capture|extract|increment|full|mongo|redis|elastic|subscribe)/target' 2>/dev/null || true
 sleep 3
 
 echo "[restart-agent] 启动新 agent ..."

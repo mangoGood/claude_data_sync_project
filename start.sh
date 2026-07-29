@@ -16,6 +16,7 @@ DB_COMPOSE_FILE="docker-compose-synctask-db.yml"
 MONGO_COMPOSE_FILE="docker-compose-synctask-mongo.yml"
 REDIS_COMPOSE_FILE="docker-compose-synctask-redis.yml"
 TIDB_COMPOSE_FILE="docker-compose-synctask-tidb.yml"
+KAFKA_SUB_COMPOSE_FILE="docker-compose-synctask-kafka-sub.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
@@ -90,6 +91,12 @@ fi
 if docker inspect synctask-tidb >/dev/null 2>&1; then
   echo "[start] 启动 TiDB 集群 (tidb:14000, pd:12379, ticdc:18300)..."
   docker compose -f "$TIDB_COMPOSE_FILE" start
+fi
+
+# 订阅任务的下游 Kafka（39092），与控制面 29092 隔离；没创建过就跳过
+if docker inspect synctask-kafka-sub >/dev/null 2>&1; then
+  echo "[start] 启动订阅下游 Kafka (kafka-sub:39092)..."
+  docker compose -f "$KAFKA_SUB_COMPOSE_FILE" start
 fi
 
 echo "[start] 等待 MySQL 健康检查通过..."

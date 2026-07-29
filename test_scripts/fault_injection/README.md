@@ -76,6 +76,55 @@ python3 fault_injection/dr_failover.py mysql2mysql --inject during
 python3 fault_injection/dr_failover.py pg2pg       --inject after --switch-back
 ```
 
+### 订阅（SUBSCRIBE）：mysql / pg / oracle 三种源 → Kafka
+
+订阅任务的目标端是 Kafka 而不是数据库，判定方式与前面都不同，因此另起 `sublib.py` + `sub_*.py`。
+
+前置：**必须先起下游专用 Kafka**（与控制面 29092 那套隔离，否则几十万条 CDC 消息会挤占
+任务下发/状态上报，测试结论不可信）：
+
+```bash
+docker compose -f docker-compose-synctask-kafka-sub.yml up -d      # localhost:39092
+.venv_fi/bin/pip install python-snappy oracledb                    # 消费端解 snappy / oracle 源
+```
+
+```bash
+# 断点续传 + 一致性：播种 20 万行大表存量 → 起订阅 → 持续 3 分钟增删改 →
+# 轮流 SIGKILL subscribe/capture/extract → 停写后比对
+python3 fault_injection/sub_resume.py mysql  --minutes 3
+python3 fault_injection/sub_resume.py pg     --minutes 3
+python3 fault_injection/sub_resume.py oracle --minutes 3
+python3 fault_injection/sub_resume.py mysql  --minutes 3 --no-inject   # 不注入故障的基线对照
+python3 fault_injection/sub_resume.py mysql  --minutes 3 --keep        # 跑完保留任务不删
+
+# 僵死检测：冻结三段中任一段，验证监控上报 FAILED
+python3 fault_injection/sub_hang.py mysql  subscribe
+python3 fault_injection/sub_hang.py pg     capture
+python3 fault_injection/sub_hang.py oracle extract
+```
+
+### 实时监控指标可见性（灾备 / 同步 / 订阅）
+
+`monitoring_visibility.py` 按监控页的真实取数路径，验证三类任务都能在下拉里出现、
+且能取到真实指标（含进程健康 N/N）：
+
+```bash
+python3 fault_injection/monitoring_visibility.py                          # 只看当前在跑的
+python3 fault_injection/monitoring_visibility.py --create-dr --create-sync --keep
+```
+
+订阅一致性用**两把尺子**，缺一不可：
+
+1. **不丢** —— 写入线程给每次 INSERT/UPDATE 打唯一 `opseq`（写进 `val`/`n`），这些真值三元组
+   必须都能在 Kafka 事件里找到。只比最终状态会漏掉"中间某次更新丢了但后来又被覆盖"的情况。
+2. **可收敛** —— 按 Kafka 投递顺序（单分区即 offset 顺序）回放 `c/u/d`、last-write-wins，
+   得到的最终状态必须与源表逐行相等。崩溃重启后重投的是"刚发过的那一段"（回退重放，
+   不是乱序补发），因此按投递顺序回放仍应收敛；若不收敛说明重投顺序真的错乱了，
+   下游拿到的就是脏数据。
+
+存量播种发生在建任务**之前**，不进 CDC 流——这样既有"大表"，又能让 Kafka 里的事件与
+写入线程记录的真值一一对应。
+
 灾备用例的要点：
 
 - **一致性判定改为库内聚合指纹**（`drlib.fingerprint`，MySQL `BIT_XOR(CRC32(...))` / PG
@@ -118,3 +167,7 @@ python3 fault_injection/dr_failover.py pg2pg       --inject after --switch-back
   进程 isAlive 仍为 true，不受此门控影响，照常检出。
 - Redis 引擎（`RedisSyncTask`）同理监控 `redis_progress.json`：增量阶段引擎靠 PSYNC 每 ~10s
   的 PING 按时间兜底刷新该文件，冻结即停更被检出。
+- 订阅链路（`SubscribeTask`）监控 `capture_liveness`、`capture_queue_depth`、
+  `subscribe_liveness` 三个文件（subscribe 主循环每轮 + 处理大文件时每 ~2s 改写第三个）。
+  实测冻结 subscribe 进程后 95s 上报 FAILED（阈值 90s + 监控轮询 5s）。
+  注意不能拿 `subscribe_rto_ms` 当活性信号：它只在碰到带源时间戳的事件时才写，空闲即停更。
