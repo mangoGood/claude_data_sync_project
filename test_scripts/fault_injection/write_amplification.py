@@ -32,6 +32,24 @@ import faultlib as F  # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 尺子2 数的是逐行的 SQL 执行日志，而它在默认配置下是 TRACE 且不带行值（见资源治理一批：
+# 逐行 INFO 打完整 DML 曾让 10 分钟任务产出 283MB，还把行数据明文落盘）。
+# 因此本用例显式把任务日志级别与行值开关打开，跑完在 finally 里还原。
+VERBOSE_ENV = {
+    "MIGRATION_TASK_LOG_LEVEL": "DEBUG",
+    "LOGGING_INCLUDE_ROW_VALUES": "true",
+}
+
+
+def restart_agent(extra_env=None):
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    r = subprocess.run(["./restart_agent.sh"], cwd=PROJECT_DIR, env=env,
+                       capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(f"重启 agent 失败: {r.stdout}\n{r.stderr}")
+    print(f"[agent] 已重启（{'逐行 SQL 日志已打开' if extra_env else '默认参数'}）")
+
 CFG = dict(host="127.0.0.1", port=33306, user="root", password="rootpassword")
 SRC_DB = "amp_src"
 TGT_DB = "amp_tgt"
@@ -132,6 +150,7 @@ def main():
 
     total_rows = args.batch * args.batches
 
+    restart_agent(VERBOSE_ENV)
     token = F.login()
     print("✓ 登录成功")
 
@@ -244,6 +263,10 @@ def main():
                                  f"DROP DATABASE IF EXISTS {TGT_DB}"])
             except Exception:
                 pass
+            try:
+                restart_agent()
+            except Exception as e:
+                print(f"[警告] 还原 agent 默认日志参数失败: {e}")
 
     return F.print_result([] if failures else ["write_amplification"], failures)
 

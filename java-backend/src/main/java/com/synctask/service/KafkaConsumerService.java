@@ -387,6 +387,11 @@ public class KafkaConsumerService {
                 return "增量同步中";
             case SUBSCRIBE_RUNNING:
                 return "数据订阅中";
+            case RECONNECTING:
+                // 子进程短期重试已耗尽，agent 仍在按间隔拉起（目标库维护窗口等可自愈场景）
+                return errorMessage != null && !errorMessage.isEmpty()
+                        ? "长期重连中: " + errorMessage
+                        : "长期重连中（子进程短期重试已耗尽，等待自动恢复）";
             case COMPLETED:
                 return "任务执行完成";
             case FAILED:
@@ -405,6 +410,7 @@ public class KafkaConsumerService {
             case FAILED:
                 return WorkflowLog.LogLevel.ERROR;
             case PAUSED:
+            case RECONNECTING:
                 return WorkflowLog.LogLevel.WARNING;
             default:
                 return WorkflowLog.LogLevel.INFO;

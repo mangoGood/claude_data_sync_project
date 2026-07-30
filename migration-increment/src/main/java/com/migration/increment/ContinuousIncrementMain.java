@@ -114,6 +114,26 @@ public class ContinuousIncrementMain {
      */
     private long txIdleFlushMs = 3000;
 
+    /**
+     * 转换失败（THL 反序列化 / 转换器抛异常这类"毒事件"）的处置策略：
+     * false=FAIL_STOP（默认，与 SQL 执行失败对齐：位点不推进、上报失败、等人工裁决）；
+     * true=DEAD_LETTER（写死信 + 推进位点 + 继续）。
+     *
+     * <p>旧行为是两者都不是：catch 住之后把<b>整个 THL 文件</b>（最大 50MB）标成"已处理完"，
+     * 剩余事件永久丢弃，且不写死信、不上报失败、任务状态还停在 INCREMENT_RUNNING——
+     * 一个事件的转换器 bug 就能静默吃掉几十万条变更。
+     */
+    private boolean convertDeadLetter = false;
+    /** 本次运行因转换失败进死信的事件数（仅 DEAD_LETTER 策略下会增长）。 */
+    private long convertDeadLetterCount = 0;
+
+    /** 逐行 SQL 日志是否带行值（合规风险 + 日志膨胀主因，默认关）。 */
+    private boolean logRowValues = false;
+    /** 表延迟 tsv 保留行数上限（超过 2 倍即裁剪回该值）。 */
+    private int tableLatencyMaxLines = 2000;
+    /** 各表 tsv 的当前行数（用于摊薄裁剪成本）。 */
+    private final Map<String, Integer> tableLatencyLines = new java.util.HashMap<>();
+
     /** 当前打开的目标事务对应的源事务标识；null=没有打开的事务。 */
     private String pendingTxId;
     private boolean pendingTxOpen = false;
@@ -265,6 +285,17 @@ public class ContinuousIncrementMain {
         if (txApplyMode) {
             logger.info("事务一致性投递已启用: 源事务 → 目标事务 1:1（单事务行数上限={}, 空闲兜底提交={}ms）",
                     txMaxRows, txIdleFlushMs);
+        }
+
+        convertDeadLetter = "DEAD_LETTER".equalsIgnoreCase(
+                props.getProperty("increment.convert.error.policy", "FAIL_STOP").trim());
+        logger.info("转换失败处置策略: {}", convertDeadLetter ? "DEAD_LETTER（写死信并跳过）" : "FAIL_STOP（停止并上报）");
+
+        logRowValues = Boolean.parseBoolean(props.getProperty("logging.include.row.values", "false").trim());
+        tableLatencyMaxLines = Math.max(60,
+                Integer.parseInt(props.getProperty("increment.table.latency.max.lines", "2000")));
+        if (logRowValues) {
+            logger.warn("logging.include.row.values=true：逐条 DML 的行值会明文写进任务日志（合规风险，仅排障时开）");
         }
 
         if (applyParallelism > 1) {
@@ -521,7 +552,17 @@ public class ContinuousIncrementMain {
         // 打断时绝不能把文件标记为“已处理完(-1)”，否则重启后整个文件被跳过造成数据丢失
         boolean aborted = false;
 
-        try (THLFileReader reader = createThlReader(thlFile.getAbsolutePath())) {
+        // reader 构造单独接住：文件级不可读（损坏/截断/权限）与"逐事件处理出错"是两回事，
+        // 但两者都不允许静默把文件标成已处理——必须上报，由人决定跳过还是修复。
+        THLFileReader openedReader;
+        try {
+            openedReader = createThlReader(thlFile.getAbsolutePath());
+        } catch (Exception openEx) {
+            failStopOnFile(fileName, "THL 文件无法打开", openEx);
+            return;
+        }
+
+        try (THLFileReader reader = openedReader) {
             THLEvent event;
             // readEventAfter 只返回 seqno > 已执行seqno 的事件：分帧格式下对已应用事件按字节跳过、
             // 不反序列化，大幅加快增量进程重启时“从 seqno 跳到当前位点”；旧格式自动回退为逐条反序列化跳过。
@@ -590,16 +631,31 @@ public class ContinuousIncrementMain {
                     continue;
                 }
 
-                // 类型化值管道优先（mysql→pg 且事件带 rows_typed）；不适用返回 null 走文本路径
-                List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
-                List<String> sqlStatements = (typedDmls == null)
-                        ? sqlConverter.convertToSql(event)
-                        : java.util.Collections.emptyList();
+                // 类型化值管道优先（mysql→pg 且事件带 rows_typed）；不适用返回 null 走文本路径。
+                // 转换器抛异常（未知类型 / NPE / 越界）单独接住：这是"毒事件"，既不能让它冒到
+                // 外层 catch 把整个文件标成已处理（静默丢剩余全部事件），也不能当没发生。
+                List<ParameterizedDml> typedDmls;
+                List<String> sqlStatements;
+                try {
+                    typedDmls = typedDmlConverter.convert(event);
+                    sqlStatements = (typedDmls == null)
+                            ? sqlConverter.convertToSql(event)
+                            : java.util.Collections.emptyList();
+                } catch (Exception convEx) {
+                    if (!handleConvertFailure(event, convEx)) {
+                        aborted = true;
+                        running.set(false);
+                        break;
+                    }
+                    continue;
+                }
 
+                // 逐事件一条同样是长跑的日志膨胀源（BEGIN/COMMIT 也各占一条），降到 DEBUG；
+                // 进度看每 100 个事件一条的汇总行即可
                 if (typedDmls != null && !typedDmls.isEmpty()) {
-                    logger.info("为seqno={}生成了{}条参数化SQL（类型化值管道）", event.getSeqno(), typedDmls.size());
+                    logger.debug("为seqno={}生成了{}条参数化SQL（类型化值管道）", event.getSeqno(), typedDmls.size());
                 } else if (sqlStatements != null && !sqlStatements.isEmpty()) {
-                    logger.info("为seqno={}生成了{}条SQL语句", event.getSeqno(), sqlStatements.size());
+                    logger.debug("为seqno={}生成了{}条SQL语句", event.getSeqno(), sqlStatements.size());
                 }
 
                 // 按事务批量执行SQL：EVENT 模式下一个 THL 事件一个目标事务（历史行为）；
@@ -629,7 +685,7 @@ public class ContinuousIncrementMain {
                         // 类型化路径：PreparedStatement 参数绑定执行
                         for (ParameterizedDml dml : typedDmls) {
                             try {
-                                logger.info("执行参数化SQL (seqno={}): {}", event.getSeqno(), dml);
+                                logAppliedDml(event, "参数化SQL", dml);
                                 executeTypedInTransaction(dml);
                                 eventCount++;
                             } catch (SQLException e) {
@@ -660,7 +716,7 @@ public class ContinuousIncrementMain {
                     } else {
                     for (String sql : sqlStatements) {
                         try {
-                            logger.info("执行SQL (seqno={}): {}", event.getSeqno(), sql.substring(0, Math.min(300, sql.length())));
+                            logAppliedDml(event, "SQL", sql.substring(0, Math.min(300, sql.length())));
                             executeSqlInTransaction(sql);
                             eventCount++;
                         } catch (SQLException e) {
@@ -765,16 +821,11 @@ public class ContinuousIncrementMain {
                 }
             }
         } catch (Exception e) {
-            logger.error("处理THL文件出错: {}, 跳过至下一个文件. 错误: {}", fileName, e.getMessage());
-            // 不再抛出 RuntimeException，避免进程崩溃后反复重启在同一位置失败
-            // 标记该文件已处理（跳过），继续处理下一个文件
-            rollbackPendingTx(null);   // 手里若有没提交完的事务，连同本文件一起放弃，等重读
-            if (isLatestFile) {
-                processedFiles.put(fileName, lastExecutedSeqno);
-            } else {
-                processedFiles.put(fileName, -1L);
-            }
-            saveProgress();
+            // 逐事件的转换失败已在循环里按策略处置过了，能到这里的是流级异常（反序列化损坏、IO 中断）。
+            // 旧实现在这里把文件标 -1「跳过至下一个文件」，剩余事件（最大 50MB）永久丢弃且不上报，
+            // 与同文件里 fail-stop 的设计自相矛盾。现在一律 fail-stop：位点停在已应用处，等人裁决。
+            failStopOnFile(fileName, "处理 THL 文件出错", e);
+            return;
         }
 
         if (eventCount > 0) {
@@ -1169,6 +1220,23 @@ public class ContinuousIncrementMain {
      * 文件格式：./files/{taskId}/binlog_output/table_latency/{tableName}.tsv
      * 每行：appliedTs\teventTs\tlatencyMs\topType
      */
+    /**
+     * 逐行的 SQL 执行日志。
+     *
+     * <p>两个问题一起改：<b>量</b>——每行一条 INFO，实测 10 分钟任务 283MB；
+     * <b>合规</b>——打的是拼好值的完整 DML / 带参数值的 dml，等于把行数据明文落盘（DTS/DMS 默认都不记）。
+     * 现在默认走 TRACE 且只留 seqno/表名（定位够用），显式开 {@code logging.include.row.values=true}
+     * 才在 DEBUG 打出带值的语句。事件级的汇总行（"为 seqno=N 生成了 M 条…"）仍是 INFO，
+     * 既能看出进度，也够判定写放大。
+     */
+    private void logAppliedDml(THLEvent event, String kind, Object detail) {
+        if (logRowValues) {
+            logger.debug("执行{} (seqno={}): {}", kind, event.getSeqno(), detail);
+        } else if (logger.isTraceEnabled()) {
+            logger.trace("执行{} (seqno={}, table={})", kind, event.getSeqno(), event.getMetadata("table_name"));
+        }
+    }
+
     private void recordTableLatency(THLEvent event, String opType) {
         if (event == null || tableLatencyDir == null) return;
         String tableName = (String) event.getMetadata("table_name");
@@ -1186,9 +1254,72 @@ public class ContinuousIncrementMain {
             try (BufferedWriter writer = new BufferedWriter(new FileWriter(file, true))) {
                 writer.write(String.format("%d\t%d\t%d\t%s%n", appliedTs, eventTs, latencyMs, opType));
             }
+            rollTableLatencyFile(safeName, file);
         } catch (IOException e) {
             logger.debug("记录表延迟失败: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 表延迟 tsv 的滚动裁剪：只保留最后 {@code increment.table.latency.max.lines} 行。
+     *
+     * <p>原来是"每个事件追加一行、从不裁剪"，读侧（TableLatencyService）却每次都整文件读进内存
+     * 再只取最后 60 条——实测单个测试任务就 46,268 行 / 2.6MB，按 5000 行/秒的生产流量估算
+     * 约 17GB/天/表，热力图接口还越来越慢。
+     *
+     * <p>裁剪本身也不能每行都做：行数攒到上限的 2 倍才重写一次，均摊后每行的额外开销接近 0。
+     */
+    private void rollTableLatencyFile(String safeName, File file) {
+        int written = tableLatencyLines.merge(safeName, 1, Integer::sum);
+        if (written == 1) {
+            // 本进程第一次写这张表：先数一遍已有行数（可能是上次运行留下的大文件）
+            written = countLines(file);
+            tableLatencyLines.put(safeName, written);
+        }
+        if (written <= tableLatencyMaxLines * 2) {
+            return;
+        }
+        java.util.ArrayDeque<String> tail = new java.util.ArrayDeque<>(tableLatencyMaxLines + 1);
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                tail.addLast(line);
+                if (tail.size() > tableLatencyMaxLines) {
+                    tail.pollFirst();
+                }
+            }
+        } catch (IOException e) {
+            logger.debug("裁剪表延迟文件读失败 {}: {}", file.getName(), e.getMessage());
+            return;
+        }
+        File tmp = new File(file.getParentFile(), file.getName() + ".tmp");
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(tmp, false))) {
+            for (String line : tail) {
+                writer.write(line);
+                writer.newLine();
+            }
+        } catch (IOException e) {
+            logger.debug("裁剪表延迟文件写失败 {}: {}", file.getName(), e.getMessage());
+            tmp.delete();
+            return;
+        }
+        if (tmp.renameTo(file)) {
+            tableLatencyLines.put(safeName, tail.size());
+            logger.debug("表延迟文件已裁剪至 {} 行: {}", tail.size(), file.getName());
+        } else {
+            tmp.delete();
+        }
+    }
+
+    private int countLines(File file) {
+        if (!file.exists()) return 0;
+        int n = 0;
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            while (reader.readLine() != null) n++;
+        } catch (IOException e) {
+            logger.debug("统计表延迟文件行数失败 {}: {}", file.getName(), e.getMessage());
+        }
+        return n;
     }
 
     private void reconnectTargetDatabase() {
@@ -1327,7 +1458,37 @@ public class ContinuousIncrementMain {
      * SQL 为尽力转换（毒事件可能在转换阶段就失败，此时只记事件元数据）。
      * 同一 eventId 带SQL/仅元数据各至多记录一次——resume 重放会反复命中已跳过事件。
      */
+    /**
+     * 转换失败（毒事件）的统一处置。返回 false 表示应 fail-stop 停止本文件。
+     *
+     * <p>无论哪种策略，都必须<b>先把手里打开的目标事务提交掉</b>再动位点——
+     * 与人工裁决跳过同理：位点一旦越过未提交的事件，崩溃就是真丢数据。
+     */
+    private boolean handleConvertFailure(THLEvent event, Exception convEx) {
+        String detail = convEx.getClass().getSimpleName()
+                + (convEx.getMessage() != null ? ": " + convEx.getMessage() : "");
+        if (pendingTxOpen && !commitPendingTx("转换失败前收口")) {
+            return false;
+        }
+        if (!convertDeadLetter) {
+            logger.error("事件转换失败，按 FAIL_STOP 停止增量应用: seqno={}, table={}, 错误={}",
+                    event.getSeqno(), event.getMetadata("table_name"), detail, convEx);
+            writeErrorStatus("E3009", "增量事件转换失败: " + detail, event);
+            return false;
+        }
+        convertDeadLetterCount++;
+        logger.error("事件转换失败，按 DEAD_LETTER 记死信并跳过: seqno={}, table={}, 错误={}（累计 {} 条）",
+                event.getSeqno(), event.getMetadata("table_name"), detail, convertDeadLetterCount, convEx);
+        recordDeadLetter(event, "convert-failed");
+        advanceCheckpoint(event);
+        return true;
+    }
+
     private void recordDeadLetter(THLEvent event) {
+        recordDeadLetter(event, "manual-skip");
+    }
+
+    private void recordDeadLetter(THLEvent event, String reason) {
         if (!deadletterIndexLoaded) {
             loadDeadletterIndex();
         }
@@ -1356,7 +1517,7 @@ public class ContinuousIncrementMain {
           .append("\"tableName\":\"").append(jsonEscape(String.valueOf(event.getMetadata("table_name")))).append("\",")
           .append("\"binlogFile\":\"").append(jsonEscape(String.valueOf(event.getMetadata("binlog_file")))).append("\",")
           .append("\"binlogPosition\":\"").append(jsonEscape(String.valueOf(event.getMetadata("binlog_position")))).append("\",")
-          .append("\"reason\":\"manual-skip\",")
+          .append("\"reason\":\"").append(jsonEscape(reason)).append("\",")
           .append("\"statements\":[");
         for (int i = 0; i < statements.size(); i++) {
             if (i > 0) sb.append(',');
@@ -1372,8 +1533,8 @@ public class ContinuousIncrementMain {
         } catch (IOException e) {
             logger.error("写入死信记录失败 (seqno={}): {}", event.getSeqno(), e.getMessage());
         }
-        logger.warn("事件已按人工裁决跳过并记入死信: seqno={}, table={}, statements={}",
-                event.getSeqno(), event.getMetadata("table_name"), statements.size());
+        logger.warn("事件已跳过并记入死信（reason={}）: seqno={}, table={}, statements={}",
+                reason, event.getSeqno(), event.getMetadata("table_name"), statements.size());
     }
 
     private static String jsonEscape(String s) {
@@ -1516,8 +1677,18 @@ public class ContinuousIncrementMain {
                 }
 
                 // 并行化 DML：转换在主线程完成（保持有序、规避转换器线程安全）
-                List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
-                List<String> sqlStatements = (typedDmls == null) ? sqlConverter.convertToSql(event) : null;
+                List<ParameterizedDml> typedDmls;
+                List<String> sqlStatements;
+                try {
+                    typedDmls = typedDmlConverter.convert(event);
+                    sqlStatements = (typedDmls == null) ? sqlConverter.convertToSql(event) : null;
+                } catch (Exception convEx) {
+                    // 毒事件：先把批里已转换的落库（否则位点推进会越过它们），再按策略处置
+                    if (!flushBatch(batch)) { aborted = true; break; }
+                    batch.clear();
+                    if (!handleConvertFailure(event, convEx)) { aborted = true; break; }
+                    continue;
+                }
                 batch.add(new WorkItem(event, typedDmls, sqlStatements));
             }
             if (!aborted) {
@@ -1525,10 +1696,7 @@ public class ContinuousIncrementMain {
                 batch.clear();
             }
         } catch (Exception e) {
-            logger.error("处理THL文件(并行)出错: {}, 错误: {}", fileName, e.getMessage(), e);
-            if (isLatestFile) processedFiles.put(fileName, lastExecutedSeqno);
-            else processedFiles.put(fileName, -1L);
-            saveProgress();
+            failStopOnFile(fileName, "处理 THL 文件出错（并行）", e);
             return;
         }
 
@@ -1949,12 +2117,30 @@ public class ContinuousIncrementMain {
         }
     }
 
+    /**
+     * 文件级不可恢复错误的统一收口：回滚未提交事务 → 位点停在已应用处（<b>绝不标 -1</b>）→
+     * 写 error_status 让 agent 判 FAILED → 停止本进程的应用循环。
+     */
+    private void failStopOnFile(String fileName, String what, Exception e) {
+        String detail = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
+        logger.error("{}: {}，fail-stop（位点停在 seqno={}，不跳过剩余事件）: {}",
+                what, fileName, lastExecutedSeqno, detail, e);
+        rollbackPendingTx(null);
+        processedFiles.put(fileName, lastExecutedSeqno);
+        saveProgress();
+        writeErrorStatus("E3010", what + " " + fileName + " - " + detail, lastExecutedSeqno, "");
+        running.set(false);
+    }
+
     private void writeErrorStatus(String errorCode, String errorMessage, THLEvent event) {
-        long seqno = event.getSeqno();
+        writeErrorStatus(errorCode, errorMessage, event.getSeqno(), event.getEventId());
+    }
+
+    private void writeErrorStatus(String errorCode, String errorMessage, long seqno, String eventId) {
         // eventId（binlog文件:位点）跨重启稳定，嵌入错误信息供后端"跳过失败事件"按稳定身份下发；
         // seqno 在 resume 重新提取后会变，仅作展示/兼容
-        if (event.getEventId() != null && !event.getEventId().isEmpty()) {
-            errorMessage = "[eventId=" + event.getEventId() + "] " + errorMessage;
+        if (eventId != null && !eventId.isEmpty()) {
+            errorMessage = "[eventId=" + eventId + "] " + errorMessage;
         }
         String metricsDir = "./files/" + taskId + "/binlog_output";
         File dir = new File(metricsDir);

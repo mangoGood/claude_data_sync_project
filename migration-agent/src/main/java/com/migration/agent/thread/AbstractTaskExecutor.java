@@ -139,6 +139,12 @@ public abstract class AbstractTaskExecutor implements Runnable {
                     break;
                 }
 
+                // 磁盘水位：先背压（暂停 capture 拉取）再判失败，避免把宿主磁盘写满拖垮所有任务
+                if (checkDiskQuota()) {
+                    stopped.set(true);
+                    break;
+                }
+
                 collectMetrics(taskMetrics);
                 sendPeriodicMetricsUpdate(taskMetrics);
                 persistMetrics(taskMetrics);
@@ -171,14 +177,29 @@ public abstract class AbstractTaskExecutor implements Runnable {
     }
 
     /**
-     * 僵死看门狗是否应在本轮执行。仅当所有受守护子进程都处于 RUNNING 时才检查——
-     * 子进程崩溃后被 ProcessGuard 重启的窗口内其活性文件本就会短暂停更，此时交给崩溃恢复路径
-     * 处理、跳过僵死判定，避免把“正在重启”误判成“僵死”。冻结（SIGSTOP）下进程 isAlive 仍为 true，
-     * 不受此门控影响，照常被检出。
+     * 写这个活性文件的子进程是否<b>正在被 ProcessGuard 重启</b>（进程当前不在跑）。
+     *
+     * <p>重启窗口内该文件本就会停更，只能跳过<b>它自己</b>的僵死判定。
+     * 旧实现是一个全局开关「有任一进程不在 RUNNING 就整轮跳过」，于是只要有一个进程在
+     * crash-loop 里反复重启，<b>其余进程的冻结就被一起静默掉</b>——最坏情况是任务表面在跑、
+     * 实际上游早已冻结，而看门狗被永久关掉。改为按进程各自判定后，A 进程重启不再掩盖 B 进程僵死。
      */
-    protected boolean guardsHealthyForStallCheck() {
-        return true;
+    protected boolean livenessOwnerRestarting(String path) {
+        if (path.endsWith("capture_liveness")) {
+            return captureGuard != null && !captureGuard.isRunning();
+        }
+        if (path.endsWith("capture_queue_depth")) {
+            return extractGuard != null && !extractGuard.isRunning();
+        }
+        if (path.endsWith("increment_liveness")) {
+            return incrementGuard != null && !incrementGuard.isRunning();
+        }
+        return false;
     }
+
+    /** 各活性文件对应进程「连续不在 RUNNING」的起始时刻，用于把长时间不可用记进日志。 */
+    private final Map<String, Long> guardDownSince = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Long> guardDownLastLog = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * 活性文件"缺失"是否也该算僵死信号：仅当写它的那个子进程**已启动且存活**时才算。
@@ -212,12 +233,21 @@ public abstract class AbstractTaskExecutor implements Runnable {
      */
     protected boolean checkPipelineStalled() {
         java.util.List<String> files = stallLivenessFiles();
-        if (files.isEmpty() || !guardsHealthyForStallCheck()) {
+        if (files.isEmpty()) {
             return false;
         }
         long now = System.currentTimeMillis();
         long threshold = config.getStallThresholdMs();
         for (String path : files) {
+            // 只跳过“正在重启的那个进程”的活性文件，其余进程照常判定
+            if (livenessOwnerRestarting(path)) {
+                noteGuardDown(path, now);
+                livenessBaseline.remove(path);
+                continue;
+            }
+            guardDownSince.remove(path);
+            guardDownLastLog.remove(path);
+
             File f = new File(path);
             if (!f.exists()) {
                 if (!livenessFileExpected(path)) {
@@ -251,6 +281,107 @@ public abstract class AbstractTaskExecutor implements Runnable {
             }
         }
         return false;
+    }
+
+    // ==================== 磁盘水位保护 ====================
+
+    private long lastDiskCheckMs = 0;
+    private boolean diskBackpressureOn = false;
+
+    /**
+     * 任务目录磁盘水位巡检：两级处置，返回 true 表示已判失败、调用方应终止任务。
+     *
+     * <ul>
+     *   <li>超过 {@code task.disk.quota.mb × task.disk.backpressure.ratio}：写 PAUSE 背压信号
+     *       让 capture 停止拉取——上游一停，THL/cap 就不再增长，给消费侧追平的机会；</li>
+     *   <li>超过配额本身：上报 E3008 失败。宁可一个任务停，也不能把宿主磁盘写满——
+     *       磁盘满会让<b>所有</b>任务的位点落盘、日志、H2 同时失败，是最难恢复的一类故障。</li>
+     * </ul>
+     * 目录大小要遍历整棵树，因此按 {@code task.disk.check.interval.ms}（默认 60s）节流。
+     */
+    protected boolean checkDiskQuota() {
+        try {
+            return checkDiskQuotaInternal();
+        } catch (Exception e) {
+            // 巡检本身出错绝不能牵连任务：遍历目录时撞上正在被删的文件是常态
+            logger.warn("[{}] 磁盘水位巡检出错（忽略）: {}", taskId, e.toString());
+            return false;
+        }
+    }
+
+    private boolean checkDiskQuotaInternal() {
+        long quotaMb = config.getTaskDiskQuotaMb();
+        if (quotaMb <= 0) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastDiskCheckMs < config.getTaskDiskCheckIntervalMs()) {
+            return false;
+        }
+        lastDiskCheckMs = now;
+
+        File taskDir = new File("./files/" + taskId);
+        if (!taskDir.isDirectory()) {
+            return false;
+        }
+        long usedMb = com.migration.agent.service.TaskFilesJanitor.dirSizeBytes(taskDir) / (1024 * 1024);
+        if (usedMb >= quotaMb) {
+            logger.error("[{}] 任务目录已用 {}MB，超过配额 {}MB，判定失败", taskId, usedMb, quotaMb);
+            sendFailedStatus("E3008", String.format(
+                    "任务磁盘用量 %dMB 超过配额 %dMB，已停止任务以保护宿主磁盘", usedMb, quotaMb));
+            return true;
+        }
+
+        long backpressureMb = (long) (quotaMb * config.getTaskDiskBackpressureRatio());
+        if (usedMb >= backpressureMb) {
+            if (!diskBackpressureOn) {
+                diskBackpressureOn = true;
+                writeBackpressureSignal("PAUSE");
+                logger.warn("[{}] 任务目录已用 {}MB，超过背压水位 {}MB（配额 {}MB），暂停 capture 拉取",
+                        taskId, usedMb, backpressureMb, quotaMb);
+            }
+        } else if (diskBackpressureOn) {
+            diskBackpressureOn = false;
+            writeBackpressureSignal("RESUME");
+            logger.info("[{}] 任务目录降到 {}MB，低于背压水位 {}MB，恢复 capture 拉取",
+                    taskId, usedMb, backpressureMb);
+        }
+        return false;
+    }
+
+    /** 复用 extract↔capture 既有的文件信号通道（files/&lt;taskId&gt;/backpressure.signal）。 */
+    private void writeBackpressureSignal(String signal) {
+        File file = new File("./files/" + taskId + "/backpressure.signal");
+        try {
+            File parent = file.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            java.nio.file.Files.write(file.toPath(),
+                    (signal + System.lineSeparator() + System.currentTimeMillis() + System.lineSeparator())
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            logger.warn("[{}] 写背压信号失败: {}", taskId, e.getMessage());
+        }
+    }
+
+    /**
+     * 记录某个进程「连续不在 RUNNING」的时长并周期性告警。
+     *
+     * <p>不在这里判失败：长期重连（RECONNECTING）本来就允许进程长时间不在——判失败是
+     * ProcessGuard 的职责（重连次数用尽才 FAILED）。这里只保证这段时间在日志里<b>看得见</b>，
+     * 而不是像旧实现那样连带把整个看门狗静默掉、什么都不留下。
+     */
+    private void noteGuardDown(String path, long now) {
+        long since = guardDownSince.computeIfAbsent(path, k -> now);
+        long downMs = now - since;
+        if (downMs < config.getStallThresholdMs()) {
+            return;
+        }
+        long lastLog = guardDownLastLog.getOrDefault(path, 0L);
+        if (now - lastLog >= config.getStallThresholdMs()) {
+            guardDownLastLog.put(path, now);
+            logger.warn("[{}] 活性文件 {} 的进程已连续 {}s 不在运行（重启/重连中），其僵死判定暂时跳过",
+                    taskId, path, downMs / 1000);
+        }
     }
 
     /**

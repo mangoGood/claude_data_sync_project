@@ -118,12 +118,13 @@ public class SubscribeTask extends AbstractTaskExecutor {
                 dir + "capture_liveness", dir + "capture_queue_depth", dir + "subscribe_liveness");
     }
 
-    /** 三个受守护进程都在 RUNNING 时才做僵死判定，避免把 ProcessGuard 的重启窗口误判成僵死。 */
+    /** subscribe 进程正在被 ProcessGuard 重启时，只跳过它自己那个活性文件（capture/extract 照常判定）。 */
     @Override
-    protected boolean guardsHealthyForStallCheck() {
-        return captureGuard != null && captureGuard.isRunning()
-                && extractGuard != null && extractGuard.isRunning()
-                && subscribeGuard != null && subscribeGuard.isRunning();
+    protected boolean livenessOwnerRestarting(String path) {
+        if (path.endsWith("subscribe_liveness")) {
+            return subscribeGuard != null && !subscribeGuard.isRunning();
+        }
+        return super.livenessOwnerRestarting(path);
     }
 
     /** subscribe_liveness 缺失只有在 subscribe 进程确实活着时才算僵死信号（启动即冻结也能检出）。 */

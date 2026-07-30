@@ -603,6 +603,16 @@ public class ConfigService {
         writeEnumPropFromEnv(props, "subscribe.transaction.topic.enabled",
                 "SUBSCRIBE_TRANSACTION_TOPIC_ENABLED", "true", "false");
 
+        // 转换失败（毒事件）处置策略：默认 FAIL_STOP（停下等人裁决），
+        // DEAD_LETTER 让此类事件写死信后自动跳过（愿意用少量丢弃换不中断）。
+        writeEnumPropFromEnv(props, "increment.convert.error.policy",
+                "INCREMENT_CONVERT_ERROR_POLICY", "FAIL_STOP", "DEAD_LETTER");
+        // 逐事件 SQL 日志是否带行值（默认不带：行数据明文落盘既是合规风险也是日志膨胀主因）
+        writeEnumPropFromEnv(props, "logging.include.row.values",
+                "LOGGING_INCLUDE_ROW_VALUES", "true", "false");
+        // 表级延迟 tsv 的保留行数（超过即滚动裁剪，避免长跑把磁盘写满）
+        writeIntPropFromEnv(props, "increment.table.latency.max.lines", "INCREMENT_TABLE_LATENCY_MAX_LINES");
+
         // 落盘前加密敏感值（口令）：config.properties 不再存明文密码，子进程读取时按 ENC: 前缀解密。
         encryptSensitiveProps(props);
 
@@ -981,9 +991,27 @@ public class ConfigService {
         return syncObjects;
     }
 
+    /**
+     * 每任务一份 logback.xml。
+     *
+     * <p>{@code com.migration} 原先固定 DEBUG，加上增量对每条 SQL 打 INFO，实测 10 分钟任务产出
+     * 283MB 日志、单任务 totalSizeCap 10GB —— N 个任务就是 N×10GB，长跑必然把宿主磁盘写满。
+     * 现在默认 INFO（{@code MIGRATION_TASK_LOG_LEVEL=DEBUG} 可临时调回排障），
+     * 单任务上限收到 2GB / 保留 7 天。
+     */
     private void createLogbackConfig(File taskDir, String taskId) throws IOException {
         File logbackFile = new File(taskDir, "logback.xml");
-        
+
+        String logLevel = System.getenv("MIGRATION_TASK_LOG_LEVEL");
+        if (logLevel == null || logLevel.trim().isEmpty()) {
+            logLevel = System.getProperty("MIGRATION_TASK_LOG_LEVEL", "INFO");
+        }
+        logLevel = logLevel.trim().toUpperCase();
+        if (!java.util.Arrays.asList("TRACE", "DEBUG", "INFO", "WARN", "ERROR").contains(logLevel)) {
+            logger.warn("MIGRATION_TASK_LOG_LEVEL={} 非法，回退 INFO", logLevel);
+            logLevel = "INFO";
+        }
+
         String logbackContent = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
             "<configuration>\n" +
             "    <property name=\"LOG_PATH\" value=\"files/" + taskId + "/logs\"/>\n" +
@@ -1007,8 +1035,8 @@ public class ConfigService {
             "            <timeBasedFileNamingAndTriggeringPolicy class=\"ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP\">\n" +
             "                <maxFileSize>100MB</maxFileSize>\n" +
             "            </timeBasedFileNamingAndTriggeringPolicy>\n" +
-            "            <maxHistory>30</maxHistory>\n" +
-            "            <totalSizeCap>10GB</totalSizeCap>\n" +
+            "            <maxHistory>7</maxHistory>\n" +
+            "            <totalSizeCap>2GB</totalSizeCap>\n" +
             "        </rollingPolicy>\n" +
             "    </appender>\n" +
             "\n" +
@@ -1017,7 +1045,7 @@ public class ConfigService {
             "        <appender-ref ref=\"FILE\"/>\n" +
             "    </root>\n" +
             "\n" +
-            "    <logger name=\"com.migration\" level=\"DEBUG\"/>\n" +
+            "    <logger name=\"com.migration\" level=\"" + logLevel + "\"/>\n" +
             "</configuration>";
         
         try (OutputStream output = new FileOutputStream(logbackFile)) {

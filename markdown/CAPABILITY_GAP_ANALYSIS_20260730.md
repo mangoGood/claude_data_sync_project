@@ -23,6 +23,11 @@
 **第 1 批（B 层的位点重放 + 孤儿双写）已实施完成并实测通过，见 §7**；
 过程中还揪出并修掉了一个被孤儿进程长期掩盖的静默丢数据缺陷（§2.3b）。
 
+**第 3 批（B 层的熔断自愈 + 2.4 静默丢文件 + C 层的资源治理）已实施完成并实测通过，见 §9**：
+依赖不可用不再永久打死任务（新增 RECONNECTING 态 + 三态熔断，恢复后自愈）、
+反复崩溃有了 E3007 而不再伪装成健康、转换失败与文件损坏一律 fail-stop 不再静默吞掉整个 THL 文件、
+日志与表延迟文件从无界变有界且默认不落行值。
+
 **第 2 批（D 层的 N² 写放大 + A 层的事务一致性投递）已实施完成并实测通过，见 §8**：
 写放大从 124× 降到 **1.00×**（1000 行 → 1000 次目标写入，未修时理论值 200,000 次）；
 `apply.transaction.mode=TRANSACTION` 下源事务与目标提交点 **150:150 严格 1:1**、
@@ -185,7 +190,7 @@ Oracle（`capture.redo.scn`）同样问题。PG 因为服务端复制槽 `confir
 
 ---
 
-### 2.4 【中·正确性】THL 文件处理异常 → 静默跳过整个文件剩余事件
+### 2.4 【中·正确性】THL 文件处理异常 → 静默跳过整个文件剩余事件　【已实施，见 §9】
 
 [ContinuousIncrementMain.java:703-713](migration-increment/src/main/java/com/migration/increment/ContinuousIncrementMain.java:703)：
 
@@ -204,7 +209,7 @@ Oracle（`capture.redo.scn`）同样问题。PG 因为服务端复制槽 `confir
 这与同文件里精心设计的 fail-stop（`aborted` 分支绝不标 -1）自相矛盾——fail-stop 只保护
 SQL 执行失败，不保护转换失败。
 
-### 2.5 【中·恢复能力】熔断器只有 CLOSED/OPEN，没有半开，永不自愈
+### 2.5 【中·恢复能力】熔断器只有 CLOSED/OPEN，没有半开，永不自愈　【已实施，见 §9】
 
 [CircuitBreaker.java:13](migration-agent/src/main/java/com/migration/agent/resilience/CircuitBreaker.java:13) 的
 `State` 枚举只有两个值，`reset()` 是 public 但**全仓无人调用**（ProcessGuard 只调
@@ -219,7 +224,7 @@ SQL 执行失败，不保护转换失败。
 `INCREMENT_RUNNING`「进程已自动重启恢复」。**永久 crash-loop 在监控上完全不可见**——
 僵死看门狗又恰好被 `guardsHealthyForStallCheck()` 在重启窗口内关掉了。
 
-### 2.6 【中·长跑】三处无界增长
+### 2.6 【中·长跑】三处无界增长　【已实施，见 §9】
 
 1. **表级延迟文件**：`recordTableLatency()` 对**每个事件**向
    `binlog_output/table_latency/<table>.tsv` 追加一行，**从不裁剪**
@@ -345,6 +350,12 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 | `subscribe_txn_metadata.py --txns 20`（**第 2 批新增**） | **通过 5 / 失败 0** | 40/40 条消息带 `transaction` 块；20 个源事务各恰好 2 条消息且共享同一 `transaction.id`；`total_order` 事务内从 1 递增；事务标记 topic BEGIN 20 / END 20，`event_count` 均为 2 |
 | `sql_resume.py mysql --minutes 3`（**第 2 批后回归，TRANSACTION 模式**） | **通过 3 / 失败 0** | 2 次 SIGKILL（capture、extract）后 23207 行两端指纹相等（BIT_XOR 1845963337）——按事务提交不影响崩溃续传语义 |
 | `position_resume.py --rows 800`（**第 2 批后回归，默认模式**） | **通过 5 / 失败 0** | 重启位点 205785312 vs 配置起始 205288696；静默窗口重放 0 条；agent SIGKILL 后 3 个子进程全部自杀；2600 行两端 xor 相等（第 1 批能力无回归） |
+| `selfheal_reconnect.py --rows 400`（**第 3 批新增**） | **通过 4 / 失败 0** | 连杀 3 次 → 错误码 E3007（任务仍是运行态，不判死）；移走 increment jar → **RECONNECTING**（旧行为是熔断打开后守护线程退出、任务判死）；放回 jar 后 **自行**回到 INCREMENT_RUNNING；自愈后 401 行两端指纹相等 |
+| `resource_governance.py --rows 3000`（**第 3 批新增**） | **通过 5 / 失败 0** | 行值明文日志 **0** 行；日志 **21KB/千行**（治理前同一用例 1118KB/千行，降 53×，阈值 400KB）；表延迟 tsv 最大 366 行（上限 200，容忍 2×，旧行为无上限）；热力图接口仍返回 4 张表；删除任务后生成 `.terminal` 终态标记 |
+| `write_amplification.py --batch 200 --batches 5`（**第 3 批后回归**） | **通过 1 / 失败 0** | 放大率仍 1.00×，执行 SQL 1000 条，两端指纹 `(1000, 1831589905)` 相等 |
+| `txn_atomicity.py --txns 150 --mode TRANSACTION`（**第 3 批后回归**） | **通过 1 / 失败 0** | 300 行事件 / **150 提交点**（1:1），8051 次抓拍 0 次读到半个事务 |
+| `sql_resume.py mysql --minutes 3`（**第 3 批后回归**） | **通过 3 / 失败 0** | 2 次 SIGKILL 后 22219 行两端指纹相等（BIT_XOR 3120551778）——改了整条崩溃恢复路径后无回归 |
+| `position_resume.py --rows 800`（**第 3 批后回归**） | **通过 5 / 失败 0** | 五把尺子全过，2600 行两端 xor 相等（第 1 批能力无回归） |
 
 现有故障注入套件的**判据盲区**（建议补齐）：
 - 只测"不丢 + 可收敛"，**不测重复量级**——2.2 的整段重放因此在 CI 里完全隐形；
@@ -499,7 +510,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P1-2　真正的熔断/自愈策略
+### P1-2　真正的熔断/自愈策略　【已实施，见 §9】
 
 - `CircuitBreaker` 补 `HALF_OPEN` + `openTimeoutMs`（默认 60s）：OPEN 到期后放行一次探测，
   成功回 CLOSED、失败回 OPEN 并指数延长（上限如 30 分钟）。
@@ -513,7 +524,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P1-3　转换失败进死信，不再静默丢文件
+### P1-3　转换失败进死信，不再静默丢文件　【已实施，见 §9】
 
 改 `ContinuousIncrementMain` 的 catch 分支（2.4）：
 
@@ -539,7 +550,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P2-1　长跑资源治理
+### P2-1　长跑资源治理　【已实施，见 §9】
 
 1. **表延迟改环形缓冲**：`recordTableLatency()` 写定长环形文件
    （固定 N 条 × 定长记录，覆盖写 + 头部游标），或直接改成写
@@ -598,7 +609,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 |---|---|---|
 | **第 1 批** ✅ | P0-2 位点持久化 + P0-3 单实例互斥 | 改动小、风险低、消除两类"长任务必炸"；且是后续一切的前提 —— **已完成，见 §7** |
 | **第 2 批** ✅ | **2.11 N² 写放大**（先做，改动最小收益最大） + P0-1 事务一致性投递 | 2.11 是把 `rows_typed` 按行切片，几行代码换来两个数量级吞吐；P0-1 改动最大但价值最高，先上 `TRANSACTION` 开关灰度，`txn_atomicity.py` 做门禁。两者都在同一段应用路径上，一起改一次回归 —— **已完成，见 §8** |
-| **第 3 批** | P1-2 熔断自愈 + P1-3 转换死信 + P2-1 资源治理 | 都是独立小改动，可并行 |
+| **第 3 批** ✅ | P1-2 熔断自愈 + P1-3 转换死信 + P2-1 资源治理 | 都是独立小改动，可并行 —— **已完成，见 §9** |
 | **第 4 批** | P1-1 集群化 + P1-4 冲突消解 | 需要元数据表变更（Flyway V3+）与较多联调 |
 | **第 5 批** | P2-2 批量装载与状态单调 + P2-3 一致性快照 + P2-4 可观测闭环 | 锦上添花，但决定能不能对外承诺 SLA |
 
@@ -813,3 +824,109 @@ TiCDC 的 DDL 也刻意不打标，让它在增量侧充当一道天然屏障。
 - **±1 交替转账的收敛判据会提前返回**。偶数个事务后余额回到初值，`tgt == src` 在事务只应用了一半时
   就已成立，量到的是 216 行事件 / 108 提交点。加一列单调递增的 `ver` 才能等到真正追平（300/150）。
   订阅侧的消息消费也换成了 Kafka 容器自带的 `kafka-console-consumer`——本机 python3.14 解不了 snappy。
+
+---
+
+## 9. 第 3 批实施记录（P1-2 熔断自愈 + P1-3 转换死信 + P2-1 资源治理）
+
+日期：2026-07-30。全量构建 `mvn clean install` 通过，单测 **413 通过 / 0 失败**（第 2 批为 392，新增 13 例）。
+新增一个任务状态 **RECONNECTING** 与四个错误码 **E3007/E3008/E3009/E3010**，
+`workflows.status` 是 MySQL ENUM，随 Flyway [V7__add_reconnecting_status.sql](java-backend/src/main/resources/db/migration/V7__add_reconnecting_status.sql) 扩容。
+
+### 9.1　P1-2　三态熔断 + 长期重连（2.5 的正面）
+
+[CircuitBreaker](migration-agent/src/main/java/com/migration/agent/resilience/CircuitBreaker.java) 补 `HALF_OPEN`：
+OPEN 到期后放行**一次**探测，成功回 CLOSED，失败回 OPEN 且打开时长按 `openTimeoutMultiplier`
+指数延长到 `circuit.breaker.open.timeout.max.ms`（默认 60s → 30min 封顶）。
+
+[ProcessGuard](migration-agent/src/main/java/com/migration/agent/resilience/ProcessGuard.java) 的恢复路径改成两级：
+
+| 档位 | 触发 | 间隔 | 任务状态 |
+|---|---|---|---|
+| 短期重试 | 进程崩溃 | 现有指数退避 5s→80s，共 `retry.max.attempts` 次 | 保持原状态 |
+| 长期重连 | 短期预算耗尽 | `max(reconnect.interval.ms, 熔断剩余时长)`，默认 5 分钟起、随熔断退避涨到 30 分钟 | **RECONNECTING** |
+| 判失败 | 长期重连也用尽（`reconnect.max.attempts`，默认 12 轮 ≈ 1 小时以上） | — | FAILED |
+
+两个改动看着小但都是必须的：
+
+- **熔断打开不再等于放弃**。旧代码 `attemptRecovery()` 里 `!allowRequest()` 直接 `return false` →
+  守护线程 `guarding.set(false)` 退出 → 进程再也不会被拉起。也就是说目标库一次超过
+  重试总时长（~2.5 分钟）的计划内维护窗口，就足以把任务永久打死。
+- **递归改循环**。旧实现失败时递归调用 `attemptRecovery()`；长期重连是无限轮次的，
+  递归会把栈打爆。顺带把睡眠切成 5s 片，`stop()` 仍能秒级收敛。
+
+### 9.2　P1-2　crash-loop 可见性 + 僵死看门狗按进程判定（2.5 的反面）
+
+反向的洞比正向更隐蔽：只要子进程每次能活过 5s，`waitForStartup()` 就判定成功，
+于是每次崩溃都上报「进程已自动重启恢复 + INCREMENT_RUNNING」——**永久 crash-loop 在看板上
+与健康任务毫无区别**。现在 ProcessGuard 用滑动窗口记重启成功时刻，
+窗口（`crashloop.window.ms`，默认 10 分钟）内达到 `crashloop.threshold`（默认 5）即改报
+**E3007**，任务状态仍是运行态（进程确实起来了，不该判死），但错误码把真相摆出来。
+
+僵死看门狗同步改掉一处连带静默：[AbstractTaskExecutor](migration-agent/src/main/java/com/migration/agent/thread/AbstractTaskExecutor.java)
+原来的 `guardsHealthyForStallCheck()` 是**全局开关**——「有任一受守护进程不在 RUNNING 就整轮跳过」。
+只要有一个进程在 crash-loop 里反复重启，其余进程的冻结就被一起静默掉。
+改为 `livenessOwnerRestarting(path)` 按文件各自判定：谁在重启只跳过谁的活性文件，
+另外把「某进程连续不在运行」的时长记进日志（超过僵死阈值周期性告警），
+不再是重启期间什么都不留下。
+
+### 9.3　P1-3　转换失败不再静默丢文件（2.4）
+
+三处改动，核心是**位点绝不越过没成功应用的事件**：
+
+1. 逐事件把 `typedDmlConverter.convert()` / `sqlConverter.convertToSql()` 单独 try 起来，
+   交给 `handleConvertFailure()` 按 `increment.convert.error.policy` 处置：
+   `FAIL_STOP`（默认）写 **E3009** 的 `error_status` 并停下等人工裁决；
+   `DEAD_LETTER` 写死信（`reason=convert-failed`）后推进位点继续。
+   两条路径都先把手里打开的目标事务提交掉再动位点——与人工裁决跳过同源的尖角。
+2. reader 构造与循环内异常分开接：前者是文件级不可读，后者是流级损坏，
+   但**两者都不再标 -1**。统一走 `failStopOnFile()`：回滚未提交事务 → 文件记到已应用的 seqno →
+   写 **E3010** → 停止应用循环。旧实现在这里「跳过至下一个文件」，
+   一个转换器 bug 就能静默吃掉最大 50MB THL 里的全部剩余事件，任务状态还停在 INCREMENT_RUNNING。
+3. 死信记录加 `reason` 字段，人工裁决（`manual-skip`）与转换失败（`convert-failed`）在 UI 上分得开。
+
+### 9.4　P2-1　长跑资源治理（2.6）
+
+| 增长点 | 旧行为 | 现在 |
+|---|---|---|
+| 任务日志 | per-task logback 固定 `com.migration=DEBUG` + 每行 DML 打 INFO（含行值），实测 10 分钟 283MB，单任务上限 10GB | 默认 INFO（`MIGRATION_TASK_LOG_LEVEL` 可临时调回 DEBUG），逐行 SQL 降到 TRACE 且**默认不打行值**（`logging.include.row.values=true` 才打，并告警合规风险），单任务上限 2GB / 保留 7 天 |
+| 表延迟 tsv | 每事件追加一行、从不裁剪；读侧整文件读进内存再取最后 60 条 | 写侧按 `increment.table.latency.max.lines`（默认 2000）滚动裁剪（攒到 2 倍才重写一次，均摊近 0）；读侧改环形窗口，内存恒定 60 条 |
+| 任务目录 | 删了也没人清，本机累积 12GB / 204 个目录 | 终态（delete/terminate）打 `.terminal` 标记，[TaskFilesJanitor](migration-agent/src/main/java/com/migration/agent/service/TaskFilesJanitor.java) 每小时巡检，过 `task.files.retention.hours`（默认 72h）才删；任务重新拉起会撤标记 |
+| 磁盘水位 | 无保护，写满宿主盘会把**所有**任务一起拖垮 | 每 60s 量一次 `files/<taskId>`：超过配额×`task.disk.backpressure.ratio` 先写 PAUSE 背压信号（复用 extract↔capture 既有通道）暂停拉取，超过 `task.disk.quota.mb` 报 **E3008** 判失败 |
+
+清理这件事上，"什么都不清" 和 "清错" 是两种事故，后者更贵：
+**只清打过终态标记的目录**——PAUSED/FAILED 的任务目录里装着位点与 checkpoint，
+删掉就等于把「恢复」变成「从头重来或直接丢数据」。单测 [TaskFilesJanitorTest](migration-agent/src/test/java/com/migration/agent/service/TaskFilesJanitorTest.java)
+把这条锁死（没标记的、运行中的、标记被撤销的，一律不动）。
+
+### 9.5　新增判据脚本
+
+| 脚本 | 尺子 |
+|---|---|
+| [selfheal_reconnect.py](test_scripts/fault_injection/selfheal_reconnect.py) | 四把：反复重启是否报 E3007（而不是一路"已自动重启恢复"）、依赖不可用时是 RECONNECTING 还是被判死、依赖恢复后能否**自己**回到 INCREMENT_RUNNING、自愈后两端指纹是否一致。用"临时移走 increment jar"模拟依赖长时间不可用，并把熔断/重连参数压到秒级 |
+| [resource_governance.py](test_scripts/fault_injection/resource_governance.py) | 四把：日志里是否出现行值明文（源数据里埋了标记串）、每千行变更的日志字节数、表延迟 tsv 是否被压在上限 2 倍内且热力图仍能出数、任务删除后是否生成终态标记 |
+
+单测新增 [CircuitBreakerHalfOpenTest](migration-agent/src/test/java/com/migration/agent/resilience/CircuitBreakerHalfOpenTest.java)（5 例）、
+[TaskFilesJanitorTest](migration-agent/src/test/java/com/migration/agent/service/TaskFilesJanitorTest.java)（5 例）、
+[ConvertFailureAndLatencyRollTest](migration-increment/src/test/java/com/migration/increment/ConvertFailureAndLatencyRollTest.java)（3 例）。
+
+### 9.6　实施过程中新发现并修掉的缺陷
+
+判据脚本第一次跑通就抓到三个，其中两个是本批自己引入的，一个是存量的静默丢数据：
+
+1. **【存量·严重】全量分页跳过主键 ≤ 0 的行**（`DataMigration`，非分片路径）。
+   首页无条件用 `WHERE pk > 0` 起扫，`currentLastId` 初始化成 0。于是表里那行 `id=0`
+   **从来没被搬过**，日志还是「本页 0 行 / 表 acct 数据迁移完成，成功: 0 / 全量迁移成功完成」——
+   静默丢数据且标 COMPLETED。分片路径不受影响（首片下界取 `minId - 1`）。
+   改为首次搬运不带下界（只有断点续传才需要），翻完首页后再启用。
+   自愈用例里源 401 行 / 目标 400 行、缺的正是 `id=0`，就是这条。
+2. **【本批引入】磁盘水位巡检把健康任务打成 FAILED**。`Files.walk` 是惰性遍历，
+   任务目录里的 THL/队列深度文件边写边删，撞上刚消失的文件抛的是 `UncheckedIOException`
+   （RuntimeException，`catch (IOException)` 接不住），一路冒到 `run()` 的兜底 catch →
+   `FAILED(E9999)`。实测就栽在 `extract_queue_depth` 被重写的瞬间。
+   现在 `dirSizeBytes` 吞掉所有异常，`checkDiskQuota` 再包一层——巡检永远不该牵连任务。
+3. **【本批引入】crash-loop 数不到**。最初按「守护循环发现的崩溃」计数，
+   而进程死在启动就绪窗口里（`waitForStartup` 期间被杀/自己退出）走的是「启动失败」分支，
+   根本不计数——恰恰是最典型的 crash-loop（起来几秒就死）。实测连杀 3 次只记到 1 次。
+   改为按**重启次数**计（与方案措辞一致），并在跨过阈值的那一刻就上报，
+   不等下一次重启成功——反复崩溃的进程完全可能卡在重连里再也起不来。

@@ -529,6 +529,10 @@ public class DataMigration {
         try {
             long processedRows = startOffset;
             Long currentLastId = (lastMigratedId != null) ? lastMigratedId : 0L;
+            // 首页是否带下界。旧实现无条件用 `pk > 0` 起扫，于是<b>主键 ≤ 0 的行被整行跳过</b>——
+            // 表里只有一行 id=0 时，日志还是"本页 0 行 / 迁移成功完成"，静默丢数据。
+            // 只有断点续传（有已落盘的 lastMigratedId）才需要下界；首次搬运不加，扫全表。
+            boolean withLowerBound = (lastMigratedId != null);
 
             if (usePaging) {
                 // ===== 分页循环：每页查询 pageSize 行，处理完关闭 ResultSet 释放源端 PGA =====
@@ -538,13 +542,25 @@ public class DataMigration {
                     Connection pageConn = sourceConnection.getConnection();
                     // 分页子句按源库方言生成：MySQL → LIMIT，Oracle/PostgreSQL → FETCH FIRST ... ROWS ONLY
                     String pageKeepClause = filterKeepClause(tableName);
+                    String lowerBoundClause = withLowerBound
+                            ? sourceQuoteIdentifier(primaryKeyColumn) + " > ? "
+                            : null;
+                    String whereClause = "";
+                    if (lowerBoundClause != null && pageKeepClause != null) {
+                        whereClause = " WHERE " + lowerBoundClause + "AND " + pageKeepClause + " ";
+                    } else if (lowerBoundClause != null) {
+                        whereClause = " WHERE " + lowerBoundClause;
+                    } else if (pageKeepClause != null) {
+                        whereClause = " WHERE " + pageKeepClause + " ";
+                    }
                     String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName) +
-                            " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? " +
-                            (pageKeepClause != null ? "AND " + pageKeepClause + " " : "") +
+                            whereClause +
                             "ORDER BY " +
                             sourceQuoteIdentifier(primaryKeyColumn) + " " + sourceDialect.limitClause(pageSize);
                     PreparedStatement selectStmt = pageConn.prepareStatement(pageSql);
-                    selectStmt.setLong(1, currentLastId);
+                    if (withLowerBound) {
+                        selectStmt.setLong(1, currentLastId);
+                    }
                     ResultSet rs = selectStmt.executeQuery();
                     // 每页重新获取 metaData：上一页 rs.close() 后旧的 metaData 会失效（ORA-17009）
                     ResultSetMetaData metaData = rs.getMetaData();
@@ -624,6 +640,8 @@ public class DataMigration {
                     // 关闭源连接，强制释放 Oracle 会话 PGA，避免 ORA-04036
                     try { pageConn.close(); } catch (SQLException e) { /* ignore */ }
                     logger.info("表 {} 分页迁移一页完成，本页 {} 行，累计 {}/{}", tableName, pageRows, processedRows, totalRows);
+                    // 首页扫完后 currentLastId 已经是真实的主键值，后续页一律带下界翻页
+                    withLowerBound = true;
                     // 是否末页必须按「从源取到的行数」判断，而非「成功插入数」：断点续传从
                     // lastMigratedId 续扫时会与已插入区间重叠、触发主键冲突被跳过，pageRows 因此
                     // 小于 pageSize；若据此判末页会 break 掉后续所有页，任务却标 COMPLETED → 丢数据。

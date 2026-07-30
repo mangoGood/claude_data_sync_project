@@ -61,6 +61,7 @@ public class AgentMain {
     private RecoveryService recoveryService;
     private ScheduledExecutorService captureMonitorExecutor;
     private ExecutorService taskExecutor;
+    private com.migration.agent.service.TaskFilesJanitor taskFilesJanitor;
     
     private final ConcurrentHashMap<String, ProcessManager> captureManagers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ProcessManager> extractManagers = new ConcurrentHashMap<>();
@@ -170,9 +171,20 @@ public class AgentMain {
             t.setName("capture-monitor");
             return t;
         });
-        captureMonitorExecutor.scheduleAtFixedRate(this::monitorCaptureProcesses, 
+        captureMonitorExecutor.scheduleAtFixedRate(this::monitorCaptureProcesses,
             CAPTURE_MONITOR_INTERVAL, CAPTURE_MONITOR_INTERVAL, TimeUnit.MILLISECONDS);
-        
+
+        // 终态任务目录的定期清理（只清打过 .terminal 标记且过了保留期的，见 TaskFilesJanitor）
+        taskFilesJanitor = new com.migration.agent.service.TaskFilesJanitor(
+                agentConfig, () -> new java.util.HashSet<>(migrationAgentThreads.keySet()));
+        captureMonitorExecutor.scheduleAtFixedRate(() -> {
+            try {
+                taskFilesJanitor.sweepOnce();
+            } catch (Exception e) {
+                logger.warn("清理终态任务目录出错: {}", e.getMessage());
+            }
+        }, 60_000, 3600_000, TimeUnit.MILLISECONDS);
+
         // 必须先收孤儿再恢复任务：上一任 agent 硬崩后遗留的子进程还在写目标库，
         // 直接恢复会让同一 taskId 起第二套进程造成双写；而任务实例锁又会被孤儿占着，
         // 导致新进程一直起不来直到熔断。顺序反了两头都不对。
@@ -314,6 +326,10 @@ public class AgentMain {
 
         TICDC_CHANGEFEED_SERVICE.removeChangefeedIfTidb(taskId);
 
+        // 任务已删除：目录打终态标记，保留期后由 TaskFilesJanitor 清掉（不立即删——
+        // 子进程可能还在收尾写文件，日志/死信在保留期内还有排障价值）
+        com.migration.agent.service.TaskFilesJanitor.markTerminal(taskId, "deleted");
+
         logger.info("Task {} deleted, all processes stopped", taskId);
     }
     
@@ -381,6 +397,9 @@ public class AgentMain {
 
             // 库级同步：同步进程已全部停止（无双写风险），此刻把源库 trigger/event 复制到目标库
             com.migration.agent.service.DbObjectsSyncService.syncTriggersAndEventsAtTaskEnd(taskId);
+
+            // 终结与删除同样是终态：打标，保留期后清理任务目录
+            com.migration.agent.service.TaskFilesJanitor.markTerminal(taskId, "terminated");
 
         } catch (Exception e) {
             logger.error("Error handling terminate message for task: {}", taskId, e);
@@ -754,7 +773,10 @@ public class AgentMain {
     private void processTask(TaskMessage taskMessage, String taskId, String migrationMode) {
         try {
             sendStatus(taskId, "RECEIVED", "Task received, preparing migration", 0);
-            
+
+            // 同一 taskId 又跑起来了（重建/重启）：撤销终态标记，别让保留期到点删掉在跑的任务目录
+            com.migration.agent.service.TaskFilesJanitor.clearTerminalMark(taskId);
+
             configService.updateConfig(taskMessage);
             logger.info("Config updated for task: {}", taskId);
             

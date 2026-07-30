@@ -498,9 +498,11 @@ public class THLToSqlConverter {
             return null;
         }
         
-        logger.info("Converting event seqno={} type={} db={} table={}", 
-            event.getSeqno(), eventType, 
-            metadata.getOrDefault("database_name", ""), 
+        // 逐事件一条（且一个 DML 会经过 TABLE_MAP/QUERY/ANONYMOUS_GTID/XID 四次），
+        // 放在 INFO 就是日志体积的头号来源：实测 3000 行变更打出 19,000 行这类日志。
+        logger.debug("Converting event seqno={} type={} db={} table={}",
+            event.getSeqno(), eventType,
+            metadata.getOrDefault("database_name", ""),
             metadata.getOrDefault("table_name", ""));
 
         switch (eventType) {

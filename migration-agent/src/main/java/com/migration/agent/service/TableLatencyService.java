@@ -208,19 +208,25 @@ public class TableLatencyService {
 
         for (File file : files) {
             String tableName = file.getName().replace(".tsv", "");
-            List<LatencyRecord> records = new ArrayList<>();
+            // 只留最后 MAX_HISTORY_POINTS 条：旧实现把整个 tsv 读进 List 再截尾，
+            // 文件是逐事件追加的（实测单任务 46k 行 / 2.6MB，长跑更大），越跑热力图接口越慢越吃内存。
+            // 改成边读边丢的环形窗口后，内存恒定为 60 条，与文件大小无关。
+            Deque<LatencyRecord> window = new ArrayDeque<>(MAX_HISTORY_POINTS + 1);
             try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     String[] parts = line.split("\t");
                     if (parts.length >= 4) {
                         try {
-                            records.add(new LatencyRecord(
+                            window.addLast(new LatencyRecord(
                                     Long.parseLong(parts[0]),
                                     Long.parseLong(parts[1]),
                                     Long.parseLong(parts[2]),
                                     parts[3]
                             ));
+                            if (window.size() > MAX_HISTORY_POINTS) {
+                                window.pollFirst();
+                            }
                         } catch (NumberFormatException ignored) {}
                     }
                 }
@@ -228,13 +234,9 @@ public class TableLatencyService {
                 logger.debug("读取表延迟文件失败 {}: {}", file.getName(), e.getMessage());
             }
 
-            if (!records.isEmpty()) {
-                // 限制历史大小
-                if (records.size() > MAX_HISTORY_POINTS) {
-                    records = new ArrayList<>(records.subList(records.size() - MAX_HISTORY_POINTS, records.size()));
-                }
+            if (!window.isEmpty()) {
                 latencyCache.computeIfAbsent(taskId, k -> new ConcurrentHashMap<>())
-                        .put(tableName, records);
+                        .put(tableName, new ArrayList<>(window));
             }
         }
     }

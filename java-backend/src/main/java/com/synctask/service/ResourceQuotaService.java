@@ -91,6 +91,9 @@ public class ResourceQuotaService {
                 .findByUserIdAndStatusAndIsDeletedFalse(userId, WorkflowStatus.FULL_MIGRATING));
         runningTasks.addAll(workflowRepository
                 .findByUserIdAndStatusAndIsDeletedFalse(userId, WorkflowStatus.SUBSCRIBE_RUNNING));
+        // 长期重连中的任务仍占着 agent 线程与子进程槽位，照样计入并发
+        runningTasks.addAll(workflowRepository
+                .findByUserIdAndStatusAndIsDeletedFalse(userId, WorkflowStatus.RECONNECTING));
 
         if (runningTasks.size() >= quota.getMaxConcurrentTasks()) {
             throw new RuntimeException(String.format("已达到最大并发任务数限制: %d/%d",
@@ -134,7 +137,8 @@ public class ResourceQuotaService {
         long runningCount = allTasks.stream()
                 .filter(w -> w.getStatus() == WorkflowStatus.INCREMENT_RUNNING
                         || w.getStatus() == WorkflowStatus.FULL_MIGRATING
-                        || w.getStatus() == WorkflowStatus.SUBSCRIBE_RUNNING)
+                        || w.getStatus() == WorkflowStatus.SUBSCRIBE_RUNNING
+                        || w.getStatus() == WorkflowStatus.RECONNECTING)
                 .count();
 
         Map<String, Object> stats = new HashMap<>();
