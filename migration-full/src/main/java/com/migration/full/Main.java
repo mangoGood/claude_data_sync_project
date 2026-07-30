@@ -34,6 +34,12 @@ public class Main {
             logger.info("任务 ID: {}", taskId);
             logger.info("使用配置文件: {}", configFile);
 
+            // 单实例互斥 + 父进程看门狗：两个全量进程同时搬同一批表会重复写目标库，
+            // 断点续传的分片进度也会被互相覆盖
+            if (taskId != null) {
+                com.migration.common.proc.ChildProcessBootstrap.init(taskId, "full");
+            }
+
             MigrationConfig config = taskId != null ? 
                 new MigrationConfig(configFile, taskId) : new MigrationConfig(configFile);
             logger.info("源数据库: {}", config.getSourceConfig().getDatabase());

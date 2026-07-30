@@ -35,6 +35,8 @@ public class ContinuousSubscribeMain {
     private String kafkaTopicPrefix;
     private String kafkaTopicStrategy;
     private String subscribeFormat;
+    /** 是否额外投递事务标记 topic（BEGIN/END），供下游重组源事务。 */
+    private boolean transactionTopicEnabled;
     private String taskId;
     private String sourceType;
     private long scanInterval;
@@ -110,13 +112,17 @@ public class ContinuousSubscribeMain {
                 }
             }
         }
-        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
-        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
-
         String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
 
         MdcUtil.setTaskId(taskId);
         MdcUtil.setProcessName("subscribe");
+
+        // 单实例互斥 + 父进程看门狗（放在解密之前，见 CaptureMain 的说明）：
+        // 两个 subscribe 同时推 Kafka 会让下游收到成倍的重复消息
+        com.migration.common.proc.ChildProcessBootstrap.init(taskId, "subscribe");
+
+        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
+        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
 
         try {
             ContinuousSubscribeMain main = new ContinuousSubscribeMain();
@@ -146,6 +152,11 @@ public class ContinuousSubscribeMain {
         this.subscribeFormat = props.getProperty("subscribe.format", "DEBEZIUM_JSON");
         this.sourceType = props.getProperty("source.db.type", "mysql");
         this.scanInterval = Long.parseLong(props.getProperty("subscribe.scan.interval", "3000"));
+        this.transactionTopicEnabled = Boolean.parseBoolean(
+                props.getProperty("subscribe.transaction.topic.enabled", "false"));
+        if (transactionTopicEnabled) {
+            logger.info("事务标记 topic 已启用: {}.{}.transaction（BEGIN/END + 事件数）", kafkaTopicPrefix, taskId);
+        }
 
         // 初始化数据脱敏服务
         this.dataMaskingService = new DataMaskingService(props);
@@ -304,6 +315,12 @@ public class ContinuousSubscribeMain {
                     sinceCheckpoint++;
                 }
 
+                // 事务末条（MySQL 的 XID / PG 的 COMMIT，它们本身不投递数据消息）：收口事务标记。
+                // Oracle/TiDB 没有这个标记，靠下一个事务的 tx_id 变化收口。
+                if (com.migration.common.txn.TxnMetadata.isTxLast(event.getMetadata())) {
+                    closeTransactionMarker();
+                }
+
                 fileLastSeqno = event.getSeqno();
                 reportRto(event);
 
@@ -432,6 +449,14 @@ public class ContinuousSubscribeMain {
             default:
                 return null;
         }
+
+        // 源事务标识：下游据此把散落的行消息重组回源事务（对齐 Debezium 的 transaction 块）。
+        // 此前消息里完全没有事务信息，下游根本无从判断两条消息是不是同一笔业务操作。
+        // 放在 operation 分派之后——序号只数真正会投递出去的消息。
+        cdcEvent.txId = com.migration.common.txn.TxnMetadata.txIdOf(metadata);
+        Object txSource = metadata.get(com.migration.common.txn.TxnMetadata.TX_SOURCE_ID);
+        cdcEvent.txSourceId = txSource != null ? txSource.toString() : null;
+        cdcEvent.txOrder = nextOrderInTransaction(cdcEvent.txId);
 
         // Extract database and table from metadata
         Object dbName = metadata.get("database_name");
@@ -722,6 +747,68 @@ public class ContinuousSubscribeMain {
         }
     }
 
+    // ==================== 事务重组支持 ====================
+
+    /** 当前正在投递的源事务；null=不在任何事务里。 */
+    private String currentTxId;
+    private long currentTxCount;
+
+    /**
+     * 事件在所属事务内的序号（从 1 开始）；顺带维护事务标记 topic 的 BEGIN/END。
+     *
+     * <p>订阅是严格按 seqno 顺序投递的，所以"tx_id 变了"就等于上一个事务投完了。
+     */
+    private long nextOrderInTransaction(String txId) {
+        if (txId == null) {
+            closeTransactionMarker();
+            return 0;
+        }
+        if (!txId.equals(currentTxId)) {
+            closeTransactionMarker();
+            currentTxId = txId;
+            currentTxCount = 0;
+            sendTransactionMarker("BEGIN", txId, -1);
+        }
+        return ++currentTxCount;
+    }
+
+    /** 收口当前事务的标记消息（END 带事件数，供下游校验有没有收全）。 */
+    private void closeTransactionMarker() {
+        if (currentTxId == null) {
+            return;
+        }
+        sendTransactionMarker("END", currentTxId, currentTxCount);
+        currentTxId = null;
+        currentTxCount = 0;
+    }
+
+    /**
+     * 事务标记 topic（{@code subscribe.transaction.topic.enabled}，默认关）：
+     * 对齐 Debezium 的事务元数据 topic，下游据此知道一个事务从哪开始、到哪结束、共几条。
+     */
+    private void sendTransactionMarker(String status, String txId, long eventCount) {
+        if (!transactionTopicEnabled) {
+            return;
+        }
+        Map<String, Object> marker = new LinkedHashMap<>();
+        marker.put("status", status);
+        marker.put("id", txId);
+        marker.put("event_count", eventCount >= 0 ? eventCount : null);
+        marker.put("ts_ms", System.currentTimeMillis());
+        String topic = kafkaTopicPrefix + "." + taskId + ".transaction";
+        try {
+            kafkaProducer.send(new ProducerRecord<>(topic, txId, gson.toJson(marker)), (md, ex) -> {
+                if (ex != null) {
+                    sendErrors.incrementAndGet();
+                    logger.error("发送事务标记到 {} 失败: {}", topic, ex.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            sendErrors.incrementAndGet();
+            logger.error("发送事务标记异常: {}", e.getMessage());
+        }
+    }
+
     private String resolveTopic(CdcEvent cdcEvent) {
         switch (kafkaTopicStrategy.toUpperCase()) {
             case "TABLE":
@@ -756,10 +843,21 @@ public class ContinuousSubscribeMain {
         source.put("table", cdcEvent.table);
         source.put("ts_ms", cdcEvent.sourceTstamp);
         source.put("seqno", cdcEvent.seqno);
+        if (cdcEvent.txId != null) {
+            // Debezium 把源事务号放在 source.txId，事务重组信息放在顶层 transaction 块
+            source.put("txId", cdcEvent.txSourceId != null ? cdcEvent.txSourceId : cdcEvent.txId);
+        }
         payload.put("source", source);
 
         payload.put("op", cdcEvent.operation);
         payload.put("ts_ms", cdcEvent.localEnqueueTstamp);
+        if (cdcEvent.txId != null) {
+            Map<String, Object> transaction = new LinkedHashMap<>();
+            transaction.put("id", cdcEvent.txId);
+            transaction.put("total_order", cdcEvent.txOrder);
+            transaction.put("data_collection_order", cdcEvent.txOrder);
+            payload.put("transaction", transaction);
+        }
 
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("payload", payload);
@@ -785,6 +883,10 @@ public class ContinuousSubscribeMain {
         message.put("after", afterMap);
         message.put("sourceTs", cdcEvent.sourceTstamp);
         message.put("seqno", cdcEvent.seqno);
+        if (cdcEvent.txId != null) {
+            message.put("txId", cdcEvent.txId);
+            message.put("txOrder", cdcEvent.txOrder);
+        }
 
         return gson.toJson(message);
     }
@@ -1165,5 +1267,11 @@ public class ContinuousSubscribeMain {
         String rawData;
         long sourceTstamp;
         long localEnqueueTstamp;
+        /** 源事务标识（extract 下发的 tx_id）；老 THL / 无事务信息时为 null。 */
+        String txId;
+        /** 源库自己的事务号（MySQL XID / PG xid / Oracle XID），供下游与源库对账。 */
+        String txSourceId;
+        /** 本事件在所属事务内的序号，从 1 开始（对齐 Debezium 的 total_order）。 */
+        long txOrder;
     }
 }

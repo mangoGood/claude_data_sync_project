@@ -56,6 +56,8 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
     private volatile long currentScnNumeric;
     /** LogMiner 会话已添加的最大日志序列号 */
     private volatile int lastAddedLogSeq = -1;
+    /** 本次启动是否从已落盘 SCN 续传（false 表示首次启动，用 checkpoint 的起始 SCN）。 */
+    private boolean resumedFromPersisted;
 
     /**
      * Oracle PDB 中无法执行 DBMS_LOGMNR.ADD_LOGFILE / START_LOGMNR（ORA-65040），
@@ -102,8 +104,15 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         database = props.getProperty("source.db.database", "ORCL");
         user = props.getProperty("source.db.username", "SYSTEM");
         password = props.getProperty("source.db.password", "");
-        startScn = props.getProperty("capture.redo.scn", "");
         outputDir = props.getProperty("capture.output.dir", "binlog_output");
+        // 位点来源优先级：已落盘 SCN > config.properties 的起始 SCN。后者是任务启动时写死一次的，
+        // 崩溃重启若还认它，LogMiner 会从任务最初的 SCN 重挖整段 redo（见 CapturePositionStore）。
+        java.util.Properties persisted = com.migration.common.position.CapturePositionStore.preferPersisted(props)
+                ? com.migration.common.position.CapturePositionStore.load(outputDir)
+                : new java.util.Properties();
+        startScn = com.migration.common.position.CapturePositionStore.prefer(
+                persisted, "redo.scn", props.getProperty("capture.redo.scn", ""), "redo SCN");
+        resumedFromPersisted = !persisted.isEmpty();
         taskId = props.getProperty("task.id", "unknown");
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         scanIntervalMs = Long.parseLong(props.getProperty("capture.redo.scan.interval", "1000"));
@@ -123,8 +132,77 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
 
         parseSyncObjects();
 
-        logger.info("Oracle Redo Capture initialized - host={}:{} database={} user={} outputDir={} taskId={} startScn={} syncedSchemas={} syncedTables={} cdbEnabled={} cdbService={}",
-                host, port, database, user, outputDir, taskId, startScn, syncedSchemas, syncedTables, cdbEnabled, cdbService);
+        verifyResumePositionAvailable();
+
+        logger.info("Oracle Redo Capture initialized - host={}:{} database={} user={} outputDir={} taskId={} startScn={} resumed={} syncedSchemas={} syncedTables={} cdbEnabled={} cdbService={}",
+                host, port, database, user, outputDir, taskId, startScn, resumedFromPersisted,
+                syncedSchemas, syncedTables, cdbEnabled, cdbService);
+    }
+
+    /**
+     * 续传 SCN 是否还挖得到。
+     *
+     * <p>在线 redo 被覆盖、归档日志被 RMAN 删除后，旧 SCN 就永远挖不回来了。LogMiner 此时
+     * 要么报 ORA-01291（missing logfile）要么什么都不返回，外层看到的只是"任务在跑但没数据"，
+     * ProcessGuard 会无限重启一个注定失败的进程。这里主动比对最早可用 SCN，不可用即判失败。
+     */
+    private void verifyResumePositionAvailable() {
+        if (!resumedFromPersisted || startScn == null
+                || !Boolean.parseBoolean(props.getProperty("capture.position.precheck.enabled", "true"))) {
+            return;
+        }
+        long resumeScn;
+        try {
+            resumeScn = Long.parseLong(startScn);
+        } catch (NumberFormatException e) {
+            return;
+        }
+        String pdbUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, database);
+        try {
+            Class.forName("oracle.jdbc.OracleDriver");
+        } catch (ClassNotFoundException ignored) {
+            return;
+        }
+        try (Connection probe = DriverManager.getConnection(pdbUrl, user, password);
+             Statement stmt = probe.createStatement()) {
+            // 在线 redo 与归档日志各自的最早 SCN，取二者最小值作为"还挖得到"的下界
+            Long earliest = null;
+            for (String sql : new String[]{
+                    "SELECT MIN(FIRST_CHANGE#) FROM V$LOG WHERE STATUS <> 'UNUSED'",
+                    "SELECT MIN(FIRST_CHANGE#) FROM V$ARCHIVED_LOG WHERE DELETED = 'NO' AND STATUS = 'A'"}) {
+                try (java.sql.ResultSet rs = stmt.executeQuery(sql)) {
+                    if (rs.next()) {
+                        long v = rs.getLong(1);
+                        if (!rs.wasNull() && v > 0 && (earliest == null || v < earliest)) {
+                            earliest = v;
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // 单个视图不可读（权限/版本差异）时用另一个的结果
+                }
+            }
+            if (earliest != null && resumeScn < earliest) {
+                String detail = "续传 SCN " + resumeScn + " 早于源端最早可用 SCN " + earliest
+                        + "，redo/归档日志已被清理，位点不可用";
+                logger.error("{}（本任务需重新初始化全量）", detail);
+                writeCaptureErrorStatus("E3006", detail + "；需重新初始化全量同步");
+                throw new IllegalStateException(detail);
+            }
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (Exception e) {
+            logger.warn("续传 SCN 可用性预检跳过（查询失败）: {}", e.getMessage());
+        }
+    }
+
+    /** 写 {@code binlog_output/error_status}（格式同 increment 端），agent 轮询到即上报 FAILED。 */
+    private void writeCaptureErrorStatus(String errorCode, String message) {
+        File dir = new File(outputDir);
+        if (!dir.exists()) dir.mkdirs();
+        com.migration.common.io.AtomicFileWriter.writeStringQuietly(
+                new File(dir, "error_status"),
+                System.currentTimeMillis() + "|" + errorCode + "|-1|"
+                        + message.replace("|", "/") + "|capture\n");
     }
 
     /**
@@ -1193,20 +1271,17 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         logger.info("Rotated to new capture output file after {} events", maxEventsPerFile);
     }
 
+    /** 落盘 redo 位点，原子写（tmp+fsync+rename），崩溃重启后据此续传而非从任务起始 SCN 重挖。 */
     private void savePosition() {
         if (currentScn == null) return;
 
-        File positionFile = new File(outputDir, "capture_position.properties");
         Properties posProps = new Properties();
         posProps.setProperty("redo.scn", currentScn);
         posProps.setProperty("redo.scn.numeric", String.valueOf(currentScnNumeric));
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date()));
 
-        try (FileOutputStream fos = new FileOutputStream(positionFile)) {
-            posProps.store(fos, "Oracle Redo Capture position for task: " + taskId);
-        } catch (IOException e) {
-            logger.warn("Failed to save Oracle redo capture position: {}", e.getMessage());
-        }
+        com.migration.common.position.CapturePositionStore.save(
+                outputDir, posProps, "Oracle Redo Capture position for task: " + taskId);
     }
 
     public String getCurrentScn() {

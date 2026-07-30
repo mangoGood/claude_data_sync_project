@@ -17,6 +17,12 @@ public class RecoveryTask implements Serializable {
     private LocalDateTime createdAt;
     private String syncObjects;
     private String sourceDbName;
+    /**
+     * 目标库名。<b>漏了它会静默丢数据</b>：恢复时若不带上，{@code ConfigService.updateConfig} 写出的
+     * {@code target.db.database} 为空，increment 的 DML 会退化成用<b>源库名</b>限定
+     * （{@code INSERT INTO `源库`.`表`}），目标库从此一条数据都收不到，而任务状态一直是"同步中"。
+     */
+    private String targetDbName;
     private String sourceType;
     private String targetType;
     private String taskType;
@@ -110,6 +116,14 @@ public class RecoveryTask implements Serializable {
         this.sourceDbName = sourceDbName;
     }
 
+    public String getTargetDbName() {
+        return targetDbName;
+    }
+
+    public void setTargetDbName(String targetDbName) {
+        this.targetDbName = targetDbName;
+    }
+
     public String getSourceType() {
         return sourceType;
     }
@@ -152,6 +166,7 @@ public class RecoveryTask implements Serializable {
         message.setMigrationMode(this.migrationMode);
         message.setCreatedAt(this.createdAt);
         message.setSourceDbName(this.sourceDbName);
+        message.setTargetDbName(this.targetDbName);
         message.setSourceType(this.sourceType != null ? this.sourceType : "mysql");
         message.setTargetType(this.targetType != null ? this.targetType : "mysql");
         message.setTaskType(this.taskType != null ? this.taskType : "SYNC");

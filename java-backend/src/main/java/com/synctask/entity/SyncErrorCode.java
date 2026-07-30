@@ -21,6 +21,7 @@ public enum SyncErrorCode {
     EXTRACT_PROCESS_START_FAILED("E3003", "Extract进程启动失败", "请检查Agent日志，确认extract模块JAR包存在且配置正确"),
     INCREMENT_PROCESS_START_FAILED("E3004", "增量同步进程启动失败", "请检查Agent日志，确认increment模块JAR包存在且配置正确"),
     INCREMENT_PROCESS_CRASHED("E3005", "增量同步进程异常退出", "请检查Agent日志，可能是目标数据库连接中断或SQL执行异常"),
+    CAPTURE_POSITION_UNAVAILABLE("E3006", "源端日志已被清理，续传位点不可用", "源库的binlog/WAL/redo已过保留期，增量位点无法恢复。请延长源库日志保留期后重新初始化全量同步"),
 
     FULL_MIGRATION_FAILED("E4001", "全量同步失败", "请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常"),
     FULL_MIGRATION_TIMEOUT("E4002", "全量同步超时", "请检查数据量是否过大，考虑分批同步或优化网络带宽"),

@@ -132,6 +132,11 @@ public class ConfigService {
                 if (targetInfo != null) {
                     props.setProperty("target.db.host", targetInfo.getHost());
                     props.setProperty("target.db.port", String.valueOf(targetInfo.getPort()));
+                    // 注意：连接串通常不带库名（mysql://user:pass@host:port），这里会把已有的
+                    // target.db.database **覆盖成空**，指望后面的 taskMessage.getTargetDbName() 再填回来。
+                    // 所以任何调用方都必须带上 targetDbName——曾经 RecoveryService 漏了它，
+                    // agent 重启后 target.db.database 为空，increment 直接拿源库名限定 DML
+                    // （INSERT INTO `源库`.`表`），目标库一条数据都收不到而状态仍显示"同步中"。
                     props.setProperty("target.db.database", targetInfo.getDatabase());
                     if (targetInfo.getUsername() != null) {
                         props.setProperty("target.db.username", targetInfo.getUsername());
@@ -589,6 +594,15 @@ public class ConfigService {
         writeIntPropFromEnv(props, "increment.apply.parallelism", "INCREMENT_APPLY_PARALLELISM");
         writeIntPropFromEnv(props, "increment.apply.batch.size", "INCREMENT_APPLY_BATCH_SIZE");
 
+        // 事务一致性投递（同上，agent 级开关灰度）：APPLY_TRANSACTION_MODE=TRANSACTION 时
+        // 一个源事务在目标端也是一个事务，目标端不再出现"半个事务"。默认不写 = EVENT（历史行为）。
+        writeEnumPropFromEnv(props, "apply.transaction.mode", "APPLY_TRANSACTION_MODE", "EVENT", "TRANSACTION");
+        writeIntPropFromEnv(props, "apply.transaction.max.rows", "APPLY_TRANSACTION_MAX_ROWS");
+        writeIntPropFromEnv(props, "apply.transaction.idle.flush.ms", "APPLY_TRANSACTION_IDLE_FLUSH_MS");
+        // 订阅侧事务标记 topic（BEGIN/END），供下游重组源事务
+        writeEnumPropFromEnv(props, "subscribe.transaction.topic.enabled",
+                "SUBSCRIBE_TRANSACTION_TOPIC_ENABLED", "true", "false");
+
         // 落盘前加密敏感值（口令）：config.properties 不再存明文密码，子进程读取时按 ENC: 前缀解密。
         encryptSensitiveProps(props);
 
@@ -649,6 +663,22 @@ public class ConfigService {
         } catch (NumberFormatException e) {
             logger.warn("环境变量 {}={} 非法整数，忽略", envName, v);
         }
+    }
+
+    /** 枚举型引擎调优参数：只接受白名单取值（大小写不敏感），非法值忽略并告警。 */
+    private void writeEnumPropFromEnv(java.util.Properties props, String key, String envName, String... allowed) {
+        String v = System.getenv(envName);
+        if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);
+        if (v == null || v.trim().isEmpty()) return;
+        String value = v.trim();
+        for (String a : allowed) {
+            if (a.equalsIgnoreCase(value)) {
+                props.setProperty(key, a);
+                logger.info("引擎调优参数已写入配置: {}={}", key, a);
+                return;
+            }
+        }
+        logger.warn("环境变量 {}={} 不在允许取值 {} 内，忽略", envName, v, java.util.Arrays.toString(allowed));
     }
 
     /** 跳过清单合并：新值与已有属性取并集后写回（保持顺序、去重）；新值为空则不动。 */

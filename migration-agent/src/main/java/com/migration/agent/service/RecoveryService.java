@@ -27,7 +27,7 @@ public class RecoveryService {
         List<RecoveryTask> tasks = new ArrayList<>();
         
         String sql = "SELECT id, name, user_id, source_connection, target_connection, " +
-                     "migration_mode, status, progress, created_at, sync_objects, source_db_name, " +
+                     "migration_mode, status, progress, created_at, sync_objects, source_db_name, target_db_name, " +
                      "source_type, target_type, task_type, dr_mode " +
                      "FROM workflows " +
                      "WHERE status IN ('STARTING', 'FULL_MIGRATING', 'FULL_COMPLETED', 'INCREMENT_RUNNING', 'SUBSCRIBE_RUNNING', 'SWITCHING') " +
@@ -57,7 +57,7 @@ public class RecoveryService {
     
     public RecoveryTask getTaskById(String taskId) {
         String sql = "SELECT id, name, user_id, source_connection, target_connection, " +
-                     "migration_mode, status, progress, created_at, sync_objects, source_db_name, " +
+                     "migration_mode, status, progress, created_at, sync_objects, source_db_name, target_db_name, " +
                      "source_type, target_type, task_type, dr_mode " +
                      "FROM workflows WHERE id = ?";
         
@@ -98,6 +98,10 @@ public class RecoveryService {
         
         task.setSyncObjects(rs.getString("sync_objects"));
         task.setSourceDbName(rs.getString("source_db_name"));
+        // 目标库名必须一起恢复：漏了它 config 里的 target.db.database 为空，increment 会拿源库名去限定
+        // DML（INSERT INTO `源库`.`表`），目标库自此一条数据都收不到，而任务状态照旧显示"同步中"。
+        // 实测复现：agent SIGKILL 后重启，停写前写入的 500 行全部落回源库、目标停在旧行数。
+        task.setTargetDbName(rs.getString("target_db_name"));
 
         try {
             String sourceType = rs.getString("source_type");

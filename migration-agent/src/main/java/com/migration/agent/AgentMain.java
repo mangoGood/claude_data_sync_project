@@ -173,8 +173,13 @@ public class AgentMain {
         captureMonitorExecutor.scheduleAtFixedRate(this::monitorCaptureProcesses, 
             CAPTURE_MONITOR_INTERVAL, CAPTURE_MONITOR_INTERVAL, TimeUnit.MILLISECONDS);
         
+        // 必须先收孤儿再恢复任务：上一任 agent 硬崩后遗留的子进程还在写目标库，
+        // 直接恢复会让同一 taskId 起第二套进程造成双写；而任务实例锁又会被孤儿占着，
+        // 导致新进程一直起不来直到熔断。顺序反了两头都不对。
+        com.migration.agent.resilience.OrphanChildReaper.reap();
+
         recoverUnfinishedTasks();
-        
+
         logger.info("Migration Agent started successfully, waiting for tasks...");
     }
     

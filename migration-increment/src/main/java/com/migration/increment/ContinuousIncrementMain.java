@@ -96,6 +96,39 @@ public class ContinuousIncrementMain {
     /** 并行应用执行器（懒初始化，仅 applyParallelism>1 时创建；进程停止时关闭）。 */
     private ParallelApplyExecutor parallelExecutor;
 
+    // ==================== 事务一致性投递（apply.transaction.mode=TRANSACTION） ====================
+    //
+    // EVENT（默认）：每个 THL 事件一个目标事务——与历史行为完全一致。
+    // TRANSACTION：按 extract 下发的 tx_id 聚合，一个源事务 → 一个目标事务。
+    //   目标端不再出现"半个事务"（转账扣款已落、入账未落），灾备倒换后备库不会读到不平的账。
+    //   位点只在提交成功后推进，崩溃即整事务回滚 + 位点不动，重启从事务首条重放（幂等）。
+
+    /** true=TRANSACTION 模式。 */
+    private boolean txApplyMode = false;
+    /** 单个目标事务的行数上限：超大源事务降级为分批提交，避免撑爆目标库事务日志/锁表。 */
+    private long txMaxRows = 50000;
+    /**
+     * 打开的目标事务多久没有新事件就直接提交（毫秒）。
+     * Oracle/TiDB 没有独立的提交事件（只能靠 tx_id 变化判定边界），一个事务的最后一批行
+     * 后面若再没有事件到达，就得靠这个兜底提交，否则会一直占着目标库的锁不放。
+     */
+    private long txIdleFlushMs = 3000;
+
+    /** 当前打开的目标事务对应的源事务标识；null=没有打开的事务。 */
+    private String pendingTxId;
+    private boolean pendingTxOpen = false;
+    private long pendingTxRows = 0;
+    /** 事务内最后一个已应用事件：提交后用它推进 checkpoint。 */
+    private THLEvent pendingTxLastEvent;
+    /**
+     * 已读入但尚未提交的最大 seqno。读游标必须独立于"已提交低水位"lastExecutedSeqno——
+     * 否则事务跨 THL 文件/跨扫描轮次时会把同一批事件重复读进同一个目标事务。
+     */
+    private long pendingTxHighSeqno = -1;
+    private long pendingTxLastAppendMs = 0;
+    /** 本事务是否已写过 origin 标记（双向防回环：一个目标事务写一次即可）。 */
+    private boolean pendingTxOriginMarked = false;
+
     public static void main(String[] args) {
         com.migration.common.OracleNetCompat.apply();
         logger.info("=== 增量同步服务启动 ===");
@@ -129,13 +162,18 @@ public class ContinuousIncrementMain {
                 }
             }
         }
-        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
-        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
-
         String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
 
         MdcUtil.setTaskId(taskId);
         MdcUtil.setProcessName("increment");
+
+        // 单实例互斥 + 父进程看门狗（放在解密之前，见 CaptureMain 的说明）：这里是最不能双开的一环——
+        // 两个 increment 同时应用同一批 THL，非幂等语句（自增列、无主键表、UPDATE ... SET x = x + 1）
+        // 会把目标库直接算错。
+        com.migration.common.proc.ChildProcessBootstrap.init(taskId, "increment");
+
+        // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
+        com.migration.common.crypto.CredentialCipher.decryptProperties(props);
 
         try {
             ContinuousIncrementMain main = new ContinuousIncrementMain();
@@ -219,9 +257,21 @@ public class ContinuousIncrementMain {
 
         applyParallelism = Math.max(1, Integer.parseInt(props.getProperty("increment.apply.parallelism", "1")));
         applyBatchSize = Math.max(1, Integer.parseInt(props.getProperty("increment.apply.batch.size", "500")));
+
+        txApplyMode = "TRANSACTION".equalsIgnoreCase(
+                props.getProperty("apply.transaction.mode", "EVENT").trim());
+        txMaxRows = Math.max(1, Long.parseLong(props.getProperty("apply.transaction.max.rows", "50000")));
+        txIdleFlushMs = Math.max(100, Long.parseLong(props.getProperty("apply.transaction.idle.flush.ms", "3000")));
+        if (txApplyMode) {
+            logger.info("事务一致性投递已启用: 源事务 → 目标事务 1:1（单事务行数上限={}, 空闲兜底提交={}ms）",
+                    txMaxRows, txIdleFlushMs);
+        }
+
         if (applyParallelism > 1) {
-            logger.info("增量并行应用已启用: 并发度={}, 批大小={}（按表分片，同表保序，跨表并发）",
-                    applyParallelism, applyBatchSize);
+            logger.info("增量并行应用已启用: 并发度={}, 批大小={}（{}）",
+                    applyParallelism, applyBatchSize,
+                    txApplyMode ? "按事务分片，同事务同连接整体提交，跨事务并发"
+                                : "按表分片，同表保序，跨表并发");
         }
         ensureDirExists(tableLatencyDir);
         // 初始化 THL 加密服务
@@ -419,6 +469,10 @@ public class ContinuousIncrementMain {
             processThlFile(thlFile, thlFile.getName().equals(latestFileName));
         }
 
+        // 本轮扫完仍有打开的目标事务（提交事件还没写进 THL，或上游已停）：空闲够久就兜底提交，
+        // 否则目标库的行锁会一直被占着。事务跨文件的正常情况下，下一个文件里就会遇到提交事件。
+        flushIdlePendingTx();
+
         // 真实指标：apply 端积压 = 尚未应用完的 .thl 文件数（processedFiles != -1），落盘供 agent 采集
         writeApplyQueueDepth(thlFiles);
     }
@@ -471,9 +525,27 @@ public class ContinuousIncrementMain {
             THLEvent event;
             // readEventAfter 只返回 seqno > 已执行seqno 的事件：分帧格式下对已应用事件按字节跳过、
             // 不反序列化，大幅加快增量进程重启时“从 seqno 跳到当前位点”；旧格式自动回退为逐条反序列化跳过。
-            while ((event = reader.readEventAfter(lastExecutedSeqno)) != null) {
+            while ((event = reader.readEventAfter(applyCursor())) != null) {
                 if (!running.get()) { aborted = true; break; }
                 touchLiveness();  // 逐事件刷新活性：单文件大积压追平（碰不到心跳事件）时也不误判僵死
+
+                // TRANSACTION 模式的事务边界：本事件不属于手里这个源事务（换了 tx_id，
+                // 或是心跳/DDL 这类不带 tx_id 的事件）→ 先把手里的提交掉再处理它。
+                // Oracle/TiDB 没有独立提交事件，正是靠这条"tx_id 变了"判定上一个事务结束。
+                // 人工裁决跳过的事件会直接推进位点，必须先把手里的事务提交掉——否则位点会越过
+                // 事务里还没提交的事件，崩溃即真丢数据。哪怕它就在当前事务内也照样先提交
+                // （操作员显式跳过一条，代价是这个事务在目标端被切成两半，比丢数据强）。
+                boolean isSkipEvent = (!skipEventIds.isEmpty() && event.getEventId() != null
+                            && skipEventIds.contains(event.getEventId()))
+                        || (!skipSeqnos.isEmpty() && skipSeqnos.contains(event.getSeqno()));
+
+                if (pendingTxOpen && (isSkipEvent || !sameTransaction(event))) {
+                    if (!commitPendingTx(isSkipEvent ? "跳过事件前收口" : "事务边界")) {
+                        aborted = true;
+                        running.set(false);   // 提交失败等同 fail-stop，不再往下处理
+                        break;
+                    }
+                }
 
                 if (event.getType() == THLEvent.HEARTBEAT_EVENT) {
                     lastExecutedSeqno = event.getSeqno();
@@ -504,8 +576,7 @@ public class ContinuousIncrementMain {
                 // 人工裁决跳过：命中 eventId（跨重启稳定）或 seqno（老错误信息兼容）的事件不应用，
                 // 写死信记录后按正常事件推进位点。放在转换之前——毒事件可能在转换阶段就抛异常，
                 // 转换只在死信记录里尽力而为
-                if ((!skipEventIds.isEmpty() && event.getEventId() != null && skipEventIds.contains(event.getEventId()))
-                        || (!skipSeqnos.isEmpty() && skipSeqnos.contains(event.getSeqno()))) {
+                if (isSkipEvent) {
                     recordDeadLetter(event);
                     lastExecutedSeqno = event.getSeqno();
                     String skipBinlogFile = (String) event.getMetadata("binlog_file");
@@ -531,22 +602,24 @@ public class ContinuousIncrementMain {
                     logger.info("为seqno={}生成了{}条SQL语句", event.getSeqno(), sqlStatements.size());
                 }
 
-                // 按事务批量执行SQL，确保同一THL事件内的SQL原子性
+                // 按事务批量执行SQL：EVENT 模式下一个 THL 事件一个目标事务（历史行为）；
+                // TRANSACTION 模式下同一源事务的事件累积进同一个目标事务，到边界才提交
                 boolean txFailed = false;
                 try {
-                    if (targetConnection != null && !targetConnection.getAutoCommit()) {
+                    if (targetConnection.getAutoCommit()) {
                         targetConnection.setAutoCommit(false);
                     }
-                    boolean origAutoCommit = targetConnection.getAutoCommit();
-                    if (origAutoCommit) {
-                        targetConnection.setAutoCommit(false);
+                    if (!pendingTxOpen) {
+                        openPendingTx(event);
                     }
 
                     // 双向防回环：数据事件在应用前先写 origin 标记（事务首条语句），
                     // 与业务 DML 原子提交进目标库 binlog，供对端 capture 识别并跳过。
-                    if (bidirectionalEnabled && isDataChangeEvent(event)) {
+                    // 一个目标事务写一次即可（TRANSACTION 模式下事务内后续事件不再重复写）。
+                    if (bidirectionalEnabled && isDataChangeEvent(event) && !pendingTxOriginMarked) {
                         try {
                             writeOriginMarker(event.getSeqno());
+                            pendingTxOriginMarked = true;
                         } catch (SQLException me) {
                             logger.warn("写 origin 标记失败 (seqno={})，本事务将不带标记: {}", event.getSeqno(), me.getMessage());
                         }
@@ -627,20 +700,20 @@ public class ContinuousIncrementMain {
                     } // end 文本路径 else
 
                     if (txFailed) {
-                        targetConnection.rollback();
-                        logger.warn("事务回滚 (seqno={})", event.getSeqno());
+                        rollbackPendingTx(event);
                     } else {
-                        targetConnection.commit();
-                    }
-
-                    // 恢复原始autoCommit设置
-                    if (origAutoCommit) {
-                        targetConnection.setAutoCommit(true);
+                        pendingTxRows += (typedDmls != null) ? typedDmls.size()
+                                : (sqlStatements != null ? sqlStatements.size() : 0);
+                        pendingTxLastEvent = event;
+                        pendingTxHighSeqno = event.getSeqno();
+                        pendingTxLastAppendMs = System.currentTimeMillis();
+                        if (shouldCommitNow(event)) {
+                            txFailed = !commitPendingTx("事件");
+                        }
                     }
                 } catch (SQLException txEx) {
                     logger.error("事务管理异常 (seqno={}): {}", event.getSeqno(), txEx.getMessage());
-                    try { targetConnection.rollback(); } catch (SQLException ignored) {}
-                    try { targetConnection.setAutoCommit(true); } catch (SQLException ignored) {}
+                    rollbackPendingTx(event);
                     txFailed = true;
                 }
 
@@ -667,23 +740,14 @@ public class ContinuousIncrementMain {
                     break;
                 }
 
-                lastExecutedSeqno = event.getSeqno();
+                // 位点推进与 checkpoint 落盘统一在 commitPendingTx() 里做——只有提交成功的事件
+                // 才计入位点。TRANSACTION 模式下事务中途崩溃即整体回滚、位点停在上一个事务末尾，
+                // 重启从本事务首条重放；EVENT 模式下每个事件都在这一轮提交，语义与改动前一致。
 
                 // 记录表级延迟（用于热力图）：优先从事件本身的 event_type 判断操作类型，
                 // 类型化值管道命中时 sqlStatements 为空列表，仅靠 SQL 文本判断会把所有类型化路径的事件误标为 UNKNOWN
-                if (!txFailed) {
-                    String opType = determineOpTypeFromEvent(event, sqlStatements);
-                    recordTableLatency(event, opType);
-                }
-
-                String binlogFile = (String) event.getMetadata("binlog_file");
-                Long binlogPosition = (Long) event.getMetadata("binlog_position");
-                checkpointManager.saveCheckpoint(
-                        event.getSeqno(),
-                        binlogFile != null ? binlogFile : "",
-                        binlogPosition != null ? binlogPosition : 0,
-                        event.getEventId() != null ? event.getEventId() : ""
-                );
+                String opType = determineOpTypeFromEvent(event, sqlStatements);
+                recordTableLatency(event, opType);
 
                 if (event.getSourceTstamp() != null) {
                     long now = System.currentTimeMillis();
@@ -704,6 +768,7 @@ public class ContinuousIncrementMain {
             logger.error("处理THL文件出错: {}, 跳过至下一个文件. 错误: {}", fileName, e.getMessage());
             // 不再抛出 RuntimeException，避免进程崩溃后反复重启在同一位置失败
             // 标记该文件已处理（跳过），继续处理下一个文件
+            rollbackPendingTx(null);   // 手里若有没提交完的事务，连同本文件一起放弃，等重读
             if (isLatestFile) {
                 processedFiles.put(fileName, lastExecutedSeqno);
             } else {
@@ -718,7 +783,9 @@ public class ContinuousIncrementMain {
 
         // 中途打断（fail-stop / 优雅停止）：只记录已应用到的 seqno，绝不标记 -1（已处理完）。
         // 否则重启后该文件被整体跳过，未应用的事件全部丢失。
-        if (aborted) {
+        // 事务跨文件时同理：本文件末尾还有事件在未提交的事务里（提交事件在下一个文件），
+        // 一旦标 -1，事务回滚后重读就会跳过本文件，只应用事务的后半段——比丢数据更糟。
+        if (aborted || pendingTxOpen) {
             processedFiles.put(fileName, lastExecutedSeqno);
             saveProgress();
             return;
@@ -732,6 +799,144 @@ public class ContinuousIncrementMain {
             cleanupProcessedThlFiles();
         }
         saveProgress();
+    }
+
+    // ==================== 目标事务边界（串行路径） ====================
+
+    /**
+     * 读游标：已提交低水位与"已读入未提交"的较大者。
+     *
+     * <p>不能只用 {@code lastExecutedSeqno}——TRANSACTION 模式下事务提交前它不推进，
+     * 而 {@code readEventAfter} 是按 seqno 过滤的，用低水位会把事务里已经读过的事件
+     * 反复读回来，同一批 DML 在同一个目标事务里重复执行。
+     */
+    private long applyCursor() {
+        return Math.max(lastExecutedSeqno, pendingTxHighSeqno);
+    }
+
+    /** 事件是否属于当前打开的目标事务（EVENT 模式下永远只有单事件事务，取决于 pendingTxId）。 */
+    private boolean sameTransaction(THLEvent event) {
+        String txId = com.migration.common.txn.TxnMetadata.txIdOf(event.getMetadata());
+        return txId != null && txId.equals(pendingTxId);
+    }
+
+    private void openPendingTx(THLEvent event) {
+        pendingTxOpen = true;
+        pendingTxId = txApplyMode
+                ? com.migration.common.txn.TxnMetadata.txIdOf(event.getMetadata())
+                : null;   // EVENT 模式：不聚合，恒逐事件提交
+        pendingTxRows = 0;
+        pendingTxLastEvent = null;
+        pendingTxOriginMarked = false;
+        pendingTxLastAppendMs = System.currentTimeMillis();
+    }
+
+    /**
+     * 本事件应用完后是否立刻提交。
+     *
+     * <p>EVENT 模式恒 true。TRANSACTION 模式下三种情况提交：
+     * 事件不属于任何源事务（老 THL / 没有 tx_id）、事件是事务末条（MySQL 的 XID / PG 的 COMMIT）、
+     * 事务行数超过上限（超大事务降级分批提交，避免撑爆目标库事务日志）。
+     */
+    private boolean shouldCommitNow(THLEvent event) {
+        if (!txApplyMode || pendingTxId == null) {
+            return true;
+        }
+        if (com.migration.common.txn.TxnMetadata.isTxLast(event.getMetadata())) {
+            return true;
+        }
+        if (pendingTxRows >= txMaxRows) {
+            logger.warn("源事务 {} 已累计 {} 行，超过 apply.transaction.max.rows={}，降级为分批提交"
+                    + "（该事务在目标端将不再是单个原子事务）", pendingTxId, pendingTxRows, txMaxRows);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 提交当前目标事务并推进位点。返回 false 表示提交失败（已回滚，调用方应 fail-stop）。
+     *
+     * <p>位点在提交<b>之后</b>才推进：提交前崩溃 → 目标端整事务回滚 + 位点停在上一个事务末尾，
+     * 重启从本事务首条重新应用；提交后崩溃 → 位点已落盘，不会重放。两种情况都不会
+     * 在目标端留下半个事务。
+     */
+    private boolean commitPendingTx(String reason) {
+        if (!pendingTxOpen) {
+            return true;
+        }
+        THLEvent last = pendingTxLastEvent;
+        try {
+            targetConnection.commit();
+        } catch (SQLException e) {
+            logger.error("目标事务提交失败 (txId={}, rows={}, 触发={}): {}",
+                    pendingTxId, pendingTxRows, reason, e.getMessage());
+            try { targetConnection.rollback(); } catch (SQLException ignored) {}
+            if (last != null) {
+                writeErrorStatus("E3004", "目标事务提交失败: " + e.getMessage(), last);
+            }
+            resetPendingTx();
+            return false;
+        }
+        if (txApplyMode && pendingTxId != null && logger.isDebugEnabled()) {
+            logger.debug("源事务 {} 已整体提交: {} 行, 触发={}", pendingTxId, pendingTxRows, reason);
+        }
+        resetPendingTx();
+        if (last != null) {
+            advanceCheckpoint(last);
+        }
+        return true;
+    }
+
+    /** 回滚当前目标事务：事务内已应用的事件全部作废，位点不动，等重读重放。 */
+    private void rollbackPendingTx(THLEvent event) {
+        if (!pendingTxOpen) {
+            return;
+        }
+        try {
+            targetConnection.rollback();
+            logger.warn("事务回滚 (txId={}, seqno={}, 已应用 {} 行全部作废)",
+                    pendingTxId, event != null ? event.getSeqno() : -1, pendingTxRows);
+        } catch (SQLException e) {
+            logger.error("事务回滚失败: {}", e.getMessage());
+        }
+        resetPendingTx();
+    }
+
+    private void resetPendingTx() {
+        pendingTxOpen = false;
+        pendingTxId = null;
+        pendingTxRows = 0;
+        pendingTxLastEvent = null;
+        pendingTxHighSeqno = -1;   // 读游标回落到已提交低水位
+        pendingTxOriginMarked = false;
+        try {
+            if (targetConnection != null && !targetConnection.isClosed() && !targetConnection.getAutoCommit()) {
+                targetConnection.setAutoCommit(true);
+            }
+        } catch (SQLException ignored) {
+        }
+    }
+
+    /**
+     * 空闲兜底提交：打开的目标事务超过 {@code apply.transaction.idle.flush.ms} 没有新事件就提交。
+     *
+     * <p>Oracle/TiDB 没有独立的提交事件，一个事务的最后一批行后面若再没有事件到达，
+     * 边界判定（tx_id 变化）就永远等不到，事务会一直占着目标库的行锁。
+     * MySQL/PG 有显式 XID/COMMIT，正常情况下毫秒级就到，走到这里说明上游已经停了——
+     * 此时提交半个事务也比一直锁着目标库强，但要留下告警。
+     */
+    private void flushIdlePendingTx() {
+        if (!pendingTxOpen) {
+            return;
+        }
+        if (System.currentTimeMillis() - pendingTxLastAppendMs < txIdleFlushMs) {
+            return;
+        }
+        if (pendingTxId != null) {
+            logger.warn("源事务 {} 已累计 {} 行且 {}ms 内没有新事件（上游可能已停），空闲兜底提交",
+                    pendingTxId, pendingTxRows, txIdleFlushMs);
+        }
+        commitPendingTx("空闲兜底");
     }
 
     /**
@@ -1199,7 +1404,7 @@ public class ContinuousIncrementMain {
     // 失败点之后已并行落库的其它表事件在 resume 时被幂等重放（与串行 fail-stop、resume 整段重放同一保证）。
 
     /** 一个待应用的已转换事件（typed 与 text 二选一）。 */
-    private static final class WorkItem {
+    static final class WorkItem {
         final THLEvent event;
         final List<ParameterizedDml> typedDmls;
         final List<String> sqlStatements;
@@ -1276,23 +1481,44 @@ public class ContinuousIncrementMain {
                 boolean isSkip = (!skipEventIds.isEmpty() && event.getEventId() != null && skipEventIds.contains(event.getEventId()))
                         || (!skipSeqnos.isEmpty() && skipSeqnos.contains(event.getSeqno()));
 
-                // barrier：心跳 / 被裁决跳过 / 非并行化（DDL、无表名）——先 drain 当前批再串行处理
+                // barrier：心跳 / 被裁决跳过 / 非并行化（DDL、无表名）——先 drain 当前批再串行处理。
+                // TRANSACTION 模式下 BEGIN/COMMIT 也走这里，但它们<b>不能</b>各自 drain 一次：
+                // 那样每个源事务都要独占一批，跨事务并发就没了。改为只记录边界、不打断批。
                 if (event.getType() == THLEvent.HEARTBEAT_EVENT || isSkip || !isParallelizable(event)) {
+                    if (txApplyMode && !isSkip && isTxBoundaryOnlyEvent(event)) {
+                        // BEGIN/COMMIT 本身没有要落库的 DML，事务归属已写在各 DML 的 tx_id 上。
+                        // 批空时说明之前的都已提交，可以安全把位点推到这里（否则纯边界事件不推位点，
+                        // 别的库的事务刷屏时本任务的 checkpoint 会长时间停着不动）。
+                        if (batch.isEmpty()) {
+                            advanceCheckpoint(event);
+                        }
+                        continue;
+                    }
                     if (!flushBatch(batch)) { aborted = true; break; }
                     batch.clear();
                     if (!handleBarrierEvent(event, isSkip)) { aborted = true; break; }
                     continue;
                 }
 
+                // 攒批切点：TRANSACTION 模式下只在事务边界切，批内切开会把一个源事务劈成两个目标事务。
+                // 判定放在入批之前——"下一个事件换了 tx_id"才是能确认的边界（DML 自己不带 tx_last）。
+                // 超大事务兜底：一个事务本身就超过 apply.transaction.max.rows 时强制切开，
+                // 否则整批要在内存里堆到事务结束（与串行路径的降级口径一致）。
+                boolean atTxBoundary = !txApplyMode || startsNewTransaction(batch, event);
+                if (batch.size() >= applyBatchSize && !atTxBoundary && batch.size() >= txMaxRows) {
+                    logger.warn("单个源事务在并行批里已累计 {} 条，超过 apply.transaction.max.rows={}，强制切批"
+                            + "（该事务在目标端将不再是单个原子事务）", batch.size(), txMaxRows);
+                    atTxBoundary = true;
+                }
+                if (batch.size() >= applyBatchSize && atTxBoundary) {
+                    if (!flushBatch(batch)) { aborted = true; break; }
+                    batch.clear();
+                }
+
                 // 并行化 DML：转换在主线程完成（保持有序、规避转换器线程安全）
                 List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
                 List<String> sqlStatements = (typedDmls == null) ? sqlConverter.convertToSql(event) : null;
                 batch.add(new WorkItem(event, typedDmls, sqlStatements));
-
-                if (batch.size() >= applyBatchSize) {
-                    if (!flushBatch(batch)) { aborted = true; break; }
-                    batch.clear();
-                }
             }
             if (!aborted) {
                 if (!flushBatch(batch)) aborted = true;
@@ -1363,27 +1589,24 @@ public class ContinuousIncrementMain {
         if (batch.isEmpty()) return true;
         final int n = parallelExecutor.n;
 
-        // 按表 hash 分片，保持各分片内 seqno 升序（batch 本身升序）
-        List<List<WorkItem>> shards = new ArrayList<>(n);
-        for (int i = 0; i < n; i++) shards.add(new ArrayList<>());
-        for (WorkItem wi : batch) {
-            String table = (String) wi.event.getMetadata("table_name");
-            int idx = Math.floorMod(table.hashCode(), n);
-            shards.get(idx).add(wi);
-        }
+        List<List<TxGroup>> shards = shardBatch(batch, n);
 
         List<Future<Long>> futures = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            final List<WorkItem> shard = shards.get(i);
+            final List<TxGroup> shard = shards.get(i);
             final Connection conn = parallelExecutor.conns[i];
             futures.add(parallelExecutor.pool.submit((Callable<Long>) () -> {
-                for (WorkItem wi : shard) {
+                for (TxGroup group : shard) {
                     try {
-                        applyEventTx(wi.event, conn, wi.typedDmls, wi.sqlStatements);
-                        recordTableLatency(wi.event, determineOpTypeFromEvent(wi.event, wi.sqlStatements));
+                        applyGroupTx(group, conn);
+                        for (WorkItem wi : group.items) {
+                            recordTableLatency(wi.event, determineOpTypeFromEvent(wi.event, wi.sqlStatements));
+                        }
                     } catch (SQLException e) {
-                        logger.error("并行 worker 应用失败 (seqno={}): {}", wi.event.getSeqno(), e.getMessage());
-                        return wi.event.getSeqno(); // 该表在此 seqno 失败，停止本 worker（同表后续不再应用）
+                        logger.error("并行 worker 应用失败 (txId={}, seqno={}..{}): {}",
+                                group.txId, group.firstSeqno, group.lastSeqno(), e.getMessage());
+                        // 整组已回滚，低水位必须退到本组<b>第一条</b>之前，否则重启会跳过组内前半段
+                        return group.firstSeqno;
                     }
                 }
                 return Long.MAX_VALUE; // 无失败
@@ -1434,6 +1657,151 @@ public class ContinuousIncrementMain {
                 minFailed == Long.MAX_VALUE ? -1 : minFailed);
         running.set(false);
         return false;
+    }
+
+    /** 一个目标事务的执行单元：EVENT 模式下就是单个事件，TRANSACTION 模式下是同 tx_id 的一串事件。 */
+    static final class TxGroup {
+        final String txId;
+        final List<WorkItem> items = new ArrayList<>();
+        final java.util.LinkedHashSet<String> tables = new java.util.LinkedHashSet<>();
+        long firstSeqno = Long.MAX_VALUE;
+
+        TxGroup(String txId) {
+            this.txId = txId;
+        }
+
+        void add(WorkItem wi) {
+            items.add(wi);
+            firstSeqno = Math.min(firstSeqno, wi.event.getSeqno());
+            Object t = wi.event.getMetadata("table_name");
+            if (t != null) tables.add(t.toString());
+        }
+
+        long lastSeqno() {
+            return items.isEmpty() ? -1 : items.get(items.size() - 1).event.getSeqno();
+        }
+    }
+
+    /** 事件是否只是事务边界标记（BEGIN / COMMIT），本身不产生任何目标端写入。 */
+    private boolean isTxBoundaryOnlyEvent(THLEvent event) {
+        Object op = event.getMetadata("operation");
+        if (op == null) return false;
+        String operation = op.toString();
+        if ("BEGIN".equals(operation) || "COMMIT".equals(operation)) return true;
+        if ("QUERY".equals(operation)) {
+            Object sql = event.getMetadata("sql");
+            return sql != null && "BEGIN".equalsIgnoreCase(sql.toString().trim());
+        }
+        return false;
+    }
+
+    /** 本事件是否开启了一个新的源事务（相对批尾那条而言）——TRANSACTION 模式的攒批切点。 */
+    private boolean startsNewTransaction(List<WorkItem> batch, THLEvent event) {
+        if (batch.isEmpty()) return true;
+        String prev = com.migration.common.txn.TxnMetadata.txIdOf(
+                batch.get(batch.size() - 1).event.getMetadata());
+        String cur = com.migration.common.txn.TxnMetadata.txIdOf(event.getMetadata());
+        return prev == null || !prev.equals(cur);
+    }
+
+    /**
+     * 把一批事件切成 N 个 worker 的执行队列。
+     *
+     * <p>EVENT 模式：每个事件自成一组，按<b>表名</b> hash 分片——同表保序、跨表并发（原行为）。
+     *
+     * <p>TRANSACTION 模式：先按 tx_id 聚成事务组，再按"<b>有表相交的事务必须同片</b>"分片。
+     * 只按 tx_id hash 分是不够的——tx1 插入 X、tx2 紧接着更新 X，两个事务落到不同 worker
+     * 就可能乱序执行，UPDATE 先跑会"未影响任何行"被吞掉，最终留下 INSERT 的旧值。
+     * 这里用并查集把共享任一张表的事务并到同一组，同时保住了两条性质：
+     * 同一事务只在一个连接上（原子性），同一张表的事件严格有序（正确性）。
+     * 并发度退化为"互不相交的表集合数"，单表压测下等于串行——这是原子性必须付的代价。
+     */
+    List<List<TxGroup>> shardBatch(List<WorkItem> batch, int n) {
+        List<TxGroup> groups = new ArrayList<>();
+        if (txApplyMode) {
+            TxGroup current = null;
+            for (WorkItem wi : batch) {
+                String txId = com.migration.common.txn.TxnMetadata.txIdOf(wi.event.getMetadata());
+                if (current == null || txId == null || !txId.equals(current.txId)) {
+                    current = new TxGroup(txId);
+                    groups.add(current);
+                }
+                current.add(wi);
+            }
+        } else {
+            for (WorkItem wi : batch) {
+                TxGroup g = new TxGroup(null);
+                g.add(wi);
+                groups.add(g);
+            }
+        }
+
+        // 并查集：把同一事务触及的所有表并起来，得到"表连通分量"
+        Map<String, String> parent = new HashMap<>();
+        for (TxGroup g : groups) {
+            String first = null;
+            for (String t : g.tables) {
+                if (first == null) first = t;
+                else union(parent, first, t);
+            }
+        }
+
+        List<List<TxGroup>> shards = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) shards.add(new ArrayList<>());
+        for (TxGroup g : groups) {
+            String key = g.tables.isEmpty()
+                    ? String.valueOf(g.txId)
+                    : find(parent, g.tables.iterator().next());
+            shards.get(Math.floorMod(key.hashCode(), n)).add(g);
+        }
+        return shards;
+    }
+
+    private String find(Map<String, String> parent, String x) {
+        String p = parent.get(x);
+        if (p == null || p.equals(x)) {
+            return x;
+        }
+        String root = find(parent, p);
+        parent.put(x, root);   // 路径压缩
+        return root;
+    }
+
+    private void union(Map<String, String> parent, String a, String b) {
+        String ra = find(parent, a);
+        String rb = find(parent, b);
+        if (!ra.equals(rb)) {
+            // 固定按字典序选根，保证同一组表在任何批里都算出同一个 key
+            if (ra.compareTo(rb) <= 0) parent.put(rb, ra);
+            else parent.put(ra, rb);
+        }
+    }
+
+    /** 在一个连接上以<b>单个目标事务</b>应用整组事件；任一条失败即整组回滚。 */
+    private void applyGroupTx(TxGroup group, Connection conn) throws SQLException {
+        if (group.items.size() == 1) {
+            WorkItem only = group.items.get(0);
+            applyEventTx(only.event, conn, only.typedDmls, only.sqlStatements);
+            return;
+        }
+        boolean origAuto = conn.getAutoCommit();
+        if (origAuto) conn.setAutoCommit(false);
+        try {
+            WorkItem first = group.items.get(0);
+            if (bidirectionalEnabled && isDataChangeEvent(first.event)) {
+                try { writeOriginMarkerOn(conn, first.event.getSeqno()); }
+                catch (SQLException me) { logger.warn("写 origin 标记失败 (txId={}): {}", group.txId, me.getMessage()); }
+            }
+            for (WorkItem wi : group.items) {
+                applyEventDmls(wi.event, conn, wi.typedDmls, wi.sqlStatements);
+            }
+            conn.commit();
+        } catch (SQLException e) {
+            try { conn.rollback(); } catch (SQLException ignored) {}
+            throw e;
+        } finally {
+            try { if (origAuto) conn.setAutoCommit(true); } catch (SQLException ignored) {}
+        }
     }
 
     /** 推进 lastExecutedSeqno 并落 checkpoint（位点信息取自事件元数据）。 */
@@ -1500,6 +1868,23 @@ public class ContinuousIncrementMain {
                 try { writeOriginMarkerOn(conn, event.getSeqno()); }
                 catch (SQLException me) { logger.warn("写 origin 标记失败 (seqno={}): {}", event.getSeqno(), me.getMessage()); }
             }
+            applyEventDmls(event, conn, typedDmls, sqlStatements);
+            conn.commit();
+        } catch (SQLException e) {
+            try { conn.rollback(); } catch (SQLException ignored) {}
+            throw e;
+        } finally {
+            try { if (origAuto) conn.setAutoCommit(true); } catch (SQLException ignored) {}
+        }
+    }
+
+    /**
+     * 执行一个事件已转换好的 DML，<b>不管理事务边界</b>（由调用方 commit/rollback）。
+     * 供单事件事务（{@link #applyEventTx}）与整组事务（{@link #applyGroupTx}）共用。
+     */
+    private void applyEventDmls(THLEvent event, Connection conn,
+                                List<ParameterizedDml> typedDmls, List<String> sqlStatements) throws SQLException {
+        {
             if (typedDmls != null) {
                 for (ParameterizedDml dml : typedDmls) {
                     try {
@@ -1542,12 +1927,6 @@ public class ContinuousIncrementMain {
                     }
                 }
             }
-            conn.commit();
-        } catch (SQLException e) {
-            try { conn.rollback(); } catch (SQLException ignored) {}
-            throw e;
-        } finally {
-            try { if (origAuto) conn.setAutoCommit(true); } catch (SQLException ignored) {}
         }
     }
 
@@ -1596,6 +1975,9 @@ public class ContinuousIncrementMain {
     }
 
     public void close() {
+        // 停止时手里可能还有没提交的目标事务（提交事件尚未到达）：回滚而不是提交——
+        // 位点没推进，重启后从事务首条完整重放，永远不会在目标端留下半个事务。
+        rollbackPendingTx(null);
         saveProgress();
         checkpointManager.close();
         if (parallelExecutor != null) {

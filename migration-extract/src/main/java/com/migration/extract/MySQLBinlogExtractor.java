@@ -1,6 +1,7 @@
 package com.migration.extract;
 
 import com.migration.common.AbstractExtractor;
+import com.migration.common.txn.TxnMetadata;
 import com.migration.db.ConnectionPoolManager;
 import com.migration.thl.THLEvent;
 import com.migration.thl.pipeline.Pipeline;
@@ -166,6 +167,8 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             thlEvent.addMetadata("operation", "ROTATE");
         }
 
+        stampTransaction(thlEvent, eventType, binlogFile, binlogPosition, eventData);
+
         if (pipeline != null) {
             thlEvent = pipeline.process(thlEvent);
         }
@@ -186,6 +189,61 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
         return thlEvent;
     }
+
+    /**
+     * 当前源事务标识：取 BEGIN 事件的 binlog 位点。
+     * 不用 XID 的值是因为 XID 只在事务<b>末尾</b>才出现，而行事件在它之前就得打上标识；
+     * BEGIN 的位点同样唯一（binlog 内单调递增），且天然在事务首位可用。不在事务中为 null。
+     */
+    private String currentTxId;
+
+    /**
+     * 给事件打上源事务边界（{@code tx_id} / {@code tx_last}）。
+     *
+     * <p>MySQL 行格式 binlog 里每个事务都是 {@code BEGIN … 行事件 … XID}（单语句自动提交也一样），
+     * 因此 BEGIN 开启、XID 收尾。DDL 的 QUERY 事件是隐式提交的独立事务，不并入当前事务。
+     */
+    private void stampTransaction(THLEvent thlEvent, String eventType,
+                                  String binlogFile, long binlogPosition, String eventData) {
+        if ("QUERY".equals(eventType)) {
+            Object sqlMeta = thlEvent.getMetadata().get("sql");
+            String sql = sqlMeta != null ? sqlMeta.toString().trim() : "";
+            if ("BEGIN".equalsIgnoreCase(sql)) {
+                currentTxId = binlogFile + ":" + binlogPosition;
+                thlEvent.addMetadata(TxnMetadata.TX_ID, currentTxId);
+                return;
+            }
+            if ("COMMIT".equalsIgnoreCase(sql)) {
+                // 非事务引擎（MyISAM 等）用 QUERY 'COMMIT' 而不是 XID 收尾
+                closeTransaction(thlEvent, binlogFile, binlogPosition);
+                return;
+            }
+            currentTxId = null;   // DDL：隐式提交，自成一个事务
+            return;
+        }
+        if ("XID".equals(eventType)) {
+            closeTransaction(thlEvent, binlogFile, binlogPosition);
+            java.util.regex.Matcher m = XID_VALUE.matcher(eventData == null ? "" : eventData);
+            if (m.find()) {
+                thlEvent.addMetadata(TxnMetadata.TX_SOURCE_ID, m.group(1));
+            }
+            return;
+        }
+        if (currentTxId != null) {
+            thlEvent.addMetadata(TxnMetadata.TX_ID, currentTxId);
+        }
+    }
+
+    /** 收尾当前事务：没见过 BEGIN（如断点续传恰好落在事务中间）时退化为该事件自成一事务。 */
+    private void closeTransaction(THLEvent thlEvent, String binlogFile, long binlogPosition) {
+        thlEvent.addMetadata(TxnMetadata.TX_ID,
+                currentTxId != null ? currentTxId : binlogFile + ":" + binlogPosition);
+        thlEvent.addMetadata(TxnMetadata.TX_LAST, Boolean.TRUE);
+        currentTxId = null;
+    }
+
+    private static final java.util.regex.Pattern XID_VALUE =
+            java.util.regex.Pattern.compile("xid=(\\d+)");
 
     private boolean shouldSkipEvent(String binlogFile, long binlogPosition) {
         if (checkpointBinlogFile == null || checkpointBinlogFile.isEmpty()) {

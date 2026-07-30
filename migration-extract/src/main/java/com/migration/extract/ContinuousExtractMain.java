@@ -95,10 +95,15 @@ public class ContinuousExtractMain {
                 }
             }
         }
+        String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
+
+        // 单实例互斥 + 父进程看门狗（放在解密之前，见 CaptureMain 的说明）：
+        // 两个 extract 同时扫同一批 .cap 会产出重复 THL
+        com.migration.common.proc.ChildProcessBootstrap.init(taskId, "extract");
+
         // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
         com.migration.common.crypto.CredentialCipher.decryptProperties(props);
 
-        String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
         String captureType = props.getProperty("capture.type", "binlog").toLowerCase();
         logger.info("=== Migration Extract (Continuous) Starting (type={}) ===", captureType);
 
@@ -507,6 +512,100 @@ public class ContinuousExtractMain {
         return new THLFileWriter(filePath);
     }
 
+    /**
+     * 多行事件拆成"每行一条"时<b>不能整份复制</b>的元数据 key：
+     * 行集合（{@code rows_*}）与它们的单行投影（{@code row_data}/{@code row_data_before}，
+     * 由 extractor 置为第 0 行），拆分时逐行重写；{@code multi_row} 拆完即不再成立。
+     */
+    private static final java.util.Set<String> PER_ROW_METADATA_KEYS = new java.util.HashSet<>(
+            java.util.Arrays.asList("rows_data", "rows_data_before", "rows_typed", "rows_before_typed",
+                    "row_data", "row_data_before", "multi_row"));
+
+    /**
+     * 把一个多行事件拆成"每行一条"的 THL 事件；不是多行事件则返回 null（调用方原样写出）。
+     *
+     * <p><b>逐行元数据必须逐行切</b>。此前拆分时只排除了 {@code rows_data}/{@code multi_row}，
+     * 其余 key 整份复制——于是拆出来的 N 个事件<b>每一个都带着全部 N 行</b>的
+     * {@code rows_typed}，而增量端的类型化值管道读的正是它：N 行的源事件产生
+     * N 个 THL 事件 × 每个 N 条 SQL = <b>N² 次目标写入</b>（实测 500 行的一批变更产生
+     * 62104 次写入，放大 124 倍，也是增量吞吐只有二三十行每秒的真正原因）。
+     * 前镜像 {@code row_data_before} 同理：整份复制时每个拆出事件拿到的都是第 0 行的前镜像，
+     * 多行 UPDATE 在文本路径与订阅端会全部指向同一行。
+     */
+    static java.util.List<THLEvent> splitMultiRowEvent(THLEvent event) {
+        Boolean multiRow = (Boolean) event.getMetadata().get("multi_row");
+        if (multiRow == null || !multiRow) {
+            return null;
+        }
+        Object rowsDataRaw = event.getMetadata().get("rows_data");
+        if (!(rowsDataRaw instanceof java.util.List)) {
+            return null;
+        }
+        java.util.List<?> rowsData = (java.util.List<?>) rowsDataRaw;
+        if (rowsData.size() <= 1) {
+            return null;
+        }
+
+        int rowCount = rowsData.size();
+        java.util.List<?> rowsBefore = rowListOf(event, "rows_data_before", rowCount);
+        java.util.List<?> rowsTyped = rowListOf(event, "rows_typed", rowCount);
+        java.util.List<?> rowsBeforeTyped = rowListOf(event, "rows_before_typed", rowCount);
+
+        java.util.List<THLEvent> out = new java.util.ArrayList<>(rowCount);
+        for (int i = 0; i < rowCount; i++) {
+            THLEvent rowEvent = new THLEvent();
+            rowEvent.setSeqno(event.getSeqno() + i);
+            rowEvent.setEventId(event.getEventId() + "_" + i);
+            rowEvent.setSourceId(event.getSourceId());
+            rowEvent.setSourceTstamp(event.getSourceTstamp());
+
+            for (java.util.Map.Entry<String, Object> entry : event.getMetadata().entrySet()) {
+                if (!PER_ROW_METADATA_KEYS.contains(entry.getKey())) {
+                    rowEvent.addMetadata(entry.getKey(), entry.getValue());
+                }
+            }
+            rowEvent.addMetadata("row_data", rowsData.get(i));
+            if (rowsBefore != null) {
+                rowEvent.addMetadata("row_data_before", rowsBefore.get(i));
+            }
+            // 类型化值管道读的是复数 key，切片后仍用原 key 传单元素列表（下游无需改动）；
+            // 行数对不上时整体不下发，让下游回退文本路径，而不是拿着错行的值往下走
+            if (rowsTyped != null) {
+                rowEvent.addMetadata("rows_typed", singletonRow(rowsTyped.get(i)));
+            }
+            if (rowsBeforeTyped != null) {
+                rowEvent.addMetadata("rows_before_typed", singletonRow(rowsBeforeTyped.get(i)));
+            }
+            out.add(rowEvent);
+        }
+        return out;
+    }
+
+    /**
+     * 取出可按行切片的行集合元数据；不是列表或行数与 {@code rows_data} 不一致时返回 null
+     * （对不齐就整体不下发，避免把第 j 行的值安到第 i 行上）。
+     */
+    private static java.util.List<?> rowListOf(THLEvent event, String key, int expectedRows) {
+        Object v = event.getMetadata().get(key);
+        if (!(v instanceof java.util.List)) {
+            return null;
+        }
+        java.util.List<?> list = (java.util.List<?>) v;
+        if (list.size() != expectedRows) {
+            logger.warn("多行事件 {} 行数 {} 与 rows_data 行数 {} 不一致，本次不下发该元数据 (seqno={})",
+                    key, list.size(), expectedRows, event.getSeqno());
+            return null;
+        }
+        return list;
+    }
+
+    /** 单行切片仍以列表形态下发，保持下游 {@code rows_typed} 的读取方式不变。 */
+    private static java.util.ArrayList<Object> singletonRow(Object row) {
+        java.util.ArrayList<Object> one = new java.util.ArrayList<>(1);
+        one.add(row);
+        return one;
+    }
+
     private int readAndExtractNewLines(File binlogFile,
                                         FileProgress progress, int skipLines) throws Exception {
         int eventCount = 0;
@@ -527,33 +626,15 @@ public class ContinuousExtractMain {
                     ensureThlWriter();
                     checkAndRotateThlFile();
 
-                    Boolean multiRow = (Boolean) event.getMetadata().get("multi_row");
-                    if (multiRow != null && multiRow) {
-                        @SuppressWarnings("unchecked")
-                        java.util.List<String> rowsData = (java.util.List<String>) event.getMetadata().get("rows_data");
-                        if (rowsData != null && rowsData.size() > 1) {
-                            for (int i = 0; i < rowsData.size(); i++) {
-                                THLEvent rowEvent = new THLEvent();
-                                rowEvent.setSeqno(event.getSeqno() + i);
-                                rowEvent.setEventId(event.getEventId() + "_" + i);
-                                rowEvent.setSourceId(event.getSourceId());
-                                rowEvent.setSourceTstamp(event.getSourceTstamp());
-                                
-                                for (java.util.Map.Entry<String, Object> entry : event.getMetadata().entrySet()) {
-                                    String key = entry.getKey();
-                                    if (!"rows_data".equals(key) && !"multi_row".equals(key)) {
-                                        rowEvent.addMetadata(key, entry.getValue());
-                                    }
-                                }
-                                rowEvent.addMetadata("row_data", rowsData.get(i));
-                                
-                                currentThlWriter.writeEvent(rowEvent);
-                                eventCount++;
-                                checkAndRotateThlFile();
-                            }
-                            progress.linesRead++;
-                            continue;
+                    java.util.List<THLEvent> rowEvents = splitMultiRowEvent(event);
+                    if (rowEvents != null) {
+                        for (THLEvent rowEvent : rowEvents) {
+                            currentThlWriter.writeEvent(rowEvent);
+                            eventCount++;
+                            checkAndRotateThlFile();
                         }
+                        progress.linesRead++;
+                        continue;
                     }
                     currentThlWriter.writeEvent(event);
                     eventCount++;

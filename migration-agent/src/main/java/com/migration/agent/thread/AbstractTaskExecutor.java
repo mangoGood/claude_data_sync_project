@@ -948,6 +948,13 @@ public abstract class AbstractTaskExecutor implements Runnable {
         }
     }
 
+    /**
+     * 轮询子进程写下的不可恢复错误。
+     *
+     * <p>文件格式 {@code 时间戳|错误码|seqno|消息[|组件]}。第 5 段是可选的组件名：
+     * increment 不带（历史格式），capture 会带 {@code capture}——例如起始位点已被源端清理（E3006）
+     * 这类"重试多少次都没用"的故障，必须立刻上报 FAILED，而不是让 ProcessGuard 无限重启。
+     */
     protected boolean checkIncrementErrorStatus() {
         String errorFilePath = "./files/" + taskId + "/binlog_output/error_status";
         java.io.File errorFile = new java.io.File(errorFilePath);
@@ -956,14 +963,18 @@ public abstract class AbstractTaskExecutor implements Runnable {
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(errorFile))) {
             String line = reader.readLine();
             if (line != null) {
-                String[] parts = line.split("\\|", 4);
+                String[] parts = line.split("\\|", 5);
                 if (parts.length >= 4) {
                     String errorCode = parts[1];
                     String seqno = parts[2];
                     String message = parts[3];
-                    logger.error("[{}] 检测到 increment 进程错误状态: errorCode={}, seqno={}, message={}",
-                            taskId, errorCode, seqno, message);
-                    sendFailedStatus(errorCode, "增量同步不可恢复错误 (seqno=" + seqno + "): " + message);
+                    String component = parts.length >= 5 ? parts[4].trim() : "increment";
+                    logger.error("[{}] 检测到 {} 进程错误状态: errorCode={}, seqno={}, message={}",
+                            taskId, component, errorCode, seqno, message);
+                    String prefix = "capture".equals(component)
+                            ? "捕获端不可恢复错误: "
+                            : "增量同步不可恢复错误 (seqno=" + seqno + "): ";
+                    sendFailedStatus(errorCode, prefix + message);
                     stopped.set(true);
                     errorFile.delete();
                     return true;
