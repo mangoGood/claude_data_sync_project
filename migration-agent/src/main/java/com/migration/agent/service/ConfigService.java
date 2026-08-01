@@ -572,11 +572,41 @@ public class ConfigService {
         boolean bidiEnabled = bidiGlobal || "BIDIRECTIONAL".equalsIgnoreCase(taskMessage.getDrMode());
         props.setProperty(com.migration.common.bidi.BidiConstants.KEY_ENABLED, String.valueOf(bidiEnabled));
         if (bidiEnabled) {
-            String nodeId = props.getProperty("source.db.name",
-                    props.getProperty("source.db.database", props.getProperty("source.db.host", "node")));
+            // 节点标识必须<b>两端不同</b>：冲突消解要靠它做确定性平局裁决，
+            // 而灾备两端库名通常是一样的（倒换要求库名一致），只用库名会得到两个相同的 id。
+            // 改用 host:port/db —— 双向的两个任务源目标恰好互换，因此两边算出的
+            // (incoming, local) 是同一对字符串、只是角色对调，裁决结果必然一致。
+            String nodeId = endpointId(props, "source");
+            String localNodeId = endpointId(props, "target");
             props.setProperty(com.migration.common.bidi.BidiConstants.KEY_NODE_ID, nodeId);
+            props.setProperty("sync.local.node.id", localNodeId);
             logger.info("Bidirectional loop-protection ENABLED for task {} (nodeId={}, source={})",
                     taskId, nodeId, bidiGlobal ? "agent-global" : "task drMode");
+
+            // 写写冲突消解（P1-4）：双向模式默认 LWW_SOURCE_TS——两端同时改同一行时，
+            // 按源事件时间戳裁决而不是"谁后到谁覆盖"，两个方向各自独立算出同一个赢家。
+            writeEnumPropFromEnv(props, "sync.bidi.conflict.policy", "SYNC_BIDI_CONFLICT_POLICY",
+                    "LWW_SOURCE_TS", "NODE_PRIORITY", "ERROR", "NONE");
+            if (!props.containsKey("sync.bidi.conflict.policy")) {
+                props.setProperty("sync.bidi.conflict.policy", "LWW_SOURCE_TS");
+            }
+            String primaryNode = System.getenv("SYNC_BIDI_PRIMARY_NODE");
+            if (primaryNode != null && !primaryNode.trim().isEmpty()) {
+                props.setProperty("sync.bidi.primary.node", primaryNode.trim());
+            }
+            // 前镜像守卫：UPDATE 带上整行前镜像，"影响 0 行"就是并发写的信号。
+            // 只有开了冲突消解才需要——它让 WHERE 变长，单向同步不必付这个代价。
+            boolean cdrOn = !"NONE".equalsIgnoreCase(props.getProperty("sync.bidi.conflict.policy", "LWW_SOURCE_TS"));
+            props.setProperty("sync.bidi.conflict.before.image.guard", String.valueOf(cdrOn));
+            // 双向 DDL：默认一条都不传（各节点带外协调）；配成 A_TO_B 时只有"正向"任务放行 DDL，
+            // 反向影子任务恒不放行——两边都传就会各自建表/改表打起来。
+            writeEnumPropFromEnv(props, "sync.bidi.ddl.direction", "SYNC_BIDI_DDL_DIRECTION",
+                    "NONE", "A_TO_B");
+            if (!props.containsKey("sync.bidi.ddl.direction")) {
+                props.setProperty("sync.bidi.ddl.direction", "NONE");
+            }
+            boolean isShadow = "DR_SHADOW".equals(taskMessage.getTaskType());
+            props.setProperty("sync.bidi.ddl.forward", String.valueOf(!isShadow));
         }
 
         // 配额落到执行层：按发起用户的 resource_quotas 写入增量限速/全量并发表数上限
@@ -659,6 +689,16 @@ public class ConfigService {
                 props.getProperty("capture.ticdc.api.url"),
                 props.getProperty("capture.ticdc.kafka.sink.bootstrap"),
                 props.getProperty("capture.ticdc.kafka.bootstrap"), sanitized);
+    }
+
+    /** 节点标识：host:port/db。双向冲突消解靠它区分两端，库名相同也不会撞。 */
+    private String endpointId(Properties props, String side) {
+        String host = props.getProperty(side + ".db.host", "");
+        String port = props.getProperty(side + ".db.port", "");
+        String db = props.getProperty(side + ".db.database", props.getProperty(side + ".db.name", ""));
+        String id = (host.isEmpty() ? "node" : host) + (port.isEmpty() ? "" : ":" + port)
+                + (db.isEmpty() ? "" : "/" + db);
+        return id;
     }
 
     /** 从环境变量/系统属性读取整数写入 props（未设或非法则不写，保持子进程默认）。 */

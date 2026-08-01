@@ -36,6 +36,8 @@ public class ContinuousIncrementMain {
     private RowRateLimiter rowRateLimiter;
     /** 双向同步/环路防护：启用后每个应用事务先写 origin 标记，供对端 capture 识别并跳过，防止回环。 */
     private boolean bidirectionalEnabled;
+    /** 双向写写冲突消解（P1-4）：只在双向模式下初始化，单向同步完全不受影响。 */
+    private ConflictResolver conflictResolver;
     /** 本节点标识（写入 origin 标记，供观测）。 */
     private String bidiNodeId;
     /** 标记表是否已在目标库确保存在（每进程一次）。 */
@@ -348,6 +350,8 @@ public class ContinuousIncrementMain {
         }
         if (bidirectionalEnabled) {
             ensureMarkerTable();
+            conflictResolver = new ConflictResolver(props, taskId, bidiNodeId, isPostgresql);
+            conflictResolver.ensureTable(targetConnection);
         }
     }
 
@@ -685,8 +689,32 @@ public class ContinuousIncrementMain {
                         // 类型化路径：PreparedStatement 参数绑定执行
                         for (ParameterizedDml dml : typedDmls) {
                             try {
+                                // 双向写写冲突：先裁决再落库。裁决查询与业务 DML、旁路表更新
+                                // 都在同一个目标事务里，崩溃时一起回滚，不会出现"数据落了、元数据没落"
+                                ConflictResolver.Decision decision = conflictDecision(dml, event);
+                                if (decision == ConflictResolver.Decision.SKIP) {
+                                    continue;
+                                }
+                                if (decision == ConflictResolver.Decision.FAIL) {
+                                    txFailed = true;
+                                    writeErrorStatus("E3011", "双向写写冲突（策略 ERROR）: "
+                                            + dml.getTargetTable() + " row=" + dml.getRowKey(), event);
+                                    break;
+                                }
                                 logAppliedDml(event, "参数化SQL", dml);
-                                executeTypedInTransaction(dml);
+                                int affected = executeTypedInTransaction(dml);
+                                if (affected == 0 && dml.hasOverride()
+                                        && conflictResolver != null && conflictResolver.isActive()) {
+                                    // 前镜像守卫没命中：这一行在目标端已被本端改过（并发写）
+                                    if (!resolveAfterGuardMiss(targetConnection, dml, event)) {
+                                        txFailed = true;
+                                        writeErrorStatus("E3011", "双向写写冲突（策略 ERROR）: "
+                                                + dml.getTargetTable() + " row=" + dml.getRowKey(), event);
+                                        break;
+                                    }
+                                } else {
+                                    recordConflictMeta(targetConnection, dml, event);
+                                }
                                 eventCount++;
                             } catch (SQLException e) {
                                 String errorMsg = e.getMessage();
@@ -1082,17 +1110,38 @@ public class ContinuousIncrementMain {
      * 类型化值管道：以 PreparedStatement 参数绑定执行单条 DML（值永不拼接进 SQL 文本）。
      * 事务边界由调用方控制。
      */
-    private void executeTypedInTransaction(ParameterizedDml dml) throws SQLException {
+    private int executeTypedInTransaction(ParameterizedDml dml) throws SQLException {
         if (targetConnection == null || targetConnection.isClosed()) {
             throw new SQLException("目标数据库连接不可用");
         }
-        try (PreparedStatement ps = targetConnection.prepareStatement(dml.getSql())) {
-            List<Object> params = dml.getParams();
+        return executeTypedOn(targetConnection, dml.getSql(), dml.getParams());
+    }
+
+    private static int executeTypedOn(Connection conn, String sql, List<Object> params) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
             for (int i = 0; i < params.size(); i++) {
                 ps.setObject(i + 1, params.get(i));
             }
-            ps.executeUpdate();
+            return ps.executeUpdate();
         }
+    }
+
+    /**
+     * 前镜像守卫命中"影响 0 行"后的处理：交给冲突消解裁决，来的一方赢就用主键版强制覆盖。
+     *
+     * @return false 表示应 fail-stop（ERROR 策略）
+     */
+    private boolean resolveAfterGuardMiss(Connection conn, ParameterizedDml dml, THLEvent event) throws SQLException {
+        ConflictResolver.Decision d = conflictResolver.decideOnMismatch(
+                conn, dml.getTargetTable(), dml.getRowKey(), sourceTsOf(event));
+        if (d == ConflictResolver.Decision.FAIL) {
+            return false;
+        }
+        if (d == ConflictResolver.Decision.APPLY) {
+            executeTypedOn(conn, dml.getOverrideSql(), dml.getOverrideParams());
+            conflictResolver.record(conn, dml.getTargetTable(), dml.getRowKey(), sourceTsOf(event));
+        }
+        return true;
     }
 
     /**
@@ -2056,10 +2105,28 @@ public class ContinuousIncrementMain {
             if (typedDmls != null) {
                 for (ParameterizedDml dml : typedDmls) {
                     try {
-                        try (PreparedStatement ps = conn.prepareStatement(dml.getSql())) {
-                            List<Object> params = dml.getParams();
-                            for (int i = 0; i < params.size(); i++) ps.setObject(i + 1, params.get(i));
-                            ps.executeUpdate();
+                        // 并行路径同样过冲突裁决：裁决/写入/记元数据都用本 worker 自己的连接，
+                        // 与它承载的那个事务同生共死
+                        if (conflictResolver != null && conflictResolver.isActive()) {
+                            ConflictResolver.Decision d = conflictResolver.decide(
+                                    conn, dml.getTargetTable(), dml.getRowKey(), sourceTsOf(event));
+                            if (d == ConflictResolver.Decision.SKIP) {
+                                continue;
+                            }
+                            if (d == ConflictResolver.Decision.FAIL) {
+                                throw new SQLException("双向写写冲突（策略 ERROR）: "
+                                        + dml.getTargetTable() + " row=" + dml.getRowKey());
+                            }
+                        }
+                        int affected = executeTypedOn(conn, dml.getSql(), dml.getParams());
+                        if (affected == 0 && dml.hasOverride()
+                                && conflictResolver != null && conflictResolver.isActive()) {
+                            if (!resolveAfterGuardMiss(conn, dml, event)) {
+                                throw new SQLException("双向写写冲突（策略 ERROR）: "
+                                        + dml.getTargetTable() + " row=" + dml.getRowKey());
+                            }
+                        } else {
+                            recordConflictMeta(conn, dml, event);
                         }
                     } catch (SQLException e) {
                         String msg = e.getMessage();
@@ -2096,6 +2163,32 @@ public class ContinuousIncrementMain {
                 }
             }
         }
+    }
+
+    /**
+     * 双向写写冲突裁决（未启用双向 / 无主键 / 事件无时间戳时恒为 APPLY）。
+     *
+     * <p>用<b>源事件时间戳</b>而不是本地时间：LWW 比较的是"业务发生的先后"，
+     * 拿两台 agent 各自的墙钟去比，网络/调度抖动就能把赢家选反。
+     */
+    private ConflictResolver.Decision conflictDecision(ParameterizedDml dml, THLEvent event) {
+        if (conflictResolver == null || !conflictResolver.isActive()) {
+            return ConflictResolver.Decision.APPLY;
+        }
+        return conflictResolver.decide(targetConnection, dml.getTargetTable(), dml.getRowKey(),
+                sourceTsOf(event));
+    }
+
+    /** 应用成功后在同一事务里记下"这一行最后由谁、在什么源时刻写过"。 */
+    private void recordConflictMeta(Connection conn, ParameterizedDml dml, THLEvent event) throws SQLException {
+        if (conflictResolver == null || !conflictResolver.isActive()) {
+            return;
+        }
+        conflictResolver.record(conn, dml.getTargetTable(), dml.getRowKey(), sourceTsOf(event));
+    }
+
+    private static long sourceTsOf(THLEvent event) {
+        return (event != null && event.getSourceTstamp() != null) ? event.getSourceTstamp().getTime() : 0L;
     }
 
     /** origin 标记写入的连接参数化版本（并行 worker 各自连接）。 */

@@ -26,6 +26,7 @@ public enum SyncErrorCode {
     TASK_DISK_QUOTA_EXCEEDED("E3008", "任务磁盘用量超限", "任务目录 files/<taskId> 超过 task.disk.quota.mb 配额。请清理历史任务目录、下调日志级别或调大配额"),
     INCREMENT_CONVERT_FAILED("E3009", "增量事件转换失败", "该事件无法转换成目标端SQL（未知类型/结构不匹配/数据异常）。可在死信页面裁决跳过该事件，或将 increment.convert.error.policy 设为 DEAD_LETTER 让此类事件自动记死信并跳过"),
     THL_FILE_UNREADABLE("E3010", "THL文件读取中断", "THL文件损坏或读取过程异常，已在断点处停止且未跳过剩余事件。请检查磁盘与 thl_output 目录，必要时重新初始化增量"),
+    BIDI_WRITE_CONFLICT("E3011", "双向同步写写冲突", "两端同时修改了同一行，且冲突策略配置为 ERROR（不自动丢写）。请人工确认应保留哪一端的值，或改用 LWW_SOURCE_TS/NODE_PRIORITY 策略自动裁决"),
 
     FULL_MIGRATION_FAILED("E4001", "全量同步失败", "请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常"),
     FULL_MIGRATION_TIMEOUT("E4002", "全量同步超时", "请检查数据量是否过大，考虑分批同步或优化网络带宽"),

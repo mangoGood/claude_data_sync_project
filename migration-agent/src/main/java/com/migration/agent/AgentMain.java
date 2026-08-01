@@ -62,6 +62,7 @@ public class AgentMain {
     private ScheduledExecutorService captureMonitorExecutor;
     private ExecutorService taskExecutor;
     private com.migration.agent.service.TaskFilesJanitor taskFilesJanitor;
+    private com.migration.agent.service.AgentRegistryService agentRegistry;
     
     private final ConcurrentHashMap<String, ProcessManager> captureManagers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ProcessManager> extractManagers = new ConcurrentHashMap<>();
@@ -139,6 +140,12 @@ public class AgentMain {
         AgentConfig agentConfig = springContext.getBean(AgentConfig.class);
         
         recoveryService = new RecoveryService(agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(), agentConfig.getMysqlDbPassword());
+
+        // 集群化：把本 agent 注册进元数据库并开始心跳/续租。必须在恢复任务之前——
+        // 恢复要按"任务是否归属自己"过滤，没有身份就没法过滤。
+        agentRegistry = new com.migration.agent.service.AgentRegistryService(
+                agentConfig, () -> new java.util.HashSet<>(migrationAgentThreads.keySet()));
+        agentRegistry.start();
 
         // 指标落盘（全局 H2 时序库）：监控页"任务启动以来"的历史曲线依赖它回填。
         // 此前该服务从未被初始化 → /api/metrics/{id}/history 一律 503，前端只能靠打开页面后的
@@ -280,7 +287,12 @@ public class AgentMain {
         if (kafkaConsumer != null) {
             kafkaConsumer.stop();
         }
-        
+
+        // 优雅停机时主动下线并释放租约，后端立刻能改派，不用干等 90s 心跳超时
+        if (agentRegistry != null) {
+            agentRegistry.stop();
+        }
+
         if (httpServer != null) {
             httpServer.stop();
         }
@@ -296,9 +308,18 @@ public class AgentMain {
     private void handleTaskMessage(TaskMessage taskMessage) {
         String taskId = taskMessage.getTaskId();
         String messageType = taskMessage.getMessageType();
-        
+
         logger.info("Received task message: {} with messageType: {}", taskId, messageType);
-        
+
+        // 定向下发：backend 已经挑好了执行的 agent，其它 agent 直接放行不处理。
+        // 消息不带 targetAgentId（老后端 / 集群里没有注册过 agent）时退回广播语义，保持兼容。
+        String target = taskMessage.getTargetAgentId();
+        if (target != null && !target.isEmpty() && agentRegistry != null
+                && !target.equals(agentRegistry.getAgentId())) {
+            logger.info("任务 {} 指派给 agent {}，本 agent({}) 忽略", taskId, target, agentRegistry.getAgentId());
+            return;
+        }
+
         if ("stop".equals(messageType)) {
             taskExecutor.submit(() -> handleStopMessage(taskMessage));
         } else if ("terminate".equals(messageType)) {
@@ -409,8 +430,14 @@ public class AgentMain {
     private void handleResumeMessage(TaskMessage taskMessage) {
         String taskId = taskMessage.getTaskId();
         logger.info("Handling resume message for task: {}", taskId);
-        
+
         pausedTasks.remove(taskId);
+        // 恢复/接管都要立刻认领，别等下一拍心跳：否则这 15s 窗口里租约还挂在老 agent 名下，
+        // 巡检可能把同一个任务再改派给第三台
+        if (agentRegistry != null) {
+            agentRegistry.claimTask(taskId);
+        }
+        com.migration.agent.service.TaskFilesJanitor.clearTerminalMark(taskId);
         
         try {
             TaskStateInfo stateInfo = taskStateService.getTaskState(taskId);
@@ -776,6 +803,9 @@ public class AgentMain {
 
             // 同一 taskId 又跑起来了（重建/重启）：撤销终态标记，别让保留期到点删掉在跑的任务目录
             com.migration.agent.service.TaskFilesJanitor.clearTerminalMark(taskId);
+            if (agentRegistry != null) {
+                agentRegistry.claimTask(taskId);
+            }
 
             configService.updateConfig(taskMessage);
             logger.info("Config updated for task: {}", taskId);
@@ -943,8 +973,20 @@ public class AgentMain {
                 return;
             }
             
+            int skipped = 0;
             for (RecoveryTask recoveryTask : unfinishedTasks) {
                 try {
+                    // 集群化后这道闸不能省：不加过滤的话，集群里<b>每台</b> agent 启动时都会把
+                    // 所有未完成任务捞起来重跑一遍，等于人为制造双写。
+                    // 归属别人且租约还有效的任务，交给它自己续跑。
+                    if (agentRegistry != null && !agentRegistry.ownsTask(recoveryTask.getTaskId())) {
+                        logger.info("任务 {} 归属其它 agent 且租约有效，跳过恢复", recoveryTask.getTaskId());
+                        skipped++;
+                        continue;
+                    }
+                    if (agentRegistry != null) {
+                        agentRegistry.claimTask(recoveryTask.getTaskId());
+                    }
                     recoverTask(recoveryTask);
                 } catch (Exception e) {
                     logger.error("Error recovering task: {}", recoveryTask.getTaskId(), e);
@@ -953,7 +995,8 @@ public class AgentMain {
                 }
             }
             
-            logger.info("Task recovery completed, recovered {} tasks", unfinishedTasks.size());
+            logger.info("Task recovery completed, recovered {} tasks（跳过 {} 个归属其它 agent 的）",
+                    unfinishedTasks.size() - skipped, skipped);
             
         } catch (Exception e) {
             logger.error("Error during task recovery", e);

@@ -23,6 +23,11 @@
 **第 1 批（B 层的位点重放 + 孤儿双写）已实施完成并实测通过，见 §7**；
 过程中还揪出并修掉了一个被孤儿进程长期掩盖的静默丢数据缺陷（§2.3b）。
 
+**第 4 批（P1-1 集群化/故障转移 + P1-4 双向冲突消解）已实施完成并实测通过，见 §10**：
+任务不再"广播抢单"而是按负载指派给具体 agent 并持租约，持有者硬崩后由其它 agent
+**自动接管续跑**（实测 SIGKILL 后改派并追平，两端指纹一致）；双向写写冲突从"谁后到谁覆盖、
+两端各留一半"变成**确定性收敛**（实测 6 个并发冲突行两端 100% 收敛到同一值，且冲突有记录）。
+
 **第 3 批（B 层的熔断自愈 + 2.4 静默丢文件 + C 层的资源治理）已实施完成并实测通过，见 §9**：
 依赖不可用不再永久打死任务（新增 RECONNECTING 态 + 三态熔断，恢复后自愈）、
 反复崩溃有了 E3007 而不再伪装成健康、转换失败与文件损坏一律 fail-stop 不再静默吞掉整个 THL 文件、
@@ -239,7 +244,7 @@ SQL 执行失败，不保护转换失败。
    `执行参数化SQL` 打的 `dml` 也含参数值。DTS/DMS 默认都不记录行值。
 3. **THL / cap 放大**：见 2.2，崩溃重放导致的放大没有任何上限保护。
 
-### 2.7 【中·灾备】双向同步只有冲突"检测"，没有冲突"消解"
+### 2.7 【中·灾备】双向同步只有冲突"检测"，没有冲突"消解"　【已实施，见 §10】
 
 - 防回环做得不错：应用事务先写 `__sync_origin` 标记行，对端 capture 见标记即跳过整个事务
   （前向单遍状态机，[MySQLBinlogCapture.java:566](migration-capture/src/main/java/com/migration/capture/MySQLBinlogCapture.java:566)）。
@@ -356,6 +361,10 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 | `txn_atomicity.py --txns 150 --mode TRANSACTION`（**第 3 批后回归**） | **通过 1 / 失败 0** | 300 行事件 / **150 提交点**（1:1），8051 次抓拍 0 次读到半个事务 |
 | `sql_resume.py mysql --minutes 3`（**第 3 批后回归**） | **通过 3 / 失败 0** | 2 次 SIGKILL 后 22219 行两端指纹相等（BIT_XOR 3120551778）——改了整条崩溃恢复路径后无回归 |
 | `position_resume.py --rows 800`（**第 3 批后回归**） | **通过 5 / 失败 0** | 五把尺子全过，2600 行两端 xor 相等（第 1 批能力无回归） |
+| `agent_failover.py --rows 600`（**第 4 批新增，双 agent**） | **通过 6 / 失败 0** | 两台 agent 注册心跳；任务指派给 `agent-c38dab7c`（lease_epoch=1）；SIGKILL 持有者后 **改派给 agent-failover-b**（epoch 1→3）；接管方拉起子进程；601 行两端指纹相等 |
+| `bidi_conflict.py --rows 6`（**第 4 批新增，双向灾备**） | **通过 5 / 失败 0** | 冻结两向 increment 制造真并发：6 个冲突行**两端 100% 收敛到同一值**（owner=B，即源事件时间戳较晚的一端）；12 条冲突记录可查；两端旁路表均有行级元数据；非冲突行照常同步 |
+| `sql_resume.py mysql --minutes 3`（**第 4 批后回归**） | **通过 3 / 失败 0** | 2 次 SIGKILL 后 23504 行两端指纹相等（BIT_XOR 1983926410）——集群化改了下发/恢复路径后无回归 |
+| `txn_atomicity.py --txns 120 --mode TRANSACTION`（**第 4 批后回归**） | **通过 1 / 失败 0** | 120 事务 / **120 提交点**，事务原子性保持 |
 
 现有故障注入套件的**判据盲区**（建议补齐）：
 - 只测"不丢 + 可收敛"，**不测重复量级**——2.2 的整段重放因此在 CI 里完全隐形；
@@ -495,7 +504,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P1-1　控制面/执行面集群化与故障转移
+### P1-1　控制面/执行面集群化与故障转移　【已实施，见 §10】
 
 在 P0-3 租约的基础上：
 
@@ -537,7 +546,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P1-4　双向冲突消解（CDR）
+### P1-4　双向冲突消解（CDR）　【已实施，见 §10】
 
 - 新增 `sync.bidi.conflict.policy`：`LWW_SOURCE_TS`（按源事件时间戳，默认）/
   `NODE_PRIORITY`（固定主端优先）/ `CUSTOM_SQL`（按表配表达式）/ `ERROR`（冲突即 fail-stop 送人工）。
@@ -610,7 +619,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 | **第 1 批** ✅ | P0-2 位点持久化 + P0-3 单实例互斥 | 改动小、风险低、消除两类"长任务必炸"；且是后续一切的前提 —— **已完成，见 §7** |
 | **第 2 批** ✅ | **2.11 N² 写放大**（先做，改动最小收益最大） + P0-1 事务一致性投递 | 2.11 是把 `rows_typed` 按行切片，几行代码换来两个数量级吞吐；P0-1 改动最大但价值最高，先上 `TRANSACTION` 开关灰度，`txn_atomicity.py` 做门禁。两者都在同一段应用路径上，一起改一次回归 —— **已完成，见 §8** |
 | **第 3 批** ✅ | P1-2 熔断自愈 + P1-3 转换死信 + P2-1 资源治理 | 都是独立小改动，可并行 —— **已完成，见 §9** |
-| **第 4 批** | P1-1 集群化 + P1-4 冲突消解 | 需要元数据表变更（Flyway V3+）与较多联调 |
+| **第 4 批** ✅ | P1-1 集群化 + P1-4 冲突消解 | 需要元数据表变更（Flyway V3+）与较多联调 —— **已完成，见 §10** |
 | **第 5 批** | P2-2 批量装载与状态单调 + P2-3 一致性快照 + P2-4 可观测闭环 | 锦上添花，但决定能不能对外承诺 SLA |
 
 每批都应在 `test_scripts/fault_injection/` 里补对应的判据脚本，
@@ -930,3 +939,84 @@ OPEN 到期后放行**一次**探测，成功回 CLOSED，失败回 OPEN 且打�
    根本不计数——恰恰是最典型的 crash-loop（起来几秒就死）。实测连杀 3 次只记到 1 次。
    改为按**重启次数**计（与方案措辞一致），并在跨过阈值的那一刻就上报，
    不等下一次重启成功——反复崩溃的进程完全可能卡在重连里再也起不来。
+
+---
+
+## 10. 第 4 批实施记录（P1-1 集群化/故障转移 + P1-4 双向冲突消解）
+
+日期：2026-07-31。全量构建 `mvn clean install` 通过，单测 **426 通过 / 0 失败**（第 3 批 413，新增 13 例）。
+元数据表变更走 Flyway [V8__agent_registry_and_lease.sql](java-backend/src/main/resources/db/migration/V8__agent_registry_and_lease.sql)：
+新增 `agents` 表 + `workflows.agent_id/lease_expire_at/lease_epoch`。
+
+### 10.1　P1-1　从"广播抢单"到"指派 + 租约"
+
+原来的下发是 **Kafka 广播 + 谁抢到算谁**：所有 agent 同组消费同一个 topic，谁拿到分区谁执行，
+后端<b>不知道任务落在哪台机器上</b>。恢复能力早就有（子进程各自 checkpoint 续传），
+缺的只是「谁负责这个任务」这条信息——所以 agent 硬崩后它名下的任务**没有任何人接管**，
+只能等那台机器被人重新拉起来。
+
+| 环节 | 实现 |
+|---|---|
+| 注册 / 心跳 | [AgentRegistryService](migration-agent/src/main/java/com/migration/agent/service/AgentRegistryService.java)：启动写 `agents`（agent_id 跨重启稳定，取 `MIGRATION_AGENT_ID` 或 `files/.agent_id`），每 15s 刷 `heartbeat_at` **并给自己在跑的任务续租** |
+| 指派 | [AgentClusterService.assign()](java-backend/src/main/java/com/synctask/service/AgentClusterService.java)：按容量占用率挑最闲的存活 agent，写 `agent_id` + 90s 租约后再投 Kafka，消息带 `targetAgentId` |
+| 过滤 | agent 收到不是指派给自己的消息直接放行；`targetAgentId` 为空时退回广播语义（单机/旧后端零影响） |
+| 接管 | 后端每 20s 巡检：**owner 心跳过期**（进程没了）或**任务租约过期**（进程在、任务线程没了）→ 改派给另一台并下发 `resume`，`lease_epoch` +1 |
+| 路由 | `WorkflowService` 里 4 处硬编码的 `AGENT_BASE_URL` 改为按 `workflow.agent_id` 查 `agents` 表；查不到回退默认地址 |
+
+两个"不这么写就出事"的点：
+
+- **启动恢复必须按归属过滤**。`recoverUnfinishedTasks()` 原来把所有未完成任务全捞起来重跑；
+  集群里每台 agent 启动都这么干一遍，等于人为制造双写。现在归属别人且租约有效的直接跳过。
+- **接管走 `resume` 而不是重新建任务**：读各自 checkpoint 续传，与一次进程崩溃恢复等价，
+  不会重做全量。而 P0-3 的任务级文件锁保证：万一老 agent 只是网络分区没真死，
+  新老两套子进程也不会同时写目标库。
+
+### 10.2　P1-4　双向写写冲突：从"值互换"到确定性收敛
+
+此前双向只有**防回环**（`__sync_origin` 事务打标），没有**冲突策略**。两端同时改同一行时，
+两条通道各自 `ON DUPLICATE KEY UPDATE` 覆盖对方，结果是**值互换**——A 变成 B 的值、
+B 变成 A 的值，两端永远不一致，而且看起来还像"同步成功"：不报错、不告警，只有对账才发现。
+
+三层机制：
+
+1. **检测：前镜像守卫**。CDR 开启时 UPDATE 的 WHERE 带上<b>整行前镜像</b>
+   （NULL 用 `<=>` / `IS NOT DISTINCT FROM`），"影响 0 行"就说明这一行在本端已被改过。
+   零额外查询——正常路径不多花一次 IO。
+2. **裁决：[ConflictResolver](migration-increment/src/main/java/com/migration/increment/ConflictResolver.java)**，
+   `sync.bidi.conflict.policy` = `LWW_SOURCE_TS`（默认，按**源事件时间戳**比大小）/
+   `NODE_PRIORITY`（`sync.bidi.primary.node` 恒赢）/ `ERROR`（冲突即 fail-stop 报 **E3011**）。
+   裁决必须**对称**：两个方向是两个独立进程各算各的，规则得让它们选出同一个赢家，
+   否则两端会稳定地收敛到不同的值——比"谁后到"更糟。时间戳无从比较时退化为**节点 id 字典序**，
+   不看时间但一定收敛。
+3. **留痕**：旁路表 `__sync_rowmeta`（表, 行键 → 最后写入节点 + 源时刻）与业务 DML 在
+   **同一个目标事务**里更新，崩溃不会错位；冲突落 `conflict.jsonl`，
+   经 `/api/agent/conflicts/{taskId}` → 后端 `/api/workflows/{id}/conflicts` 供 UI 复用死信页面展示。
+
+配套：节点标识从"源库名"改成 **host:port/db**——灾备两端库名通常一致（倒换要求），
+只用库名会得到两个相同的 id，平局裁决直接失效。
+双向 DDL 也开了口子：`sync.bidi.ddl.direction=NONE|A_TO_B`，
+只有正向通道放行 DDL（反向影子恒不放行，两边都传会各自建表打架），内部表 DDL 任何方向都不传。
+
+### 10.3　新增判据脚本
+
+| 脚本 | 尺子 |
+|---|---|
+| [agent_failover.py](test_scripts/fault_injection/agent_failover.py) | 六把：两台 agent 都注册并心跳、任务被明确指派（非广播）、SIGKILL 持有者后被改派、`lease_epoch` 递增、接管方真把子进程拉起来、接管后数据追平指纹一致 |
+| [bidi_conflict.py](test_scripts/fault_injection/bidi_conflict.py) | 五把：并发冲突行两端是否收敛到同一值、赢家是否确定一致、冲突是否有记录、旁路表是否有行级元数据、非冲突行是否照常双向同步。用 SIGSTOP 冻住两个方向的 increment 来制造**真并发**（否则一端的写会先同步过去，变成顺序修改） |
+
+单测新增 [AgentClusterServiceTest](java-backend/src/test/java/com/synctask/service/AgentClusterServiceTest.java)（6 例：选派/退回广播/改派/不误抢/租约过期/终态忽略）与
+[ConflictResolverTest](migration-increment/src/test/java/com/migration/increment/ConflictResolverTest.java)（7 例，含"平局裁决必须对称"）。
+
+### 10.4　实施过程中新发现并修掉的缺陷
+
+1. **【本批引入·致命】心跳时间戳用了 SQL 的 `NOW()`**。元数据库跑在容器里（UTC），
+   后端存活判定用 `LocalDateTime.now()`（JVM 时区），两边差 8 小时 —— 于是
+   **任何 agent 都永远显示"不在线"**：选派退回广播、故障转移整个不工作，
+   日志里只有一句"没有存活的 agent 注册"，不看这条几乎发现不了。
+   改为所有时间戳一律 JVM 侧 `setTimestamp` 绑定。第一次跑 `agent_failover.py` 就是栽在这里。
+2. **【本批引入】`aliveAgents()` 就地排序仓储返回的列表**。列表不保证可变，
+   `List.of` / 不可变实现会抛 `UnsupportedOperationException`，而它会被巡检的兜底 catch 吞掉——
+   表现为"故障转移悄悄不工作"。单测直接抓到，改为拷贝后排序。
+3. **【测试脚手架】被杀的 agent 若是脚本的子进程且没 `wait()`**，会以 `<defunct>` 僵尸留在进程表里，
+   而 `ProcessHandle.isAlive()` 对僵尸仍返回 true——它的子进程的父进程看门狗永远不触发，
+   孤儿继续写目标库（生产上 init 立刻回收，不存在此问题）。脚本里补了回收。

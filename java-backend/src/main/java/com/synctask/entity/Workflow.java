@@ -144,6 +144,17 @@ public class Workflow {
     @Column(name = "sync_account_super_privilege")
     private Boolean syncAccountSuperPrivilege = false;
 
+    // 集群化（P1-1）：任务归属哪个 agent、租约到期时刻与代次。
+    // agent_id 为 NULL 表示还没指派（或集群里一个 agent 都没注册，退回旧的广播语义）。
+    @Column(name = "agent_id", length = 64)
+    private String agentId;
+
+    @Column(name = "lease_expire_at")
+    private LocalDateTime leaseExpireAt;
+
+    @Column(name = "lease_epoch")
+    private Integer leaseEpoch = 0;
+
     @PrePersist
     protected void onCreate() {
         createdAt = LocalDateTime.now();
@@ -505,5 +516,29 @@ public class Workflow {
 
     public void setSyncAccountSuperPrivilege(Boolean syncAccountSuperPrivilege) {
         this.syncAccountSuperPrivilege = syncAccountSuperPrivilege;
+    }
+
+    public String getAgentId() {
+        return agentId;
+    }
+
+    public void setAgentId(String agentId) {
+        this.agentId = agentId;
+    }
+
+    public LocalDateTime getLeaseExpireAt() {
+        return leaseExpireAt;
+    }
+
+    public void setLeaseExpireAt(LocalDateTime leaseExpireAt) {
+        this.leaseExpireAt = leaseExpireAt;
+    }
+
+    public Integer getLeaseEpoch() {
+        return leaseEpoch;
+    }
+
+    public void setLeaseEpoch(Integer leaseEpoch) {
+        this.leaseEpoch = leaseEpoch;
     }
 }

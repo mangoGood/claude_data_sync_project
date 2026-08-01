@@ -133,6 +133,12 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         serverId = Long.parseLong(props.getProperty("capture.server.id", "65535"));
         bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
         loopGuard = new com.migration.common.bidi.BidiLoopGuard(bidirectionalEnabled);
+        // 双向 DDL 单向传播：只有"方向开了 A_TO_B"且"本任务是正向通道"时才放行
+        bidiDdlForwardAllowed = "A_TO_B".equalsIgnoreCase(props.getProperty("sync.bidi.ddl.direction", "NONE").trim())
+                && Boolean.parseBoolean(props.getProperty("sync.bidi.ddl.forward", "false"));
+        if (bidirectionalEnabled) {
+            logger.info("双向 DDL 传播: {}", bidiDdlForwardAllowed ? "本任务放行（A→B 正向）" : "不传播");
+        }
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
 
         heartbeatDatabase = props.getProperty("source.db.database", "");
@@ -569,6 +575,18 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
     }
 
+    /** 本任务是否允许把 DDL 传给对端（sync.bidi.ddl.direction=A_TO_B 且本任务是正向通道）。 */
+    private boolean bidiDdlForwardAllowed = false;
+
+    /** 同步内部表的 DDL 永远不外传：它们是机制自身的表，传过去只会互相建表打架。 */
+    private static boolean isInternalDdl(String sql) {
+        if (sql == null) return false;
+        String up = sql.toUpperCase();
+        return up.contains(com.migration.common.bidi.BidiConstants.MARKER_TABLE.toUpperCase())
+                || up.contains("__SYNC_ROWMETA")
+                || up.contains("__SYNC_HEARTBEAT");
+    }
+
     /**
      * 启动后台线程定期检查背压信号，确保无事件时也能及时响应暂停/恢复。
      */
@@ -634,10 +652,12 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                     String sql = ((QueryEventData) eventData).getSql();
                     if (sql != null && "BEGIN".equalsIgnoreCase(sql.trim())) {
                         loopGuard.onTransactionBoundary();
-                    } else {
-                        // 双向模式只复制 DML，不传播 DDL（CREATE/ALTER/DROP…）：DDL 无法用行标记打标
+                    } else if (!bidiDdlForwardAllowed || isInternalDdl(sql)) {
+                        // 默认双向模式只复制 DML，不传播 DDL（CREATE/ALTER/DROP…）：DDL 无法用行标记打标
                         // （隐式提交，与 DML 不同事务），在 active-active 里会无限回环。
-                        // schema 变更需各节点带外协调。此举也顺带滤掉 __sync_heartbeat/__sync_origin 建表 DDL。
+                        // 配了 sync.bidi.ddl.direction=A_TO_B 时<b>只有正向任务</b>放行 DDL，
+                        // 反向影子通道恒不放行——两边都传就会各自建表/改表打架，且照样回环。
+                        // 内部表（__sync_origin/__sync_rowmeta/__sync_heartbeat）的 DDL 任何方向都不传。
                         return;
                     }
                 } else if (eventData instanceof XidEventData) {

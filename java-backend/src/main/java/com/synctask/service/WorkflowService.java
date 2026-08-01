@@ -129,6 +129,9 @@ public class WorkflowService {
     @Autowired
     private KafkaProducerService kafkaProducerService;
 
+    @Autowired
+    private AgentClusterService agentClusterService;
+
     @Transactional
     public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId, String taskType) {
         return createWorkflow(name, sourceType, targetType, userId, taskType, null);
@@ -308,8 +311,13 @@ public class WorkflowService {
 
         workflow.setStatus(WorkflowStatus.PENDING);
         workflow.setIsBilling(true);
+        // 集群化：先挑一台存活 agent 写进 agent_id + 租约，再投 Kafka（消息带 targetAgentId）。
+        // 一台都没注册时 assign 返回 false，退回"广播 + 谁抢到算谁"的旧语义。
+        if (agentClusterService.assign(workflow)) {
+            addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务已指派给 agent: " + workflow.getAgentId());
+        }
         workflowRepository.save(workflow);
-        
+
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务启动中，状态: 启动中");
         
         try {
@@ -459,6 +467,8 @@ public class WorkflowService {
         message.setTaskType(w.getTaskType());
         message.setDrMode(w.getDrMode());
         message.setSyncObjects(parseSyncObjects(w.getSyncObjects()));
+        // 控制消息（stop/resume/terminate/delete）同样定向：任务在哪台 agent 上跑，就只让那台处理
+        message.setTargetAgentId(w.getAgentId());
         return message;
     }
 
@@ -803,7 +813,7 @@ public class WorkflowService {
     /** 同步位点可视化：代理 agent 的 /api/checkpoint/{taskId}（先做属主校验）。 */
     public Map<String, Object> getCheckpointVisualization(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）");
+        return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）", id);
     }
 
     // ==================== 实时监控指标：代理 agent 的只读监控接口 ====================
@@ -817,26 +827,26 @@ public class WorkflowService {
     /** 单任务实时指标：代理 agent 的 /api/metrics/{taskId}（先做属主校验）。 */
     public Map<String, Object> getTaskMetrics(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/metrics/" + id, "查询任务实时指标失败（agent 不可达或未运行）");
+        return callAgentJson("/api/metrics/" + id, "查询任务实时指标失败（agent 不可达或未运行）", id);
     }
 
     /** 单任务历史指标：代理 agent 的 /api/metrics/{taskId}/history（先做属主校验）。 */
     public Map<String, Object> getTaskMetricsHistory(String id, Long userId, String query) {
         getWorkflowById(id, userId);
         String path = "/api/metrics/" + id + "/history" + (query != null && !query.isEmpty() ? "?" + query : "");
-        return callAgentJson(path, "查询任务历史指标失败（agent 不可达或未运行）");
+        return callAgentJson(path, "查询任务历史指标失败（agent 不可达或未运行）", id);
     }
 
     /** 表级延迟热力图：代理 agent 的 /api/table-latency/{taskId}（先做属主校验）。 */
     public Map<String, Object> getTableLatency(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/table-latency/" + id, "查询表级延迟失败（agent 不可达或未运行）");
+        return callAgentJson("/api/table-latency/" + id, "查询表级延迟失败（agent 不可达或未运行）", id);
     }
 
     /** 一对多分发状态：代理 agent 的 /api/fanout/{taskId}（先做属主校验）。 */
     public Map<String, Object> getFanoutStatus(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/fanout/" + id, "查询分发状态失败（agent 不可达或未运行）");
+        return callAgentJson("/api/fanout/" + id, "查询分发状态失败（agent 不可达或未运行）", id);
     }
 
     /**
@@ -864,7 +874,7 @@ public class WorkflowService {
      */
     public byte[] getDiagnosticsBundle(String id, Long userId) {
         getWorkflowById(id, userId);
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentBase = agentBaseUrlFor(id);
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/diagnostics/" + id);
@@ -914,9 +924,35 @@ public class WorkflowService {
         return result;
     }
 
+    /**
+     * 任务当前归属 agent 的基址。集群化后 agent 不止一台，硬编码 localhost:8083 会问错机器
+     * （查到的指标是空的、位点是别人的）。查不到归属或该 agent 没注册时回退默认地址，
+     * 单机部署行为不变。
+     */
+    private String agentBaseUrlFor(String taskId) {
+        String fallback = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        if (taskId == null) {
+            return fallback;
+        }
+        try {
+            Workflow w = workflowRepository.findById(taskId).orElse(null);
+            if (w == null) {
+                return fallback;
+            }
+            return agentClusterService.agentBaseUrl(w.getAgentId()).orElse(fallback);
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
     /** GET agent HTTP 接口并解析 JSON（带可选 Bearer token）。 */
     private Map<String, Object> callAgentJson(String path, String errPrefix) {
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        return callAgentJson(path, errPrefix, null);
+    }
+
+    /** taskId 非空时按任务归属路由到对应 agent。 */
+    private Map<String, Object> callAgentJson(String path, String errPrefix, String taskId) {
+        String agentBase = agentBaseUrlFor(taskId);
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + path);
@@ -944,7 +980,7 @@ public class WorkflowService {
     public Map<String, Object> getDeadletterRecords(String id, Long userId) {
         getWorkflowById(id, userId);
 
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentBase = agentBaseUrlFor(id);
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/agent/deadletter/" + id);
@@ -966,6 +1002,12 @@ public class WorkflowService {
         } catch (Exception e) {
             throw new RuntimeException("查询死信记录失败（agent 不可达或未运行）: " + e.getMessage());
         }
+    }
+
+    /** 双向写写冲突记录：代理 agent 的 /api/agent/conflicts/{taskId}（与死信同格式，前端复用同一套展示）。 */
+    public Map<String, Object> getConflictRecords(String id, Long userId) {
+        getWorkflowById(id, userId);
+        return callAgentJson("/api/agent/conflicts/" + id, "查询冲突记录失败（agent 不可达或未运行）", id);
     }
 
     private Map<String, Object> parseSyncObjects(String syncObjects) {
@@ -1095,7 +1137,7 @@ public class WorkflowService {
     private boolean callAgentFailoverApi(TaskCreatedMessage message) {
         // agent 地址与鉴权 token 均可配（环境变量优先），不再写死 localhost；
         // agent 侧 failover 是敏感端点，配置了 AGENT_API_TOKEN 时必须带 Bearer token。
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentBase = agentBaseUrlFor(message.getTaskId());
         String agentToken = System.getenv("AGENT_API_TOKEN");
         String agentUrl = agentBase + "/api/agent/failover";
         try {

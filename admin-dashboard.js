@@ -423,6 +423,7 @@
             'E3008': { desc: '任务磁盘用量超限', solution: '任务目录 files/<taskId> 超过配额。请清理历史任务目录、下调日志级别或调大 task.disk.quota.mb' },
             'E3009': { desc: '增量事件转换失败', solution: '该事件无法转换成目标端SQL（未知类型/结构不匹配）。可在死信页面裁决跳过，或将 increment.convert.error.policy 设为 DEAD_LETTER 自动记死信并跳过' },
             'E3010': { desc: 'THL文件读取中断', solution: 'THL文件损坏或读取异常，已在断点处停止且未跳过剩余事件。请检查磁盘与 thl_output 目录，必要时重新初始化增量' },
+            'E3011': { desc: '双向同步写写冲突', solution: '两端同时改了同一行且策略为 ERROR（不自动丢写）。请人工确认保留哪一端，或改用 LWW_SOURCE_TS/NODE_PRIORITY 自动裁决' },
             'E4001': { desc: '全量同步失败', solution: '请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常' },
             'E4002': { desc: '全量同步超时', solution: '请检查数据量是否过大，考虑分批同步或优化网络带宽' },
             'E4003': { desc: '目标数据库写入失败', solution: '请检查目标数据库磁盘空间、表结构是否与源库一致、是否有写入权限' },

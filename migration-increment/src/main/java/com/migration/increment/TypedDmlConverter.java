@@ -40,6 +40,7 @@ public class TypedDmlConverter {
 
     private final boolean enabled;
     private final boolean targetIsMysql;
+    private final boolean guardWithBeforeImage;
     private final boolean sourceIsMysql;
     private final String targetDatabaseName;
     /** 表名映射（仅表级同步下发）："源库.源表" → 目标表名，来自 schema.mapping.table.* */
@@ -66,6 +67,10 @@ public class TypedDmlConverter {
                         || ("postgresql".equals(source) && "postgresql".equals(target));
         this.enabled = switchOn && pairSupported;
         this.targetIsMysql = "mysql".equals(target);
+        // 双向冲突消解：UPDATE 的 WHERE 额外带上<b>整行前镜像</b>，"影响 0 行"即说明
+        // 目标端这一行已被本端改过（并发写），交由 ConflictResolver 裁决。
+        this.guardWithBeforeImage = Boolean.parseBoolean(
+                props.getProperty("sync.bidi.conflict.before.image.guard", "false"));
         this.sourceIsMysql = "mysql".equals(source);
         this.targetDatabaseName = props.getProperty("target.db.database", "");
 
@@ -266,7 +271,8 @@ public class TypedDmlConverter {
                 logger.debug("列过滤跳过 INSERT 行: {}.{}", srcDb, srcTable);
                 continue;
             }
-            out.add(new ParameterizedDml(insertSql, row));
+            out.add(new ParameterizedDml(insertSql, row, table,
+                    rowKeyOf(cols, row, pkSet(metadata)), "INSERT"));
         }
         return out;
     }
@@ -341,14 +347,16 @@ public class TypedDmlConverter {
                         if (!appendWhere(del, delParams, whereCols, sqlWhereCols, before, pks)) {
                             return null;
                         }
-                        out.add(new ParameterizedDml(del.toString(), delParams));
+                        out.add(new ParameterizedDml(del.toString(), delParams, table,
+                                rowKeyOf(whereCols, before, pks), "DELETE"));
                         logger.debug("列过滤将 UPDATE 转为 DELETE: {}.{}", srcDb, srcTable);
                     }
                     continue;
                 }
                 if (beforeExcluded) {
                     String insertSql = buildInsertSql(metadata, srcDb, srcTable, table, setCols);
-                    out.add(new ParameterizedDml(insertSql, after));
+                    out.add(new ParameterizedDml(insertSql, after, table,
+                            rowKeyOf(setCols, after, pks), "INSERT"));
                     logger.debug("列过滤将 UPDATE 转为 INSERT: {}.{}", srcDb, srcTable);
                     continue;
                 }
@@ -361,10 +369,26 @@ public class TypedDmlConverter {
                 sql.append(quote(sqlSetCols[i])).append("=?");
                 params.add(after.get(i));
             }
-            if (!appendWhere(sql, params, whereCols, sqlWhereCols, before, pks)) {
+            // 主键定位版（冲突裁决判"来的一方赢"时用它强制覆盖）
+            StringBuilder pkOnly = new StringBuilder(sql);
+            List<Object> pkOnlyParams = new ArrayList<>(params);
+            if (!appendWhere(pkOnly, pkOnlyParams, whereCols, sqlWhereCols, before, pks)) {
                 return null;
             }
-            out.add(new ParameterizedDml(sql.toString(), params));
+            if (guardWithBeforeImage) {
+                if (!appendBeforeImageWhere(sql, params, whereCols, sqlWhereCols, before, pks)) {
+                    return null;
+                }
+            } else {
+                sql = pkOnly;
+                params = pkOnlyParams;
+            }
+            ParameterizedDml dml = new ParameterizedDml(sql.toString(), params, table,
+                    rowKeyOf(whereCols, before, pks), "UPDATE");
+            if (guardWithBeforeImage) {
+                dml.withOverride(pkOnly.toString(), pkOnlyParams);
+            }
+            out.add(dml);
         }
         return out;
     }
@@ -393,9 +417,32 @@ public class TypedDmlConverter {
             if (!appendWhere(sql, params, cols, sqlCols, row, pks)) {
                 return null;
             }
-            out.add(new ParameterizedDml(sql.toString(), params));
+            out.add(new ParameterizedDml(sql.toString(), params, table,
+                    rowKeyOf(cols, row, pks), "DELETE"));
         }
         return out;
+    }
+
+    /**
+     * 行标识：主键列值按源列序拼接。双向冲突消解（P1-4）用它在旁路表里定位"同一行"，
+     * 因此必须在两个方向上算出<b>同一个</b>字符串——所以用源列名顺序而不是目标列名顺序。
+     * 无主键返回 null：这类表天然无法做行级冲突消解，调用方直接放行。
+     */
+    private String rowKeyOf(String[] cols, List<Object> values, java.util.Set<String> pks) {
+        if (pks.isEmpty() || cols == null || values == null) {
+            return null;
+        }
+        StringBuilder key = new StringBuilder();
+        boolean any = false;
+        for (int i = 0; i < cols.length && i < values.size(); i++) {
+            if (!pks.contains(cols[i].trim().toLowerCase())) {
+                continue;
+            }
+            if (any) key.append('\u0001');
+            key.append(values.get(i));
+            any = true;
+        }
+        return any ? key.toString() : null;
     }
 
     private java.util.Set<String> pkSet(Map<String, Object> metadata) {
@@ -407,6 +454,36 @@ public class TypedDmlConverter {
             }
         }
         return pks;
+    }
+
+    /**
+     * 主键 + <b>整行前镜像</b>的 WHERE：双向并发写的检测手段。
+     * 目标端那一行若已被本端改动过，这条 UPDATE 就会"影响 0 行"，从而被识别成冲突。
+     * NULL 用 NULL 安全等价（MySQL {@code <=>} / PG {@code IS NOT DISTINCT FROM}），
+     * 否则 NULL=NULL 恒为 UNKNOWN，含 NULL 的行会被误判成冲突。
+     */
+    private boolean appendBeforeImageWhere(StringBuilder sql, List<Object> params,
+                                           String[] cols, String[] sqlCols, List<Object> values,
+                                           java.util.Set<String> pks) {
+        sql.append(" WHERE ");
+        boolean first = true;
+        String nullSafeEq = targetIsMysql ? "<=>" : "IS NOT DISTINCT FROM";
+        for (int i = 0; i < cols.length; i++) {
+            if (!first) sql.append(" AND ");
+            first = false;
+            Object v = values.get(i);
+            boolean isPk = pks.contains(cols[i].trim().toLowerCase());
+            if (v == null) {
+                sql.append(quote(sqlCols[i])).append(" IS NULL");
+            } else if (isPk) {
+                sql.append(quote(sqlCols[i])).append("=?");
+                params.add(v);
+            } else {
+                sql.append(quote(sqlCols[i])).append(' ').append(nullSafeEq).append(" ?");
+                params.add(v);
+            }
+        }
+        return !first;
     }
 
     /**

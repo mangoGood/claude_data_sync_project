@@ -32,6 +32,16 @@ public class TaskCreatedMessage {
     private Boolean syncAccount;
     /** 是否同步超级账号权限 */
     private Boolean syncAccountSuperPrivilege;
+    /** 指派执行本任务的 agent（集群化）。为空=广播语义，任一 agent 都可接（兼容旧行为） */
+    private String targetAgentId;
+
+    public String getTargetAgentId() {
+        return targetAgentId;
+    }
+
+    public void setTargetAgentId(String targetAgentId) {
+        this.targetAgentId = targetAgentId;
+    }
 
     public TaskCreatedMessage() {
         this.messageType = "TASK_CREATED";

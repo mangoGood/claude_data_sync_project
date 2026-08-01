@@ -440,6 +440,19 @@ public class WorkflowController {
         }
     }
 
+    /** 双向写写冲突记录（代理 agent）。 */
+    @GetMapping("/{id}/conflicts")
+    public ResponseEntity<?> getConflictRecords(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getConflictRecords(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     @PostMapping("/{id}/failover")
     public ResponseEntity<?> failoverWorkflow(
             @PathVariable String id,
