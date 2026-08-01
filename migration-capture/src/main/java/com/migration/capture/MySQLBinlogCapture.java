@@ -183,6 +183,8 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             binlogPosition = 0;
         }
 
+        recordReplayAmplification();
+
         // 解析同步对象配置，构建数据库/表过滤集合
         parseSyncObjects();
 
@@ -933,9 +935,74 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
      * GTID 集同理：连接器只在 XID/COMMIT 时把事务并入已执行集，事务中途落盘存的是提交前的前缀，
      * 重启重放整个事务，仍是至少一次而非丢失。
      */
+    /**
+     * 启动时算一次<b>重放放大量</b>（P2-4 的 {@code capture_replay_bytes}）：
+     * 上一轮跑到过的最远位点 − 本轮实际起始位点。
+     *
+     * <p>健康的重启这个数接近 0（位点文件每 1000 事件/若干秒落一次，最多重放这一小段）。
+     * 一旦它变成几十上百 MB，就说明位点没被用上——起始位点退回了任务最初那个值，
+     * 也就是 §2.2 那类"每次重启整段重放"的故障。这类故障不报错、不告警，任务看着一直在跑，
+     * 只有下游消息量翻倍才看得出来；有了这个数就能直接对它设告警。
+     *
+     * <p>高水位文件<b>跨重启单调保留</b>（主备倒换会连同整个 binlog_output 一起清掉，
+     * 那时新源的位点与旧源无可比性，重新从 0 开始正是想要的）。
+     */
+    private void recordReplayAmplification() {
+        try {
+            File hw = new File(outputDir, "capture_high_water");
+            if (!hw.exists() || binlogFile == null) {
+                writeMetricFile("capture_replay_bytes", "0");
+                return;
+            }
+            String line;
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(hw))) {
+                line = r.readLine();
+            }
+            if (line == null || !line.contains("|")) {
+                writeMetricFile("capture_replay_bytes", "0");
+                return;
+            }
+            String[] parts = line.trim().split("\\|", 2);
+            long replay = 0;
+            // 只在同一个 binlog 文件内比较：跨文件的字节差需要知道中间各文件大小，算不出来也没必要
+            if (parts[0].equals(binlogFile)) {
+                long highWater = Long.parseLong(parts[1].trim());
+                replay = Math.max(0, highWater - binlogPosition);
+            }
+            writeMetricFile("capture_replay_bytes", String.valueOf(replay));
+            if (replay > 0) {
+                logger.warn("本次启动重放放大量 {} 字节（上轮最远位点 {} → 本次起点 {}:{}）",
+                        replay, line.trim(), binlogFile, binlogPosition);
+            }
+        } catch (Exception e) {
+            logger.debug("计算重放放大量失败: {}", e.getMessage());
+        }
+    }
+
+    /** 更新跨重启单调的位点高水位，供下次启动算重放放大量。 */
+    private void saveHighWater() {
+        if (currentBinlogFile == null) return;
+        writeMetricFile("capture_high_water", currentBinlogFile + "|" + currentBinlogPosition);
+    }
+
+    private void writeMetricFile(String name, String content) {
+        try {
+            File dir = new File(outputDir);
+            if (!dir.exists() && !dir.mkdirs()) {
+                return;
+            }
+            try (java.io.FileWriter w = new java.io.FileWriter(new File(dir, name), false)) {
+                w.write(content);
+            }
+        } catch (Exception e) {
+            logger.debug("写指标文件 {} 失败: {}", name, e.getMessage());
+        }
+    }
+
     private void savePosition() {
         if (currentBinlogFile == null) return;
 
+        saveHighWater();
         Properties posProps = new Properties();
         posProps.setProperty("binlog.file", currentBinlogFile);
         posProps.setProperty("binlog.position", String.valueOf(currentBinlogPosition));

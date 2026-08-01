@@ -189,6 +189,11 @@ public class ConfigService {
 
         if (taskMessage.getSyncObjects() != null && !taskMessage.getSyncObjects().isEmpty()) {
             syncObjectsUpdated = true;
+            // 端到端探针开启时把探针表并入同步范围：表级同步下不并入的话，标记行根本不会被捕获，
+            // 探针只会一直报超时。必须在这里做——下面的 included.tables/included.databases 都由它派生。
+            if (agentConfig != null && agentConfig.isProbeEnabled()) {
+                E2eProbeService.includeProbeTable(taskMessage.getSyncObjects());
+            }
             String syncObjectsJson = gson.toJson(taskMessage.getSyncObjects());
             props.setProperty("migration.sync.objects", syncObjectsJson);
             logger.info("Sync objects config updated: {}", syncObjectsJson);

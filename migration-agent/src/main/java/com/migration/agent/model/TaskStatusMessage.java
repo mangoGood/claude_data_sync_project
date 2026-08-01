@@ -17,9 +17,47 @@ public class TaskStatusMessage {
     private Long rpoMs;
     private Long rtoMs;
 
+    // ===== SLA 闭环指标（P2-4）：随状态一起上报，落到 workflows 表供告警规则读取 =====
+    /** 绝对复制延迟：源库当前时刻 − 已应用事件的源端时刻（源库空闲时 RPO 恒为 0，这个不会）。 */
+    private Long replicationLagMs;
+    /** capture 重启后重放的字节数。 */
+    private Long captureReplayBytes;
+    /** 近 10 分钟（crashloop.window.ms）子进程重启次数。 */
+    private Integer restartCount10m;
+    /** 双向冲突裁决累计条数。 */
+    private Long conflictCount;
+    /** 死信累计条数。 */
+    private Long deadletterCount;
+    /** 任务工作目录占用字节数。 */
+    private Long diskUsageBytes;
+
     public TaskStatusMessage() {
         this.timestamp = System.currentTimeMillis();
     }
+
+    public Long getReplicationLagMs() { return replicationLagMs; }
+
+    public void setReplicationLagMs(Long replicationLagMs) { this.replicationLagMs = replicationLagMs; }
+
+    public Long getCaptureReplayBytes() { return captureReplayBytes; }
+
+    public void setCaptureReplayBytes(Long captureReplayBytes) { this.captureReplayBytes = captureReplayBytes; }
+
+    public Integer getRestartCount10m() { return restartCount10m; }
+
+    public void setRestartCount10m(Integer restartCount10m) { this.restartCount10m = restartCount10m; }
+
+    public Long getConflictCount() { return conflictCount; }
+
+    public void setConflictCount(Long conflictCount) { this.conflictCount = conflictCount; }
+
+    public Long getDeadletterCount() { return deadletterCount; }
+
+    public void setDeadletterCount(Long deadletterCount) { this.deadletterCount = deadletterCount; }
+
+    public Long getDiskUsageBytes() { return diskUsageBytes; }
+
+    public void setDiskUsageBytes(Long diskUsageBytes) { this.diskUsageBytes = diskUsageBytes; }
 
     public String getTaskId() {
         return taskId;

@@ -5842,10 +5842,38 @@
         }
 
         function clearMetricsDisplay() {
-            ['metricCaptureRate', 'metricE2eLatency', 'metricQueueDepth', 'metricCheckpointLag', 'metricProcessHealth'].forEach(id => {
+            ['metricCaptureRate', 'metricE2eLatency', 'metricQueueDepth', 'metricCheckpointLag', 'metricProcessHealth',
+             'metricReplicationLag', 'metricReplayBytes', 'metricRestartCount', 'metricConflictCount',
+             'metricDeadletterCount', 'metricDiskUsage'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) { el.textContent = '--'; el.className = 'metric-card-value'; }
             });
+        }
+
+        /** SLA 闭环指标（P2-4）。老 agent 不上报这些字段，缺字段时保持 '--' 而不是显示 0（0 会被当成"健康"）。 */
+        function renderSlaMetrics(data) {
+            const setCard = (id, value, colorFn, format) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (value === undefined || value === null) {
+                    el.textContent = '--';
+                    el.className = 'metric-card-value';
+                    return;
+                }
+                el.textContent = format ? format(value) : value;
+                el.className = 'metric-card-value ' + colorFn(value);
+            };
+            setCard('metricReplicationLag', data.replicationLagMs,
+                v => v < 5000 ? 'good' : v < 60000 ? 'warn' : 'bad');
+            setCard('metricReplayBytes', data.captureReplayBytes,
+                v => v === 0 ? 'good' : v < 10 * 1024 * 1024 ? 'warn' : 'bad');
+            setCard('metricRestartCount', data.restartCount10m,
+                v => v === 0 ? 'good' : v < 3 ? 'warn' : 'bad');
+            setCard('metricConflictCount', data.conflictCount, v => v === 0 ? 'good' : 'warn');
+            setCard('metricDeadletterCount', data.deadletterCount, v => v === 0 ? 'good' : 'warn');
+            setCard('metricDiskUsage', data.diskUsageBytes,
+                v => v < 5 * 1024 * 1024 * 1024 ? 'good' : v < 15 * 1024 * 1024 * 1024 ? 'warn' : 'bad',
+                v => (v / (1024 * 1024)).toFixed(1));
         }
 
         function renderMetrics(data) {
@@ -5891,6 +5919,7 @@
             updateChart('chartCheckpointLag', 'checkpointLag', '滞后(sec)', _metricsHistory.timestamps, _metricsHistory.checkpointLag, '#f5222d');
 
             renderProcessStatus(processes);
+            renderSlaMetrics(data);
 
             if (_chartModalInstance && _currentModalKey) {
                 renderModalChart(_currentModalKey, _currentModalUnit, _currentModalColor);

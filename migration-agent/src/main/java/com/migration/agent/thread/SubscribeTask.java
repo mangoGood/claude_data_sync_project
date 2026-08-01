@@ -152,6 +152,8 @@ public class SubscribeTask extends AbstractTaskExecutor {
             Long rtoMs = readMetricFile("./files/" + taskId + "/metrics/subscribe_rto_ms");
             statusMessage.setRtoMs(rtoMs);
 
+            attachSlaMetrics(statusMessage);
+
             kafkaProducer.sendStatus(statusMessage);
             logger.debug("[{}] Subscribe metrics update: rtoMs={}", taskId, rtoMs);
         } catch (Exception e) {

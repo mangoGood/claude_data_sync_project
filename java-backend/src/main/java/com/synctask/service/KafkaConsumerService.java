@@ -97,7 +97,20 @@ public class KafkaConsumerService {
                 logger.info("倒换相关状态变更 {} -> {}，重新从数据库读取最新连接信息", oldStatus, newStatus);
                 workflow = workflowRepository.findById(taskId).orElse(workflow);
             }
-            
+
+            // 生命周期单调性：低阶段状态不得覆盖高阶段状态（见 WorkflowStatus.phase()）。
+            // 只丢弃"状态"这一个字段，同一条消息里的进度/表信息/RPO 等仍照常应用——
+            // 迟到的那条消息里的进度依然是真实观测值，连带丢掉会让进度条卡住。
+            // 状态由 API 侧改写（重启/暂停/倒换）不经过这里，因此不会被此规则挡住。
+            if (newStatus != null && oldStatus != null
+                    && newStatus.isLifecyclePhase() && oldStatus.isLifecyclePhase()
+                    && newStatus.phase() < oldStatus.phase()) {
+                logger.warn("忽略倒退的状态更新: {}(phase={}) -> {}(phase={}), taskId={}",
+                        oldStatus, oldStatus.phase(), newStatus, newStatus.phase(), taskId);
+                newStatus = null;
+            }
+
+
             // newStatus 为 null：agent 的过程/通知类状态（CAPTURE_STARTED/RUNNING 等）或未知状态，
             // 不改变生命周期状态，但仍继续应用下面的进度、表信息、计费、RPO/RTO 等字段
             if (newStatus != null) {
@@ -147,6 +160,32 @@ public class KafkaConsumerService {
             }
             if (rtoMs != null) {
                 workflow.setRtoMs(rtoMs);
+            }
+
+            // SLA 闭环指标（P2-4）：老 agent 不带这些字段，一律按"没上报就不覆盖"处理
+            Long replicationLagMs = getLongValue(messageMap, "replicationLagMs");
+            if (replicationLagMs != null) {
+                workflow.setReplicationLagMs(replicationLagMs);
+            }
+            Long captureReplayBytes = getLongValue(messageMap, "captureReplayBytes");
+            if (captureReplayBytes != null) {
+                workflow.setCaptureReplayBytes(captureReplayBytes);
+            }
+            Integer restartCount10m = getIntegerValue(messageMap, "restartCount10m");
+            if (restartCount10m != null) {
+                workflow.setRestartCount10m(restartCount10m);
+            }
+            Long conflictCount = getLongValue(messageMap, "conflictCount");
+            if (conflictCount != null) {
+                workflow.setConflictCount(conflictCount);
+            }
+            Long deadletterCount = getLongValue(messageMap, "deadletterCount");
+            if (deadletterCount != null) {
+                workflow.setDeadletterCount(deadletterCount);
+            }
+            Long diskUsageBytes = getLongValue(messageMap, "diskUsageBytes");
+            if (diskUsageBytes != null) {
+                workflow.setDiskUsageBytes(diskUsageBytes);
             }
 
             String migrationMode = workflow.getMigrationMode();
@@ -362,6 +401,13 @@ public class KafkaConsumerService {
 
     private String buildStatusLogMessage(WorkflowStatus newStatus, WorkflowStatus oldStatus, Integer progress, String errorMessage, String errorCode,
             Integer totalTables, Integer completedTables, String currentTable, Integer currentTableProgress) {
+        // newStatus 可以为 null：agent 的过程/通知类状态，以及被单调性规则挡下的倒退状态。
+        // 这里原本直接 switch(null) 抛 NPE，被外层 catch 吞掉——表现是进度存进了库，
+        // 但这一条既不写任务日志也不推 WebSocket，页面要等下一条消息才动。
+        if (newStatus == null) {
+            String base = "任务进度更新";
+            return progress != null ? base + "：" + progress + "%" : base;
+        }
         switch (newStatus) {
             case CONFIGURING:
                 return "任务配置中";
@@ -406,6 +452,9 @@ public class KafkaConsumerService {
     }
 
     private WorkflowLog.LogLevel determineLogLevel(WorkflowStatus status) {
+        if (status == null) {
+            return WorkflowLog.LogLevel.INFO;
+        }
         switch (status) {
             case FAILED:
                 return WorkflowLog.LogLevel.ERROR;

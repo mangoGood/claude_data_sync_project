@@ -262,7 +262,10 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
         // ---------- 告警管理页 ----------
 
         const ADV_METRIC_LABELS = {
-            RPO_MS: 'RPO(ms)', RTO_MS: 'RTO(ms)', PROCESS_DOWN: '任务失败', SYNC_FAILED: '同步失败'
+            RPO_MS: 'RPO(ms)', RTO_MS: 'RTO(ms)', PROCESS_DOWN: '任务失败', SYNC_FAILED: '同步失败',
+            REPLICATION_LAG_MS: '复制延迟·绝对(ms)', CAPTURE_REPLAY_BYTES: '重放放大量(bytes)',
+            RESTART_COUNT_10M: '重启次数(10m)', CONFLICT_COUNT: '冲突数', DEADLETTER_COUNT: '死信数',
+            DISK_USAGE_BYTES: '磁盘占用(bytes)'
         };
         const ADV_OP_LABELS = { GT: '>', GTE: '>=', LT: '<', LTE: '<=', EQ: '=' };
 
@@ -275,12 +278,25 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             advLoadAlertEvents(1);
         }
 
+        // 各指标的默认阈值：填一个能用的起点，省得用户对着空框猜量纲（单位见 ADV_METRIC_LABELS）
+        const ADV_METRIC_DEFAULT_THRESHOLD = {
+            REPLICATION_LAG_MS: '60000',              // 1 分钟
+            CAPTURE_REPLAY_BYTES: '10485760',         // 10MB：健康重启该接近 0
+            RESTART_COUNT_10M: '3',
+            CONFLICT_COUNT: '0',
+            DEADLETTER_COUNT: '0',
+            DISK_USAGE_BYTES: '16106127360'           // 15GB，低于 task.disk.quota.mb 默认 20GB
+        };
+
         function advOnAlertMetricChange() {
             const metric = document.getElementById('alertMetricSelect').value;
             // 布尔型指标（任务失败/同步失败）取值 0/1：默认 > 0 即告警
             if (metric === 'PROCESS_DOWN' || metric === 'SYNC_FAILED') {
                 document.getElementById('alertOperatorSelect').value = 'GT';
                 document.getElementById('alertThresholdInput').value = '0';
+            } else if (ADV_METRIC_DEFAULT_THRESHOLD[metric]) {
+                document.getElementById('alertOperatorSelect').value = 'GT';
+                document.getElementById('alertThresholdInput').value = ADV_METRIC_DEFAULT_THRESHOLD[metric];
             }
         }
 

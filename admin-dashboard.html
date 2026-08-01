@@ -539,6 +539,40 @@
                             </div>
                         </div>
 
+                        <!-- SLA 闭环指标（P2-4）：与上排"各段自报"的指标不同，这一排是能直接签 SLA / 设告警的那几个数 -->
+                        <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 16px;">
+                            <div class="metric-card" title="源库当前时刻 − 已应用事件的源端时刻。源库空闲时 RPO 恒为 0，这个指标不会">
+                                <div class="metric-card-label">复制延迟(绝对)</div>
+                                <div class="metric-card-value" id="metricReplicationLag">--</div>
+                                <div class="metric-card-unit">ms</div>
+                            </div>
+                            <div class="metric-card" title="capture 重启后重新读取的字节数，持续偏大说明位点没被用上">
+                                <div class="metric-card-label">重放放大量</div>
+                                <div class="metric-card-value" id="metricReplayBytes">--</div>
+                                <div class="metric-card-unit">bytes</div>
+                            </div>
+                            <div class="metric-card" title="近 10 分钟子进程重启次数">
+                                <div class="metric-card-label">重启次数(10m)</div>
+                                <div class="metric-card-value" id="metricRestartCount">--</div>
+                                <div class="metric-card-unit">次</div>
+                            </div>
+                            <div class="metric-card" title="双向同步的写写冲突裁决条数">
+                                <div class="metric-card-label">冲突数</div>
+                                <div class="metric-card-value" id="metricConflictCount">--</div>
+                                <div class="metric-card-unit">条</div>
+                            </div>
+                            <div class="metric-card" title="人工裁决跳过的事件条数">
+                                <div class="metric-card-label">死信数</div>
+                                <div class="metric-card-value" id="metricDeadletterCount">--</div>
+                                <div class="metric-card-unit">条</div>
+                            </div>
+                            <div class="metric-card" title="任务工作目录（THL/日志）占用">
+                                <div class="metric-card-label">磁盘占用</div>
+                                <div class="metric-card-value" id="metricDiskUsage">--</div>
+                                <div class="metric-card-unit">MB</div>
+                            </div>
+                        </div>
+
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
                             <div class="metric-chart-card metric-chart-expandable" onclick="openChartModal('captureRate','事件捕获速率趋势','事件/sec','#52c41a')">
                                 <div class="metric-chart-title">事件捕获速率趋势 <span class="chart-expand-hint">点击放大 ↗</span></div>
@@ -718,6 +752,12 @@
                                 <option value="RTO_MS">RTO（毫秒）</option>
                                 <option value="PROCESS_DOWN">任务失败（进程异常）</option>
                                 <option value="SYNC_FAILED">同步失败</option>
+                                <option value="REPLICATION_LAG_MS">复制延迟·绝对（毫秒）</option>
+                                <option value="CAPTURE_REPLAY_BYTES">重放放大量（字节）</option>
+                                <option value="RESTART_COUNT_10M">重启次数（10 分钟）</option>
+                                <option value="CONFLICT_COUNT">冲突数（条）</option>
+                                <option value="DEADLETTER_COUNT">死信数（条）</option>
+                                <option value="DISK_USAGE_BYTES">磁盘占用（字节）</option>
                             </select>
                             <select class="form-input" id="alertOperatorSelect" style="width: 90px;">
                                 <option value="GT">&gt;</option>

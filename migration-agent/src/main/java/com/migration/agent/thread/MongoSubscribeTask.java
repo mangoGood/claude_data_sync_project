@@ -132,6 +132,8 @@ public class MongoSubscribeTask extends AbstractTaskExecutor {
             statusMessage.setMessage("数据订阅中");
             statusMessage.setProgress(100);
             statusMessage.setRtoMs(readMetricFile("./files/" + taskId + "/metrics/subscribe_rto_ms"));
+            attachSlaMetrics(statusMessage);
+
             kafkaProducer.sendStatus(statusMessage);
         } catch (Exception e) {
             logger.debug("[{}] Error sending mongo subscribe metrics update", taskId, e);

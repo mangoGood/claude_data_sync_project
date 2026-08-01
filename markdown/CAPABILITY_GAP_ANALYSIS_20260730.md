@@ -255,7 +255,7 @@ SQL 执行失败，不保护转换失败。
 - 双向模式下 **DDL 被完全丢弃**（capture 在 bidi 分支对 `QueryEventData` 直接 `return`），
   注释里说"需各节点带外协调"——对标 DTS 双向同步的 DDL 单向传播能力，这是明确缺口。
 
-### 2.8 【低·可观测】任务状态可以倒退（实测命中）
+### 2.8 【低·可观测】任务状态可以倒退（实测命中）　【已修复，见 §11.2】
 
 本轮 `dr_resume.py mysql2mysql` 的状态序列实测为：
 `FULL_MIGRATING → FULL_COMPLETED → FULL_MIGRATING → INCREMENT_RUNNING`——**回退了一次**。
@@ -271,7 +271,7 @@ SQL 执行失败，不保护转换失败。
 修法：给 `WorkflowStatus` 定义阶段序号，`setStatus` 前拒绝低阶段覆盖高阶段
 （FAILED/SWITCHING/STOPPED 等显式终止态除外）；agent 侧监控线程发送前再确认一次 `stopped`。
 
-### 2.9 【低·性能】全量吞吐偏低
+### 2.9 【低·性能】全量吞吐偏低　【已修复，见 §11.1】
 
 `dr_resume.py mysql2mysql` 全量阶段：**200,000 行 / 686 秒 ≈ 291 行/秒**（单表、无限速配额约束、
 两个独立 MySQL 实例）。逐页 `SELECT … LIMIT` + 逐行 `INSERT` 的路径没有用
@@ -280,7 +280,7 @@ SQL 执行失败，不保护转换失败。
 建议在 `DataMigration` 的写侧引入按方言的批量通道（MySQL `LOAD DATA`、PG `COPY`、
 Oracle 数组绑定），预期 1~2 个数量级提升。
 
-### 2.10 【低·一致性】全量阶段无一致性快照
+### 2.10 【低·一致性】全量阶段无一致性快照　【已实施，见 §11.3】
 
 `DataMigration` 全程 autocommit + 逐页 `WHERE pk > last ORDER BY pk LIMIT n`，
 没有 `START TRANSACTION WITH CONSISTENT SNAPSHOT` / `REPEATABLE READ` / 任何快照点。
@@ -577,7 +577,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P2-2　全量批量装载 + 状态单调性
+### P2-2　全量批量装载 + 状态单调性　【已实施，见 §11】
 
 - `DataMigration` 写侧按方言分流：MySQL 走 `LOAD DATA LOCAL INFILE`（或至少
   `rewriteBatchedStatements=true` + `addBatch/executeBatch`）、PG 走 `COPY … FROM STDIN`、
@@ -586,7 +586,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P2-3　全量一致性快照
+### P2-3　全量一致性快照　【已实施，见 §11】
 
 - MySQL：全量搬运前 `FLUSH TABLES WITH READ LOCK` → 取 `SHOW MASTER STATUS`/`gtid_executed`
   → 开 `START TRANSACTION WITH CONSISTENT SNAPSHOT`（每个并行 worker 用
@@ -600,7 +600,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 
 ---
 
-### P2-4　可观测性与 SLA 闭环
+### P2-4　可观测性与 SLA 闭环　【已实施，见 §11】
 
 - 指标补齐：`replication_lag_seconds`（源最新事件时间 − 已应用事件时间，现有
   `calculateRpo()` 已接近，但依赖心跳事件，需补"源库 `NOW()` − 已应用事件时间"的绝对口径）、
@@ -620,7 +620,7 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 | **第 2 批** ✅ | **2.11 N² 写放大**（先做，改动最小收益最大） + P0-1 事务一致性投递 | 2.11 是把 `rows_typed` 按行切片，几行代码换来两个数量级吞吐；P0-1 改动最大但价值最高，先上 `TRANSACTION` 开关灰度，`txn_atomicity.py` 做门禁。两者都在同一段应用路径上，一起改一次回归 —— **已完成，见 §8** |
 | **第 3 批** ✅ | P1-2 熔断自愈 + P1-3 转换死信 + P2-1 资源治理 | 都是独立小改动，可并行 —— **已完成，见 §9** |
 | **第 4 批** ✅ | P1-1 集群化 + P1-4 冲突消解 | 需要元数据表变更（Flyway V3+）与较多联调 —— **已完成，见 §10** |
-| **第 5 批** | P2-2 批量装载与状态单调 + P2-3 一致性快照 + P2-4 可观测闭环 | 锦上添花，但决定能不能对外承诺 SLA |
+| **第 5 批** ✅ | P2-2 批量装载与状态单调 + P2-3 一致性快照 + P2-4 可观测闭环 | 锦上添花，但决定能不能对外承诺 SLA —— **已完成，见 §11**（全量 291→38,365 行/秒） |
 
 每批都应在 `test_scripts/fault_injection/` 里补对应的判据脚本，
 并入 `e2e_smoke.py` 的 CI 门禁场景表。
@@ -1020,3 +1020,138 @@ B 变成 A 的值，两端永远不一致，而且看起来还像"同步成功"�
 3. **【测试脚手架】被杀的 agent 若是脚本的子进程且没 `wait()`**，会以 `<defunct>` 僵尸留在进程表里，
    而 `ProcessHandle.isAlive()` 对僵尸仍返回 true——它的子进程的父进程看门狗永远不触发，
    孤儿继续写目标库（生产上 init 立刻回收，不存在此问题）。脚本里补了回收。
+
+---
+
+## 11. 第 5 批实施记录（P2-2 批量装载/状态单调 + P2-3 一致性快照 + P2-4 可观测闭环）
+
+日期：2026-08-01。全量构建 `mvn clean install` 通过，单测 **439 通过 / 0 失败**（第 4 批 426，新增 13 例）。
+元数据表变更走 Flyway [V9__sla_metrics.sql](java-backend/src/main/resources/db/migration/V9__sla_metrics.sql)：
+`workflows` 增 6 个 SLA 指标列。
+
+### 11.1　P2-2(1)　全量批量装载：291 行/秒 → 38,365 行/秒
+
+原来的写侧是"逐行 `addBatch` + 每 1000 行 `executeBatch`"，但 JDBC 默认<b>不合并语句</b>——
+一批 1000 行仍是 1000 次往返，§2.9 实测 291 行/秒的瓶颈全在这里。
+
+改动只有两件事，都收敛在 [BatchWriter](migration-full/src/main/java/com/migration/full/migration/BatchWriter.java)：
+
+| 项 | 做法 |
+|---|---|
+| 语句重写 | 目标连接挂 `rewriteBatchedStatements=true`（MySQL/TiDB）/ `reWriteBatchedInserts=true`（PG），驱动把一批单行 INSERT 合成一条多值 INSERT；Oracle 的 `executeBatch` 本身即数组绑定，不需要参数 |
+| 批大小 | `migration.full.bulk.rows`，默认 `batchSize × 5` |
+
+**为什么不用 `LOAD DATA LOCAL INFILE` / `COPY FROM STDIN`**（报告 P2-2 原本的首选）：那两条通道都是
+**文本协议**，值要先渲染成字符串再由服务端解析，等于绕开 PreparedStatement 的类型绑定。
+本项目增量链路正是因为文本管道踩过 5 类值保真缺陷（见 [value-conversion 收敛]），
+后来才统一到类型化绑定；为一档吞吐把全量退回文本管道不划算，何况 LOAD DATA 还要服务端
+`local_infile=ON`。实测语句重写通道已经拿到 **58×**，文本通道的边际收益不值这个风险。
+
+两个"不这么写就出事"的点：
+
+- **`SUCCESS_NO_INFO(-2)` 必须算成功**。语句一旦被重写，`executeBatch` 返回的就是 SUCCESS_NO_INFO
+  而非逐行影响数；沿用原先"负数即失败"的口径，开启重写后<b>每一次全量都会把全部行报成失败</b>。
+  只有 `EXECUTE_FAILED(-3)` 才是真失败。判据脚本专门有一把尺子盯这个。
+- **批失败必须按行重放**。重写之后一行主键冲突会让<b>整条多值 INSERT</b> 失败，而原逻辑只是
+  warn 一句继续下一页——等于静默丢掉一整批（最多 5000 行）。现在失败后逐行重放，只跳过真正冲突的行。
+  顺带修掉原有的另一个丢数据口子：**目标连接重建时已 addBatch 的行随旧 statement 一起消失，
+  计数却照常推进**；现在保留行缓冲，重连后重放。
+
+### 11.2　P2-2(2)　任务状态单调性（§2.8）
+
+两侧各堵一半：
+
+- agent 侧：`fullMonitorDone` 标志 + 监控线程**发送前二次确认**。只 interrupt 挡不住已经进入
+  循环体、正在构造 FULL_MIGRATING 的那一轮——它会在 FULL_COMPLETED 之后才发出去。
+- backend 侧：[WorkflowStatus.phase()](java-backend/src/main/java/com/synctask/entity/WorkflowStatus.java)
+  给生命周期状态定阶段序号，`KafkaConsumerService` 拒绝低阶段覆盖高阶段。倒换/重连/失败/暂停
+  是**控制态**（`PHASE_CONTROL`），任何方向都放行。
+
+一个容易做错的取舍：被挡下的消息**只丢"状态"这一个字段**，同一条消息里的进度/表信息/RPO 照常应用——
+迟到消息里的进度依然是真实观测值，连带丢掉会让进度条卡住。
+
+顺手修掉一个被外层 catch 吞掉的老 NPE：`buildStatusLogMessage` / `determineLogLevel` 对
+`newStatus == null` 直接 `switch` 抛 NPE。这条路径本来就存在（agent 的过程/通知类状态），
+表现是进度存进了库、但这一条既不写任务日志也不推 WebSocket。单调性规则会让它更频繁地被走到。
+
+### 11.3　P2-3　全量一致性快照
+
+[ConsistentSnapshot](migration-full/src/main/java/com/migration/full/snapshot/ConsistentSnapshot.java)，
+`migration.full.snapshot.mode` 三档：
+
+| 模式 | 行为 |
+|---|---|
+| `NONE` | 完全的旧行为 |
+| `GTID_ONLY`（默认） | 只在搬运前记一次位点（GTID / binlog 坐标 / LSN / SCN），不加锁、不改读取路径。零风险，换来"这次全量对应哪个位点"的可观测性 |
+| `CONSISTENT` | 真快照 |
+
+各库手法不同，差别决定了实现形态：
+
+- **MySQL 没有"把快照导出给别的会话"的能力**，只能在 `FLUSH TABLES WITH READ LOCK` 期间把
+  <b>所有读连接</b>的 `START TRANSACTION WITH CONSISTENT SNAPSHOT` 一起开出来再解锁（mydumper 的做法）。
+  因此读连接必须**预建成池并全程复用**——而默认路径是<b>每页新建连接</b>（为释放 Oracle 会话 PGA，
+  避免 ORA-04036）。解锁之后再开的会话，快照点已经不是记下的那个位点了。
+  池大小按最坏并发算：表级并行度 × 单表分片数。
+- **PostgreSQL** 有 `pg_export_snapshot()`，快照可被任意会话导入，每页新建连接的模型原样保留
+  （借出时导入快照，归还时提交）。
+- **Oracle** 用闪回 `AS OF SCN`，是逐查询生效的，同样不需要固定连接。
+
+一条硬规则：**快照是增强项，不能让全量起不来**。源库缺 RELOAD 权限、连不上、版本不支持——
+任何一种都安静降级为无快照全量（数据仍最终一致），只丢"全量结束点"这个语义，绝不把任务打失败。
+
+位点落到 `files/<taskId>/full_snapshot_position`，这才让"全量完成即校验"成为可能：
+此前全量结束点不对应任何一个 LSN/GTID/SCN，只能等增量追平后再校验。
+
+### 11.4　P2-4　可观测性与 SLA 闭环
+
+新增 6 个指标，全链路打通到告警：agent 采集（[SlaMetricsCollector](migration-agent/src/main/java/com/migration/agent/service/SlaMetricsCollector.java)）
+→ 随状态消息上报 → `workflows` 表（Flyway V9）→ `AlertRuleService` 可设阈值 → dashboard 展示。
+
+| 指标 | 来源 | 为什么值得单独有一个 |
+|---|---|---|
+| `replication_lag_ms` | 源库当前时刻 − 已应用事件的源端时刻 | **和现有 `rpo_ms` 不是一回事**：rpo 是"最新捕获事件 − 已应用事件"，源库空闲时分子分母都不动、**恒为 0**——链路整段卡死也是 0。绝对口径用源库时钟做分子，卡多久涨多久，这才是能签 SLA 的那个数 |
+| `capture_replay_bytes` | capture 启动时算"上轮跑到过的最远位点 − 本轮起始位点" | 直接暴露 §2.2 那类"每次重启整段重放"。健康时接近 0；一旦变成几十上百 MB，就是位点没被用上，而这类故障不报错、不告警 |
+| `restart_count_10m` | `ProcessGuard.restartCountInWindow()` | crash-loop 此前只存在于 agent 日志 |
+| `conflict_count` / `deadletter_count` | `conflict.jsonl` / `deadletter.jsonl` 行数（按文件长度缓存，不重复数） | 双向冲突与人工裁决的量此前只能翻文件 |
+| `disk_usage_bytes` | 任务目录字节数 | 长跑资源治理的可观测面 |
+
+源库时钟不是每次采集都去查：按 `sourceNow − localNow` 的**偏移量**缓存 60 秒，源库短暂不可达时
+沿用上一次偏移（指标不该因为一次连接抖动而跳变）。
+
+**端到端探针**（[E2eProbeService](migration-agent/src/main/java/com/migration/agent/service/E2eProbeService.java)）默认**关闭**：
+它要在用户源库里建 `__sync_probe` 表并持续写入，这是对源库的副作用，必须显式同意（`probe.enabled`）。
+开启后 `ConfigService` 会把探针表**并入任务的同步范围**——表级同步下不并入的话，标记行根本不会被捕获，
+探针只会一直报超时。它是唯一同时证明"链路真的通"和"延迟多少"的指标：各段自报的活性文件都有
+"段内自洽但整条链路不通"的盲区（比如 THL 一直在产出、位点一直在推进，目标库却因某个过滤条件一行没落）。
+
+### 11.5　新增判据脚本
+
+| 脚本 | 尺子 |
+|---|---|
+| [bulk_snapshot.py](test_scripts/fault_injection/bulk_snapshot.py) | 九把：值保真（逐行 MD5 汇总与源端一致，证明没退回文本通道）、成功计数不塌（SUCCESS_NO_INFO）、吞吐提升、快照位点落盘、CONSISTENT 下"快照点之后写入的行不得进来"、"快照点之前已提交的行必须全部搬到"。实测 **668 → 38,365 行/秒（56×）**，快照隔离 0 泄漏 |
+| [sla_metrics.py](test_scripts/fault_injection/sla_metrics.py) | 七把：绝对延迟/磁盘占用有值、SIGKILL capture 后重启次数涨上来、重放放大量有值、新指标类型能建告警规则、**告警规则真的按新指标触发**（指标→落库→告警全链路） |
+
+判据脚本的两个坑：
+
+1. **快照判据必须以"快照建立时刻"为界，不是"进程启动时刻"**。JVM 启动 + 建表要一两秒，
+   这期间写进源库的行本来就在快照之内、理应被搬走。第一版按进程启动时刻算，直接误报
+   "漏入 100 行"。位点文件第一段就是快照时刻（epoch ms），拿它当界才对。
+2. **对照组要用 `GTID_ONLY` 而不是 `NONE`**：判据需要快照时刻，而 NONE 根本不记位点。
+   GTID_ONLY 只记位点、不隔离读取，正好是"知道位点、数据却不属于那个位点"的旧状态——
+   实测它漏入 200 行，证明尺子确实有效（否则 CONSISTENT 的 0 泄漏可能只是没赶上时序）。
+
+单测新增 [BatchWriterTest](migration-full/src/test/java/com/migration/full/migration/BatchWriterTest.java)（4 例）、
+[ConsistentSnapshotTest](migration-full/src/test/java/com/migration/full/snapshot/ConsistentSnapshotTest.java)（4 例）、
+[StatusMonotonicityTest](java-backend/src/test/java/com/synctask/service/StatusMonotonicityTest.java)（5 例）。
+
+### 11.6　实施过程中的坑
+
+1. **批失败后的计数口径**。逐行重放遇主键冲突时若按"跳过"计（原逐行路径的口径），
+   一批里只要有一行冲突整批就都不计数——进度条平白少掉一整批。冲突意味着目标端已有该行，
+   对全量的语义（行已就位）就是成功，改为计成功。
+2. **多库模式下批量参数会丢**。驱动参数挂在 `DatabaseConfig` 上，而多库模式会派生 per-db 配置，
+   不显式 `copyJdbcOptionsFrom` 就只有单库模式提速。
+3. **本机 JDK 24 跑不了后端单测**（Mockito inline mockmaker 无法 instrument
+   `SimpMessagingTemplate` / `KafkaProducerService`），与本批改动无关；用 `start.sh` 同款 JDK 21 即可。
+   另外 `SimpMessagingTemplate` 本身 mock 不了，测试里用真实实例 + mock 的 `MessageChannel`
+   （`send` 必须返回 true，否则模板抛 `MessageDeliveryException`）。

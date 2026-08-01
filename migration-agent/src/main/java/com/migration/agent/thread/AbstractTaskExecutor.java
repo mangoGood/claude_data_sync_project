@@ -11,6 +11,7 @@ import com.migration.agent.service.AgentConfig;
 import com.migration.agent.service.KafkaProducerService;
 import com.migration.agent.service.MetricsService;
 import com.migration.agent.service.MetricsPersistenceService;
+import com.migration.agent.service.SlaMetricsCollector;
 import com.migration.agent.service.TaskStateService;
 import com.migration.agent.util.SyncErrorCodeMapper;
 import com.migration.common.MdcUtil;
@@ -48,6 +49,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
     protected ProcessGuard incrementGuard;
 
     protected Thread fullMigrationMonitorThread;
+    /** 全量进度监控是否已收工：置位后监控线程不得再发 FULL_MIGRATING（防状态倒退）。 */
+    protected final AtomicBoolean fullMonitorDone = new AtomicBoolean(false);
 
     protected int totalTables = 0;
     protected volatile int completedTables = 0;
@@ -55,6 +58,11 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
     protected long lastMetricsReportTime = 0;
     protected static final long METRICS_REPORT_INTERVAL_MS = 30000;
+
+    /** SLA 指标采集器（P2-4），首次采集时创建。 */
+    private volatile com.migration.agent.service.SlaMetricsCollector slaCollector;
+    /** 端到端探针（P2-4），默认关闭；开启时在监控循环里惰性创建。 */
+    private volatile com.migration.agent.service.E2eProbeService probe;
 
     public AbstractTaskExecutor(TaskMessage taskMessage, KafkaProducerService kafkaProducer,
                                 TaskStateService taskStateService, boolean skipFullMigration, AgentConfig config) {
@@ -867,6 +875,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
         logger.info("[{}] 开始执行全量迁移", threadName);
 
         try {
+            fullMonitorDone.set(false);
             fullProcess = new ProcessManager(config.getMigrationFullJarPath(), "MigrationFull-" + taskId);
             fullProcess.setTaskId(taskId);
             fullProcess.start();
@@ -876,6 +885,10 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
             int exitCode = fullProcess.waitFor();
 
+            // 先置"监控已收工"再 interrupt：只 interrupt 挡不住已经进入循环体、正在构造
+            // FULL_MIGRATING 的那一轮——它会在 FULL_COMPLETED 之后才发出去，把状态顶回全量中
+            // （实测到过 FULL_COMPLETED → FULL_MIGRATING 的倒退）。监控线程发送前二次确认此标志。
+            fullMonitorDone.set(true);
             if (fullMigrationMonitorThread != null) {
                 fullMigrationMonitorThread.interrupt();
             }
@@ -911,7 +924,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
         fullMigrationMonitorThread = new Thread(() -> {
             String progressDbUrl = "jdbc:h2:./files/" + taskId + "/migration_progress;MODE=MySQL;AUTO_SERVER=TRUE";
 
-            while (!stopped.get() && fullProcess != null && fullProcess.isRunning()) {
+            while (!stopped.get() && !fullMonitorDone.get() && fullProcess != null && fullProcess.isRunning()) {
                 try {
                     Thread.sleep(config.getProgressMonitorIntervalMs());
                     if (stopped.get()) break;
@@ -945,6 +958,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
                         int overallProgress = totalTables > 0 ? (completedTables * 100) / totalTables : 0;
 
+                        // 发送前最后一次确认：从上面的 while 条件到这里之间，全量进程可能已经退出、
+                        // FULL_COMPLETED 也可能已经发出，此时再发 FULL_MIGRATING 就是状态倒退
+                        if (fullMonitorDone.get() || stopped.get()) break;
                         sendStatus("FULL_MIGRATING", "全量同步中", overallProgress,
                                 totalTables, completedTables, currentTable, currentTableProgress,
                                 currentTableRows, currentTableTotalRows);
@@ -968,6 +984,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
     protected void stopAllProcesses() {
         String threadName = "TaskExecutor-" + taskId;
         logger.info("[{}] 停止所有进程", threadName);
+
+        stopProbe();
 
         if (incrementGuard != null) {
             try { incrementGuard.stop(); logger.info("[{}] 增量同步进程已停止", threadName); }
@@ -1033,6 +1051,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
         if (calculatedRpo != null) rpoMs = calculatedRpo;
         statusMessage.setRpoMs(rpoMs);
         statusMessage.setRtoMs(rtoMs);
+        attachSlaMetrics(statusMessage);
 
         if ("FAILED".equals(status)) {
             String errorCode = SyncErrorCodeMapper.mapFailureToErrorCode(message);
@@ -1063,9 +1082,92 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
             taskMetrics.recordCaptureRate(readCaptureRateFromFile());
             readQueueDepthsFromFiles(taskMetrics);
+            collectSlaMetrics(taskMetrics);
         } catch (Exception e) {
             logger.debug("[{}] Error collecting metrics", taskId, e);
         }
+    }
+
+    /**
+     * 把 SLA 指标挂到状态消息上（P2-4），落到 workflows 表后 {@code AlertRuleService} 才能对它们设阈值。
+     * 全部只读文件 + 缓存的源库时钟，失败一律吞掉——指标取不到绝不能影响状态上报本身。
+     */
+    protected void attachSlaMetrics(TaskStatusMessage statusMessage) {
+        try {
+            SlaMetricsCollector collector = slaCollector();
+            long lag = collector.replicationLagMs(readMetricTimestamp("./files/" + taskId + "/binlog_output/rto_metric"));
+            if (lag >= 0) {
+                statusMessage.setReplicationLagMs(lag);
+            }
+            statusMessage.setCaptureReplayBytes(collector.captureReplayBytes());
+            statusMessage.setConflictCount(collector.conflictCount());
+            statusMessage.setDeadletterCount(collector.deadletterCount());
+            statusMessage.setDiskUsageBytes(collector.diskUsageBytes());
+            statusMessage.setRestartCount10m((int) restartCountInWindow());
+        } catch (Exception e) {
+            logger.debug("[{}] 附加 SLA 指标失败", taskId, e);
+        }
+    }
+
+    /** SLA 闭环指标（P2-4）：绝对复制延迟、重放量、重启次数、冲突/死信数、磁盘占用。 */
+    protected void collectSlaMetrics(MetricsService.TaskMetrics taskMetrics) {
+        try {
+            SlaMetricsCollector collector = slaCollector();
+            Long lastAppliedSourceTs = readMetricTimestamp("./files/" + taskId + "/binlog_output/rto_metric");
+            long lag = collector.replicationLagMs(lastAppliedSourceTs);
+            if (lag >= 0) {
+                taskMetrics.recordReplicationLag(lag);
+            }
+            taskMetrics.recordCaptureReplayBytes(collector.captureReplayBytes());
+            taskMetrics.recordConflictCount(collector.conflictCount());
+            taskMetrics.recordDeadletterCount(collector.deadletterCount());
+            taskMetrics.recordDiskUsageBytes(collector.diskUsageBytes());
+            taskMetrics.recordRestartCount10m(restartCountInWindow());
+            startProbeIfEnabled(taskMetrics);
+        } catch (Exception e) {
+            logger.debug("[{}] Error collecting SLA metrics", taskId, e);
+        }
+    }
+
+    /**
+     * 端到端探针（P2-4）：默认关闭；开启时在监控循环里惰性起一次，随任务停止一起关。
+     * 只在增量类任务上有意义——纯全量没有持续的链路可探。
+     */
+    private void startProbeIfEnabled(MetricsService.TaskMetrics taskMetrics) {
+        // incrementGuard 为空说明增量进程还没起来，链路不成立，探针必然超时
+        if (probe != null || !config.isProbeEnabled() || incrementGuard == null) {
+            return;
+        }
+        probe = new com.migration.agent.service.E2eProbeService(
+                taskId, taskMessage.getSourceConnection(), taskMessage.getTargetConnection(),
+                config.getProbeIntervalMs(), config.getProbeTimeoutMs(), taskMetrics);
+        probe.start();
+    }
+
+    /** 停止端到端探针（任务停止时调用）。 */
+    protected void stopProbe() {
+        if (probe != null) {
+            probe.close();
+            probe = null;
+        }
+    }
+
+    private SlaMetricsCollector slaCollector() {
+        SlaMetricsCollector local = slaCollector;
+        if (local == null) {
+            local = new SlaMetricsCollector(taskId, taskMessage.getSourceConnection());
+            slaCollector = local;
+        }
+        return local;
+    }
+
+    /** 三个子进程近 10 分钟的重启次数之和（crash-loop 的可观测面，见 ProcessGuard）。 */
+    protected long restartCountInWindow() {
+        long total = 0;
+        if (captureGuard != null) total += captureGuard.restartCountInWindow();
+        if (extractGuard != null) total += extractGuard.restartCountInWindow();
+        if (incrementGuard != null) total += incrementGuard.restartCountInWindow();
+        return total;
     }
 
     protected void persistMetrics(MetricsService.TaskMetrics taskMetrics) {

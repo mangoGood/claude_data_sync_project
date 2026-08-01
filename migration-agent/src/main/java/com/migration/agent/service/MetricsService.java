@@ -99,6 +99,27 @@ public class MetricsService {
         private final AtomicLong captureEventsTotal = new AtomicLong(0);
         private final AtomicLong appliedEventsTotal = new AtomicLong(0);
 
+        // ===== SLA 闭环指标（P2-4）=====
+        /**
+         * 复制延迟的<b>绝对口径</b>：源库当前时刻 − 已应用事件的源端时刻。
+         * 与 {@code rpoMs} 的区别：rpo 是"最新捕获事件 − 已应用事件"，源库<b>没有写入</b>时
+         * 两端都不动，rpo 恒为 0——链路整段卡死也一样是 0。绝对口径用源库时钟做分子，
+         * 卡住多久就涨多久，才是能拿来签 SLA 的那个数。
+         */
+        private final AtomicLong replicationLagMs = new AtomicLong(0);
+        /** 重放放大量：capture 重启后从早于已落盘位点的地方重新读取的字节数（直接暴露"每次重启整段重放"）。 */
+        private final AtomicLong captureReplayBytes = new AtomicLong(0);
+        /** 近 10 分钟子进程重启次数（crash-loop 的可观测面）。 */
+        private final AtomicLong restartCount10m = new AtomicLong(0);
+        /** 双向冲突裁决累计条数。 */
+        private final AtomicLong conflictCount = new AtomicLong(0);
+        /** 死信累计条数。 */
+        private final AtomicLong deadletterCount = new AtomicLong(0);
+        /** 任务工作目录占用字节数（THL/日志无界增长的可观测面）。 */
+        private final AtomicLong diskUsageBytes = new AtomicLong(0);
+        /** 端到端探针延迟：标记行从写入源库到出现在目标库的毫秒数（-1 = 未启用/未取到）。 */
+        private final AtomicLong probeLatencyMs = new AtomicLong(-1);
+
         private final ConcurrentHashMap<String, ProcessStatus> processStatuses = new ConcurrentHashMap<>();
 
         public TaskMetrics(String taskId) {
@@ -140,6 +161,42 @@ public class MetricsService {
             rtoMs.set(ms);
         }
 
+        public void recordReplicationLag(long ms) {
+            replicationLagMs.set(Math.max(0, ms));
+        }
+
+        public void recordCaptureReplayBytes(long bytes) {
+            captureReplayBytes.set(Math.max(0, bytes));
+        }
+
+        public void recordRestartCount10m(long count) {
+            restartCount10m.set(Math.max(0, count));
+        }
+
+        public void recordConflictCount(long count) {
+            conflictCount.set(Math.max(0, count));
+        }
+
+        public void recordDeadletterCount(long count) {
+            deadletterCount.set(Math.max(0, count));
+        }
+
+        public void recordDiskUsageBytes(long bytes) {
+            diskUsageBytes.set(Math.max(0, bytes));
+        }
+
+        public void recordProbeLatency(long ms) {
+            probeLatencyMs.set(ms);
+        }
+
+        public long getReplicationLagMs() { return replicationLagMs.get(); }
+        public long getCaptureReplayBytes() { return captureReplayBytes.get(); }
+        public long getRestartCount10m() { return restartCount10m.get(); }
+        public long getConflictCount() { return conflictCount.get(); }
+        public long getDeadletterCount() { return deadletterCount.get(); }
+        public long getDiskUsageBytes() { return diskUsageBytes.get(); }
+        public long getProbeLatencyMs() { return probeLatencyMs.get(); }
+
         public void incrementEventsCaptured(long count) {
             captureEventsTotal.addAndGet(count);
         }
@@ -170,6 +227,13 @@ public class MetricsService {
             snapshot.put("rtoMs", rtoMs.get());
             snapshot.put("captureEventsTotal", captureEventsTotal.get());
             snapshot.put("appliedEventsTotal", appliedEventsTotal.get());
+            snapshot.put("replicationLagMs", replicationLagMs.get());
+            snapshot.put("captureReplayBytes", captureReplayBytes.get());
+            snapshot.put("restartCount10m", restartCount10m.get());
+            snapshot.put("conflictCount", conflictCount.get());
+            snapshot.put("deadletterCount", deadletterCount.get());
+            snapshot.put("diskUsageBytes", diskUsageBytes.get());
+            snapshot.put("probeLatencyMs", probeLatencyMs.get());
 
             List<Map<String, Object>> processes = new ArrayList<>();
             for (ProcessStatus ps : processStatuses.values()) {

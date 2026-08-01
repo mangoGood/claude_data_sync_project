@@ -143,6 +143,8 @@ public class FullMigrationTask extends AbstractTaskExecutor {
             statusMessage.setRpoMs(rpoMs);
             statusMessage.setRtoMs(rtoMs);
 
+            attachSlaMetrics(statusMessage);
+
             kafkaProducer.sendStatus(statusMessage);
             logger.debug("[{}] Periodic metrics update: rpoMs={}, rtoMs={}", taskId, rpoMs, rtoMs);
         } catch (Exception e) {

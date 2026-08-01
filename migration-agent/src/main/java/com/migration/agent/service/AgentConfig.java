@@ -286,6 +286,22 @@ public class AgentConfig {
         return Integer.parseInt(props.getProperty("crashloop.threshold", "5"));
     }
 
+    /**
+     * 端到端探针（P2-4）。默认<b>关闭</b>：它会在用户源库里建 {@code __sync_probe} 表并持续写入，
+     * 这是对源库的副作用，必须显式开启；开启后探针表会自动并入任务同步范围。
+     */
+    public boolean isProbeEnabled() {
+        return Boolean.parseBoolean(props.getProperty("probe.enabled", "false"));
+    }
+
+    public long getProbeIntervalMs() {
+        return Long.parseLong(props.getProperty("probe.interval.ms", "60000"));
+    }
+
+    public long getProbeTimeoutMs() {
+        return Long.parseLong(props.getProperty("probe.timeout.ms", "30000"));
+    }
+
     public long getTaskDiskQuotaMb() {
         return Long.parseLong(props.getProperty("task.disk.quota.mb", "20480"));
     }

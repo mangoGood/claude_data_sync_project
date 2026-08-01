@@ -46,6 +46,8 @@ public class ParallelDataMigration {
     private final com.migration.config.DatabaseConfig sourceCfg;
     private final com.migration.config.DatabaseConfig targetCfg;
     private final ProgressManager progressManager;
+    /** 全量一致性快照（可为 null = 无快照）；所有 worker 共用同一个快照。 */
+    private com.migration.full.snapshot.ConsistentSnapshot snapshot;
 
     public ParallelDataMigration(MigrationConfig config,
                                  com.migration.config.DatabaseConfig sourceCfg,
@@ -55,6 +57,11 @@ public class ParallelDataMigration {
         this.sourceCfg = sourceCfg;
         this.targetCfg = targetCfg;
         this.progressManager = progressManager;
+    }
+
+    public ParallelDataMigration setSnapshot(com.migration.full.snapshot.ConsistentSnapshot snapshot) {
+        this.snapshot = snapshot;
+        return this;
     }
 
     public void migrateAllData(List<TableInfo> tables, int parallelism) throws SQLException {
@@ -77,9 +84,10 @@ public class ParallelDataMigration {
                 try {
                     prepareTargetSession(tgt);
                     DataMigration dataMigration = new DataMigration(
-                            src, tgt, config.getBatchSize(), config.isContinueOnError(), progressManager,
+                            src, tgt, config.getBulkBatchRows(), config.isContinueOnError(), progressManager,
                             config.isShardEnabled(), config.getShardMinRows(), config.getShardCount());
                     dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
+                    dataMigration.setSnapshot(snapshot);
 
                     TableInfo table;
                     while ((table = queue.poll()) != null) {

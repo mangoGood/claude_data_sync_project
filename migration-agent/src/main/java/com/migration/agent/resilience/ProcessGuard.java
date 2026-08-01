@@ -365,8 +365,8 @@ public class ProcessGuard {
         }
     }
 
-    /** 滑动窗口内的重启次数（只读）。 */
-    int restartCountInWindow() {
+    /** 滑动窗口内的重启次数（只读）。指标采集（P2-4 restart_count_10m）也读这个数。 */
+    public int restartCountInWindow() {
         synchronized (restartTimestamps) {
             pruneCrashWindow(System.currentTimeMillis());
             return restartTimestamps.size();
