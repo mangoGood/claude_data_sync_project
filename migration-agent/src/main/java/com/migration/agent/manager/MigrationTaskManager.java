@@ -58,9 +58,15 @@ public class MigrationTaskManager {
             throw new RuntimeException("Jar file not found: " + jarPath);
         }
         
+        // 父进程看门狗：本类是"仅全量"任务的独立启动路径（不走 ProcessManager），
+        // 同样要让子进程在 agent 硬崩后自杀，否则全量进程会成为孤儿继续往目标库灌数据。
+        ProcessHandle self = ProcessHandle.current();
         ProcessBuilder pb = new ProcessBuilder(
             "java",
             "-Dtask.id=" + taskId,
+            "-D" + com.migration.common.proc.ParentWatchdog.PID_KEY + "=" + self.pid(),
+            "-D" + com.migration.common.proc.ParentWatchdog.START_KEY + "="
+                + self.info().startInstant().map(java.time.Instant::toEpochMilli).orElse(0L),
             "-Dlogback.configurationFile=files/" + taskId + "/logback.xml",
             // H2 AUTO_SERVER 默认按 InetAddress.getLocalHost() 绑定监听地址；当主机名解析到
             // 局域网 IP（而非回环）时，agent 与本进程间纯本机的进度轮询连接会因局域网连通性

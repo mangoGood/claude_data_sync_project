@@ -16,8 +16,12 @@ cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
 
 # ---- JDK 21（Spring Boot 3.2 用 21 最稳，不要用 24）----
+# 兜底路径与 start.sh / restart_agent.sh 一致：没有它时 set -u 会直接炸在下一行的
+# $JAVA_HOME 上，报 "unbound variable" 而不是"没装 JDK 21"，很难排查。
 if /usr/libexec/java_home -v 21 >/dev/null 2>&1; then
   export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+else
+  export JAVA_HOME="/Users/finn/Library/Java/JavaVirtualMachines/ms-21.0.9/Contents/Home"
 fi
 export PATH="$JAVA_HOME/bin:$PATH"
 echo "[build] JAVA_HOME=$JAVA_HOME"

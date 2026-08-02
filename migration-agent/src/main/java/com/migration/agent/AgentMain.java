@@ -61,6 +61,8 @@ public class AgentMain {
     private RecoveryService recoveryService;
     private ScheduledExecutorService captureMonitorExecutor;
     private ExecutorService taskExecutor;
+    private com.migration.agent.service.TaskFilesJanitor taskFilesJanitor;
+    private com.migration.agent.service.AgentRegistryService agentRegistry;
     
     private final ConcurrentHashMap<String, ProcessManager> captureManagers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ProcessManager> extractManagers = new ConcurrentHashMap<>();
@@ -139,6 +141,12 @@ public class AgentMain {
         
         recoveryService = new RecoveryService(agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(), agentConfig.getMysqlDbPassword());
 
+        // 集群化：把本 agent 注册进元数据库并开始心跳/续租。必须在恢复任务之前——
+        // 恢复要按"任务是否归属自己"过滤，没有身份就没法过滤。
+        agentRegistry = new com.migration.agent.service.AgentRegistryService(
+                agentConfig, () -> new java.util.HashSet<>(migrationAgentThreads.keySet()));
+        agentRegistry.start();
+
         // 指标落盘（全局 H2 时序库）：监控页"任务启动以来"的历史曲线依赖它回填。
         // 此前该服务从未被初始化 → /api/metrics/{id}/history 一律 503，前端只能靠打开页面后的
         // 实时轮询累积数据，看起来像"从点开监控页的时间开始统计"。
@@ -170,11 +178,27 @@ public class AgentMain {
             t.setName("capture-monitor");
             return t;
         });
-        captureMonitorExecutor.scheduleAtFixedRate(this::monitorCaptureProcesses, 
+        captureMonitorExecutor.scheduleAtFixedRate(this::monitorCaptureProcesses,
             CAPTURE_MONITOR_INTERVAL, CAPTURE_MONITOR_INTERVAL, TimeUnit.MILLISECONDS);
-        
+
+        // 终态任务目录的定期清理（只清打过 .terminal 标记且过了保留期的，见 TaskFilesJanitor）
+        taskFilesJanitor = new com.migration.agent.service.TaskFilesJanitor(
+                agentConfig, () -> new java.util.HashSet<>(migrationAgentThreads.keySet()));
+        captureMonitorExecutor.scheduleAtFixedRate(() -> {
+            try {
+                taskFilesJanitor.sweepOnce();
+            } catch (Exception e) {
+                logger.warn("清理终态任务目录出错: {}", e.getMessage());
+            }
+        }, 60_000, 3600_000, TimeUnit.MILLISECONDS);
+
+        // 必须先收孤儿再恢复任务：上一任 agent 硬崩后遗留的子进程还在写目标库，
+        // 直接恢复会让同一 taskId 起第二套进程造成双写；而任务实例锁又会被孤儿占着，
+        // 导致新进程一直起不来直到熔断。顺序反了两头都不对。
+        com.migration.agent.resilience.OrphanChildReaper.reap();
+
         recoverUnfinishedTasks();
-        
+
         logger.info("Migration Agent started successfully, waiting for tasks...");
     }
     
@@ -263,7 +287,12 @@ public class AgentMain {
         if (kafkaConsumer != null) {
             kafkaConsumer.stop();
         }
-        
+
+        // 优雅停机时主动下线并释放租约，后端立刻能改派，不用干等 90s 心跳超时
+        if (agentRegistry != null) {
+            agentRegistry.stop();
+        }
+
         if (httpServer != null) {
             httpServer.stop();
         }
@@ -279,9 +308,18 @@ public class AgentMain {
     private void handleTaskMessage(TaskMessage taskMessage) {
         String taskId = taskMessage.getTaskId();
         String messageType = taskMessage.getMessageType();
-        
+
         logger.info("Received task message: {} with messageType: {}", taskId, messageType);
-        
+
+        // 定向下发：backend 已经挑好了执行的 agent，其它 agent 直接放行不处理。
+        // 消息不带 targetAgentId（老后端 / 集群里没有注册过 agent）时退回广播语义，保持兼容。
+        String target = taskMessage.getTargetAgentId();
+        if (target != null && !target.isEmpty() && agentRegistry != null
+                && !target.equals(agentRegistry.getAgentId())) {
+            logger.info("任务 {} 指派给 agent {}，本 agent({}) 忽略", taskId, target, agentRegistry.getAgentId());
+            return;
+        }
+
         if ("stop".equals(messageType)) {
             taskExecutor.submit(() -> handleStopMessage(taskMessage));
         } else if ("terminate".equals(messageType)) {
@@ -308,6 +346,10 @@ public class AgentMain {
         stopMigrationAgentThread(taskId);
 
         TICDC_CHANGEFEED_SERVICE.removeChangefeedIfTidb(taskId);
+
+        // 任务已删除：目录打终态标记，保留期后由 TaskFilesJanitor 清掉（不立即删——
+        // 子进程可能还在收尾写文件，日志/死信在保留期内还有排障价值）
+        com.migration.agent.service.TaskFilesJanitor.markTerminal(taskId, "deleted");
 
         logger.info("Task {} deleted, all processes stopped", taskId);
     }
@@ -377,6 +419,9 @@ public class AgentMain {
             // 库级同步：同步进程已全部停止（无双写风险），此刻把源库 trigger/event 复制到目标库
             com.migration.agent.service.DbObjectsSyncService.syncTriggersAndEventsAtTaskEnd(taskId);
 
+            // 终结与删除同样是终态：打标，保留期后清理任务目录
+            com.migration.agent.service.TaskFilesJanitor.markTerminal(taskId, "terminated");
+
         } catch (Exception e) {
             logger.error("Error handling terminate message for task: {}", taskId, e);
         }
@@ -385,8 +430,14 @@ public class AgentMain {
     private void handleResumeMessage(TaskMessage taskMessage) {
         String taskId = taskMessage.getTaskId();
         logger.info("Handling resume message for task: {}", taskId);
-        
+
         pausedTasks.remove(taskId);
+        // 恢复/接管都要立刻认领，别等下一拍心跳：否则这 15s 窗口里租约还挂在老 agent 名下，
+        // 巡检可能把同一个任务再改派给第三台
+        if (agentRegistry != null) {
+            agentRegistry.claimTask(taskId);
+        }
+        com.migration.agent.service.TaskFilesJanitor.clearTerminalMark(taskId);
         
         try {
             TaskStateInfo stateInfo = taskStateService.getTaskState(taskId);
@@ -593,6 +644,20 @@ public class AgentMain {
                 logger.info("Deleted checkpoint file: {}, success: {}", f.getAbsolutePath(), f.delete());
             }
         }
+
+        // 单进程引擎（Mongo）的位点同样是旧源专属：resume token 里编码的是旧副本集的时间戳与 UUID，
+        // 拿去 resumeAfter 新源的 oplog 要么报 ChangeStreamHistoryLost、要么落到毫无关系的位置。
+        // 进度文件一并清掉，否则 MongoSyncTask 会读到倒换前残留的 phase 误判任务状态。
+        String[] singleProcessEngineFiles = {
+            "files/" + taskId + "/checkpoint/mongo_resume_token.json",
+            "files/" + taskId + "/mongo_progress.json"
+        };
+        for (String path : singleProcessEngineFiles) {
+            java.io.File f = new java.io.File(path);
+            if (f.exists()) {
+                logger.info("Deleted single-process engine checkpoint: {}, success: {}", f.getAbsolutePath(), f.delete());
+            }
+        }
         logger.info("All checkpoint DB files deleted before config update for failover task: {}", taskId);
     }
 
@@ -634,6 +699,9 @@ public class AgentMain {
             for (String key : STALE_POSITION_KEYS_ON_FAILOVER) {
                 configProps.remove(key);
             }
+            // 倒换后新源就是原目标实例，再跑一次全量等于把备库整个灌回原主库。SQL 管线靠编排层的
+            // skipFullMigration 跳过；单进程引擎（Mongo）在进程内自行决定全量与否，只能靠配置项传达。
+            configProps.setProperty("migration.increment.only", "true");
             try (java.io.OutputStream cos = new java.io.FileOutputStream(configFile)) {
                 configProps.store(cos, "Updated for failover - binlog position cleared");
             }
@@ -732,7 +800,13 @@ public class AgentMain {
     private void processTask(TaskMessage taskMessage, String taskId, String migrationMode) {
         try {
             sendStatus(taskId, "RECEIVED", "Task received, preparing migration", 0);
-            
+
+            // 同一 taskId 又跑起来了（重建/重启）：撤销终态标记，别让保留期到点删掉在跑的任务目录
+            com.migration.agent.service.TaskFilesJanitor.clearTerminalMark(taskId);
+            if (agentRegistry != null) {
+                agentRegistry.claimTask(taskId);
+            }
+
             configService.updateConfig(taskMessage);
             logger.info("Config updated for task: {}", taskId);
             
@@ -899,8 +973,20 @@ public class AgentMain {
                 return;
             }
             
+            int skipped = 0;
             for (RecoveryTask recoveryTask : unfinishedTasks) {
                 try {
+                    // 集群化后这道闸不能省：不加过滤的话，集群里<b>每台</b> agent 启动时都会把
+                    // 所有未完成任务捞起来重跑一遍，等于人为制造双写。
+                    // 归属别人且租约还有效的任务，交给它自己续跑。
+                    if (agentRegistry != null && !agentRegistry.ownsTask(recoveryTask.getTaskId())) {
+                        logger.info("任务 {} 归属其它 agent 且租约有效，跳过恢复", recoveryTask.getTaskId());
+                        skipped++;
+                        continue;
+                    }
+                    if (agentRegistry != null) {
+                        agentRegistry.claimTask(recoveryTask.getTaskId());
+                    }
                     recoverTask(recoveryTask);
                 } catch (Exception e) {
                     logger.error("Error recovering task: {}", recoveryTask.getTaskId(), e);
@@ -909,7 +995,8 @@ public class AgentMain {
                 }
             }
             
-            logger.info("Task recovery completed, recovered {} tasks", unfinishedTasks.size());
+            logger.info("Task recovery completed, recovered {} tasks（跳过 {} 个归属其它 agent 的）",
+                    unfinishedTasks.size() - skipped, skipped);
             
         } catch (Exception e) {
             logger.error("Error during task recovery", e);

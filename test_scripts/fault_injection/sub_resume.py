@@ -28,10 +28,14 @@ import sublib as S  # noqa: E402
 
 # 各源的默认参数：存量行数（大表）、DML 速率、注入哪些进程
 PROFILES = {
-    "mysql": dict(seed=200000, rate=200, engines=["subscribe", "capture", "extract"]),
-    "pg": dict(seed=200000, rate=200, engines=["subscribe", "capture", "extract"]),
+    "mysql": dict(seed=200000, rate=200, engines=S.SUB_ENGINES["mysql"]),
+    "pg": dict(seed=200000, rate=200, engines=S.SUB_ENGINES["pg"]),
     # Oracle 走 LogMiner，捕获吞吐远低于 binlog/WAL，速率给低一些否则永远追不平
-    "oracle": dict(seed=20000, rate=20, engines=["subscribe", "capture", "extract"]),
+    "oracle": dict(seed=20000, rate=20, engines=S.SUB_ENGINES["oracle"]),
+    # TiDB 增量经 TiCDC changefeed → Kafka → capture 消费，比直连 binlog 多一跳，速率适中
+    "tidb": dict(seed=50000, rate=100, engines=S.SUB_ENGINES["tidb"]),
+    # Mongo 是单进程引擎，唯一可注入的进程就是 mongo 本身
+    "mongo": dict(seed=50000, rate=150, engines=S.SUB_ENGINES["mongo"]),
 }
 
 
@@ -89,7 +93,7 @@ def writer_start(writer):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["mysql", "pg", "oracle"])
+    ap.add_argument("kind", choices=list(PROFILES.keys()))
     ap.add_argument("--minutes", type=float, default=3)
     ap.add_argument("--seed-rows", type=int, default=None)
     ap.add_argument("--rate", type=int, default=None)
@@ -165,7 +169,7 @@ def main():
           f"真值={len(w.writes)} 注入崩溃={len(kills)} 次 err={w.error}")
 
     if not args.no_inject:
-        alive = {e: len(S.child_pids(tid, e)) for e in ["capture", "extract", "subscribe"]}
+        alive = {e: len(S.child_pids(tid, e)) for e in engines}
         print(f"[自愈] 崩溃后子进程存活情况: {alive}")
         all_up = all(v > 0 for v in alive.values())
         (passed if all_up else failed).append(f"崩溃后三个子进程均自愈重启（{alive}）")

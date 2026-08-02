@@ -1,5 +1,7 @@
 package com.migration.config;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Properties;
 
 public class DatabaseConfig {
@@ -10,6 +12,12 @@ public class DatabaseConfig {
     private String password;
     private String dbType = "mysql";
     private String schema;
+    /**
+     * 追加到 JDBC URL 上的驱动参数（仅 MySQL / PostgreSQL；Oracle 的 thin URL 不带查询串）。
+     * 目前用于全量写侧的批量语句重写（rewriteBatchedStatements / reWriteBatchedInserts），
+     * 见 {@code BatchWriter}。按连接对象逐个设置，不影响其它链路的连接。
+     */
+    private final Map<String, String> extraJdbcOptions = new LinkedHashMap<>();
 
     public DatabaseConfig(String host, int port, String database, String username, String password) {
         this.host = host;
@@ -64,11 +72,41 @@ public class DatabaseConfig {
         this.schema = schema;
     }
 
+    /** 追加一个 JDBC URL 参数（Oracle 忽略）。同名参数覆盖。 */
+    public void setJdbcOption(String key, String value) {
+        if (key != null && !key.isEmpty() && value != null) {
+            extraJdbcOptions.put(key, value);
+        }
+    }
+
+    /** 复制另一份配置上的 JDBC 参数（多库模式下派生 per-db 配置时用，否则参数会丢）。 */
+    public void copyJdbcOptionsFrom(DatabaseConfig other) {
+        if (other != null) {
+            extraJdbcOptions.putAll(other.extraJdbcOptions);
+        }
+    }
+
+    public Map<String, String> getJdbcOptions() {
+        return java.util.Collections.unmodifiableMap(extraJdbcOptions);
+    }
+
+    private String withExtraOptions(String url) {
+        if (extraJdbcOptions.isEmpty()) {
+            return url;
+        }
+        StringBuilder sb = new StringBuilder(url);
+        for (Map.Entry<String, String> e : extraJdbcOptions.entrySet()) {
+            sb.append(url.contains("?") || sb.indexOf("?") >= 0 ? '&' : '?')
+              .append(e.getKey()).append('=').append(e.getValue());
+        }
+        return sb.toString();
+    }
+
     public String getJdbcUrl() {
         if ("postgresql".equals(dbType)) {
             String currentSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
-            return String.format("jdbc:postgresql://%s:%d/%s?currentSchema=%s&stringtype=unspecified",
-                               host, port, database, currentSchema);
+            return withExtraOptions(String.format("jdbc:postgresql://%s:%d/%s?currentSchema=%s&stringtype=unspecified",
+                               host, port, database, currentSchema));
         }
         if ("oracle".equals(dbType)) {
             // Oracle 使用 service name 方式连接: jdbc:oracle:thin:@host:port/service
@@ -76,8 +114,8 @@ public class DatabaseConfig {
             String service = (database != null && !database.isEmpty()) ? database : "ORCL";
             return String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, service);
         }
-        return String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&autoReconnect=true&connectTimeout=30000&socketTimeout=0",
-                           host, port, database);
+        return withExtraOptions(String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&autoReconnect=true&connectTimeout=30000&socketTimeout=0",
+                           host, port, database));
     }
 
     public String getJdbcDriverClass() {

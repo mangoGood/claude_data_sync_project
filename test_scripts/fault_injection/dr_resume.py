@@ -44,6 +44,52 @@ def kill_engine(task_id, engine, label=""):
 
 # --------------------------------------------------------------- 全量阶段故障注入
 
+def inject_full_phase_guarded(token, task_id, tgt, passed, failed, engine, seed_rows=0, kills=2):
+    """单进程引擎（Mongo）的全量阶段注入：进程受 ProcessGuard 守护，崩溃后自愈重跑。
+
+    与 SQL 管线的关键差别：这里**不该**出现 FAILED + retry —— migration-full 不受守护所以
+    崩溃即判死，而 mongo 引擎受守护，杀掉后 guard 会按退避自动拉起。全量重跑靠 upsert 幂等
+    收敛（已搬的文档再写一遍是同值覆盖），因此"崩溃后任务始终不 FAILED"本身就是一条断言。
+    """
+    print("[全量] 等待全量搬运推进并注入崩溃（单进程引擎，受守护自愈）...")
+    marks = [max(2000, int(seed_rows * f)) for f in (0.25, 0.55, 0.75)] if seed_rows else [2000, 4000, 6000]
+    injected = 0
+    saw_failed = False
+    deadline = time.time() + 1800
+    while time.time() < deadline and injected < kills:
+        time.sleep(2)
+        st = F.get_status(token, task_id)
+        if st in ("FULL_COMPLETED", "INCREMENT_RUNNING", "COMPLETED"):
+            print(f"    全量已完成（状态 {st}），停止注入（已注入 {injected} 次）")
+            break
+        if st == "FAILED":
+            saw_failed = True
+            print("    任务 FAILED（不应发生：受守护进程应自愈）→ retry 兜底")
+            DR.retry(token, task_id)
+            time.sleep(5)
+            continue
+        if tgt.count() > marks[min(injected, len(marks) - 1)]:
+            kill_engine(task_id, engine, label="[全量] ")
+            injected += 1
+            time.sleep(6)
+    (passed if injected else failed).append(
+        f"全量搬运途中注入 {injected} 次崩溃" if injected else "未能在全量阶段注入崩溃（数据量太小/太快）")
+    (passed if not saw_failed else failed).append("全量阶段崩溃由 ProcessGuard 自愈（任务未被判 FAILED）")
+
+    st = None
+    deadline = time.time() + 1800
+    while time.time() < deadline:
+        st = F.get_status(token, task_id)
+        if st in ("INCREMENT_RUNNING", "COMPLETED"):
+            break
+        if st == "FAILED":
+            DR.retry(token, task_id)
+        time.sleep(4)
+    ok = st in ("INCREMENT_RUNNING", "COMPLETED")
+    (passed if ok else failed).append(f"全量崩溃自愈后进入增量（终态 {st}）")
+    return ok
+
+
 def inject_full_phase(token, task_id, tgt, passed, failed, seed_rows=0, kills=2):
     """全量搬运途中杀 migration-full（无守护 → FAILED），retry 续传。"""
     print("[全量] 等待全量搬运推进并注入崩溃 ...")
@@ -159,7 +205,12 @@ def run_uni(link, phase, minutes, seed_rows):
     try:
         t_full = time.time()
         if phase in ("full", "both"):
-            if not inject_full_phase(token, task_id, b, passed, failed, seed_rows=seed_rows):
+            if L.get("single_process"):
+                ok = inject_full_phase_guarded(token, task_id, b, passed, failed,
+                                               L["engines"][0], seed_rows=seed_rows)
+            else:
+                ok = inject_full_phase(token, task_id, b, passed, failed, seed_rows=seed_rows)
+            if not ok:
                 return F.print_result(passed, failed)
         else:
             st = F.wait_status(token, task_id, {"INCREMENT_RUNNING"}, timeout=1800)
@@ -260,8 +311,13 @@ def main():
     ap.add_argument("--mode", choices=["uni", "bidi"], default="uni")
     ap.add_argument("--phase", choices=["full", "incre", "both"], default="both")
     ap.add_argument("--minutes", type=float, default=5)
-    ap.add_argument("--seed-rows", type=int, default=int(os.environ.get("DR_SEED_ROWS", "200000")))
+    # Mongo 链路的一致性指纹在 Python 侧算（Mongo 没有 BIT_XOR 之类的聚合指纹），
+    # 默认播种量相应调小；SQL 链路仍用库内聚合指纹，可以跑到几十万行。
+    ap.add_argument("--seed-rows", type=int, default=None)
     args = ap.parse_args()
+    if args.seed_rows is None:
+        default_seed = "30000" if DR.is_mongo(args.link) else "200000"
+        args.seed_rows = int(os.environ.get("DR_SEED_ROWS", default_seed))
     if args.mode == "bidi":
         rc = run_bidi(args.link, args.minutes, args.seed_rows)
     else:

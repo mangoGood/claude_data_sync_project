@@ -132,6 +132,11 @@ public class ConfigService {
                 if (targetInfo != null) {
                     props.setProperty("target.db.host", targetInfo.getHost());
                     props.setProperty("target.db.port", String.valueOf(targetInfo.getPort()));
+                    // 注意：连接串通常不带库名（mysql://user:pass@host:port），这里会把已有的
+                    // target.db.database **覆盖成空**，指望后面的 taskMessage.getTargetDbName() 再填回来。
+                    // 所以任何调用方都必须带上 targetDbName——曾经 RecoveryService 漏了它，
+                    // agent 重启后 target.db.database 为空，increment 直接拿源库名限定 DML
+                    // （INSERT INTO `源库`.`表`），目标库一条数据都收不到而状态仍显示"同步中"。
                     props.setProperty("target.db.database", targetInfo.getDatabase());
                     if (targetInfo.getUsername() != null) {
                         props.setProperty("target.db.username", targetInfo.getUsername());
@@ -184,6 +189,11 @@ public class ConfigService {
 
         if (taskMessage.getSyncObjects() != null && !taskMessage.getSyncObjects().isEmpty()) {
             syncObjectsUpdated = true;
+            // 端到端探针开启时把探针表并入同步范围：表级同步下不并入的话，标记行根本不会被捕获，
+            // 探针只会一直报超时。必须在这里做——下面的 included.tables/included.databases 都由它派生。
+            if (agentConfig != null && agentConfig.isProbeEnabled()) {
+                E2eProbeService.includeProbeTable(taskMessage.getSyncObjects());
+            }
             String syncObjectsJson = gson.toJson(taskMessage.getSyncObjects());
             props.setProperty("migration.sync.objects", syncObjectsJson);
             logger.info("Sync objects config updated: {}", syncObjectsJson);
@@ -478,6 +488,13 @@ public class ConfigService {
             props.setProperty("migration.mode", "fullAndIncre");
             logger.info("DR task detected (taskType={}), setting task.type=DR, migration.mode=fullAndIncre", taskType);
         }
+        if ("DR_SHADOW".equals(taskType)) {
+            // 反向影子通道绝不能跑全量——那会把灾备库整个搬回主库。SQL 管线靠 agent 编排层的
+            // skipFullMigration 达成（IncrementSyncTask），单进程引擎（Mongo）在进程内自行决定
+            // 全量与否，只能靠配置项传达。
+            props.setProperty("migration.increment.only", "true");
+            logger.info("DR_SHADOW 反向通道: migration.increment.only=true（禁止反向全量）");
+        }
 
         if ("SUBSCRIBE".equals(taskType)) {
             props.setProperty("task.type", "SUBSCRIBE");
@@ -560,11 +577,41 @@ public class ConfigService {
         boolean bidiEnabled = bidiGlobal || "BIDIRECTIONAL".equalsIgnoreCase(taskMessage.getDrMode());
         props.setProperty(com.migration.common.bidi.BidiConstants.KEY_ENABLED, String.valueOf(bidiEnabled));
         if (bidiEnabled) {
-            String nodeId = props.getProperty("source.db.name",
-                    props.getProperty("source.db.database", props.getProperty("source.db.host", "node")));
+            // 节点标识必须<b>两端不同</b>：冲突消解要靠它做确定性平局裁决，
+            // 而灾备两端库名通常是一样的（倒换要求库名一致），只用库名会得到两个相同的 id。
+            // 改用 host:port/db —— 双向的两个任务源目标恰好互换，因此两边算出的
+            // (incoming, local) 是同一对字符串、只是角色对调，裁决结果必然一致。
+            String nodeId = endpointId(props, "source");
+            String localNodeId = endpointId(props, "target");
             props.setProperty(com.migration.common.bidi.BidiConstants.KEY_NODE_ID, nodeId);
+            props.setProperty("sync.local.node.id", localNodeId);
             logger.info("Bidirectional loop-protection ENABLED for task {} (nodeId={}, source={})",
                     taskId, nodeId, bidiGlobal ? "agent-global" : "task drMode");
+
+            // 写写冲突消解（P1-4）：双向模式默认 LWW_SOURCE_TS——两端同时改同一行时，
+            // 按源事件时间戳裁决而不是"谁后到谁覆盖"，两个方向各自独立算出同一个赢家。
+            writeEnumPropFromEnv(props, "sync.bidi.conflict.policy", "SYNC_BIDI_CONFLICT_POLICY",
+                    "LWW_SOURCE_TS", "NODE_PRIORITY", "ERROR", "NONE");
+            if (!props.containsKey("sync.bidi.conflict.policy")) {
+                props.setProperty("sync.bidi.conflict.policy", "LWW_SOURCE_TS");
+            }
+            String primaryNode = System.getenv("SYNC_BIDI_PRIMARY_NODE");
+            if (primaryNode != null && !primaryNode.trim().isEmpty()) {
+                props.setProperty("sync.bidi.primary.node", primaryNode.trim());
+            }
+            // 前镜像守卫：UPDATE 带上整行前镜像，"影响 0 行"就是并发写的信号。
+            // 只有开了冲突消解才需要——它让 WHERE 变长，单向同步不必付这个代价。
+            boolean cdrOn = !"NONE".equalsIgnoreCase(props.getProperty("sync.bidi.conflict.policy", "LWW_SOURCE_TS"));
+            props.setProperty("sync.bidi.conflict.before.image.guard", String.valueOf(cdrOn));
+            // 双向 DDL：默认一条都不传（各节点带外协调）；配成 A_TO_B 时只有"正向"任务放行 DDL，
+            // 反向影子任务恒不放行——两边都传就会各自建表/改表打起来。
+            writeEnumPropFromEnv(props, "sync.bidi.ddl.direction", "SYNC_BIDI_DDL_DIRECTION",
+                    "NONE", "A_TO_B");
+            if (!props.containsKey("sync.bidi.ddl.direction")) {
+                props.setProperty("sync.bidi.ddl.direction", "NONE");
+            }
+            boolean isShadow = "DR_SHADOW".equals(taskMessage.getTaskType());
+            props.setProperty("sync.bidi.ddl.forward", String.valueOf(!isShadow));
         }
 
         // 配额落到执行层：按发起用户的 resource_quotas 写入增量限速/全量并发表数上限
@@ -581,6 +628,25 @@ public class ConfigService {
         // resume 时重写保持生效。默认不写=增量子进程按串行（parallelism=1）运行。
         writeIntPropFromEnv(props, "increment.apply.parallelism", "INCREMENT_APPLY_PARALLELISM");
         writeIntPropFromEnv(props, "increment.apply.batch.size", "INCREMENT_APPLY_BATCH_SIZE");
+
+        // 事务一致性投递（同上，agent 级开关灰度）：APPLY_TRANSACTION_MODE=TRANSACTION 时
+        // 一个源事务在目标端也是一个事务，目标端不再出现"半个事务"。默认不写 = EVENT（历史行为）。
+        writeEnumPropFromEnv(props, "apply.transaction.mode", "APPLY_TRANSACTION_MODE", "EVENT", "TRANSACTION");
+        writeIntPropFromEnv(props, "apply.transaction.max.rows", "APPLY_TRANSACTION_MAX_ROWS");
+        writeIntPropFromEnv(props, "apply.transaction.idle.flush.ms", "APPLY_TRANSACTION_IDLE_FLUSH_MS");
+        // 订阅侧事务标记 topic（BEGIN/END），供下游重组源事务
+        writeEnumPropFromEnv(props, "subscribe.transaction.topic.enabled",
+                "SUBSCRIBE_TRANSACTION_TOPIC_ENABLED", "true", "false");
+
+        // 转换失败（毒事件）处置策略：默认 FAIL_STOP（停下等人裁决），
+        // DEAD_LETTER 让此类事件写死信后自动跳过（愿意用少量丢弃换不中断）。
+        writeEnumPropFromEnv(props, "increment.convert.error.policy",
+                "INCREMENT_CONVERT_ERROR_POLICY", "FAIL_STOP", "DEAD_LETTER");
+        // 逐事件 SQL 日志是否带行值（默认不带：行数据明文落盘既是合规风险也是日志膨胀主因）
+        writeEnumPropFromEnv(props, "logging.include.row.values",
+                "LOGGING_INCLUDE_ROW_VALUES", "true", "false");
+        // 表级延迟 tsv 的保留行数（超过即滚动裁剪，避免长跑把磁盘写满）
+        writeIntPropFromEnv(props, "increment.table.latency.max.lines", "INCREMENT_TABLE_LATENCY_MAX_LINES");
 
         // 落盘前加密敏感值（口令）：config.properties 不再存明文密码，子进程读取时按 ENC: 前缀解密。
         encryptSensitiveProps(props);
@@ -630,6 +696,16 @@ public class ConfigService {
                 props.getProperty("capture.ticdc.kafka.bootstrap"), sanitized);
     }
 
+    /** 节点标识：host:port/db。双向冲突消解靠它区分两端，库名相同也不会撞。 */
+    private String endpointId(Properties props, String side) {
+        String host = props.getProperty(side + ".db.host", "");
+        String port = props.getProperty(side + ".db.port", "");
+        String db = props.getProperty(side + ".db.database", props.getProperty(side + ".db.name", ""));
+        String id = (host.isEmpty() ? "node" : host) + (port.isEmpty() ? "" : ":" + port)
+                + (db.isEmpty() ? "" : "/" + db);
+        return id;
+    }
+
     /** 从环境变量/系统属性读取整数写入 props（未设或非法则不写，保持子进程默认）。 */
     private void writeIntPropFromEnv(java.util.Properties props, String key, String envName) {
         String v = System.getenv(envName);
@@ -642,6 +718,22 @@ public class ConfigService {
         } catch (NumberFormatException e) {
             logger.warn("环境变量 {}={} 非法整数，忽略", envName, v);
         }
+    }
+
+    /** 枚举型引擎调优参数：只接受白名单取值（大小写不敏感），非法值忽略并告警。 */
+    private void writeEnumPropFromEnv(java.util.Properties props, String key, String envName, String... allowed) {
+        String v = System.getenv(envName);
+        if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);
+        if (v == null || v.trim().isEmpty()) return;
+        String value = v.trim();
+        for (String a : allowed) {
+            if (a.equalsIgnoreCase(value)) {
+                props.setProperty(key, a);
+                logger.info("引擎调优参数已写入配置: {}={}", key, a);
+                return;
+            }
+        }
+        logger.warn("环境变量 {}={} 不在允许取值 {} 内，忽略", envName, v, java.util.Arrays.toString(allowed));
     }
 
     /** 跳过清单合并：新值与已有属性取并集后写回（保持顺序、去重）；新值为空则不动。 */
@@ -944,9 +1036,27 @@ public class ConfigService {
         return syncObjects;
     }
 
+    /**
+     * 每任务一份 logback.xml。
+     *
+     * <p>{@code com.migration} 原先固定 DEBUG，加上增量对每条 SQL 打 INFO，实测 10 分钟任务产出
+     * 283MB 日志、单任务 totalSizeCap 10GB —— N 个任务就是 N×10GB，长跑必然把宿主磁盘写满。
+     * 现在默认 INFO（{@code MIGRATION_TASK_LOG_LEVEL=DEBUG} 可临时调回排障），
+     * 单任务上限收到 2GB / 保留 7 天。
+     */
     private void createLogbackConfig(File taskDir, String taskId) throws IOException {
         File logbackFile = new File(taskDir, "logback.xml");
-        
+
+        String logLevel = System.getenv("MIGRATION_TASK_LOG_LEVEL");
+        if (logLevel == null || logLevel.trim().isEmpty()) {
+            logLevel = System.getProperty("MIGRATION_TASK_LOG_LEVEL", "INFO");
+        }
+        logLevel = logLevel.trim().toUpperCase();
+        if (!java.util.Arrays.asList("TRACE", "DEBUG", "INFO", "WARN", "ERROR").contains(logLevel)) {
+            logger.warn("MIGRATION_TASK_LOG_LEVEL={} 非法，回退 INFO", logLevel);
+            logLevel = "INFO";
+        }
+
         String logbackContent = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
             "<configuration>\n" +
             "    <property name=\"LOG_PATH\" value=\"files/" + taskId + "/logs\"/>\n" +
@@ -970,8 +1080,8 @@ public class ConfigService {
             "            <timeBasedFileNamingAndTriggeringPolicy class=\"ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP\">\n" +
             "                <maxFileSize>100MB</maxFileSize>\n" +
             "            </timeBasedFileNamingAndTriggeringPolicy>\n" +
-            "            <maxHistory>30</maxHistory>\n" +
-            "            <totalSizeCap>10GB</totalSizeCap>\n" +
+            "            <maxHistory>7</maxHistory>\n" +
+            "            <totalSizeCap>2GB</totalSizeCap>\n" +
             "        </rollingPolicy>\n" +
             "    </appender>\n" +
             "\n" +
@@ -980,7 +1090,7 @@ public class ConfigService {
             "        <appender-ref ref=\"FILE\"/>\n" +
             "    </root>\n" +
             "\n" +
-            "    <logger name=\"com.migration\" level=\"DEBUG\"/>\n" +
+            "    <logger name=\"com.migration\" level=\"" + logLevel + "\"/>\n" +
             "</configuration>";
         
         try (OutputStream output = new FileOutputStream(logbackFile)) {

@@ -440,6 +440,19 @@ public class WorkflowController {
         }
     }
 
+    /** 双向写写冲突记录（代理 agent）。 */
+    @GetMapping("/{id}/conflicts")
+    public ResponseEntity<?> getConflictRecords(
+            @PathVariable String id,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getConflictRecords(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     @PostMapping("/{id}/failover")
     public ResponseEntity<?> failoverWorkflow(
             @PathVariable String id,
@@ -486,6 +499,13 @@ public class WorkflowController {
         map.put("target_type", workflow.getTargetType());
         map.put("rpo_ms", workflow.getRpoMs());
         map.put("rto_ms", workflow.getRtoMs());
+        // SLA 闭环指标（P2-4）：老 agent 不上报时为 null，前端据此显示 "--" 而不是 0
+        map.put("replication_lag_ms", workflow.getReplicationLagMs());
+        map.put("capture_replay_bytes", workflow.getCaptureReplayBytes());
+        map.put("restart_count_10m", workflow.getRestartCount10m());
+        map.put("conflict_count", workflow.getConflictCount());
+        map.put("deadletter_count", workflow.getDeadletterCount());
+        map.put("disk_usage_bytes", workflow.getDiskUsageBytes());
         map.put("task_type", workflow.getTaskType());
         map.put("dr_status", workflow.getDrStatus());
         map.put("dr_mode", workflow.getDrMode());

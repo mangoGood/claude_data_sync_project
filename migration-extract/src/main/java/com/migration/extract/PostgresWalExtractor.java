@@ -1,6 +1,7 @@
 package com.migration.extract;
 
 import com.migration.common.AbstractExtractor;
+import com.migration.common.txn.TxnMetadata;
 import com.migration.thl.THLEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -145,7 +146,40 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
             thlEvent.addMetadata("raw_data", eventData);
         }
 
+        stampTransaction(thlEvent, eventType, lsn);
+
         return thlEvent;
+    }
+
+    /**
+     * 当前源事务标识。PG 的逻辑解码流本身就是 {@code BEGIN … 变更 … COMMIT} 的形态，
+     * 且 BEGIN/COMMIT 都带 xid，直接拿 xid 做标识。不在事务中为 null。
+     */
+    private String currentTxId;
+
+    /** 给事件打上源事务边界（{@code tx_id} / {@code tx_last}）。 */
+    private void stampTransaction(THLEvent thlEvent, String eventType, String lsn) {
+        if ("BEGIN".equals(eventType)) {
+            Object xid = thlEvent.getMetadata().get("transaction_xid");
+            currentTxId = "pg:" + (xid != null ? xid : lsn);
+            thlEvent.addMetadata(TxnMetadata.TX_ID, currentTxId);
+            return;
+        }
+        if ("COMMIT".equals(eventType)) {
+            Object xid = thlEvent.getMetadata().get("transaction_xid");
+            // 没见过 BEGIN（断点续传落在事务中间）时退化为该事件自成一事务
+            thlEvent.addMetadata(TxnMetadata.TX_ID,
+                    currentTxId != null ? currentTxId : "pg:" + (xid != null ? xid : lsn));
+            thlEvent.addMetadata(TxnMetadata.TX_LAST, Boolean.TRUE);
+            if (xid != null) {
+                thlEvent.addMetadata(TxnMetadata.TX_SOURCE_ID, String.valueOf(xid));
+            }
+            currentTxId = null;
+            return;
+        }
+        if (currentTxId != null) {
+            thlEvent.addMetadata(TxnMetadata.TX_ID, currentTxId);
+        }
     }
 
     private void parseBeginEvent(THLEvent thlEvent, String eventData) {

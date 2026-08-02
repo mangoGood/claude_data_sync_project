@@ -48,7 +48,9 @@ public class MetadataController {
                 String type = request.get("type");
 
                 if (host != null && port != null && username != null) {
-                    String protocol = "postgresql".equalsIgnoreCase(type) ? "postgresql" : "mysql";
+                    // 连接串协议名按所选类型分派：不能一律 mysql/postgresql，否则 MongoDB 灾备
+                    // 用主机/端口表单测连时会拼出 mysql:// 串，被类型互斥判定直接拒掉。
+                    String protocol = connectionProtocolFor(type);
                     connectionStr = String.format("%s://%s:%s@%s:%s", protocol, username, password != null ? password : "", host, port);
                     if (expectedType == null || expectedType.isEmpty()) {
                         expectedType = protocol;
@@ -80,6 +82,24 @@ public class MetadataController {
                 "success", false,
                 "message", e.getMessage()
             ));
+        }
+    }
+
+    /**
+     * 数据库类型 → 连接串协议名。TiDB 讲 MySQL 协议故连接串仍是 {@code mysql://}；
+     * 未知类型回退 mysql，与历史行为一致。
+     */
+    private static String connectionProtocolFor(String type) {
+        if (type == null) {
+            return "mysql";
+        }
+        switch (type.toLowerCase()) {
+            case "postgresql": return "postgresql";
+            case "oracle":     return "oracle";
+            case "mongodb":    return "mongodb";
+            case "redis":      return "redis";
+            case "elasticsearch": return "elasticsearch";
+            default:           return "mysql";
         }
     }
 

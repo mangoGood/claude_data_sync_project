@@ -492,30 +492,24 @@ public class TiCDCCapture extends AbstractCapture<byte[]> {
         }
     }
 
+    /** 落盘 commitTs 位点，原子写（tmp+fsync+rename）——崩溃重启读它续传，见 {@link #loadResumeTs}。 */
     private void savePosition() {
         if (currentCommitTs <= 0) return;
-        File positionFile = new File(outputDir, "capture_position.properties");
         Properties posProps = new Properties();
         posProps.setProperty("binlog.file", positionFileName);
         posProps.setProperty("binlog.position", String.valueOf(currentCommitTs));
         posProps.setProperty("ticdc.commit.ts", String.valueOf(currentCommitTs));
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
-        try (FileOutputStream fos = new FileOutputStream(positionFile)) {
-            posProps.store(fos, "TiCDC capture position for task: " + taskId);
-        } catch (IOException e) {
-            logger.warn("保存捕获位点失败: {}", e.getMessage());
-        }
+        com.migration.common.position.CapturePositionStore.save(
+                outputDir, posProps, "TiCDC capture position for task: " + taskId);
     }
 
     private long loadResumeTs() {
-        File positionFile = new File(outputDir, "capture_position.properties");
-        if (!positionFile.exists()) return 0;
-        Properties posProps = new Properties();
-        try (java.io.FileInputStream fis = new java.io.FileInputStream(positionFile)) {
-            posProps.load(fis);
+        Properties posProps = com.migration.common.position.CapturePositionStore.load(outputDir);
+        try {
             return Long.parseLong(posProps.getProperty("ticdc.commit.ts", "0"));
-        } catch (Exception e) {
-            logger.warn("读取历史捕获位点失败，按 checkpoint 起点开始: {}", e.getMessage());
+        } catch (NumberFormatException e) {
+            logger.warn("历史捕获位点格式异常，按 checkpoint 起点开始: {}", e.getMessage());
             return 0;
         }
     }

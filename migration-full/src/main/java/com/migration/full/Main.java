@@ -34,6 +34,12 @@ public class Main {
             logger.info("任务 ID: {}", taskId);
             logger.info("使用配置文件: {}", configFile);
 
+            // 单实例互斥 + 父进程看门狗：两个全量进程同时搬同一批表会重复写目标库，
+            // 断点续传的分片进度也会被互相覆盖
+            if (taskId != null) {
+                com.migration.common.proc.ChildProcessBootstrap.init(taskId, "full");
+            }
+
             MigrationConfig config = taskId != null ? 
                 new MigrationConfig(configFile, taskId) : new MigrationConfig(configFile);
             logger.info("源数据库: {}", config.getSourceConfig().getDatabase());
@@ -332,25 +338,35 @@ public class Main {
             logger.info("========================================");
 
             int parallelism = Math.min(config.getFullParallelism(), tables.size());
-            if (parallelism > 1) {
-                // 表级并行：每个 worker 独立连接对，从共享队列领表（详见 ParallelDataMigration）。
-                // 连接配置必须用本次调用的 per-db 连接对——多库模式下全局配置的 database 为空/
-                // 无映射，worker 用它建连会连错库
-                new com.migration.full.migration.ParallelDataMigration(
-                        config, sourceConn.getConfig(), targetConn.getConfig(), progressManager)
-                        .migrateAllData(tables, parallelism);
-            } else {
-                DataMigration dataMigration = new DataMigration(
-                    sourceConn, targetConn,
-                    config.getBatchSize(),
-                    config.isContinueOnError(),
-                    progressManager,
-                    config.isShardEnabled(),
-                    config.getShardMinRows(),
-                    config.getShardCount()
-                );
-                dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
-                dataMigration.migrateAllData(tables);
+            // 一致性快照（P2-3）：搬运开始前建立，全库搬完再释放。
+            // 预建读会话数按最坏并发算（表级并行 × 单表分片）——MySQL 的快照绑在会话上，
+            // 预建少了会让 worker 排队等连接。
+            int readerCount = Math.max(1, parallelism) * (config.isShardEnabled() ? Math.max(1, config.getShardCount()) : 1);
+            try (com.migration.full.snapshot.ConsistentSnapshot snapshot =
+                         com.migration.full.snapshot.ConsistentSnapshot.begin(
+                                 sourceConn.getConfig(), config.getSnapshotMode(), readerCount, config.getTaskId())) {
+                if (parallelism > 1) {
+                    // 表级并行：每个 worker 独立连接对，从共享队列领表（详见 ParallelDataMigration）。
+                    // 连接配置必须用本次调用的 per-db 连接对——多库模式下全局配置的 database 为空/
+                    // 无映射，worker 用它建连会连错库
+                    new com.migration.full.migration.ParallelDataMigration(
+                            config, sourceConn.getConfig(), targetConn.getConfig(), progressManager)
+                            .setSnapshot(snapshot)
+                            .migrateAllData(tables, parallelism);
+                } else {
+                    DataMigration dataMigration = new DataMigration(
+                        sourceConn, targetConn,
+                        config.getBulkBatchRows(),
+                        config.isContinueOnError(),
+                        progressManager,
+                        config.isShardEnabled(),
+                        config.getShardMinRows(),
+                        config.getShardCount()
+                    );
+                    dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
+                    dataMigration.setSnapshot(snapshot);
+                    dataMigration.migrateAllData(tables);
+                }
             }
             logger.info("数据迁移完成");
         }
@@ -386,7 +402,7 @@ public class Main {
     }
 
     private static DatabaseConfig createDbConfig(DatabaseConfig baseConfig, String dbName) {
-        return new DatabaseConfig(
+        DatabaseConfig cfg = new DatabaseConfig(
             baseConfig.getHost(),
             baseConfig.getPort(),
             dbName,
@@ -394,6 +410,10 @@ public class Main {
             baseConfig.getPassword(),
             baseConfig.getDbType()
         );
+        // 批量装载的驱动参数挂在配置对象上，派生 per-db 配置时必须一并带走，
+        // 否则多库模式下目标连接拿不到 rewriteBatchedStatements，只有单库模式提速
+        cfg.copyJdbcOptionsFrom(baseConfig);
+        return cfg;
     }
 
     /**

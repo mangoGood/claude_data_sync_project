@@ -51,6 +51,8 @@ public class DataMigration {
     private static final long SHARDED_LAST_ID_SENTINEL = -1L;
     // 列处理（仅表级同步、mysql→mysql）：SELECT 行过滤 + INSERT 列名映射；附加列由建表 DEFAULT 承载
     private com.migration.config.ColumnProcessingConfig columnProcessing;
+    // 全量一致性快照（P2-3）：未注入 = 旧行为（每页新建源连接、无快照语义）
+    private com.migration.full.snapshot.ConsistentSnapshot snapshot;
 
     public DataMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection,
                         int batchSize, boolean continueOnError, ProgressManager progressManager) {
@@ -84,6 +86,48 @@ public class DataMigration {
     /** 注入列处理配置（未注入 = 无列处理，行为与既有逻辑完全一致）。 */
     public void setColumnProcessing(com.migration.config.ColumnProcessingConfig columnProcessing) {
         this.columnProcessing = columnProcessing;
+    }
+
+    /** 注入一致性快照（未注入 = 无快照，读取路径与旧行为一致）。 */
+    public void setSnapshot(com.migration.full.snapshot.ConsistentSnapshot snapshot) {
+        this.snapshot = snapshot;
+    }
+
+    /**
+     * 取一个源端分页读连接。
+     * 默认每页新建（关闭后强制释放 Oracle 会话 PGA，避免 ORA-04036）；
+     * 一致性快照下改为向快照借用——MySQL 的快照必须绑在固定会话上，每页新建就不是同一个快照了。
+     */
+    private Connection acquirePageConnection(DatabaseConnection src) throws SQLException {
+        if (snapshot != null && snapshot.providesReaders()) {
+            return snapshot.borrowReader();
+        }
+        return src.getConnection();
+    }
+
+    /** 归还分页读连接：快照连接交回快照管理（不能提交），否则按原逻辑关闭。 */
+    private void releasePageConnection(Connection conn) {
+        if (snapshot != null && snapshot.providesReaders()) {
+            snapshot.releaseReader(conn);
+            return;
+        }
+        try { conn.close(); } catch (SQLException e) { /* ignore */ }
+    }
+
+    /** 表引用加快照修饰（Oracle 闪回 {@code AS OF SCN}；其它库原样）。 */
+    private String snapshotTable(String quotedTable) {
+        return snapshot != null ? snapshot.decorateTable(quotedTable) : quotedTable;
+    }
+
+    /** 读一行并按源→目标库对做值转换，返回可直接绑定到 INSERT 的值数组。 */
+    private Object[] readRowValues(ResultSet rs, ResultSetMetaData metaData, int columnCount, TableInfo table)
+            throws SQLException {
+        Object[] values = new Object[columnCount];
+        for (int i = 1; i <= columnCount; i++) {
+            Object value = readColumnValue(rs, i, metaData, table);
+            values[i - 1] = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
+        }
+        return values;
     }
 
     /**
@@ -383,24 +427,25 @@ public class DataMigration {
                                  String columnList, String primaryKeyColumn,
                                  long lowerExclusive, long upperInclusive, String tableName,
                                  AtomicLong aggregateRows, AtomicLong maxSeenId, AtomicBoolean abort) throws SQLException {
-        int successCount = 0;
-        int failCount = 0;
+        long successCount = 0;
+        long failCount = 0;
         String sourceQuoteColumnList = buildSourceQuotedColumnList(table);
         // 表名映射：目标端 INSERT 用目标表名；源端 SELECT 与进度 key 仍用源表名
         String insertSql = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName()) + " (" + columnList + ") VALUES (" +
                 String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
 
         Connection targetConn = acquireTargetConnection(shardTgt);
-        PreparedStatement insertStmt = targetConn.prepareStatement(insertSql);
+        BatchWriter writer = new BatchWriter(targetConn, insertSql, tableName, batchSize);
         final int pageSize = 1000;
         long currentLastId = lowerExclusive;
 
         try {
             while (!abort.get() && currentLastId < upperInclusive) {
-                // 每页用独立连接：避免 Oracle 源端 PGA 累积（ORA-04036），做法与串行分页路径一致
-                Connection pageConn = shardSrc.getConnection();
+                // 每页用独立连接：避免 Oracle 源端 PGA 累积（ORA-04036），做法与串行分页路径一致；
+                // 一致性快照下改为向快照借用固定的快照会话（见 acquirePageConnection）
+                Connection pageConn = acquirePageConnection(shardSrc);
                 String shardKeepClause = filterKeepClause(tableName);
-                String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName) +
+                String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + snapshotTable(sourceQuoteIdentifier(tableName)) +
                         " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? AND " +
                         sourceQuoteIdentifier(primaryKeyColumn) + " <= ? " +
                         (shardKeepClause != null ? "AND " + shardKeepClause + " " : "") +
@@ -412,7 +457,6 @@ public class DataMigration {
                 ResultSet rs = selectStmt.executeQuery();
                 ResultSetMetaData metaData = rs.getMetaData();
                 int columnCount = metaData.getColumnCount();
-                int batchCount = 0;
                 int pageRows = 0;
                 int pageFetched = 0;   // 本页从源取到的行数（含冲突跳过的），用于判末页
                 while (rs.next()) {
@@ -420,13 +464,9 @@ public class DataMigration {
                     try {
                         if (targetConn.isClosed()) {
                             targetConn = acquireTargetConnection(shardTgt);
-                            insertStmt = targetConn.prepareStatement(insertSql);
+                            writer.rebind(targetConn);
                         }
-                        for (int i = 1; i <= columnCount; i++) {
-                            Object value = readColumnValue(rs, i, metaData, table);
-                            value = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
-                            insertStmt.setObject(i, value);
-                        }
+                        Object[] values = readRowValues(rs, metaData, columnCount, table);
                         for (int i = 1; i <= columnCount; i++) {
                             if (metaData.getColumnName(i).equals(primaryKeyColumn)) {
                                 Object idValue = rs.getObject(i);
@@ -436,44 +476,33 @@ public class DataMigration {
                                 break;
                             }
                         }
-                        insertStmt.addBatch();
-                        batchCount++;
-                        if (batchCount >= batchSize) {
-                            int[] results = insertStmt.executeBatch();
-                            successCount += countSuccess(results);
-                            failCount += countFailures(results);
-                            batchCount = 0;
+                        writer.add(values);
+                        if (writer.isFull()) {
+                            long[] r = writer.flush();
+                            successCount += r[0];
+                            failCount += r[1];
                         }
                         pageRows++;
                     } catch (SQLException e) {
-                        if (isDuplicateKeyError(e)) {
-                            logger.warn("主键冲突，跳过该行，表: {}", tableName);
-                        } else {
-                            failCount++;
-                            logger.error("插入数据失败，表: {}", tableName, e);
-                            if (!continueOnError) { throw e; }
-                            try {
-                                if (targetConn.isClosed()) { targetConn = acquireTargetConnection(shardTgt); }
-                                insertStmt = targetConn.prepareStatement(insertSql);
-                            } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
-                        }
+                        failCount++;
+                        logger.error("读取/写入数据失败，表: {}", tableName, e);
+                        if (!continueOnError) { throw e; }
+                        try {
+                            if (targetConn.isClosed()) {
+                                targetConn = acquireTargetConnection(shardTgt);
+                                writer.rebind(targetConn);
+                            }
+                        } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
                     }
                 }
-                if (batchCount > 0) {
-                    try {
-                        int[] results = insertStmt.executeBatch();
-                        successCount += countSuccess(results);
-                        failCount += countFailures(results);
-                    } catch (SQLException e) {
-                        if (!isDuplicateKeyError(e)) {
-                            logger.error("执行批数据失败，表: {}", tableName, e);
-                            if (!continueOnError) { throw e; }
-                        }
-                    }
+                if (!writer.isEmpty()) {
+                    long[] r = writer.flush();
+                    successCount += r[0];
+                    failCount += r[1];
                 }
                 rs.close();
                 selectStmt.close();
-                try { pageConn.close(); } catch (SQLException e) { /* ignore */ }
+                releasePageConnection(pageConn);
 
                 // 仅更新内存中的聚合计数（纯原子操作，无 DB I/O）；落库由外层统一的
                 // 低频 progressReporter 线程完成，避免 shards 个线程各自落库造成的写压力
@@ -485,17 +514,17 @@ public class DataMigration {
                 if (pageFetched < pageSize) break;
             }
         } finally {
-            try { insertStmt.close(); } catch (SQLException e) { /* ignore */ }
+            writer.close();
         }
 
-        return new int[]{successCount, failCount};
+        return new int[]{(int) successCount, (int) failCount};
     }
 
     private int[] migrateDataBatch(TableInfo table, String columnList, long totalRows, String primaryKeyColumn) throws SQLException {
         String tableName = table.getTableName();
-        int successCount = 0;
-        int failCount = 0;
-        
+        long successCount = 0;
+        long failCount = 0;
+
         MigrationProgress progress = null;
         Long lastMigratedId = null;
         long startOffset = 0;
@@ -518,9 +547,8 @@ public class DataMigration {
         String insertSql = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName()) + " (" + columnList + ") VALUES (" +
                           String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
 
-        Connection sourceConn = sourceConnection.getConnection();
         Connection targetConn = acquireTargetConnection(targetConnection);
-        PreparedStatement insertStmt = targetConn.prepareStatement(insertSql);
+        BatchWriter writer = new BatchWriter(targetConn, insertSql, tableName, batchSize);
 
         // 分页大小：有主键时启用分页查询，避免大结果集（尤其含 LOB）占用源端 PGA 导致 ORA-04036
         final int pageSize = 1000;
@@ -529,27 +557,42 @@ public class DataMigration {
         try {
             long processedRows = startOffset;
             Long currentLastId = (lastMigratedId != null) ? lastMigratedId : 0L;
+            // 首页是否带下界。旧实现无条件用 `pk > 0` 起扫，于是<b>主键 ≤ 0 的行被整行跳过</b>——
+            // 表里只有一行 id=0 时，日志还是"本页 0 行 / 迁移成功完成"，静默丢数据。
+            // 只有断点续传（有已落盘的 lastMigratedId）才需要下界；首次搬运不加，扫全表。
+            boolean withLowerBound = (lastMigratedId != null);
 
             if (usePaging) {
                 // ===== 分页循环：每页查询 pageSize 行，处理完关闭 ResultSet 释放源端 PGA =====
                 while (true) {
                     // 每页用独立连接：上一页查询后 Oracle 会话 PGA 累积不释放（ORA-04036），
-                    // 关闭并重建连接强制释放源端会话 PGA
-                    Connection pageConn = sourceConnection.getConnection();
+                    // 关闭并重建连接强制释放源端会话 PGA；一致性快照下改为借用快照会话
+                    Connection pageConn = acquirePageConnection(sourceConnection);
                     // 分页子句按源库方言生成：MySQL → LIMIT，Oracle/PostgreSQL → FETCH FIRST ... ROWS ONLY
                     String pageKeepClause = filterKeepClause(tableName);
-                    String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName) +
-                            " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? " +
-                            (pageKeepClause != null ? "AND " + pageKeepClause + " " : "") +
+                    String lowerBoundClause = withLowerBound
+                            ? sourceQuoteIdentifier(primaryKeyColumn) + " > ? "
+                            : null;
+                    String whereClause = "";
+                    if (lowerBoundClause != null && pageKeepClause != null) {
+                        whereClause = " WHERE " + lowerBoundClause + "AND " + pageKeepClause + " ";
+                    } else if (lowerBoundClause != null) {
+                        whereClause = " WHERE " + lowerBoundClause;
+                    } else if (pageKeepClause != null) {
+                        whereClause = " WHERE " + pageKeepClause + " ";
+                    }
+                    String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + snapshotTable(sourceQuoteIdentifier(tableName)) +
+                            whereClause +
                             "ORDER BY " +
                             sourceQuoteIdentifier(primaryKeyColumn) + " " + sourceDialect.limitClause(pageSize);
                     PreparedStatement selectStmt = pageConn.prepareStatement(pageSql);
-                    selectStmt.setLong(1, currentLastId);
+                    if (withLowerBound) {
+                        selectStmt.setLong(1, currentLastId);
+                    }
                     ResultSet rs = selectStmt.executeQuery();
                     // 每页重新获取 metaData：上一页 rs.close() 后旧的 metaData 会失效（ORA-17009）
                     ResultSetMetaData metaData = rs.getMetaData();
                     int columnCount = metaData.getColumnCount();
-                    int batchCount = 0;
                     int pageRows = 0;
                     int pageFetched = 0;   // 本页从源取到的行数（含冲突跳过的），用于判末页
                     while (rs.next()) {
@@ -558,13 +601,9 @@ public class DataMigration {
                             if (targetConn.isClosed()) {
                                 logger.warn("目标数据库连接已关闭，重新建立连接");
                                 targetConn = acquireTargetConnection(targetConnection);
-                                insertStmt = targetConn.prepareStatement(insertSql);
+                                writer.rebind(targetConn);
                             }
-                            for (int i = 1; i <= columnCount; i++) {
-                                Object value = readColumnValue(rs, i, metaData, table);
-                                value = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
-                                insertStmt.setObject(i, value);
-                            }
+                            Object[] values = readRowValues(rs, metaData, columnCount, table);
                             for (int i = 1; i <= columnCount; i++) {
                                 if (metaData.getColumnName(i).equals(primaryKeyColumn)) {
                                     Object idValue = rs.getObject(i);
@@ -574,13 +613,11 @@ public class DataMigration {
                                     break;
                                 }
                             }
-                            insertStmt.addBatch();
-                            batchCount++;
-                            if (batchCount >= batchSize) {
-                                int[] results = insertStmt.executeBatch();
-                                successCount += countSuccess(results);
-                                failCount += countFailures(results);
-                                batchCount = 0;
+                            writer.add(values);
+                            if (writer.isFull()) {
+                                long[] r = writer.flush();
+                                successCount += r[0];
+                                failCount += r[1];
                                 if (progressManager != null && progressManager.isEnabled()) {
                                     progressManager.updateProgress(tableName, processedRows, currentLastId);
                                 }
@@ -588,42 +625,35 @@ public class DataMigration {
                             processedRows++;
                             pageRows++;
                         } catch (SQLException e) {
-                            if (isDuplicateKeyError(e)) {
-                                logger.warn("主键冲突，跳过该行，表: {}, 行: {}", tableName, processedRows);
-                            } else {
-                                failCount++;
-                                logger.error("插入数据失败，表: {}, 行: {}", tableName, processedRows, e);
-                                if (progressManager != null && progressManager.isEnabled()) {
-                                    try { progressManager.updateProgress(tableName, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
-                                }
-                                if (!continueOnError) { throw e; }
-                                try {
-                                    if (targetConn.isClosed()) { targetConn = acquireTargetConnection(targetConnection); }
-                                    insertStmt = targetConn.prepareStatement(insertSql);
-                                } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
+                            failCount++;
+                            logger.error("读取/写入数据失败，表: {}, 行: {}", tableName, processedRows, e);
+                            if (progressManager != null && progressManager.isEnabled()) {
+                                try { progressManager.updateProgress(tableName, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
                             }
+                            if (!continueOnError) { throw e; }
+                            try {
+                                if (targetConn.isClosed()) {
+                                    targetConn = acquireTargetConnection(targetConnection);
+                                    writer.rebind(targetConn);
+                                }
+                            } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
                         }
                     }
-                    if (batchCount > 0) {
-                        try {
-                            int[] results = insertStmt.executeBatch();
-                            successCount += countSuccess(results);
-                            failCount += countFailures(results);
-                        } catch (SQLException e) {
-                            if (!isDuplicateKeyError(e)) {
-                                logger.error("执行批数据失败，表: {}", tableName, e);
-                                if (!continueOnError) { throw e; }
-                            }
-                        }
+                    if (!writer.isEmpty()) {
+                        long[] r = writer.flush();
+                        successCount += r[0];
+                        failCount += r[1];
                     }
                     if (progressManager != null && progressManager.isEnabled()) {
                         try { progressManager.updateProgress(tableName, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
                     }
                     rs.close();
                     selectStmt.close();
-                    // 关闭源连接，强制释放 Oracle 会话 PGA，避免 ORA-04036
-                    try { pageConn.close(); } catch (SQLException e) { /* ignore */ }
+                    // 关闭源连接，强制释放 Oracle 会话 PGA，避免 ORA-04036（快照模式下交回快照池）
+                    releasePageConnection(pageConn);
                     logger.info("表 {} 分页迁移一页完成，本页 {} 行，累计 {}/{}", tableName, pageRows, processedRows, totalRows);
+                    // 首页扫完后 currentLastId 已经是真实的主键值，后续页一律带下界翻页
+                    withLowerBound = true;
                     // 是否末页必须按「从源取到的行数」判断，而非「成功插入数」：断点续传从
                     // lastMigratedId 续扫时会与已插入区间重叠、触发主键冲突被跳过，pageRows 因此
                     // 小于 pageSize；若据此判末页会 break 掉后续所有页，任务却标 COMPLETED → 丢数据。
@@ -631,57 +661,55 @@ public class DataMigration {
                 }
             } else {
                 // ===== 无主键 fallback：单次全表查询 =====
-                String selectSql = "SELECT " + sourceQuoteColumnList + " FROM " + sourceQuoteIdentifier(tableName);
+                String selectSql = "SELECT " + sourceQuoteColumnList + " FROM " + snapshotTable(sourceQuoteIdentifier(tableName));
                 String fullKeepClause = filterKeepClause(tableName);
                 if (fullKeepClause != null) {
                     selectSql += " WHERE " + fullKeepClause;
                 }
-                PreparedStatement selectStmt = sourceConn.prepareStatement(selectSql);
+                Connection scanConn = acquirePageConnection(sourceConnection);
+                PreparedStatement selectStmt = scanConn.prepareStatement(selectSql);
                 ResultSet rs = selectStmt.executeQuery();
                 ResultSetMetaData metaData = rs.getMetaData();
                 int columnCount = metaData.getColumnCount();
-                int batchCount = 0;
                 while (rs.next()) {
                     try {
                         if (targetConn.isClosed()) {
                             targetConn = acquireTargetConnection(targetConnection);
-                            insertStmt = targetConn.prepareStatement(insertSql);
+                            writer.rebind(targetConn);
                         }
-                        for (int i = 1; i <= columnCount; i++) {
-                            Object value = readColumnValue(rs, i, metaData, table);
-                            value = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
-                            insertStmt.setObject(i, value);
-                        }
-                        insertStmt.addBatch();
-                        batchCount++;
-                        if (batchCount >= batchSize) {
-                            int[] results = insertStmt.executeBatch();
-                            successCount += countSuccess(results);
-                            failCount += countFailures(results);
-                            batchCount = 0;
+                        writer.add(readRowValues(rs, metaData, columnCount, table));
+                        if (writer.isFull()) {
+                            long[] r = writer.flush();
+                            successCount += r[0];
+                            failCount += r[1];
                             if (progressManager != null && progressManager.isEnabled()) {
                                 progressManager.updateProgress(tableName, processedRows, currentLastId);
                             }
                         }
                         processedRows++;
                     } catch (SQLException e) {
-                        if (isDuplicateKeyError(e)) {
-                            logger.warn("主键冲突，跳过该行，表: {}, 行: {}", tableName, processedRows);
-                        } else {
-                            failCount++;
-                            logger.error("插入数据失败，表: {}, 行: {}", tableName, processedRows, e);
-                            if (!continueOnError) { throw e; }
-                            try { insertStmt = targetConn.prepareStatement(insertSql); } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
-                        }
+                        failCount++;
+                        logger.error("读取/写入数据失败，表: {}, 行: {}", tableName, processedRows, e);
+                        if (!continueOnError) { throw e; }
+                        try {
+                            if (targetConn.isClosed()) {
+                                targetConn = acquireTargetConnection(targetConnection);
+                                writer.rebind(targetConn);
+                            }
+                        } catch (SQLException ex2) { logger.error("重建目标连接失败", ex2); }
                     }
                 }
-                if (batchCount > 0) {
-                    int[] results = insertStmt.executeBatch();
-                    successCount += countSuccess(results);
-                    failCount += countFailures(results);
+                if (!writer.isEmpty()) {
+                    long[] r = writer.flush();
+                    successCount += r[0];
+                    failCount += r[1];
                 }
                 rs.close();
                 selectStmt.close();
+                // 无主键路径此前用的是共享的 sourceConnection（不关闭）；快照下必须归还借出的会话
+                if (snapshot != null && snapshot.providesReaders()) {
+                    releasePageConnection(scanConn);
+                }
             }
 
             logger.info("表 {} 数据迁移完成，成功: {}, 失败: {}", tableName, successCount, failCount);
@@ -689,10 +717,10 @@ public class DataMigration {
                 try { progressManager.completeMigration(tableName); } catch (SQLException e) { logger.error("标记迁移完成失败", e); }
             }
         } finally {
-            try { insertStmt.close(); } catch (SQLException e) { /* ignore */ }
+            writer.close();
         }
 
-        return new int[]{successCount, failCount};
+        return new int[]{(int) successCount, (int) failCount};
     }
 
     private Object readColumnValue(ResultSet rs, int i, ResultSetMetaData metaData, TableInfo table) throws SQLException {
@@ -863,43 +891,8 @@ public class DataMigration {
         return placeholders;
     }
 
-    private int countSuccess(int[] results) {
-        int count = 0;
-        for (int result : results) {
-            if (result >= 0) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    private int countFailures(int[] results) {
-        int count = 0;
-        for (int result : results) {
-            if (result < 0) {
-                count++;
-            }
-        }
-        return count;
-    }
-    
-    private boolean isDuplicateKeyError(SQLException e) {
-        int errorCode = e.getErrorCode();
-        String sqlState = e.getSQLState();
-        
-        if (errorCode == 1062 || "23000".equals(sqlState)) {
-            return true;
-        }
-        
-        String message = e.getMessage();
-        if (message != null && (message.contains("Duplicate entry") || 
-            message.contains("duplicate key value") || 
-            message.contains("PRIMARY") || message.contains("UNIQUE"))) {
-            return true;
-        }
-        
-        return false;
-    }
+    // countSuccess / countFailures / isDuplicateKeyError → 已随批量装载通道收敛到 BatchWriter：
+    // 批结果码的判定（SUCCESS_NO_INFO 必须算成功）与冲突跳过必须和装载方式绑在一起，分开写必错。
 
     private String quoteIdentifier(String identifier) {
         return targetDialect.quoteIdentifier(identifier);

@@ -9,3 +9,4 @@ files/
 .synctask_agent_token
 __pycache__/
 .venv_fi/
+.DS_Store

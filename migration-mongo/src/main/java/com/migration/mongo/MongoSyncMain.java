@@ -2,9 +2,12 @@ package com.migration.mongo;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import com.migration.common.bidi.BidiConstants;
+import com.migration.common.bidi.BidiLoopGuard;
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.client.ChangeStreamIterable;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
@@ -61,6 +64,9 @@ public final class MongoSyncMain {
     private static final int TOKEN_FLUSH_EVERY_EVENTS = 100;
     private static final long TOKEN_FLUSH_INTERVAL_MS = 5000;
 
+    /** 系统库：灾备/订阅自动发现同步对象时一律排除。 */
+    static final List<String> SYSTEM_DATABASES = java.util.Arrays.asList("admin", "local", "config");
+
     private final String taskId;
     private final Properties props;
     /** 同步对象：db -> 集合清单；空清单 = 整库（dbLevel） */
@@ -69,6 +75,20 @@ public final class MongoSyncMain {
     private final MongoDocumentProcessor processor;
     private final Path progressPath;
     private final Path tokenPath;
+    /** 灾备任务（含双向的反向影子通道）：同步对象可留空由本进程在源实例上自动发现。 */
+    private final boolean drTask;
+    /**
+     * 仅增量：跳过全量、从当前流位点起步。两种场景必须置位，否则会把数据反向灌回去：
+     * <ul>
+     *   <li>双向灾备的反向影子通道（DR_SHADOW）——反向全量会把灾备库整个搬回主库；</li>
+     *   <li>主备倒换后的重启——新源就是原目标，全量等于把备库重新灌回原主库。</li>
+     * </ul>
+     */
+    private final boolean incrementOnly;
+    /** 双向灾备防回环：应用写入带 origin 标记事务，捕获侧见标记即跳过整个事务。 */
+    private final boolean bidiEnabled;
+    /** 本节点标识（写进标记文档，仅供观测/排障；跳过判定不依赖其取值）。 */
+    private final String nodeId;
 
     // 进度状态
     private volatile String phase = "FULL";
@@ -77,6 +97,7 @@ public final class MongoSyncMain {
     private volatile String currentCollection = "";
     private volatile long copiedDocs;
     private volatile long incrEvents;
+    private volatile long skippedLoopEvents;
     private volatile String error;
 
     private MongoSyncMain(String taskId, Properties props) {
@@ -86,6 +107,10 @@ public final class MongoSyncMain {
         this.processor = MongoDocumentProcessor.fromProperties(props);
         this.progressPath = Paths.get("files", taskId, "mongo_progress.json");
         this.tokenPath = Paths.get("files", taskId, "checkpoint", "mongo_resume_token.json");
+        this.drTask = "DR".equals(props.getProperty("task.type", ""));
+        this.incrementOnly = Boolean.parseBoolean(props.getProperty("migration.increment.only", "false"));
+        this.bidiEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
+        this.nodeId = com.migration.common.bidi.BidiConstants.nodeId(props);
     }
 
     public static void main(String[] args) throws Exception {
@@ -100,10 +125,28 @@ public final class MongoSyncMain {
             System.exit(1);
         }
 
+        // 单实例互斥 + 父进程看门狗：同一 taskId 只允许一个 mongo 引擎进程
+        com.migration.common.proc.ChildProcessBootstrap.init(taskId, "mongo");
+
         Properties props = new Properties();
         File configFile = new File("files/" + taskId + "/config.properties");
         try (FileInputStream in = new FileInputStream(configFile)) {
             props.load(in);
+        }
+
+        // 数据订阅（mongodb → Kafka）与同步（mongodb → mongodb）共用本 jar 的入口：
+        // 二者都是"单进程 + Change Streams"，只是出口不同，分派放在这里比再拆一个模块/jar 划算。
+        if ("SUBSCRIBE".equals(props.getProperty("task.type", ""))) {
+            MongoSubscribeMain subscribe = new MongoSubscribeMain(taskId, props,
+                    parseSyncObjects(props.getProperty("migration.sync.objects", "")));
+            try {
+                subscribe.run();
+            } catch (Exception e) {
+                logger.error("Mongo 订阅失败", e);
+                subscribe.failProgress(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+                System.exit(1);
+            }
+            return;
         }
 
         MongoSyncMain sync = new MongoSyncMain(taskId, props);
@@ -119,9 +162,12 @@ public final class MongoSyncMain {
     }
 
     private void run() throws Exception {
-        boolean fullAndIncre = "fullAndIncre".equals(props.getProperty("migration.mode", "full"));
-        logger.info("Mongo 同步启动: taskId={}, mode={}, syncObjects={}",
-                taskId, fullAndIncre ? "fullAndIncre" : "full", syncObjects.keySet());
+        // 仅增量（灾备反向通道 / 倒换后重启）必然含增量阶段，即便 migration.mode 缺省也不能当纯全量跑
+        boolean fullAndIncre = incrementOnly
+                || "fullAndIncre".equals(props.getProperty("migration.mode", "full"));
+        logger.info("Mongo 同步启动: taskId={}, mode={}, syncObjects={}, dr={}, incrementOnly={}, bidi={}",
+                taskId, fullAndIncre ? "fullAndIncre" : "full", syncObjects.keySet(),
+                drTask, incrementOnly, bidiEnabled);
         if (!processor.isEmpty()) {
             logger.info("列处理已启用（列过滤/列名映射/附加列按集合生效）");
         }
@@ -129,20 +175,39 @@ public final class MongoSyncMain {
         try (MongoClient source = MongoClients.create(clientSettings("source"));
              MongoClient target = MongoClients.create(clientSettings("target"))) {
 
-            // 增量起点：优先用 checkpoint 里的 token（断点续传）；否则在全量前取当前流位点，
-            // 保证全量期间源库的写入会在增量阶段被重放（upsert 幂等，不丢不重）。
-            BsonDocument resumeToken = fullAndIncre ? loadResumeToken() : null;
+            // 灾备任务允许不指定同步对象：在源实例上发现全部非系统库（整库同步）
+            discoverDrDatabases(source);
+
+            // resume token 只在"同一个源部署"上有意义：主备倒换后源已换成原目标实例，
+            // 旧 token 里的时间戳/UUID 在新源的 oplog 上要么直接报错要么落到错误位置。
+            // 因此 checkpoint 连同源部署标识一起落盘，不匹配即丢弃、从当前位点起步。
+            String sourceId = deploymentId(source, "source");
+            Checkpoint checkpoint = fullAndIncre ? loadCheckpoint(sourceId) : null;
+            BsonDocument resumeToken = checkpoint != null ? checkpoint.token : null;
             boolean resumedFromCheckpoint = resumeToken != null;
             if (fullAndIncre && resumeToken == null) {
                 resumeToken = currentStreamToken(source);
-                logger.info("已记录增量起始位点（全量开始前）");
+                logger.info("已记录增量起始位点（{}）", incrementOnly ? "仅增量，从当前位点起步" : "全量开始前");
+                if (incrementOnly) {
+                    // 仅增量模式必须**立刻**把起始位点落盘。否则进程在首次周期性 flush（5s）之前
+                    // 崩溃，重启后又是"没有 checkpoint 的仅增量"，只能再从**当时的**最新位点起步，
+                    // 这两次起步之间源库的写入就永久漏掉了——而仅增量模式没有全量兜底可以补回来。
+                    // 实测：主备倒换窗口内杀掉引擎，新方向少了 628 行。
+                    //
+                    // 只在仅增量模式这么做：普通模式下"token 存在"意味着"全量已完成"，
+                    // 提前落盘会让全量中途崩溃的进程重启后直接跳过全量，那才是真丢数据。
+                    saveCheckpoint(resumeToken, null, sourceId);
+                    logger.info("仅增量模式：起始位点已立即落盘，崩溃重启从该位点续传而非跳到最新");
+                }
             }
 
             // 断点续传（进程重启）时跳过全量：数据已在目标，增量从 token 续传即可
-            if (!resumedFromCheckpoint) {
-                runFullCopy(source, target);
-            } else {
+            if (resumedFromCheckpoint) {
                 logger.info("检测到增量 checkpoint，跳过全量，直接从断点续传增量");
+            } else if (incrementOnly) {
+                logger.info("仅增量模式：跳过全量（反向灾备通道/主备倒换后重启），从当前流位点开始捕获");
+            } else {
+                runFullCopy(source, target);
             }
 
             if (!fullAndIncre) {
@@ -154,8 +219,44 @@ public final class MongoSyncMain {
 
             phase = "INCREMENT";
             writeProgress();
-            runChangeStream(source, target, resumeToken);
+            runChangeStream(source, target, resumeToken,
+                    checkpoint != null ? checkpoint.markedTxnKey : null, sourceId);
         }
+    }
+
+    /**
+     * 灾备任务未指定同步对象时，在源实例上发现全部非系统库并按整库同步登记。
+     *
+     * <p>与 SQL 灾备链路（agent ConfigService.discoverDrSyncObjects）同样的语义，但 Mongo 走
+     * mongodb-driver 而非 JDBC，放在引擎侧做可以让 agent 不必额外引入 mongo 驱动。
+     */
+    private void discoverDrDatabases(MongoClient source) {
+        if (!syncObjects.isEmpty() || !drTask) {
+            return;
+        }
+        for (String db : source.listDatabaseNames()) {
+            if (SYSTEM_DATABASES.contains(db)) {
+                continue;
+            }
+            syncObjects.put(db, new ArrayList<>()); // 空清单 = 整库
+        }
+        logger.info("灾备任务自动发现同步对象（整库）: {}", syncObjects.keySet());
+    }
+
+    /** 源部署标识：主机端口 + 副本集名。倒换/换源后与 checkpoint 里记录的不一致，据此作废旧 token。 */
+    private String deploymentId(MongoClient client, String prefix) {
+        String setName = "";
+        try {
+            Document hello = client.getDatabase("admin").runCommand(new Document("hello", 1));
+            Object sn = hello.get("setName");
+            if (sn != null) {
+                setName = String.valueOf(sn);
+            }
+        } catch (Exception e) {
+            logger.warn("获取源部署信息失败（不影响同步，仅用于 checkpoint 归属判定）: {}", e.getMessage());
+        }
+        return props.getProperty(prefix + ".db.host", "") + ":"
+                + props.getProperty(prefix + ".db.port", "") + "/" + setName;
     }
 
     // ==================== 全量 ====================
@@ -248,8 +349,10 @@ public final class MongoSyncMain {
         }
     }
 
-    private void runChangeStream(MongoClient source, MongoClient target, BsonDocument resumeToken) throws Exception {
-        logger.info("增量启动（Change Streams），resumeToken={}", resumeToken != null ? "已有" : "无（从当前）");
+    private void runChangeStream(MongoClient source, MongoClient target, BsonDocument resumeToken,
+                                 String resumedMarkedTxnKey, String sourceId) throws Exception {
+        logger.info("增量启动（Change Streams），resumeToken={}, 防回环={}",
+                resumeToken != null ? "已有" : "无（从当前）", bidiEnabled ? "开启" : "关闭");
         ChangeStreamIterable<Document> stream = source.watch()
                 .fullDocument(FullDocument.UPDATE_LOOKUP)
                 .maxAwaitTime(1, TimeUnit.SECONDS);
@@ -261,14 +364,45 @@ public final class MongoSyncMain {
         int sinceFlush = 0;
         ReplaceOptions upsert = new ReplaceOptions().upsert(true);
 
+        // 防回环状态机：与 MySQL binlog / PG WAL 用的是同一个 BidiLoopGuard，
+        // 只是"事务边界"在 Change Streams 里靠事件自带的 (lsid, txnNumber) 变化来识别。
+        BidiLoopGuard guard = new BidiLoopGuard(bidiEnabled);
+        String currentTxnKey = null;
+        if (bidiEnabled && resumedMarkedTxnKey != null) {
+            // 断点恰好落在"已读到标记、事务其余事件还没读完"的中间：恢复跳过态，
+            // 否则该事务剩下的业务事件会被当成本地写入回传，形成回环。
+            currentTxnKey = resumedMarkedTxnKey;
+            guard.onOriginMarker();
+            logger.info("恢复防回环跳过态：断点位于已打标事务 {} 中间", resumedMarkedTxnKey);
+        }
+
         try (MongoChangeStreamCursor<ChangeStreamDocument<Document>> cursor = stream.cursor()) {
             while (true) {
                 ChangeStreamDocument<Document> event = cursor.tryNext();
                 long now = System.currentTimeMillis();
 
                 if (event != null) {
-                    applyEvent(target, event, upsert);
-                    incrEvents++;
+                    boolean propagate = true;
+                    if (bidiEnabled) {
+                        String txnKey = txnKeyOf(event);
+                        if (!java.util.Objects.equals(txnKey, currentTxnKey)) {
+                            currentTxnKey = txnKey;
+                            guard.onTransactionBoundary();
+                        }
+                        if (isMarkerEvent(event)) {
+                            // 标记本身永不传播；它的出现说明本事务是对端 apply 写进来的
+                            guard.onOriginMarker();
+                            propagate = false;
+                        } else if (guard.shouldSkipReplicatedData()) {
+                            propagate = false;
+                            skippedLoopEvents++;
+                        }
+                    }
+
+                    if (propagate) {
+                        applyEvent(target, event, upsert);
+                        incrEvents++;
+                    }
                     sinceFlush++;
                 }
 
@@ -276,7 +410,7 @@ public final class MongoSyncMain {
                 if (sinceFlush >= TOKEN_FLUSH_EVERY_EVENTS || now - lastFlush >= TOKEN_FLUSH_INTERVAL_MS) {
                     BsonDocument token = cursor.getResumeToken();
                     if (token != null) {
-                        saveResumeToken(token);
+                        saveCheckpoint(token, guard.currentTxnMarked() ? currentTxnKey : null, sourceId);
                     }
                     writeProgress();
                     lastFlush = now;
@@ -284,6 +418,22 @@ public final class MongoSyncMain {
                 }
             }
         }
+    }
+
+    /** 事务身份：同一事务内的所有 change stream 事件带同一对 (lsid, txnNumber)；非事务写入返回 null。 */
+    private static String txnKeyOf(ChangeStreamDocument<Document> event) {
+        BsonDocument lsid = event.getLsid();
+        org.bson.BsonInt64 txnNumber = event.getTxnNumber();
+        if (lsid == null || txnNumber == null) {
+            return null;
+        }
+        return lsid.toJson() + "#" + txnNumber.getValue();
+    }
+
+    /** 是否是对端 apply 写入的 origin 标记事件（集合名即约定的标记集合）。 */
+    private static boolean isMarkerEvent(ChangeStreamDocument<Document> event) {
+        return event.getNamespace() != null
+                && BidiConstants.MARKER_TABLE.equals(event.getNamespace().getCollectionName());
     }
 
     private void applyEvent(MongoClient target, ChangeStreamDocument<Document> event, ReplaceOptions upsert) {
@@ -296,47 +446,136 @@ public final class MongoSyncMain {
             return;
         }
 
-        MongoCollection<Document> tgt = target.getDatabase(db).getCollection(coll);
-        boolean active = processor.isActive(db, coll);
         OperationType op = event.getOperationType();
         try {
-            switch (op) {
-                case INSERT:
-                case REPLACE:
-                case UPDATE: {
-                    // 统一用 fullDocument upsert：幂等、天然处理乱序/重放；
-                    // UPDATE 且 fullDocument 为 null = 文档在 lookup 前已被删除，交给后续 DELETE 事件
-                    Document full = event.getFullDocument();
-                    if (full != null) {
-                        if (active && processor.excluded(db, coll, full)) {
-                            // 后镜像命中列过滤 → 目标端按 _id 删除（与 mysql/pg 的
-                            // "UPDATE 后镜像被过滤转 DELETE" 语义一致，处理"原本符合、改后不符合"）
-                            tgt.deleteOne(new Document("_id", full.get("_id")));
-                        } else {
-                            Document out = active ? processor.transform(db, coll, full) : full;
-                            tgt.replaceOne(new Document("_id", out.get("_id")), out, upsert);
-                        }
-                    }
-                    break;
-                }
-                case DELETE: {
-                    BsonDocument key = event.getDocumentKey();
-                    if (key != null) {
-                        tgt.deleteOne(key);
-                    }
-                    break;
-                }
-                case DROP:
-                    tgt.drop();
-                    logger.info("集合 {}.{} 已随源库 drop", db, coll);
-                    break;
-                default:
-                    logger.debug("跳过不处理的事件类型: {} on {}.{}", op, db, coll);
+            if (op == OperationType.DROP) {
+                // DDL 不能进事务，因此 drop 无法带 origin 标记。双向下对端会把这次 drop 回传一次，
+                // 但对一个已经不存在的集合执行 drop 是 no-op 且不产生 oplog 事件，回环在一跳内自然终止。
+                target.getDatabase(db).getCollection(coll).drop();
+                logger.info("集合 {}.{} 已随源库 drop", db, coll);
+                return;
+            }
+            if (bidiEnabled) {
+                applyInMarkedTransaction(target, db, coll, event, upsert);
+            } else {
+                applyDml(target.getDatabase(db).getCollection(coll), db, coll, event, upsert, null);
             }
         } catch (Exception e) {
             // 单事件失败记日志继续（upsert/delete 幂等，绝大多数为暂时性错误，
             // 下轮 resume 重放可自愈；不因单事件卡死整个流）
             logger.error("应用增量事件失败: {} {}.{}: {}", op, db, coll, e.getMessage());
+        }
+    }
+
+    /**
+     * 双向灾备的应用写入：在一个多文档事务里**先**写 origin 标记、再写业务数据。
+     *
+     * <p>这两条写入原子提交进目标库的 oplog，对端的 change stream 会按顺序读到它们，且同一事务
+     * 的事件带相同 (lsid, txnNumber)。对端捕获侧读到标记即判定整个事务"是复制来的"，跳过其业务
+     * 事件不再回传 —— 与 MySQL binlog / PG WAL 侧完全同一套约定（标记必先于业务 DML）。
+     *
+     * <p>每个事件一个事务而不是攒批：批内任一事件写失败会整批回滚，重放/补偿逻辑复杂且容易在
+     * 极端条件下丢事件；单事件事务在副本集上开销可接受，换来的是"失败只影响这一条"。
+     */
+    private void applyInMarkedTransaction(MongoClient target, String db, String coll,
+                                          ChangeStreamDocument<Document> event, ReplaceOptions upsert) {
+        MongoDatabase tgtDb = target.getDatabase(db);
+        // 事务内隐式建集合要 MongoDB 4.4+，先在事务外确保集合存在，兼容 4.0/4.2 且只做一次
+        ensureCollection(tgtDb, BidiConstants.MARKER_TABLE);
+        ensureCollection(tgtDb, coll);
+
+        try (ClientSession session = target.startSession()) {
+            session.startTransaction();
+            try {
+                writeOriginMarker(tgtDb, session);
+                applyDml(tgtDb.getCollection(coll), db, coll, event, upsert, session);
+                session.commitTransaction();
+            } catch (RuntimeException e) {
+                try {
+                    session.abortTransaction();
+                } catch (Exception ignore) {
+                    // abort 失败无需再处理：事务未提交，超时后自动回滚
+                }
+                throw e;
+            }
+        }
+    }
+
+    /** 应用一条 DML（session 为 null 时非事务写入，即单向同步的原有路径）。 */
+    private void applyDml(MongoCollection<Document> tgt, String db, String coll,
+                          ChangeStreamDocument<Document> event, ReplaceOptions upsert,
+                          ClientSession session) {
+        boolean active = processor.isActive(db, coll);
+        switch (event.getOperationType()) {
+            case INSERT:
+            case REPLACE:
+            case UPDATE: {
+                // 统一用 fullDocument upsert：幂等、天然处理乱序/重放；
+                // UPDATE 且 fullDocument 为 null = 文档在 lookup 前已被删除，交给后续 DELETE 事件
+                Document full = event.getFullDocument();
+                if (full == null) {
+                    break;
+                }
+                if (active && processor.excluded(db, coll, full)) {
+                    // 后镜像命中列过滤 → 目标端按 _id 删除（与 mysql/pg 的
+                    // "UPDATE 后镜像被过滤转 DELETE" 语义一致，处理"原本符合、改后不符合"）
+                    Document filter = new Document("_id", full.get("_id"));
+                    if (session != null) {
+                        tgt.deleteOne(session, filter);
+                    } else {
+                        tgt.deleteOne(filter);
+                    }
+                } else {
+                    Document out = active ? processor.transform(db, coll, full) : full;
+                    Document filter = new Document("_id", out.get("_id"));
+                    if (session != null) {
+                        tgt.replaceOne(session, filter, out, upsert);
+                    } else {
+                        tgt.replaceOne(filter, out, upsert);
+                    }
+                }
+                break;
+            }
+            case DELETE: {
+                BsonDocument key = event.getDocumentKey();
+                if (key != null) {
+                    if (session != null) {
+                        tgt.deleteOne(session, key);
+                    } else {
+                        tgt.deleteOne(key);
+                    }
+                }
+                break;
+            }
+            default:
+                logger.debug("跳过不处理的事件类型: {} on {}.{}", event.getOperationType(), db, coll);
+        }
+    }
+
+    /** origin 标记：单文档滚动更新，每个应用事务都产生一次行事件供对端识别。 */
+    private void writeOriginMarker(MongoDatabase tgtDb, ClientSession session) {
+        Document marker = new Document("_id", BidiConstants.MARKER_ROW_ID)
+                .append("origin", nodeId)
+                .append("taskId", taskId)
+                .append("ts", System.currentTimeMillis());
+        tgtDb.getCollection(BidiConstants.MARKER_TABLE).replaceOne(session,
+                new Document("_id", BidiConstants.MARKER_ROW_ID), marker,
+                new ReplaceOptions().upsert(true));
+    }
+
+    /** 已确保存在的集合（库.集合），避免每个事件都发一次 create 命令。 */
+    private final java.util.Set<String> ensuredCollections = new java.util.HashSet<>();
+
+    private void ensureCollection(MongoDatabase db, String coll) {
+        String key = db.getName() + "." + coll;
+        if (!ensuredCollections.add(key)) {
+            return;
+        }
+        try {
+            db.createCollection(coll);
+        } catch (Exception e) {
+            // 已存在（NamespaceExists）是正常路径，其它异常留给随后的写入去报
+            logger.debug("确保集合 {} 存在: {}", key, e.getMessage());
         }
     }
 
@@ -383,7 +622,7 @@ public final class MongoSyncMain {
             if (e.getValue().isEmpty()) {
                 List<String> colls = new ArrayList<>();
                 for (String c : source.getDatabase(e.getKey()).listCollectionNames()) {
-                    if (!c.startsWith("system.")) {
+                    if (!c.startsWith("system.") && !BidiConstants.MARKER_TABLE.equals(c)) {
                         colls.add(c);
                     }
                 }
@@ -404,12 +643,21 @@ public final class MongoSyncMain {
         if (coll.startsWith("system.")) {
             return false;
         }
+        // 防回环标记集合是同步链路自己的簿记数据，任何方向都不作为业务数据传播
+        if (BidiConstants.MARKER_TABLE.equals(coll)) {
+            return false;
+        }
         return colls.isEmpty() || colls.contains(coll);
     }
 
     // ==================== 连接 ====================
 
     private MongoClientSettings clientSettings(String prefix) {
+        return buildClientSettings(props, prefix);
+    }
+
+    /** 连接设置（同步与订阅两条链路共用）。 */
+    static MongoClientSettings buildClientSettings(Properties props, String prefix) {
         String host = props.getProperty(prefix + ".db.host", "localhost");
         String port = props.getProperty(prefix + ".db.port", "27017");
         String user = props.getProperty(prefix + ".db.username", "");
@@ -439,7 +687,27 @@ public final class MongoSyncMain {
 
     // ==================== checkpoint / 进度 ====================
 
-    private BsonDocument loadResumeToken() {
+    /**
+     * 增量断点：resume token + 归属的源部署 + 断点所在的"已打标事务"。
+     *
+     * <p>后两项都是防数据错乱的必需项，不是锦上添花：
+     * <ul>
+     *   <li>{@code sourceId} 不匹配 = 主备倒换/换源了，旧 token 在新源 oplog 上无意义，必须丢弃；</li>
+     *   <li>{@code markedTxnKey} 记录"断点落在某个对端写入事务的中间"，重启后据此继续跳过该事务
+     *       剩余事件，否则这些事件会被当本地写入回传，双向下形成回环。</li>
+     * </ul>
+     */
+    private static final class Checkpoint {
+        final BsonDocument token;
+        final String markedTxnKey;
+
+        Checkpoint(BsonDocument token, String markedTxnKey) {
+            this.token = token;
+            this.markedTxnKey = markedTxnKey;
+        }
+    }
+
+    private Checkpoint loadCheckpoint(String sourceId) {
         try {
             File f = tokenPath.toFile();
             if (!f.exists()) {
@@ -449,18 +717,38 @@ public final class MongoSyncMain {
             if (json.trim().isEmpty()) {
                 return null;
             }
-            return BsonDocument.parse(json);
+            BsonDocument doc = BsonDocument.parse(json);
+            // 旧格式：整个文件就是 resume token 本身（只有 _data）
+            if (!doc.containsKey("resumeToken")) {
+                return new Checkpoint(doc, null);
+            }
+            String savedSource = doc.containsKey("sourceId") ? doc.getString("sourceId").getValue() : null;
+            if (savedSource != null && sourceId != null && !savedSource.equals(sourceId)) {
+                logger.warn("checkpoint 归属的源部署（{}）与当前源（{}）不一致——判定为主备倒换/换源，"
+                        + "丢弃旧 resume token，从当前位点开始捕获", savedSource, sourceId);
+                return null;
+            }
+            BsonDocument token = doc.getDocument("resumeToken");
+            String markedTxn = doc.containsKey("markedTxnKey") && !doc.isNull("markedTxnKey")
+                    ? doc.getString("markedTxnKey").getValue() : null;
+            return new Checkpoint(token, markedTxn);
         } catch (Exception e) {
             logger.warn("读取 resume token 失败，将从当前位点开始: {}", e.getMessage());
             return null;
         }
     }
 
-    private void saveResumeToken(BsonDocument token) {
+    private void saveCheckpoint(BsonDocument token, String markedTxnKey, String sourceId) {
         try {
+            BsonDocument doc = new BsonDocument();
+            doc.put("resumeToken", token);
+            doc.put("sourceId", new org.bson.BsonString(sourceId != null ? sourceId : ""));
+            if (markedTxnKey != null) {
+                doc.put("markedTxnKey", new org.bson.BsonString(markedTxnKey));
+            }
             Files.createDirectories(tokenPath.getParent());
             Path tmp = tokenPath.resolveSibling(tokenPath.getFileName() + ".tmp");
-            Files.write(tmp, token.toJson().getBytes(StandardCharsets.UTF_8));
+            Files.write(tmp, doc.toJson().getBytes(StandardCharsets.UTF_8));
             Files.move(tmp, tokenPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (Exception e) {
             logger.warn("持久化 resume token 失败: {}", e.getMessage());
@@ -476,6 +764,9 @@ public final class MongoSyncMain {
             p.put("currentCollection", currentCollection);
             p.put("copiedDocs", copiedDocs);
             p.put("incrEvents", incrEvents);
+            if (bidiEnabled) {
+                p.put("skippedLoopEvents", skippedLoopEvents);
+            }
             if (error != null) {
                 p.put("error", error);
             }

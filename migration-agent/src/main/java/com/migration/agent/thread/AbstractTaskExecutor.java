@@ -11,6 +11,7 @@ import com.migration.agent.service.AgentConfig;
 import com.migration.agent.service.KafkaProducerService;
 import com.migration.agent.service.MetricsService;
 import com.migration.agent.service.MetricsPersistenceService;
+import com.migration.agent.service.SlaMetricsCollector;
 import com.migration.agent.service.TaskStateService;
 import com.migration.agent.util.SyncErrorCodeMapper;
 import com.migration.common.MdcUtil;
@@ -48,6 +49,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
     protected ProcessGuard incrementGuard;
 
     protected Thread fullMigrationMonitorThread;
+    /** 全量进度监控是否已收工：置位后监控线程不得再发 FULL_MIGRATING（防状态倒退）。 */
+    protected final AtomicBoolean fullMonitorDone = new AtomicBoolean(false);
 
     protected int totalTables = 0;
     protected volatile int completedTables = 0;
@@ -55,6 +58,11 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
     protected long lastMetricsReportTime = 0;
     protected static final long METRICS_REPORT_INTERVAL_MS = 30000;
+
+    /** SLA 指标采集器（P2-4），首次采集时创建。 */
+    private volatile com.migration.agent.service.SlaMetricsCollector slaCollector;
+    /** 端到端探针（P2-4），默认关闭；开启时在监控循环里惰性创建。 */
+    private volatile com.migration.agent.service.E2eProbeService probe;
 
     public AbstractTaskExecutor(TaskMessage taskMessage, KafkaProducerService kafkaProducer,
                                 TaskStateService taskStateService, boolean skipFullMigration, AgentConfig config) {
@@ -139,6 +147,12 @@ public abstract class AbstractTaskExecutor implements Runnable {
                     break;
                 }
 
+                // 磁盘水位：先背压（暂停 capture 拉取）再判失败，避免把宿主磁盘写满拖垮所有任务
+                if (checkDiskQuota()) {
+                    stopped.set(true);
+                    break;
+                }
+
                 collectMetrics(taskMetrics);
                 sendPeriodicMetricsUpdate(taskMetrics);
                 persistMetrics(taskMetrics);
@@ -171,14 +185,29 @@ public abstract class AbstractTaskExecutor implements Runnable {
     }
 
     /**
-     * 僵死看门狗是否应在本轮执行。仅当所有受守护子进程都处于 RUNNING 时才检查——
-     * 子进程崩溃后被 ProcessGuard 重启的窗口内其活性文件本就会短暂停更，此时交给崩溃恢复路径
-     * 处理、跳过僵死判定，避免把“正在重启”误判成“僵死”。冻结（SIGSTOP）下进程 isAlive 仍为 true，
-     * 不受此门控影响，照常被检出。
+     * 写这个活性文件的子进程是否<b>正在被 ProcessGuard 重启</b>（进程当前不在跑）。
+     *
+     * <p>重启窗口内该文件本就会停更，只能跳过<b>它自己</b>的僵死判定。
+     * 旧实现是一个全局开关「有任一进程不在 RUNNING 就整轮跳过」，于是只要有一个进程在
+     * crash-loop 里反复重启，<b>其余进程的冻结就被一起静默掉</b>——最坏情况是任务表面在跑、
+     * 实际上游早已冻结，而看门狗被永久关掉。改为按进程各自判定后，A 进程重启不再掩盖 B 进程僵死。
      */
-    protected boolean guardsHealthyForStallCheck() {
-        return true;
+    protected boolean livenessOwnerRestarting(String path) {
+        if (path.endsWith("capture_liveness")) {
+            return captureGuard != null && !captureGuard.isRunning();
+        }
+        if (path.endsWith("capture_queue_depth")) {
+            return extractGuard != null && !extractGuard.isRunning();
+        }
+        if (path.endsWith("increment_liveness")) {
+            return incrementGuard != null && !incrementGuard.isRunning();
+        }
+        return false;
     }
+
+    /** 各活性文件对应进程「连续不在 RUNNING」的起始时刻，用于把长时间不可用记进日志。 */
+    private final Map<String, Long> guardDownSince = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Long> guardDownLastLog = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * 活性文件"缺失"是否也该算僵死信号：仅当写它的那个子进程**已启动且存活**时才算。
@@ -212,12 +241,21 @@ public abstract class AbstractTaskExecutor implements Runnable {
      */
     protected boolean checkPipelineStalled() {
         java.util.List<String> files = stallLivenessFiles();
-        if (files.isEmpty() || !guardsHealthyForStallCheck()) {
+        if (files.isEmpty()) {
             return false;
         }
         long now = System.currentTimeMillis();
         long threshold = config.getStallThresholdMs();
         for (String path : files) {
+            // 只跳过“正在重启的那个进程”的活性文件，其余进程照常判定
+            if (livenessOwnerRestarting(path)) {
+                noteGuardDown(path, now);
+                livenessBaseline.remove(path);
+                continue;
+            }
+            guardDownSince.remove(path);
+            guardDownLastLog.remove(path);
+
             File f = new File(path);
             if (!f.exists()) {
                 if (!livenessFileExpected(path)) {
@@ -251,6 +289,107 @@ public abstract class AbstractTaskExecutor implements Runnable {
             }
         }
         return false;
+    }
+
+    // ==================== 磁盘水位保护 ====================
+
+    private long lastDiskCheckMs = 0;
+    private boolean diskBackpressureOn = false;
+
+    /**
+     * 任务目录磁盘水位巡检：两级处置，返回 true 表示已判失败、调用方应终止任务。
+     *
+     * <ul>
+     *   <li>超过 {@code task.disk.quota.mb × task.disk.backpressure.ratio}：写 PAUSE 背压信号
+     *       让 capture 停止拉取——上游一停，THL/cap 就不再增长，给消费侧追平的机会；</li>
+     *   <li>超过配额本身：上报 E3008 失败。宁可一个任务停，也不能把宿主磁盘写满——
+     *       磁盘满会让<b>所有</b>任务的位点落盘、日志、H2 同时失败，是最难恢复的一类故障。</li>
+     * </ul>
+     * 目录大小要遍历整棵树，因此按 {@code task.disk.check.interval.ms}（默认 60s）节流。
+     */
+    protected boolean checkDiskQuota() {
+        try {
+            return checkDiskQuotaInternal();
+        } catch (Exception e) {
+            // 巡检本身出错绝不能牵连任务：遍历目录时撞上正在被删的文件是常态
+            logger.warn("[{}] 磁盘水位巡检出错（忽略）: {}", taskId, e.toString());
+            return false;
+        }
+    }
+
+    private boolean checkDiskQuotaInternal() {
+        long quotaMb = config.getTaskDiskQuotaMb();
+        if (quotaMb <= 0) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastDiskCheckMs < config.getTaskDiskCheckIntervalMs()) {
+            return false;
+        }
+        lastDiskCheckMs = now;
+
+        File taskDir = new File("./files/" + taskId);
+        if (!taskDir.isDirectory()) {
+            return false;
+        }
+        long usedMb = com.migration.agent.service.TaskFilesJanitor.dirSizeBytes(taskDir) / (1024 * 1024);
+        if (usedMb >= quotaMb) {
+            logger.error("[{}] 任务目录已用 {}MB，超过配额 {}MB，判定失败", taskId, usedMb, quotaMb);
+            sendFailedStatus("E3008", String.format(
+                    "任务磁盘用量 %dMB 超过配额 %dMB，已停止任务以保护宿主磁盘", usedMb, quotaMb));
+            return true;
+        }
+
+        long backpressureMb = (long) (quotaMb * config.getTaskDiskBackpressureRatio());
+        if (usedMb >= backpressureMb) {
+            if (!diskBackpressureOn) {
+                diskBackpressureOn = true;
+                writeBackpressureSignal("PAUSE");
+                logger.warn("[{}] 任务目录已用 {}MB，超过背压水位 {}MB（配额 {}MB），暂停 capture 拉取",
+                        taskId, usedMb, backpressureMb, quotaMb);
+            }
+        } else if (diskBackpressureOn) {
+            diskBackpressureOn = false;
+            writeBackpressureSignal("RESUME");
+            logger.info("[{}] 任务目录降到 {}MB，低于背压水位 {}MB，恢复 capture 拉取",
+                    taskId, usedMb, backpressureMb);
+        }
+        return false;
+    }
+
+    /** 复用 extract↔capture 既有的文件信号通道（files/&lt;taskId&gt;/backpressure.signal）。 */
+    private void writeBackpressureSignal(String signal) {
+        File file = new File("./files/" + taskId + "/backpressure.signal");
+        try {
+            File parent = file.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            java.nio.file.Files.write(file.toPath(),
+                    (signal + System.lineSeparator() + System.currentTimeMillis() + System.lineSeparator())
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            logger.warn("[{}] 写背压信号失败: {}", taskId, e.getMessage());
+        }
+    }
+
+    /**
+     * 记录某个进程「连续不在 RUNNING」的时长并周期性告警。
+     *
+     * <p>不在这里判失败：长期重连（RECONNECTING）本来就允许进程长时间不在——判失败是
+     * ProcessGuard 的职责（重连次数用尽才 FAILED）。这里只保证这段时间在日志里<b>看得见</b>，
+     * 而不是像旧实现那样连带把整个看门狗静默掉、什么都不留下。
+     */
+    private void noteGuardDown(String path, long now) {
+        long since = guardDownSince.computeIfAbsent(path, k -> now);
+        long downMs = now - since;
+        if (downMs < config.getStallThresholdMs()) {
+            return;
+        }
+        long lastLog = guardDownLastLog.getOrDefault(path, 0L);
+        if (now - lastLog >= config.getStallThresholdMs()) {
+            guardDownLastLog.put(path, now);
+            logger.warn("[{}] 活性文件 {} 的进程已连续 {}s 不在运行（重启/重连中），其僵死判定暂时跳过",
+                    taskId, path, downMs / 1000);
+        }
     }
 
     /**
@@ -736,6 +875,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
         logger.info("[{}] 开始执行全量迁移", threadName);
 
         try {
+            fullMonitorDone.set(false);
             fullProcess = new ProcessManager(config.getMigrationFullJarPath(), "MigrationFull-" + taskId);
             fullProcess.setTaskId(taskId);
             fullProcess.start();
@@ -745,6 +885,10 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
             int exitCode = fullProcess.waitFor();
 
+            // 先置"监控已收工"再 interrupt：只 interrupt 挡不住已经进入循环体、正在构造
+            // FULL_MIGRATING 的那一轮——它会在 FULL_COMPLETED 之后才发出去，把状态顶回全量中
+            // （实测到过 FULL_COMPLETED → FULL_MIGRATING 的倒退）。监控线程发送前二次确认此标志。
+            fullMonitorDone.set(true);
             if (fullMigrationMonitorThread != null) {
                 fullMigrationMonitorThread.interrupt();
             }
@@ -780,7 +924,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
         fullMigrationMonitorThread = new Thread(() -> {
             String progressDbUrl = "jdbc:h2:./files/" + taskId + "/migration_progress;MODE=MySQL;AUTO_SERVER=TRUE";
 
-            while (!stopped.get() && fullProcess != null && fullProcess.isRunning()) {
+            while (!stopped.get() && !fullMonitorDone.get() && fullProcess != null && fullProcess.isRunning()) {
                 try {
                     Thread.sleep(config.getProgressMonitorIntervalMs());
                     if (stopped.get()) break;
@@ -814,6 +958,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
                         int overallProgress = totalTables > 0 ? (completedTables * 100) / totalTables : 0;
 
+                        // 发送前最后一次确认：从上面的 while 条件到这里之间，全量进程可能已经退出、
+                        // FULL_COMPLETED 也可能已经发出，此时再发 FULL_MIGRATING 就是状态倒退
+                        if (fullMonitorDone.get() || stopped.get()) break;
                         sendStatus("FULL_MIGRATING", "全量同步中", overallProgress,
                                 totalTables, completedTables, currentTable, currentTableProgress,
                                 currentTableRows, currentTableTotalRows);
@@ -837,6 +984,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
     protected void stopAllProcesses() {
         String threadName = "TaskExecutor-" + taskId;
         logger.info("[{}] 停止所有进程", threadName);
+
+        stopProbe();
 
         if (incrementGuard != null) {
             try { incrementGuard.stop(); logger.info("[{}] 增量同步进程已停止", threadName); }
@@ -902,6 +1051,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
         if (calculatedRpo != null) rpoMs = calculatedRpo;
         statusMessage.setRpoMs(rpoMs);
         statusMessage.setRtoMs(rtoMs);
+        attachSlaMetrics(statusMessage);
 
         if ("FAILED".equals(status)) {
             String errorCode = SyncErrorCodeMapper.mapFailureToErrorCode(message);
@@ -932,9 +1082,92 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
             taskMetrics.recordCaptureRate(readCaptureRateFromFile());
             readQueueDepthsFromFiles(taskMetrics);
+            collectSlaMetrics(taskMetrics);
         } catch (Exception e) {
             logger.debug("[{}] Error collecting metrics", taskId, e);
         }
+    }
+
+    /**
+     * 把 SLA 指标挂到状态消息上（P2-4），落到 workflows 表后 {@code AlertRuleService} 才能对它们设阈值。
+     * 全部只读文件 + 缓存的源库时钟，失败一律吞掉——指标取不到绝不能影响状态上报本身。
+     */
+    protected void attachSlaMetrics(TaskStatusMessage statusMessage) {
+        try {
+            SlaMetricsCollector collector = slaCollector();
+            long lag = collector.replicationLagMs(readMetricTimestamp("./files/" + taskId + "/binlog_output/rto_metric"));
+            if (lag >= 0) {
+                statusMessage.setReplicationLagMs(lag);
+            }
+            statusMessage.setCaptureReplayBytes(collector.captureReplayBytes());
+            statusMessage.setConflictCount(collector.conflictCount());
+            statusMessage.setDeadletterCount(collector.deadletterCount());
+            statusMessage.setDiskUsageBytes(collector.diskUsageBytes());
+            statusMessage.setRestartCount10m((int) restartCountInWindow());
+        } catch (Exception e) {
+            logger.debug("[{}] 附加 SLA 指标失败", taskId, e);
+        }
+    }
+
+    /** SLA 闭环指标（P2-4）：绝对复制延迟、重放量、重启次数、冲突/死信数、磁盘占用。 */
+    protected void collectSlaMetrics(MetricsService.TaskMetrics taskMetrics) {
+        try {
+            SlaMetricsCollector collector = slaCollector();
+            Long lastAppliedSourceTs = readMetricTimestamp("./files/" + taskId + "/binlog_output/rto_metric");
+            long lag = collector.replicationLagMs(lastAppliedSourceTs);
+            if (lag >= 0) {
+                taskMetrics.recordReplicationLag(lag);
+            }
+            taskMetrics.recordCaptureReplayBytes(collector.captureReplayBytes());
+            taskMetrics.recordConflictCount(collector.conflictCount());
+            taskMetrics.recordDeadletterCount(collector.deadletterCount());
+            taskMetrics.recordDiskUsageBytes(collector.diskUsageBytes());
+            taskMetrics.recordRestartCount10m(restartCountInWindow());
+            startProbeIfEnabled(taskMetrics);
+        } catch (Exception e) {
+            logger.debug("[{}] Error collecting SLA metrics", taskId, e);
+        }
+    }
+
+    /**
+     * 端到端探针（P2-4）：默认关闭；开启时在监控循环里惰性起一次，随任务停止一起关。
+     * 只在增量类任务上有意义——纯全量没有持续的链路可探。
+     */
+    private void startProbeIfEnabled(MetricsService.TaskMetrics taskMetrics) {
+        // incrementGuard 为空说明增量进程还没起来，链路不成立，探针必然超时
+        if (probe != null || !config.isProbeEnabled() || incrementGuard == null) {
+            return;
+        }
+        probe = new com.migration.agent.service.E2eProbeService(
+                taskId, taskMessage.getSourceConnection(), taskMessage.getTargetConnection(),
+                config.getProbeIntervalMs(), config.getProbeTimeoutMs(), taskMetrics);
+        probe.start();
+    }
+
+    /** 停止端到端探针（任务停止时调用）。 */
+    protected void stopProbe() {
+        if (probe != null) {
+            probe.close();
+            probe = null;
+        }
+    }
+
+    private SlaMetricsCollector slaCollector() {
+        SlaMetricsCollector local = slaCollector;
+        if (local == null) {
+            local = new SlaMetricsCollector(taskId, taskMessage.getSourceConnection());
+            slaCollector = local;
+        }
+        return local;
+    }
+
+    /** 三个子进程近 10 分钟的重启次数之和（crash-loop 的可观测面，见 ProcessGuard）。 */
+    protected long restartCountInWindow() {
+        long total = 0;
+        if (captureGuard != null) total += captureGuard.restartCountInWindow();
+        if (extractGuard != null) total += extractGuard.restartCountInWindow();
+        if (incrementGuard != null) total += incrementGuard.restartCountInWindow();
+        return total;
     }
 
     protected void persistMetrics(MetricsService.TaskMetrics taskMetrics) {
@@ -948,6 +1181,13 @@ public abstract class AbstractTaskExecutor implements Runnable {
         }
     }
 
+    /**
+     * 轮询子进程写下的不可恢复错误。
+     *
+     * <p>文件格式 {@code 时间戳|错误码|seqno|消息[|组件]}。第 5 段是可选的组件名：
+     * increment 不带（历史格式），capture 会带 {@code capture}——例如起始位点已被源端清理（E3006）
+     * 这类"重试多少次都没用"的故障，必须立刻上报 FAILED，而不是让 ProcessGuard 无限重启。
+     */
     protected boolean checkIncrementErrorStatus() {
         String errorFilePath = "./files/" + taskId + "/binlog_output/error_status";
         java.io.File errorFile = new java.io.File(errorFilePath);
@@ -956,14 +1196,18 @@ public abstract class AbstractTaskExecutor implements Runnable {
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(errorFile))) {
             String line = reader.readLine();
             if (line != null) {
-                String[] parts = line.split("\\|", 4);
+                String[] parts = line.split("\\|", 5);
                 if (parts.length >= 4) {
                     String errorCode = parts[1];
                     String seqno = parts[2];
                     String message = parts[3];
-                    logger.error("[{}] 检测到 increment 进程错误状态: errorCode={}, seqno={}, message={}",
-                            taskId, errorCode, seqno, message);
-                    sendFailedStatus(errorCode, "增量同步不可恢复错误 (seqno=" + seqno + "): " + message);
+                    String component = parts.length >= 5 ? parts[4].trim() : "increment";
+                    logger.error("[{}] 检测到 {} 进程错误状态: errorCode={}, seqno={}, message={}",
+                            taskId, component, errorCode, seqno, message);
+                    String prefix = "capture".equals(component)
+                            ? "捕获端不可恢复错误: "
+                            : "增量同步不可恢复错误 (seqno=" + seqno + "): ";
+                    sendFailedStatus(errorCode, prefix + message);
                     stopped.set(true);
                     errorFile.delete();
                     return true;

@@ -72,6 +72,28 @@ public class AgentConfig {
         props.setProperty("retry.max.delay.ms", "300000");
 
         props.setProperty("circuit.breaker.failure.threshold", "5");
+        // 熔断打开后多久放行一次探测（HALF_OPEN）。探测失败即按 multiplier 指数延长，封顶 30 分钟：
+        // 目标库长时间维护时不至于高频空转，修好后又能在一个探测周期内自愈。
+        props.setProperty("circuit.breaker.open.timeout.ms", "60000");
+        props.setProperty("circuit.breaker.open.timeout.multiplier", "2.0");
+        props.setProperty("circuit.breaker.open.timeout.max.ms", "1800000");
+
+        // 短期重试预算耗尽后的“长期重连”：固定间隔（与熔断剩余时长取大）无限轮次地拉起进程，
+        // 期间任务状态为 RECONNECTING（可自愈、不算失败）。次数用尽才判 FAILED；-1 表示不限次。
+        // 默认 12 轮 × ≥5 分钟 ≈ 覆盖 1 小时以上的计划内维护窗口。
+        props.setProperty("reconnect.interval.ms", "300000");
+        props.setProperty("reconnect.max.attempts", "12");
+
+        // crash-loop 检测：窗口内重启成功次数达到阈值即报 E3007，而不是每次都报“已自动重启恢复”。
+        props.setProperty("crashloop.window.ms", "600000");
+        props.setProperty("crashloop.threshold", "5");
+
+        // 任务目录磁盘水位：超过 backpressure 比例先背压限速，超过 quota 则判失败（0 表示不限）。
+        props.setProperty("task.disk.quota.mb", "20480");
+        props.setProperty("task.disk.backpressure.ratio", "0.8");
+        props.setProperty("task.disk.check.interval.ms", "60000");
+        // 任务进入终态后保留 files/<taskId> 的时长，到期由 agent 清理；0 表示不清理。
+        props.setProperty("task.files.retention.hours", "72");
     }
 
     private void loadFromFile() {
@@ -234,6 +256,66 @@ public class AgentConfig {
 
     public int getCircuitBreakerFailureThreshold() {
         return Integer.parseInt(props.getProperty("circuit.breaker.failure.threshold"));
+    }
+
+    public long getCircuitBreakerOpenTimeoutMs() {
+        return Long.parseLong(props.getProperty("circuit.breaker.open.timeout.ms", "60000"));
+    }
+
+    public double getCircuitBreakerOpenTimeoutMultiplier() {
+        return Double.parseDouble(props.getProperty("circuit.breaker.open.timeout.multiplier", "2.0"));
+    }
+
+    public long getCircuitBreakerMaxOpenTimeoutMs() {
+        return Long.parseLong(props.getProperty("circuit.breaker.open.timeout.max.ms", "1800000"));
+    }
+
+    public long getReconnectIntervalMs() {
+        return Long.parseLong(props.getProperty("reconnect.interval.ms", "300000"));
+    }
+
+    public int getReconnectMaxAttempts() {
+        return Integer.parseInt(props.getProperty("reconnect.max.attempts", "12"));
+    }
+
+    public long getCrashLoopWindowMs() {
+        return Long.parseLong(props.getProperty("crashloop.window.ms", "600000"));
+    }
+
+    public int getCrashLoopThreshold() {
+        return Integer.parseInt(props.getProperty("crashloop.threshold", "5"));
+    }
+
+    /**
+     * 端到端探针（P2-4）。默认<b>关闭</b>：它会在用户源库里建 {@code __sync_probe} 表并持续写入，
+     * 这是对源库的副作用，必须显式开启；开启后探针表会自动并入任务同步范围。
+     */
+    public boolean isProbeEnabled() {
+        return Boolean.parseBoolean(props.getProperty("probe.enabled", "false"));
+    }
+
+    public long getProbeIntervalMs() {
+        return Long.parseLong(props.getProperty("probe.interval.ms", "60000"));
+    }
+
+    public long getProbeTimeoutMs() {
+        return Long.parseLong(props.getProperty("probe.timeout.ms", "30000"));
+    }
+
+    public long getTaskDiskQuotaMb() {
+        return Long.parseLong(props.getProperty("task.disk.quota.mb", "20480"));
+    }
+
+    public double getTaskDiskBackpressureRatio() {
+        return Double.parseDouble(props.getProperty("task.disk.backpressure.ratio", "0.8"));
+    }
+
+    public long getTaskDiskCheckIntervalMs() {
+        return Long.parseLong(props.getProperty("task.disk.check.interval.ms", "60000"));
+    }
+
+    public int getTaskFilesRetentionHours() {
+        return Integer.parseInt(props.getProperty("task.files.retention.hours", "72"));
     }
 
     public long getMetricsFlushIntervalMs() {

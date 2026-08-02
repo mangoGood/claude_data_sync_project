@@ -58,6 +58,14 @@ public class ProcessManager {
         // 跨进程连接会挂起数分钟。agent 自身在 main() 已设，子进程是独立 JVM 必须显式透传，否则失效。
         command.add("-Dh2.bindAddress=127.0.0.1");
 
+        // 父进程看门狗：子进程据此每 5s 探活 agent，agent 硬崩（SIGKILL/OOM/容器驱逐）后自杀。
+        // ProcessBuilder 起出来的子进程不会随父进程退出，此前只能靠 restart_agent.sh 里的 pkill
+        // 人肉收尸——而那只覆盖"通过脚本重启"这一条路径。带上启动时刻是为了排除 PID 复用。
+        ProcessHandle self = ProcessHandle.current();
+        command.add("-D" + com.migration.common.proc.ParentWatchdog.PID_KEY + "=" + self.pid());
+        command.add("-D" + com.migration.common.proc.ParentWatchdog.START_KEY + "="
+                + self.info().startInstant().map(java.time.Instant::toEpochMilli).orElse(0L));
+
         if (taskId != null) {
             command.add("-Dtask.id=" + taskId);
             command.add("-Dlogback.configurationFile=files/" + taskId + "/logback.xml");

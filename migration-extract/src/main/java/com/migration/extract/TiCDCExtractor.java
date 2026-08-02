@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.migration.common.txn.TxnMetadata;
 import com.migration.thl.THLEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -111,6 +112,9 @@ public class TiCDCExtractor extends MySQLBinlogExtractor {
                 return null;
             }
             parseRow(thlEvent, msg, operation);
+            // 源事务边界：同一事务的行共享 commitTs。TiCDC 不投递独立的提交消息，
+            // 只能靠"commitTs 变了"判定上一个事务结束，故只下发 tx_id、不下发 tx_last。
+            thlEvent.addMetadata(TxnMetadata.TX_ID, "tso:" + commitTs);
         }
 
         if (pipeline != null) {

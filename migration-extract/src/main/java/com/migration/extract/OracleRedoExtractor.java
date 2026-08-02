@@ -1,6 +1,7 @@
 package com.migration.extract;
 
 import com.migration.common.AbstractExtractor;
+import com.migration.common.txn.TxnMetadata;
 import com.migration.thl.THLEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -144,6 +145,14 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
         thlEvent.addMetadata("redo_scn", scn);
         thlEvent.addMetadata("redo_scn_numeric", scnNumeric);
         thlEvent.addMetadata("xid", xid);
+
+        // 源事务边界：LogMiner 以 COMMITTED_DATA_ONLY 输出，同一事务的行共享 XID，
+        // 但没有独立的提交事件——只能靠"XID 变了"判定上一个事务结束（增量端据此提交），
+        // 因此这里只下发 tx_id、不下发 tx_last。
+        if (xid != 0) {
+            thlEvent.addMetadata(TxnMetadata.TX_ID, "ora:" + xid);
+            thlEvent.addMetadata(TxnMetadata.TX_SOURCE_ID, fields[4].trim());
+        }
 
         if ("INSERT".equals(eventType)) {
             parseInsertEvent(thlEvent, eventData);

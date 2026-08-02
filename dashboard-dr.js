@@ -311,7 +311,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             currentDrTaskId = taskId;
             // 从列表进入已有任务时用任务自身类型；从创建流程进入时沿用创建弹窗所选类型
             if (dbType) currentDrDbType = dbType;
-            const defaultPort = currentDrDbType === 'postgresql' ? '5432' : '3306';
+            const defaultPort = drDefaultPort(currentDrDbType);
             const typeLabel = formatDbTypeLabel(currentDrDbType);
             document.getElementById('drConfigTitle').textContent = '灾备任务配置（' + typeLabel + '）';
             document.getElementById('drSourceHost').value = '';
@@ -340,6 +340,19 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
 
         // 灾备任务当前选中的数据库类型（源/目标同构）：驱动连接协议、默认端口与校验文案
         let currentDrDbType = 'mysql';
+
+        // 连接协议/默认端口按类型分派。MongoDB 走 mongodb:// 直连副本集 Primary
+        // （Change Streams 与写入都要求 Primary），端口 27017。
+        function drProtocol(type) {
+            if (type === 'postgresql') return 'postgresql';
+            if (type === 'mongodb') return 'mongodb';
+            return 'mysql';
+        }
+        function drDefaultPort(type) {
+            if (type === 'postgresql') return '5432';
+            if (type === 'mongodb') return '27017';
+            return '3306';
+        }
         function selectDrDbType(type) {
             currentDrDbType = type;
             document.querySelectorAll('#createDrTaskModal .dr-dbtype-option').forEach(opt => {
@@ -476,7 +489,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             if (!drConnectionTestStatus.source) { showNotification('请先测试主库连接并确保连接成功', 'error'); return; }
             if (!drConnectionTestStatus.target) { showNotification('请先测试备库连接并确保连接成功', 'error'); return; }
             
-            const drProto = currentDrDbType === 'postgresql' ? 'postgresql' : 'mysql';
+            const drProto = drProtocol(currentDrDbType);
             const sourceConnection = `${drProto}://${sourceUser}:${sourcePassword}@${sourceHost}:${sourcePort}`;
             const targetConnection = `${drProto}://${targetUser}:${targetPassword}@${targetHost}:${targetPort}`;
             
@@ -509,7 +522,8 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             document.getElementById('drValidationModal').classList.add('show');
             document.getElementById('launchDrTaskBtn').disabled = true;
             
-            const logCheckName = currentDrDbType === 'postgresql' ? '主库WAL(logical)检查' : '主库Binlog开启检查';
+            const logCheckName = currentDrDbType === 'postgresql' ? '主库WAL(logical)检查'
+                    : (currentDrDbType === 'mongodb' ? '主库副本集(Change Streams)检查' : '主库Binlog开启检查');
             const checks = [
                 { name: '主库连接检查', status: 'running' },
                 { name: '备库连接检查', status: 'pending' },

@@ -112,6 +112,9 @@ public final class ElasticSyncMain {
             System.exit(1);
         }
 
+        // 单实例互斥 + 父进程看门狗：同一 taskId 只允许一个 elastic 引擎进程
+        com.migration.common.proc.ChildProcessBootstrap.init(taskId, "elastic");
+
         Properties props = new Properties();
         File configFile = new File("files/" + taskId + "/config.properties");
         try (FileInputStream in = new FileInputStream(configFile)) {

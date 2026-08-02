@@ -20,6 +20,12 @@ public class MigrationConfig {
     private boolean shardEnabled;
     private long shardMinRows;
     private int shardCount;
+    /** 全量写侧批量装载（migration.full.bulk.enabled，默认 true）。 */
+    private boolean bulkLoadEnabled;
+    /** 单批提交行数（migration.full.bulk.rows，默认 batchSize×5）。 */
+    private int bulkBatchRows;
+    /** 全量一致性快照模式（migration.full.snapshot.mode）：NONE / GTID_ONLY / CONSISTENT。 */
+    private String snapshotMode;
     private Set<String> includedDatabases;
     private Set<String> includedTables;
     private Set<String> dbLevelDatabases;
@@ -110,6 +116,22 @@ public class MigrationConfig {
             shardCount = 1;
         }
 
+        // 批量装载（P2-2）：让驱动把 executeBatch 重写成一条多值 INSERT，往返次数从 N 降到 1。
+        // 只加驱动参数、不改协议（仍是 PreparedStatement 类型绑定），故默认开启。
+        bulkLoadEnabled = Boolean.parseBoolean(props.getProperty("migration.full.bulk.enabled", "true"));
+        bulkBatchRows = Integer.parseInt(props.getProperty("migration.full.bulk.rows", "0"));
+        if (bulkBatchRows <= 0) {
+            // 未显式配置时按 batchSize 放大：重写后的多值 INSERT 每批越大往返越少，
+            // 但单条语句过大会撞 max_allowed_packet，取 5 倍是实测的稳妥档位
+            bulkBatchRows = bulkLoadEnabled ? batchSize * 5 : batchSize;
+        }
+        if (bulkLoadEnabled) {
+            applyBulkJdbcOptions(targetConfig, targetDbType);
+        }
+
+        // 全量一致性快照（P2-3）：NONE / GTID_ONLY（默认，只记位点不加锁）/ CONSISTENT
+        snapshotMode = props.getProperty("migration.full.snapshot.mode", "GTID_ONLY").trim().toUpperCase();
+
         includedDatabases = parseStringSet(props.getProperty("migration.included.databases", ""));
         includedTables = parseStringSet(props.getProperty("migration.included.tables", ""));
         dbLevelDatabases = parseStringSet(props.getProperty("sync.db.level.databases", ""));
@@ -190,6 +212,36 @@ public class MigrationConfig {
     /** 触发分片的最小行数阈值（migration.full.shard.min.rows，默认 200000）。 */
     public long getShardMinRows() {
         return shardMinRows;
+    }
+
+    /**
+     * 给目标连接挂上批量语句重写参数。MySQL 与 PostgreSQL 的驱动都能把一批单行 INSERT
+     * 合并成一条多值 INSERT；Oracle 的 executeBatch 本身即数组绑定，无需参数。
+     *
+     * <p>注意：开了重写之后 executeBatch 返回的是 {@code SUCCESS_NO_INFO(-2)} 而非逐行影响数，
+     * 计数口径必须同步改（见 {@code BatchWriter.count}），否则全量会把所有行报成失败。
+     */
+    private static void applyBulkJdbcOptions(DatabaseConfig target, String targetDbType) {
+        if ("mysql".equalsIgnoreCase(targetDbType) || "tidb".equalsIgnoreCase(targetDbType)) {
+            target.setJdbcOption("rewriteBatchedStatements", "true");
+        } else if ("postgresql".equalsIgnoreCase(targetDbType)) {
+            target.setJdbcOption("reWriteBatchedInserts", "true");
+        }
+    }
+
+    /** 全量写侧批量装载是否启用。 */
+    public boolean isBulkLoadEnabled() {
+        return bulkLoadEnabled;
+    }
+
+    /** 单批提交行数。 */
+    public int getBulkBatchRows() {
+        return bulkBatchRows;
+    }
+
+    /** 全量一致性快照模式：NONE / GTID_ONLY / CONSISTENT。 */
+    public String getSnapshotMode() {
+        return snapshotMode;
     }
 
     /** 单表分片数（migration.full.shard.count，默认 4，最小 1）。 */

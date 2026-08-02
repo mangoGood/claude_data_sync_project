@@ -106,6 +106,11 @@ public class RetryPolicy {
         return false;
     }
 
+    /** 刚通过 {@link #recordAttempt()} 记下的这次尝试对应的退避时长（调用方自己睡，便于分片可中断）。 */
+    public long getCurrentDelayMs() {
+        return getNextDelayMsForAttempt(Math.max(0, attemptCount.get() - 1));
+    }
+
     public void sleepBeforeRetry() throws InterruptedException {
         long delay = getNextDelayMsForAttempt(attemptCount.get() - 1);
         if (delay > 0) {

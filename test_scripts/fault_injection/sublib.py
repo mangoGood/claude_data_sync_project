@@ -211,10 +211,14 @@ def consume_all(prefix, idle_timeout=15):
     if total == 0:
         c.close()
         return out
+    # parse_float=Decimal：消息里的 DECIMAL/DOUBLE 字面量若按 float 读，测试自己就把精度弄丢了，
+    # 再拿去和源库比会把"链路没问题"误判成"精度丢失"（反之亦然，真丢了也看不出来）。
+    from decimal import Decimal
     try:
         for msg in c:
             try:
-                out.append((msg.topic, msg.partition, msg.offset, json.loads(msg.value)))
+                out.append((msg.topic, msg.partition, msg.offset,
+                            json.loads(msg.value, parse_float=Decimal)))
             except Exception:
                 out.append((msg.topic, msg.partition, msg.offset, {"_raw": msg.value}))
             if len(out) >= total:
@@ -226,20 +230,34 @@ def consume_all(prefix, idle_timeout=15):
 
 
 def parse_events(records, fmt="DEBEZIUM_JSON"):
-    """把 Kafka 消息解析成 (op, seqno, after_map, before_map) 序列，保持投递顺序。"""
+    """把 Kafka 消息解析成 (op, seqno, after_map, before_map) 序列，保持投递顺序。
+
+    MongoDB 源的 UPDATE 事件另外带 documentKey + updateDescription.updatedFields：
+    change stream 的 fullDocument 是「事件读出时再查一次」的结果，同一文档连续快速更新时
+    第一条事件查到的可能已是后一次的值，中间那次更新的取值只存在于 updatedFields 里。
+    这里把 (documentKey ⊕ updatedFields) 合成一个等价的后像参与判定，
+    使「不丢」这把尺子对 Mongo 也成立。
+    """
     evs = []
     for _topic, _p, _off, v in records:
         if fmt == "DEBEZIUM_JSON":
             p = v.get("payload") or {}
-            op = p.get("op")
-            after = p.get("after")
-            before = p.get("before")
-            seqno = (p.get("source") or {}).get("seqno")
         else:
-            op = v.get("op")
-            after = v.get("after")
-            before = v.get("before")
-            seqno = v.get("seqno")
+            p = v
+        op = p.get("op")
+        after = p.get("after")
+        before = p.get("before")
+        seqno = (p.get("source") or {}).get("seqno") if fmt == "DEBEZIUM_JSON" else p.get("seqno")
+
+        doc_key = p.get("documentKey")
+        upd = (p.get("updateDescription") or {}).get("updatedFields")
+        if op == "u" and upd:
+            delta = dict(doc_key or {})
+            delta.update(upd)
+            # 后像缺失（文档在 lookup 前已被删）时，增量本身就是这条事件唯一的后像
+            after = {**(after or {}), **delta} if after else delta
+        elif after is None and before is None and doc_key:
+            before = doc_key
         if op is None:
             continue
         evs.append((op, seqno, after, before))
@@ -278,6 +296,37 @@ def replay(events, idcol="id"):
                 unparsed += 1
                 continue
             state[rid] = (_norm_field(after, "val"), _to_int(_norm_field(after, "n")))
+        elif op == "d":
+            rid = _norm_id(after, idcol)
+            if rid is None:
+                rid = _norm_id(before, idcol)
+            if rid is None:
+                unparsed += 1
+                continue
+            state.pop(rid, None)
+    return state, unparsed
+
+
+def replay_full(events, idcol="id"):
+    """按投递顺序回放成 {id: 完整后像 dict}；c/u 合并覆盖，d 删除。
+
+    与 replay 的差别：保留**全部字段**而不只是 (val, n)，供全类型保真比对使用。
+    u 事件按字段合并而不是整体替换 —— Mongo 的 updateDescription 只带变更字段。
+    """
+    state = {}
+    unparsed = 0
+    for op, _seq, after, before in events:
+        if op in ("c", "u", "r"):
+            rid = _norm_id(after, idcol)
+            if rid is None:
+                unparsed += 1
+                continue
+            if op == "u" and rid in state:
+                merged = dict(state[rid])
+                merged.update(after)
+                state[rid] = merged
+            else:
+                state[rid] = dict(after)
         elif op == "d":
             rid = _norm_id(after, idcol)
             if rid is None:
@@ -625,10 +674,147 @@ class OracleWriter(_WriterBase):
             self.error = e
 
 
+class TidbSource(MysqlSource):
+    """TiDB 源：讲 MySQL 协议（连接串/驱动/DDL 都同构），但增量出口是 TiCDC changefeed。
+
+    因此 source_type 必须是 tidb 而不是 mysql —— 后端据此把 capture.type 设成 ticdc，
+    否则会去读根本不存在的 binlog。测试侧除了端口/口令，其余与 MysqlSource 完全一致。
+    """
+    kind = "tidb"
+    source_type = "tidb"
+
+    def __init__(self, host="127.0.0.1", port=14000, user="root",
+                 password="tidbpassword", db="fi_sub_tidb"):
+        super().__init__(host, port, user, password, db)
+
+
+class MongoSource:
+    """MongoDB 源：订阅走 Change Streams 单进程直投 Kafka（没有 capture/extract 两段）。"""
+    kind = "mongo"
+    source_type = "mongodb"
+    idcol = "_id"
+
+    def __init__(self, host="127.0.0.1", port=27117, user="root",
+                 password="rootpassword", db="fi_sub_mongo"):
+        self.host, self.port, self.user, self.password, self.db = host, port, user, password, db
+
+    def _client(self):
+        import pymongo
+        return pymongo.MongoClient(
+            f"mongodb://{self.user}:{self.password}@{self.host}:{self.port}"
+            f"/?authSource=admin&directConnection=true")
+
+    def src_conn_str(self):
+        return f"mongodb://{self.user}:{self.password}@{self.host}:{self.port}"
+
+    def sync_objects(self):
+        return json.dumps({self.db: {"tables": [TABLE]}})
+
+    def reset(self):
+        cl = self._client()
+        cl.drop_database(self.db)
+        cl[self.db].create_collection(TABLE)
+        cl.close()
+
+    def seed(self, rows):
+        cl = self._client()
+        coll = cl[self.db][TABLE]
+        batch = []
+        for i in range(1, rows + 1):
+            batch.append({"_id": i, "grp": i % 100, "val": f"seed-{i}", "payload": "x" * 200, "n": i})
+            if len(batch) >= 2000:
+                coll.insert_many(batch); batch = []
+        if batch:
+            coll.insert_many(batch)
+        cl.close()
+
+    def state(self):
+        cl = self._client()
+        try:
+            return {int(d["_id"]): (d.get("val"), None if d.get("n") is None else int(d["n"]))
+                    for d in cl[self.db][TABLE].find({}, {"_id": 1, "val": 1, "n": 1})}
+        finally:
+            cl.close()
+
+    def make_writer(self, start_id, rate):
+        return MongoSubWriter(self, start_id, rate)
+
+
+class MongoSubWriter(threading.Thread):
+    """与 SqlWriter 同样的真值记录约定：每次 INSERT/UPDATE 都把 (id,val,n) 记进 writes，
+    其中 val/n 带唯一 opseq，用于"不丢"判定（只比最终状态会漏掉被覆盖的中间更新）。"""
+
+    def __init__(self, ep, start_id, rate):
+        super().__init__(daemon=True)
+        self.ep = ep
+        self._start_id = start_id
+        self.rate = rate
+        self.stop = threading.Event()
+        self.inserts = self.updates = self.deletes = 0
+        self.opseq = 0
+        self.error = None
+        self.writes = set()
+        self.live = []
+        self.deleted = set()
+
+    def _rec(self, rid, val, n):
+        self.writes.add((rid, val, n))
+
+    def run(self):
+        try:
+            cl = self.ep._client()
+            coll = cl[self.ep.db][TABLE]
+            rid = self._start_id
+            seq = 0
+            interval = 1.0 / max(self.rate, 1)
+            while not self.stop.is_set():
+                seq += 1
+                self.opseq += 1
+                s = self.opseq
+                val, n = f"ins-{s}", 1000000 + s
+                coll.insert_one({"_id": rid, "grp": seq % 100, "val": val,
+                                 "payload": "y" * 200, "n": n})
+                self._rec(rid, val, n)
+                self.live.append(rid)
+                self.inserts += 1
+                rid += 1
+
+                if seq % 4 == 0 and self.live:
+                    self.opseq += 1
+                    s2 = self.opseq
+                    tgt = random.choice(self.live)
+                    val2, n2 = f"upd-{s2}", 1000000 + s2
+                    coll.update_one({"_id": tgt}, {"$set": {"val": val2, "n": n2}})
+                    self._rec(tgt, val2, n2)
+                    self.updates += 1
+
+                if seq % 11 == 0 and len(self.live) > 50:
+                    victim = self.live.pop(0)
+                    coll.delete_one({"_id": victim})
+                    self.deletes += 1
+                    self.deleted.add(victim)
+                time.sleep(interval)
+            cl.close()
+        except Exception as e:  # noqa: BLE001
+            self.error = e
+
+
 SOURCES = {
     "mysql": MysqlSource,
     "pg": PgSource,
     "oracle": OracleSource,
+    "tidb": TidbSource,
+    "mongo": MongoSource,
+}
+
+# 每种源的订阅链路由哪些子进程组成（故障注入的目标集合）。
+# MongoDB 是单进程引擎（Change Streams 直投 Kafka），没有 capture/extract 两段。
+SUB_ENGINES = {
+    "mysql": ["subscribe", "capture", "extract"],
+    "pg": ["subscribe", "capture", "extract"],
+    "oracle": ["subscribe", "capture", "extract"],
+    "tidb": ["subscribe", "capture", "extract"],
+    "mongo": ["mongo"],
 }
 
 

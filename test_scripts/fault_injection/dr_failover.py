@@ -96,10 +96,12 @@ def do_failover_round(token, task_id, link, src, tgt, src_side, tgt_side,
         return False
     pre_fp = sfp
 
+    engines = DR.DR_LINKS[link]["engines"]
+
     if inject == "before":
         print("=== 注入：倒换前崩溃（自愈窗口内立即发起倒换）===")
-        kill_engine(task_id, "increment", tag="[倒换前] ")
-        kill_engine(task_id, "capture", tag="[倒换前] ")
+        for eng in engines[-2:]:  # 单进程引擎只有一个，SQL 管线取 extract+increment
+            kill_engine(task_id, eng, tag="[倒换前] ")
         time.sleep(2)
         passed.append(f"{round_name} 倒换前已注入子进程崩溃")
 
@@ -115,7 +117,7 @@ def do_failover_round(token, task_id, link, src, tgt, src_side, tgt_side,
         killed = 0
         for _ in range(6):
             time.sleep(5)
-            for eng in ("capture", "extract", "increment"):
+            for eng in engines:
                 if kill_engine(task_id, eng, tag="[倒换中] "):
                     killed += 1
             if killed >= 3:
@@ -164,10 +166,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("link", choices=list(DR.DR_LINKS.keys()))
     ap.add_argument("--inject", choices=["before", "during", "after", "none"], default="before")
-    ap.add_argument("--seed-rows", type=int, default=int(os.environ.get("DR_SEED_ROWS", "200000")))
+    ap.add_argument("--seed-rows", type=int, default=None)
     ap.add_argument("--write-seconds", type=int, default=60)
     ap.add_argument("--switch-back", action="store_true")
     args = ap.parse_args()
+    if args.seed_rows is None:
+        args.seed_rows = int(os.environ.get(
+            "DR_SEED_ROWS", "30000" if DR.is_mongo(args.link) else "200000"))
 
     token = F.login()
     print(f"✓ 登录；单向灾备 {args.link} 主备倒换测试，注入时机={args.inject}")

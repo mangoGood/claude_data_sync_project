@@ -49,10 +49,15 @@ public class CaptureMain {
                 System.exit(1);
             }
         }
+        String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
+
+        // 单实例互斥 + 父进程看门狗：同一 taskId 只允许一个 capture，且 agent 死了不留孤儿。
+        // 放在解密之前——互斥应当是进程启动后的第一件实事，任何在它之前的失败都会让"是否已有实例在跑"
+        // 这个问题得不到回答；也确保绝不会有第二个进程走到打开 binlog 流那一步。
+        com.migration.common.proc.ChildProcessBootstrap.init(taskId, "capture");
+
         // 解密 config.properties 中的加密口令（ENC: 前缀）；历史明文配置无前缀，原样通过。
         com.migration.common.crypto.CredentialCipher.decryptProperties(props);
-
-        String taskId = props.getProperty("task.id", System.getProperty("task.id", "unknown"));
 
         String outputDir = props.getProperty("capture.output.dir",
                 "files/" + taskId + "/binlog_output");

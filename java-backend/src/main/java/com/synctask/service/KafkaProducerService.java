@@ -49,6 +49,8 @@ public class KafkaProducerService {
         message.setSubscribeFormat(workflow.getSubscribeFormat());
         message.setSyncAccount(workflow.getSyncAccount());
         message.setSyncAccountSuperPrivilege(workflow.getSyncAccountSuperPrivilege());
+        // 集群化：任务已指派给某台 agent 时随消息下发，其它 agent 见到不是自己就放行
+        message.setTargetAgentId(workflow.getAgentId());
 
         if (workflow.getSyncObjects() != null && !workflow.getSyncObjects().isEmpty()) {
             try {
@@ -96,6 +98,8 @@ public class KafkaProducerService {
         message.setSubscribeFormat(workflow.getSubscribeFormat());
         message.setSyncAccount(workflow.getSyncAccount());
         message.setSyncAccountSuperPrivilege(workflow.getSyncAccountSuperPrivilege());
+        // 集群化：任务已指派给某台 agent 时随消息下发，其它 agent 见到不是自己就放行
+        message.setTargetAgentId(workflow.getAgentId());
 
         if (workflow.getSyncObjects() != null && !workflow.getSyncObjects().isEmpty()) {
             try {

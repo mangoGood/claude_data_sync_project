@@ -28,7 +28,9 @@ export AGENT_API_TOKEN="$(cat "$PROJECT_DIR/.synctask_agent_token")"
 
 echo "[restart-agent] 停止旧 agent ..."
 pkill -f 'migration-agent/target/migration-agent-1.0.0.jar' 2>/dev/null || true
-# 子进程（capture/extract/increment/full）随 agent 退出不会自动收敛，一并清理
+# 子进程现在有两道自动收敛机制：进程内的父进程看门狗（ParentWatchdog，~5s 自杀）与 agent 启动时的
+# 孤儿回收（OrphanChildReaper）。这里的 pkill 只是第三道兜底——脚本重启是可预期的场景，
+# 与其等看门狗那几秒，不如直接清干净；真正靠前两道兜住的是 agent 被 OOM/kill -9/容器驱逐这些不过脚本的路径。
 pkill -f 'migration-(capture|extract|increment|full|mongo|redis|elastic|subscribe)/target' 2>/dev/null || true
 sleep 3
 

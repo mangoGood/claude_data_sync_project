@@ -61,6 +61,8 @@
             'FULL_MIGRATING': { text: '全量同步中', class: 'status-full-migrating', dot: true },
             'FULL_COMPLETED': { text: '全量同步完成', class: 'status-full-completed', icon: '✓' },
             'INCREMENT_RUNNING': { text: '增量同步中', class: 'status-increment-running', dot: true },
+            // 长期重连：子进程短期重试已耗尽、agent 仍在按间隔拉起（可自愈，不是失败态）
+            'RECONNECTING': { text: '重连中', class: 'status-starting', dot: true },
             'COMPLETED': { text: '已完成', class: 'status-completed', icon: '✓' },
             'FAILED': { text: '失败', class: 'status-failed', icon: '✗' },
             'PAUSED': { text: '已暂停', class: 'status-paused', icon: '' }
@@ -416,6 +418,12 @@
             'E3003': { desc: 'Extract进程启动失败', solution: '请检查Agent日志，确认extract模块JAR包存在且配置正确' },
             'E3004': { desc: '增量同步进程启动失败', solution: '请检查Agent日志，确认increment模块JAR包存在且配置正确' },
             'E3005': { desc: '增量同步进程异常退出', solution: '请检查Agent日志，可能是目标数据库连接中断或SQL执行异常' },
+            'E3006': { desc: '源端日志已被清理，续传位点不可用', solution: '源库的binlog/WAL/redo已过保留期，增量位点无法恢复。请延长源库日志保留期后重新初始化全量同步' },
+            'E3007': { desc: '子进程反复崩溃重启', solution: '进程能起来但很快再次退出（crash-loop），任务表面在跑实则不断丢进度。请查看该子进程日志定位崩溃原因' },
+            'E3008': { desc: '任务磁盘用量超限', solution: '任务目录 files/<taskId> 超过配额。请清理历史任务目录、下调日志级别或调大 task.disk.quota.mb' },
+            'E3009': { desc: '增量事件转换失败', solution: '该事件无法转换成目标端SQL（未知类型/结构不匹配）。可在死信页面裁决跳过，或将 increment.convert.error.policy 设为 DEAD_LETTER 自动记死信并跳过' },
+            'E3010': { desc: 'THL文件读取中断', solution: 'THL文件损坏或读取异常，已在断点处停止且未跳过剩余事件。请检查磁盘与 thl_output 目录，必要时重新初始化增量' },
+            'E3011': { desc: '双向同步写写冲突', solution: '两端同时改了同一行且策略为 ERROR（不自动丢写）。请人工确认保留哪一端，或改用 LWW_SOURCE_TS/NODE_PRIORITY 自动裁决' },
             'E4001': { desc: '全量同步失败', solution: '请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常' },
             'E4002': { desc: '全量同步超时', solution: '请检查数据量是否过大，考虑分批同步或优化网络带宽' },
             'E4003': { desc: '目标数据库写入失败', solution: '请检查目标数据库磁盘空间、表结构是否与源库一致、是否有写入权限' },
@@ -5688,7 +5696,7 @@
             const RUNNING_STATES = new Set([
                 'PENDING', 'RECEIVED', 'STARTING', 'RUNNING',
                 'FULL_MIGRATING', 'FULL_COMPLETED', 'INCREMENT_RUNNING',
-                'SUBSCRIBE_RUNNING', 'SWITCHING'
+                'SUBSCRIBE_RUNNING', 'SWITCHING', 'RECONNECTING'
             ]);
             _metricsTaskList = Array.from(taskMap.values())
                 .filter(t => RUNNING_STATES.has((t.status || '').toUpperCase()));
@@ -5834,10 +5842,38 @@
         }
 
         function clearMetricsDisplay() {
-            ['metricCaptureRate', 'metricE2eLatency', 'metricQueueDepth', 'metricCheckpointLag', 'metricProcessHealth'].forEach(id => {
+            ['metricCaptureRate', 'metricE2eLatency', 'metricQueueDepth', 'metricCheckpointLag', 'metricProcessHealth',
+             'metricReplicationLag', 'metricReplayBytes', 'metricRestartCount', 'metricConflictCount',
+             'metricDeadletterCount', 'metricDiskUsage'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) { el.textContent = '--'; el.className = 'metric-card-value'; }
             });
+        }
+
+        /** SLA 闭环指标（P2-4）。老 agent 不上报这些字段，缺字段时保持 '--' 而不是显示 0（0 会被当成"健康"）。 */
+        function renderSlaMetrics(data) {
+            const setCard = (id, value, colorFn, format) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (value === undefined || value === null) {
+                    el.textContent = '--';
+                    el.className = 'metric-card-value';
+                    return;
+                }
+                el.textContent = format ? format(value) : value;
+                el.className = 'metric-card-value ' + colorFn(value);
+            };
+            setCard('metricReplicationLag', data.replicationLagMs,
+                v => v < 5000 ? 'good' : v < 60000 ? 'warn' : 'bad');
+            setCard('metricReplayBytes', data.captureReplayBytes,
+                v => v === 0 ? 'good' : v < 10 * 1024 * 1024 ? 'warn' : 'bad');
+            setCard('metricRestartCount', data.restartCount10m,
+                v => v === 0 ? 'good' : v < 3 ? 'warn' : 'bad');
+            setCard('metricConflictCount', data.conflictCount, v => v === 0 ? 'good' : 'warn');
+            setCard('metricDeadletterCount', data.deadletterCount, v => v === 0 ? 'good' : 'warn');
+            setCard('metricDiskUsage', data.diskUsageBytes,
+                v => v < 5 * 1024 * 1024 * 1024 ? 'good' : v < 15 * 1024 * 1024 * 1024 ? 'warn' : 'bad',
+                v => (v / (1024 * 1024)).toFixed(1));
         }
 
         function renderMetrics(data) {
@@ -5883,6 +5919,7 @@
             updateChart('chartCheckpointLag', 'checkpointLag', '滞后(sec)', _metricsHistory.timestamps, _metricsHistory.checkpointLag, '#f5222d');
 
             renderProcessStatus(processes);
+            renderSlaMetrics(data);
 
             if (_chartModalInstance && _currentModalKey) {
                 renderModalChart(_currentModalKey, _currentModalUnit, _currentModalColor);

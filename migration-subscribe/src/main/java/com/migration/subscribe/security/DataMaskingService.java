@@ -109,10 +109,11 @@ public class DataMaskingService {
             Object value = entry.getValue();
 
             if (value == null) continue;
-            if (!(value instanceof String)) continue;
 
-            String strValue = (String) value;
-            if (strValue.isEmpty()) continue;
+            // 值可能是原始 String，也可能是 Gson 语法树节点（订阅侧为了保留数字字面量精度，
+            // 行数据是按 JsonElement 传下来的）。两种都要能脱敏，否则开了脱敏也不生效。
+            String strValue = asMaskableString(value);
+            if (strValue == null || strValue.isEmpty()) continue;
 
             // 1. 按字段名规则脱敏
             MaskRule rule = fieldRules.get(fieldName);
@@ -123,12 +124,27 @@ public class DataMaskingService {
 
             if (rule != null) {
                 String masked = applyMask(strValue, rule);
-                entry.setValue(masked);
+                // 写回时保持与原值同一种表示，避免把 JsonElement 换成裸 String 后
+                // 序列化行为发生变化（引号/转义规则不同）
+                entry.setValue(value instanceof com.google.gson.JsonElement
+                        ? new com.google.gson.JsonPrimitive(masked) : masked);
                 totalMasked++;
             }
         }
 
         return dataMap;
+    }
+
+    /** 取出可脱敏的字符串值：原始 String 或字符串型 JsonPrimitive；其它类型（数字/对象）返回 null。 */
+    private String asMaskableString(Object value) {
+        if (value instanceof String) {
+            return (String) value;
+        }
+        if (value instanceof com.google.gson.JsonPrimitive
+                && ((com.google.gson.JsonPrimitive) value).isString()) {
+            return ((com.google.gson.JsonPrimitive) value).getAsString();
+        }
+        return null;
     }
 
     /** 自动检测字符串应使用的脱敏规则 */

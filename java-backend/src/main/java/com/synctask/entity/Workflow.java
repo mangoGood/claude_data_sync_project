@@ -93,6 +93,26 @@ public class Workflow {
     @Column(name = "rto_ms")
     private Long rtoMs;
 
+    // ===== SLA 闭环指标（P2-4），由 agent 随状态消息上报 =====
+    /** 绝对复制延迟：源库当前时刻 − 已应用事件的源端时刻。源库空闲时 rpoMs 恒为 0，这个不会。 */
+    @Column(name = "replication_lag_ms")
+    private Long replicationLagMs;
+
+    @Column(name = "capture_replay_bytes")
+    private Long captureReplayBytes;
+
+    @Column(name = "restart_count_10m")
+    private Integer restartCount10m;
+
+    @Column(name = "conflict_count")
+    private Long conflictCount;
+
+    @Column(name = "deadletter_count")
+    private Long deadletterCount;
+
+    @Column(name = "disk_usage_bytes")
+    private Long diskUsageBytes;
+
     @Column(name = "task_type", length = 20)
     private String taskType = "SYNC";
 
@@ -143,6 +163,17 @@ public class Workflow {
 
     @Column(name = "sync_account_super_privilege")
     private Boolean syncAccountSuperPrivilege = false;
+
+    // 集群化（P1-1）：任务归属哪个 agent、租约到期时刻与代次。
+    // agent_id 为 NULL 表示还没指派（或集群里一个 agent 都没注册，退回旧的广播语义）。
+    @Column(name = "agent_id", length = 64)
+    private String agentId;
+
+    @Column(name = "lease_expire_at")
+    private LocalDateTime leaseExpireAt;
+
+    @Column(name = "lease_epoch")
+    private Integer leaseEpoch = 0;
 
     @PrePersist
     protected void onCreate() {
@@ -379,6 +410,54 @@ public class Workflow {
         this.rtoMs = rtoMs;
     }
 
+    public Long getReplicationLagMs() {
+        return replicationLagMs;
+    }
+
+    public void setReplicationLagMs(Long replicationLagMs) {
+        this.replicationLagMs = replicationLagMs;
+    }
+
+    public Long getCaptureReplayBytes() {
+        return captureReplayBytes;
+    }
+
+    public void setCaptureReplayBytes(Long captureReplayBytes) {
+        this.captureReplayBytes = captureReplayBytes;
+    }
+
+    public Integer getRestartCount10m() {
+        return restartCount10m;
+    }
+
+    public void setRestartCount10m(Integer restartCount10m) {
+        this.restartCount10m = restartCount10m;
+    }
+
+    public Long getConflictCount() {
+        return conflictCount;
+    }
+
+    public void setConflictCount(Long conflictCount) {
+        this.conflictCount = conflictCount;
+    }
+
+    public Long getDeadletterCount() {
+        return deadletterCount;
+    }
+
+    public void setDeadletterCount(Long deadletterCount) {
+        this.deadletterCount = deadletterCount;
+    }
+
+    public Long getDiskUsageBytes() {
+        return diskUsageBytes;
+    }
+
+    public void setDiskUsageBytes(Long diskUsageBytes) {
+        this.diskUsageBytes = diskUsageBytes;
+    }
+
     public String getTaskType() {
         return taskType;
     }
@@ -505,5 +584,29 @@ public class Workflow {
 
     public void setSyncAccountSuperPrivilege(Boolean syncAccountSuperPrivilege) {
         this.syncAccountSuperPrivilege = syncAccountSuperPrivilege;
+    }
+
+    public String getAgentId() {
+        return agentId;
+    }
+
+    public void setAgentId(String agentId) {
+        this.agentId = agentId;
+    }
+
+    public LocalDateTime getLeaseExpireAt() {
+        return leaseExpireAt;
+    }
+
+    public void setLeaseExpireAt(LocalDateTime leaseExpireAt) {
+        this.leaseExpireAt = leaseExpireAt;
+    }
+
+    public Integer getLeaseEpoch() {
+        return leaseEpoch;
+    }
+
+    public void setLeaseEpoch(Integer leaseEpoch) {
+        this.leaseEpoch = leaseEpoch;
     }
 }

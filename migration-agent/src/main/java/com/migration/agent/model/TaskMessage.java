@@ -40,6 +40,16 @@ public class TaskMessage implements Serializable {
     private String skipSeqnos;
     /** 人工裁决要跳过的增量事件 eventId（binlog文件:位点，逗号分隔）——跨重启稳定的首选身份，写入 increment.skip.event.ids */
     private String skipEventIds;
+    /** 指派执行本任务的 agent（集群化）。为空=广播语义，任一 agent 都可接（兼容旧后端） */
+    private String targetAgentId;
+
+    public String getTargetAgentId() {
+        return targetAgentId;
+    }
+
+    public void setTargetAgentId(String targetAgentId) {
+        this.targetAgentId = targetAgentId;
+    }
 
     public static class DatabaseConfig {
         private String host;

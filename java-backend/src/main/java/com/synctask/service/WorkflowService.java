@@ -47,10 +47,20 @@ public class WorkflowService {
     }
 
     /**
-     * 非 SQL 管线类型的配对约束（均仅限实时同步任务，灾备/订阅链路走 SQL 管线不适用）：
+     * 订阅任务的出口恒为 Kafka，与"目标库类型"无关——前端为了复用配置表单会把 targetType
+     * 填成与 sourceType 相同的值。因此配对校验对订阅任务只看源类型，不看目标类型，
+     * 否则 tidb 源的订阅会被"TiDB 不支持作为同步目标"误拦。
+     */
+    private static boolean isSubscribeTaskType(String taskType) {
+        return "SUBSCRIBE".equals(taskType);
+    }
+
+    /**
+     * 非 SQL 管线类型的配对约束：
      * <ul>
-     *   <li>MongoDB 只支持 mongodb→mongodb（副本集到副本集）；</li>
-     *   <li>Elasticsearch 只能作为目标，且源必须是 MySQL（binlog 增量捕获）。</li>
+     *   <li>MongoDB 只支持 mongodb→mongodb（副本集到副本集），实时同步与灾备（单向/双向）均可，
+     *       订阅任务则是 mongodb→Kafka；</li>
+     *   <li>Elasticsearch 只能作为目标，且源必须是 MySQL（binlog 增量捕获），仅实时同步。</li>
      * </ul>
      */
     private void validateMongoTypePairing(String sourceType, String targetType, String taskType) {
@@ -62,31 +72,40 @@ public class WorkflowService {
         if (!srcMongo && !tgtMongo && !srcEs && !tgtEs) {
             return;
         }
-        if (srcMongo != tgtMongo) {
-            throw new RuntimeException("MongoDB 只能与 MongoDB 互相同步，不支持与其它数据库类型组合");
-        }
         if (srcEs) {
             throw new RuntimeException("Elasticsearch 不支持作为同步源，仅支持 MySQL 到 Elasticsearch");
+        }
+        if (srcMongo && isSubscribeTaskType(taskType)) {
+            // 订阅：mongodb → Kafka（Change Streams 直投），目标类型不参与校验
+            return;
+        }
+        if (srcMongo != tgtMongo) {
+            throw new RuntimeException("MongoDB 只能与 MongoDB 互相同步，不支持与其它数据库类型组合");
         }
         if (tgtEs && !"mysql".equalsIgnoreCase(sourceType)) {
             throw new RuntimeException("到 Elasticsearch 的同步目前仅支持 MySQL 源");
         }
-        if (taskType != null && !"SYNC".equals(taskType)) {
-            throw new RuntimeException("MongoDB/Elasticsearch 同步目前仅支持实时同步任务，不支持灾备/订阅");
+        if (tgtEs && taskType != null && !"SYNC".equals(taskType)) {
+            throw new RuntimeException("Elasticsearch 同步目前仅支持实时同步任务，不支持灾备/订阅");
         }
     }
 
     /**
-     * TiDB 配对约束：只支持 TiDB→MySQL 的实时同步。
+     * TiDB 配对约束：TiDB 只能作为源。
      * <ul>
-     *   <li>TiDB 只能作为源：反向（MySQL→TiDB）需要在 TiDB 侧建表/写入的整套适配，尚未支持；</li>
-     *   <li>目标只能是 MySQL；</li>
-     *   <li>仅 SYNC 任务：灾备的反向影子通道正是 MySQL→TiDB，订阅链路也未适配 TiCDC 位点语义。</li>
+     *   <li>反向（MySQL→TiDB）需要在 TiDB 侧建表/写入的整套适配，尚未支持，故不能作目标；</li>
+     *   <li>实时同步的目标只能是 MySQL；</li>
+     *   <li>订阅任务出口是 Kafka（增量走 TiCDC changefeed），不受目标类型约束；</li>
+     *   <li>灾备仍不支持：单向灾备的主备倒换会把 TiDB 变成写入目标，双向灾备的反向通道
+     *       同样是 MySQL→TiDB，而 TiDB 作目标的建表/写入适配尚未支持。</li>
      * </ul>
      */
     private void validateTidbTypePairing(String sourceType, String targetType, String taskType) {
         boolean srcTidb = "tidb".equalsIgnoreCase(sourceType);
         boolean tgtTidb = "tidb".equalsIgnoreCase(targetType);
+        if (srcTidb && isSubscribeTaskType(taskType)) {
+            return;
+        }
         if (tgtTidb) {
             throw new RuntimeException("TiDB 目前仅支持作为同步源，不支持作为同步目标");
         }
@@ -97,7 +116,7 @@ public class WorkflowService {
             throw new RuntimeException("TiDB 源目前仅支持同步到 MySQL");
         }
         if (taskType != null && !"SYNC".equals(taskType)) {
-            throw new RuntimeException("TiDB 同步目前仅支持实时同步任务，不支持灾备/订阅");
+            throw new RuntimeException("TiDB 目前支持实时同步与数据订阅，不支持灾备任务");
         }
     }
 
@@ -109,6 +128,9 @@ public class WorkflowService {
 
     @Autowired
     private KafkaProducerService kafkaProducerService;
+
+    @Autowired
+    private AgentClusterService agentClusterService;
 
     @Transactional
     public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId, String taskType) {
@@ -143,17 +165,18 @@ public class WorkflowService {
         if ("DR".equals(taskType)) {
             workflow.setMigrationMode("fullAndIncre");
             workflow.setDrStatus("DR_CONFIGURING");
-            // 灾备方向：默认单向。双向（active-active 防回环）依赖 capture 侧的 origin 标记跳过，
-            // 目前 MySQL binlog 与 PostgreSQL WAL 两条 capture 均已实现，故支持 mysql↔mysql 与 pg↔pg；
-            // 其它类型（Oracle/Mongo/ES）capture 侧未实现防回环，暂不支持双向。
+            // 灾备方向：默认单向。双向（active-active 防回环）依赖捕获侧的 origin 标记跳过，
+            // 目前 MySQL binlog、PostgreSQL WAL、MongoDB Change Streams 三条捕获链路均已实现，
+            // 故支持 mysql↔mysql、pg↔pg 与 mongodb↔mongodb；其它类型（Oracle/ES）暂不支持双向。
             String effectiveDrMode = "BIDIRECTIONAL".equalsIgnoreCase(drMode) ? "BIDIRECTIONAL" : "UNIDIRECTIONAL";
             if ("BIDIRECTIONAL".equals(effectiveDrMode)) {
                 String st = workflow.getSourceType();
                 String tt = workflow.getTargetType();
                 boolean bothMysql = "mysql".equalsIgnoreCase(st) && "mysql".equalsIgnoreCase(tt);
                 boolean bothPg = "postgresql".equalsIgnoreCase(st) && "postgresql".equalsIgnoreCase(tt);
-                if (!bothMysql && !bothPg) {
-                    throw new RuntimeException("双向灾备目前仅支持 MySQL↔MySQL 或 PostgreSQL↔PostgreSQL");
+                boolean bothMongo = "mongodb".equalsIgnoreCase(st) && "mongodb".equalsIgnoreCase(tt);
+                if (!bothMysql && !bothPg && !bothMongo) {
+                    throw new RuntimeException("双向灾备目前仅支持 MySQL↔MySQL、PostgreSQL↔PostgreSQL 或 MongoDB↔MongoDB");
                 }
             }
             workflow.setDrMode(effectiveDrMode);
@@ -288,8 +311,13 @@ public class WorkflowService {
 
         workflow.setStatus(WorkflowStatus.PENDING);
         workflow.setIsBilling(true);
+        // 集群化：先挑一台存活 agent 写进 agent_id + 租约，再投 Kafka（消息带 targetAgentId）。
+        // 一台都没注册时 assign 返回 false，退回"广播 + 谁抢到算谁"的旧语义。
+        if (agentClusterService.assign(workflow)) {
+            addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务已指派给 agent: " + workflow.getAgentId());
+        }
         workflowRepository.save(workflow);
-        
+
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务启动中，状态: 启动中");
         
         try {
@@ -439,6 +467,8 @@ public class WorkflowService {
         message.setTaskType(w.getTaskType());
         message.setDrMode(w.getDrMode());
         message.setSyncObjects(parseSyncObjects(w.getSyncObjects()));
+        // 控制消息（stop/resume/terminate/delete）同样定向：任务在哪台 agent 上跑，就只让那台处理
+        message.setTargetAgentId(w.getAgentId());
         return message;
     }
 
@@ -783,7 +813,7 @@ public class WorkflowService {
     /** 同步位点可视化：代理 agent 的 /api/checkpoint/{taskId}（先做属主校验）。 */
     public Map<String, Object> getCheckpointVisualization(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）");
+        return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）", id);
     }
 
     // ==================== 实时监控指标：代理 agent 的只读监控接口 ====================
@@ -797,26 +827,26 @@ public class WorkflowService {
     /** 单任务实时指标：代理 agent 的 /api/metrics/{taskId}（先做属主校验）。 */
     public Map<String, Object> getTaskMetrics(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/metrics/" + id, "查询任务实时指标失败（agent 不可达或未运行）");
+        return callAgentJson("/api/metrics/" + id, "查询任务实时指标失败（agent 不可达或未运行）", id);
     }
 
     /** 单任务历史指标：代理 agent 的 /api/metrics/{taskId}/history（先做属主校验）。 */
     public Map<String, Object> getTaskMetricsHistory(String id, Long userId, String query) {
         getWorkflowById(id, userId);
         String path = "/api/metrics/" + id + "/history" + (query != null && !query.isEmpty() ? "?" + query : "");
-        return callAgentJson(path, "查询任务历史指标失败（agent 不可达或未运行）");
+        return callAgentJson(path, "查询任务历史指标失败（agent 不可达或未运行）", id);
     }
 
     /** 表级延迟热力图：代理 agent 的 /api/table-latency/{taskId}（先做属主校验）。 */
     public Map<String, Object> getTableLatency(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/table-latency/" + id, "查询表级延迟失败（agent 不可达或未运行）");
+        return callAgentJson("/api/table-latency/" + id, "查询表级延迟失败（agent 不可达或未运行）", id);
     }
 
     /** 一对多分发状态：代理 agent 的 /api/fanout/{taskId}（先做属主校验）。 */
     public Map<String, Object> getFanoutStatus(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/fanout/" + id, "查询分发状态失败（agent 不可达或未运行）");
+        return callAgentJson("/api/fanout/" + id, "查询分发状态失败（agent 不可达或未运行）", id);
     }
 
     /**
@@ -844,7 +874,7 @@ public class WorkflowService {
      */
     public byte[] getDiagnosticsBundle(String id, Long userId) {
         getWorkflowById(id, userId);
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentBase = agentBaseUrlFor(id);
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/diagnostics/" + id);
@@ -894,9 +924,35 @@ public class WorkflowService {
         return result;
     }
 
+    /**
+     * 任务当前归属 agent 的基址。集群化后 agent 不止一台，硬编码 localhost:8083 会问错机器
+     * （查到的指标是空的、位点是别人的）。查不到归属或该 agent 没注册时回退默认地址，
+     * 单机部署行为不变。
+     */
+    private String agentBaseUrlFor(String taskId) {
+        String fallback = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        if (taskId == null) {
+            return fallback;
+        }
+        try {
+            Workflow w = workflowRepository.findById(taskId).orElse(null);
+            if (w == null) {
+                return fallback;
+            }
+            return agentClusterService.agentBaseUrl(w.getAgentId()).orElse(fallback);
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
     /** GET agent HTTP 接口并解析 JSON（带可选 Bearer token）。 */
     private Map<String, Object> callAgentJson(String path, String errPrefix) {
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        return callAgentJson(path, errPrefix, null);
+    }
+
+    /** taskId 非空时按任务归属路由到对应 agent。 */
+    private Map<String, Object> callAgentJson(String path, String errPrefix, String taskId) {
+        String agentBase = agentBaseUrlFor(taskId);
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + path);
@@ -924,7 +980,7 @@ public class WorkflowService {
     public Map<String, Object> getDeadletterRecords(String id, Long userId) {
         getWorkflowById(id, userId);
 
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentBase = agentBaseUrlFor(id);
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/agent/deadletter/" + id);
@@ -946,6 +1002,12 @@ public class WorkflowService {
         } catch (Exception e) {
             throw new RuntimeException("查询死信记录失败（agent 不可达或未运行）: " + e.getMessage());
         }
+    }
+
+    /** 双向写写冲突记录：代理 agent 的 /api/agent/conflicts/{taskId}（与死信同格式，前端复用同一套展示）。 */
+    public Map<String, Object> getConflictRecords(String id, Long userId) {
+        getWorkflowById(id, userId);
+        return callAgentJson("/api/agent/conflicts/" + id, "查询冲突记录失败（agent 不可达或未运行）", id);
     }
 
     private Map<String, Object> parseSyncObjects(String syncObjects) {
@@ -1075,7 +1137,7 @@ public class WorkflowService {
     private boolean callAgentFailoverApi(TaskCreatedMessage message) {
         // agent 地址与鉴权 token 均可配（环境变量优先），不再写死 localhost；
         // agent 侧 failover 是敏感端点，配置了 AGENT_API_TOKEN 时必须带 Bearer token。
-        String agentBase = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String agentBase = agentBaseUrlFor(message.getTaskId());
         String agentToken = System.getenv("AGENT_API_TOKEN");
         String agentUrl = agentBase + "/api/agent/failover";
         try {

@@ -47,6 +47,8 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
 
     private volatile String currentLsn;
     private volatile long currentLsnNumeric;
+    /** 本次启动是否从已落盘 LSN 续传（false 表示首次启动，用 checkpoint 的起始 LSN）。 */
+    private boolean resumedFromPersisted;
 
     // 背压控制：extract 通过信号文件通知 capture 暂停/恢复
     private volatile boolean backpressurePaused = false;
@@ -65,8 +67,14 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         database = props.getProperty("source.db.database", "postgres");
         user = props.getProperty("source.db.username", "postgres");
         password = props.getProperty("source.db.password", "");
-        startLsn = props.getProperty("capture.wal.lsn", "");
         outputDir = props.getProperty("capture.output.dir", "binlog_output");
+        // 位点来源优先级：已落盘 LSN > config.properties 的起始 LSN。后者是任务启动时写死一次的，
+        // 崩溃重启若还认它，复制槽会被要求从任务最初的 LSN 重发，整段 WAL 重放（见 CapturePositionStore）。
+        java.util.Properties persisted = com.migration.common.position.CapturePositionStore.preferPersisted(props)
+                ? com.migration.common.position.CapturePositionStore.load(outputDir)
+                : new java.util.Properties();
+        startLsn = com.migration.common.position.CapturePositionStore.prefer(
+                persisted, "wal.lsn", props.getProperty("capture.wal.lsn", ""), "WAL LSN");
         taskId = props.getProperty("task.id", "unknown");
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         slotName = props.getProperty("capture.wal.slot.name", "migration_slot_" + taskId.replaceAll("[^a-z0-9_]", "_"));
@@ -84,9 +92,72 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         if (startLsn.isEmpty()) {
             startLsn = null;
         }
+        resumedFromPersisted = !persisted.isEmpty();
 
-        logger.info("PostgreSQL WAL Capture initialized - host={}:{} database={} user={} outputDir={} taskId={} startLsn={} slotName={}",
-                host, port, database, user, outputDir, taskId, startLsn, slotName);
+        verifyResumePositionAvailable();
+
+        logger.info("PostgreSQL WAL Capture initialized - host={}:{} database={} user={} outputDir={} taskId={} startLsn={} resumed={} slotName={}",
+                host, port, database, user, outputDir, taskId, startLsn, resumedFromPersisted, slotName);
+    }
+
+    /**
+     * 续传 LSN 是否还被复制槽保留着。
+     *
+     * <p>逻辑复制槽是 WAL 保留的唯一凭据：槽被删掉（或被下面 {@link #ensureReplicationSlot} 的
+     * drop/recreate 路径重建过），{@code restart_lsn} 之前的 WAL 就已经被回收。此时拿旧 LSN
+     * 发起 START_REPLICATION，服务端<b>不会报错</b>，而是从槽当前位置开始发——中间那段变更
+     * 静默消失。这比报错危险得多，所以这里主动比对、发现即判失败。
+     *
+     * <p>只在"从已落盘位点续传"时检查：首次启动时槽还没建，startLsn 来自 checkpoint，属正常。
+     */
+    private void verifyResumePositionAvailable() {
+        if (!resumedFromPersisted || startLsn == null
+                || !Boolean.parseBoolean(props.getProperty("capture.position.precheck.enabled", "true"))) {
+            return;
+        }
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        try (Connection checkConn = DriverManager.getConnection(url, user, password);
+             Statement stmt = checkConn.createStatement()) {
+            ResultSet rs = stmt.executeQuery(
+                    "SELECT restart_lsn, restart_lsn > '" + startLsn + "'::pg_lsn AS lost "
+                            + "FROM pg_replication_slots WHERE slot_name = '" + slotName + "'");
+            if (!rs.next()) {
+                failPositionUnavailable("复制槽 " + slotName + " 已不存在，续传 LSN " + startLsn
+                        + " 之后的 WAL 未被保留");
+                return;
+            }
+            if (rs.getBoolean("lost")) {
+                failPositionUnavailable("复制槽 " + slotName + " 的 restart_lsn=" + rs.getString("restart_lsn")
+                        + " 已越过续传 LSN " + startLsn + "，中间 WAL 已被回收");
+            }
+        } catch (CapturePositionUnavailableException e) {
+            throw e;
+        } catch (Exception e) {
+            logger.warn("续传 LSN 可用性预检跳过（查询失败）: {}", e.getMessage());
+        }
+    }
+
+    private void failPositionUnavailable(String detail) {
+        logger.error("{}（本任务需重新初始化全量）", detail);
+        writeCaptureErrorStatus("E3006", detail + "；需重新初始化全量同步");
+        throw new CapturePositionUnavailableException(detail);
+    }
+
+    /** 起始位点已被源端回收，无法自动恢复。 */
+    static class CapturePositionUnavailableException extends RuntimeException {
+        CapturePositionUnavailableException(String message) {
+            super(message);
+        }
+    }
+
+    /** 写 {@code binlog_output/error_status}（格式同 increment 端），agent 轮询到即上报 FAILED。 */
+    private void writeCaptureErrorStatus(String errorCode, String message) {
+        File dir = new File(outputDir);
+        if (!dir.exists()) dir.mkdirs();
+        com.migration.common.io.AtomicFileWriter.writeStringQuietly(
+                new File(dir, "error_status"),
+                System.currentTimeMillis() + "|" + errorCode + "|-1|"
+                        + message.replace("|", "/") + "|capture\n");
     }
 
     @Override
@@ -412,20 +483,31 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 boolean active = rs.getBoolean("active");
                 int activePid = rs.getInt("active_pid");
                 if (active && activePid > 0) {
-                    logger.warn("Replication slot '{}' is active for PID {}, terminating backend", slotName, activePid);
+                    // 崩溃重启后旧的 walsender 后端可能还没被服务端回收，槽显示 active。
+                    // 只需踢掉那个后端等它释放——**绝不能顺手 drop 掉槽**：槽是 WAL 保留的唯一凭据，
+                    // 删了再建，restart_lsn 之前的 WAL 立刻被回收，随后拿旧 LSN 续传时服务端不报错、
+                    // 直接从新槽位置开始发，中间的变更静默消失。这是"位点在、数据没了"的典型丢数据路径。
+                    logger.warn("Replication slot '{}' is active for PID {}, terminating backend (slot is kept to preserve WAL retention)",
+                            slotName, activePid);
                     try {
                         stmt.execute("SELECT pg_terminate_backend(" + activePid + ")");
                     } catch (Exception e) {
                         logger.warn("Failed to terminate backend PID {}: {}", activePid, e.getMessage());
                     }
-                    Thread.sleep(500);
-                    try {
-                        stmt.execute("SELECT pg_drop_replication_slot('" + slotName + "')");
-                        logger.info("Dropped active replication slot '{}', will recreate", slotName);
-                        stmt.execute("SELECT pg_create_logical_replication_slot('" + slotName + "', 'pgoutput')");
-                        logger.info("Recreated replication slot '{}' with pgoutput plugin", slotName);
-                    } catch (Exception e) {
-                        logger.warn("Failed to drop/recreate slot '{}': {}", slotName, e.getMessage());
+                    if (waitForSlotInactive(stmt)) {
+                        logger.info("Replication slot '{}' released, resuming on the existing slot", slotName);
+                    } else if (resumedFromPersisted) {
+                        // 槽始终不释放且我们有续传位点：重建槽必然丢数据，宁可失败让人来处理。
+                        failPositionUnavailable("复制槽 " + slotName + " 长时间未释放，无法在不丢数据的前提下续传");
+                    } else {
+                        logger.warn("Replication slot '{}' still active, recreating (no resume position to protect)", slotName);
+                        try {
+                            stmt.execute("SELECT pg_drop_replication_slot('" + slotName + "')");
+                            stmt.execute("SELECT pg_create_logical_replication_slot('" + slotName + "', 'pgoutput')");
+                            logger.info("Recreated replication slot '{}' with pgoutput plugin", slotName);
+                        } catch (Exception e) {
+                            logger.warn("Failed to drop/recreate slot '{}': {}", slotName, e.getMessage());
+                        }
                     }
                 } else {
                     logger.info("Replication slot '{}' already exists (inactive)", slotName);
@@ -435,6 +517,20 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 logger.info("Created replication slot '{}' with pgoutput plugin", slotName);
             }
         }
+    }
+
+    /** 轮询等待槽被释放（被踢掉的 walsender 后端退出通常在数百毫秒内），最多 ~10s。 */
+    private boolean waitForSlotInactive(Statement stmt) throws Exception {
+        for (int i = 0; i < 20; i++) {
+            Thread.sleep(500);
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT active FROM pg_replication_slots WHERE slot_name = '" + slotName + "'")) {
+                if (!rs.next() || !rs.getBoolean("active")) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private void ensurePublication() throws Exception {
@@ -1069,20 +1165,17 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         logger.info("Rotated to new capture output file after {} events", maxEventsPerFile);
     }
 
+    /** 落盘 WAL 位点，原子写（tmp+fsync+rename），崩溃重启后据此续传而非从任务起始 LSN 重放。 */
     private void savePosition() {
         if (currentLsn == null) return;
 
-        File positionFile = new File(outputDir, "capture_position.properties");
         Properties posProps = new Properties();
         posProps.setProperty("wal.lsn", currentLsn);
         posProps.setProperty("wal.lsn.numeric", String.valueOf(currentLsnNumeric));
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
 
-        try (FileOutputStream fos = new FileOutputStream(positionFile)) {
-            posProps.store(fos, "WAL Capture position for task: " + taskId);
-        } catch (IOException e) {
-            logger.warn("Failed to save WAL capture position: {}", e.getMessage());
-        }
+        com.migration.common.position.CapturePositionStore.save(
+                outputDir, posProps, "WAL Capture position for task: " + taskId);
     }
 
     public String getCurrentLsn() {

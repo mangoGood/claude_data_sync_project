@@ -63,6 +63,8 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
     private volatile String currentBinlogFile;
     private volatile long currentBinlogPosition;
+    /** 本次启动是否从已落盘位点续传（false 表示首次启动，用配置里的起始位点）。 */
+    private boolean resumedFromPersisted;
 
     private Thread heartbeatThread;
     private Connection heartbeatConnection;
@@ -95,8 +97,18 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         port = Integer.parseInt(props.getProperty("source.db.port", "3306"));
         user = props.getProperty("source.db.username", "root");
         password = props.getProperty("source.db.password", "");
-        binlogFile = props.getProperty("capture.binlog.file", "");
-        binlogPosition = Long.parseLong(props.getProperty("capture.binlog.position", "4"));
+        outputDir = props.getProperty("capture.output.dir", "binlog_output");
+        // 位点来源优先级：已落盘位点 > config.properties 的起始位点。config 里的
+        // capture.binlog.* 是任务启动时写死一次的，只在首次启动有意义；崩溃重启若还认它，
+        // 就等于每次都从任务最初的位点整段重放（见 CapturePositionStore 的说明）。
+        java.util.Properties persisted = com.migration.common.position.CapturePositionStore.preferPersisted(props)
+                ? com.migration.common.position.CapturePositionStore.load(outputDir)
+                : new java.util.Properties();
+        binlogFile = com.migration.common.position.CapturePositionStore.prefer(
+                persisted, "binlog.file", props.getProperty("capture.binlog.file", ""), "binlog 文件");
+        binlogPosition = Long.parseLong(com.migration.common.position.CapturePositionStore.prefer(
+                persisted, "binlog.position", props.getProperty("capture.binlog.position", "4"), "binlog 位点"));
+        resumedFromPersisted = !persisted.isEmpty();
         // GTID 位点：gtid_executed 快照与 file+pos 在同一时刻记录（CheckpointManager），
         // 有 GTID 集且未显式关闭时优先按 GTID 自动定位——源端 HA 切换/binlog 文件名变化时
         // file+pos 失效而 GTID 仍然有效。gtid_executed 原文可能含换行，需归一化。
@@ -107,17 +119,26 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         // AUTO_POSITION 会被拒："replication sender thread cannot start in AUTO_POSITION
         // mode: this server has GTID_MODE = OFF"，导致 binlog 拉取彻底失败、增量不同步。
         // 因此以 gtid_mode 而非 gtid_executed 是否非空为准，非 ON 一律回退 file+pos。
-        gtidSet = props.getProperty("capture.gtid.set", "").replaceAll("\\s+", "");
+        // 同理，GTID 集也优先用已落盘的：连接器在流式过程中持续维护 client.getGtidSet()，
+        // savePosition 落的是"已提交事务"的集合，拿它续传只会重放最后一小段。
+        gtidSet = com.migration.common.position.CapturePositionStore.prefer(
+                persisted, "gtid.set", props.getProperty("capture.gtid.set", ""), "GTID 集")
+                .replaceAll("\\s+", "");
         if (gtidEnabled && !gtidSet.isEmpty() && !sourceGtidModeOn()) {
             logger.warn("源库 gtid_mode 非 ON（gtid_executed={} 可能是历史遗留），放弃 GTID 自动定位，回退 file+pos", gtidSet);
             gtidSet = "";
         }
-        outputDir = props.getProperty("capture.output.dir", "binlog_output");
         taskId = props.getProperty("task.id", "unknown");
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         serverId = Long.parseLong(props.getProperty("capture.server.id", "65535"));
         bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
         loopGuard = new com.migration.common.bidi.BidiLoopGuard(bidirectionalEnabled);
+        // 双向 DDL 单向传播：只有"方向开了 A_TO_B"且"本任务是正向通道"时才放行
+        bidiDdlForwardAllowed = "A_TO_B".equalsIgnoreCase(props.getProperty("sync.bidi.ddl.direction", "NONE").trim())
+                && Boolean.parseBoolean(props.getProperty("sync.bidi.ddl.forward", "false"));
+        if (bidirectionalEnabled) {
+            logger.info("双向 DDL 传播: {}", bidiDdlForwardAllowed ? "本任务放行（A→B 正向）" : "不传播");
+        }
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
 
         heartbeatDatabase = props.getProperty("source.db.database", "");
@@ -162,12 +183,112 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             binlogPosition = 0;
         }
 
+        recordReplayAmplification();
+
         // 解析同步对象配置，构建数据库/表过滤集合
         parseSyncObjects();
 
-        logger.info("Capture初始化完成 - host={}:{} user={} outputDir={} taskId={} binlogFile={} binlogPosition={} heartbeatDatabase={} syncedDatabases={} syncedTables={}",
-                host, port, user, outputDir, taskId, binlogFile, binlogPosition, heartbeatDatabase,
-                syncedDatabases, syncedTables);
+        verifyResumePositionAvailable();
+
+        logger.info("Capture初始化完成 - host={}:{} user={} outputDir={} taskId={} binlogFile={} binlogPosition={} resumed={} heartbeatDatabase={} syncedDatabases={} syncedTables={}",
+                host, port, user, outputDir, taskId, binlogFile, binlogPosition, resumedFromPersisted,
+                heartbeatDatabase, syncedDatabases, syncedTables);
+    }
+
+    /**
+     * 起始位点是否还在源端保留期内。
+     *
+     * <p>源库 {@code PURGE BINARY LOGS} / {@code expire_logs_days} 到期后，我们记着的位点会永久失效。
+     * 此时连接器每次连上都被服务端拒绝、ProcessGuard 无限重启，任务对外一直显示"同步中"，
+     * 实际一条数据都不动。与其让它空转，不如立刻写错误状态文件让 agent 上报 FAILED，
+     * 由人决定重做全量——这类故障没有自动补救手段，唯一正确的动作是尽早暴露。
+     */
+    private void verifyResumePositionAvailable() {
+        if (!Boolean.parseBoolean(props.getProperty("capture.position.precheck.enabled", "true"))) {
+            return;
+        }
+        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        try (Connection conn = DriverManager.getConnection(url, user, password)) {
+            if (gtidEnabled && gtidSet != null && !gtidSet.isEmpty()) {
+                verifyGtidNotPurged(conn);
+            } else if (binlogFile != null && !binlogFile.isEmpty()) {
+                verifyBinlogFileRetained(conn);
+            }
+        } catch (CapturePositionUnavailableException e) {
+            throw e;
+        } catch (Exception e) {
+            // 预检本身失败（权限不足、瞬时网络问题）不该阻断启动：放行后按原路径重试，
+            // 真正不可用时连接器会报错，只是没有这条明确提示而已。
+            logger.warn("起始位点可用性预检跳过（查询失败）: {}", e.getMessage());
+        }
+    }
+
+    private void verifyBinlogFileRetained(Connection conn) throws Exception {
+        java.util.List<String> logs = new java.util.ArrayList<>();
+        try (Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery("SHOW BINARY LOGS")) {
+            while (rs.next()) {
+                logs.add(rs.getString(1));
+            }
+        }
+        if (logs.isEmpty() || logs.contains(binlogFile)) {
+            return;
+        }
+        failPositionUnavailable(String.format(
+                "起始 binlog 文件 %s 已不在源端（现存 %s ... %s，共 %d 个），日志已被清理，位点不可用",
+                binlogFile, logs.get(0), logs.get(logs.size() - 1), logs.size()));
+    }
+
+    private void verifyGtidNotPurged(Connection conn) throws Exception {
+        String purged = "";
+        try (Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_purged")) {
+            if (rs.next()) {
+                purged = rs.getString(1) == null ? "" : rs.getString(1).replaceAll("\\s+", "");
+            }
+        }
+        if (purged.isEmpty()) {
+            return;
+        }
+        // 已清理的事务必须全部落在"我们已经拿到过"的集合里；否则中间缺了一段永远补不回来。
+        com.github.shyiko.mysql.binlog.GtidSet purgedSet = new com.github.shyiko.mysql.binlog.GtidSet(purged);
+        com.github.shyiko.mysql.binlog.GtidSet mine = new com.github.shyiko.mysql.binlog.GtidSet(gtidSet);
+        if (!purgedSet.isContainedWithin(mine)) {
+            failPositionUnavailable(String.format(
+                    "源端已清理的 GTID 集 %s 不被本任务已捕获集 %s 覆盖，中间事务已永久丢失，位点不可用",
+                    purged, gtidSet));
+        }
+    }
+
+    private void failPositionUnavailable(String detail) {
+        logger.error("{}（本任务需重新初始化全量）", detail);
+        writeCaptureErrorStatus("E3006", detail + "；需重新初始化全量同步");
+        throw new CapturePositionUnavailableException(detail);
+    }
+
+    /** 起始位点已被源端清理，无法自动恢复。 */
+    static class CapturePositionUnavailableException extends RuntimeException {
+        CapturePositionUnavailableException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * 写 {@code binlog_output/error_status}，格式与 increment 端一致：
+     * {@code 时间戳|错误码|seqno|消息|组件}。agent 的 {@code checkIncrementErrorStatus} 轮询到即上报 FAILED，
+     * 不再让 ProcessGuard 对一个永远起不来的进程无限重试。
+     */
+    private void writeCaptureErrorStatus(String errorCode, String message) {
+        try {
+            File dir = new File(outputDir);
+            if (!dir.exists()) dir.mkdirs();
+            com.migration.common.io.AtomicFileWriter.writeStringQuietly(
+                    new File(dir, "error_status"),
+                    System.currentTimeMillis() + "|" + errorCode + "|-1|"
+                            + message.replace("|", "/") + "|capture\n");
+        } catch (Exception e) {
+            logger.warn("写入 capture 错误状态文件失败: {}", e.getMessage());
+        }
     }
 
     /**
@@ -456,6 +577,18 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
     }
 
+    /** 本任务是否允许把 DDL 传给对端（sync.bidi.ddl.direction=A_TO_B 且本任务是正向通道）。 */
+    private boolean bidiDdlForwardAllowed = false;
+
+    /** 同步内部表的 DDL 永远不外传：它们是机制自身的表，传过去只会互相建表打架。 */
+    private static boolean isInternalDdl(String sql) {
+        if (sql == null) return false;
+        String up = sql.toUpperCase();
+        return up.contains(com.migration.common.bidi.BidiConstants.MARKER_TABLE.toUpperCase())
+                || up.contains("__SYNC_ROWMETA")
+                || up.contains("__SYNC_HEARTBEAT");
+    }
+
     /**
      * 启动后台线程定期检查背压信号，确保无事件时也能及时响应暂停/恢复。
      */
@@ -513,19 +646,24 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
             // 双向同步/环路防护：前向单遍事务标记状态机
             if (bidirectionalEnabled) {
-                // 事务边界：BEGIN 开启新事务 / XID 提交，复位标记状态；双向模式下二者均不外传。
+                // 事务边界：BEGIN 开启新事务 / XID 提交，复位标记状态。
+                // BEGIN/XID 本身<b>照常外传</b>——下游靠它们还原源事务边界做原子提交；
+                // 丢掉它们等于双向链路永远只能逐行提交，备端随时停在半个事务上。
+                // 被标记事务的数据事件仍然跳过，下游看到的只是一对空的 BEGIN/XID，无副作用。
                 if (eventData instanceof QueryEventData) {
                     String sql = ((QueryEventData) eventData).getSql();
                     if (sql != null && "BEGIN".equalsIgnoreCase(sql.trim())) {
                         loopGuard.onTransactionBoundary();
+                    } else if (!bidiDdlForwardAllowed || isInternalDdl(sql)) {
+                        // 默认双向模式只复制 DML，不传播 DDL（CREATE/ALTER/DROP…）：DDL 无法用行标记打标
+                        // （隐式提交，与 DML 不同事务），在 active-active 里会无限回环。
+                        // 配了 sync.bidi.ddl.direction=A_TO_B 时<b>只有正向任务</b>放行 DDL，
+                        // 反向影子通道恒不放行——两边都传就会各自建表/改表打架，且照样回环。
+                        // 内部表（__sync_origin/__sync_rowmeta/__sync_heartbeat）的 DDL 任何方向都不传。
+                        return;
                     }
-                    // 双向模式只复制 DML，不传播 DDL / 事务控制语句（BEGIN/COMMIT/CREATE/ALTER/DROP…）：
-                    // DDL 无法用行标记打标（隐式提交，与 DML 不同事务），在 active-active 里会无限回环。
-                    // schema 变更需各节点带外协调。此举也顺带滤掉 __sync_heartbeat/__sync_origin 建表 DDL。
-                    return;
                 } else if (eventData instanceof XidEventData) {
                     loopGuard.onTransactionBoundary();
-                    return;
                 }
                 // origin 标记行事件：置位并丢弃（标记表不外传），后续本事务数据事件将被跳过
                 String markerTable = com.migration.common.bidi.BidiConstants.MARKER_TABLE;
@@ -788,25 +926,95 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         return sb.toString();
     }
 
+    /**
+     * 落盘捕获位点——这是崩溃重启后唯一的续传依据，走原子写（tmp+fsync+rename）。
+     *
+     * <p>顺序上是安全的：本方法只在事件已 {@code writer.flush()} 之后调用，而连接器是
+     * <b>先通知监听器、后推进 binlogPosition</b> 的（BinaryLogClient#listenForEventPackets），
+     * 所以这里存下的是"当前事件的起始位点"——重启至多重放这一个事件，绝不会跳过。
+     * GTID 集同理：连接器只在 XID/COMMIT 时把事务并入已执行集，事务中途落盘存的是提交前的前缀，
+     * 重启重放整个事务，仍是至少一次而非丢失。
+     */
+    /**
+     * 启动时算一次<b>重放放大量</b>（P2-4 的 {@code capture_replay_bytes}）：
+     * 上一轮跑到过的最远位点 − 本轮实际起始位点。
+     *
+     * <p>健康的重启这个数接近 0（位点文件每 1000 事件/若干秒落一次，最多重放这一小段）。
+     * 一旦它变成几十上百 MB，就说明位点没被用上——起始位点退回了任务最初那个值，
+     * 也就是 §2.2 那类"每次重启整段重放"的故障。这类故障不报错、不告警，任务看着一直在跑，
+     * 只有下游消息量翻倍才看得出来；有了这个数就能直接对它设告警。
+     *
+     * <p>高水位文件<b>跨重启单调保留</b>（主备倒换会连同整个 binlog_output 一起清掉，
+     * 那时新源的位点与旧源无可比性，重新从 0 开始正是想要的）。
+     */
+    private void recordReplayAmplification() {
+        try {
+            File hw = new File(outputDir, "capture_high_water");
+            if (!hw.exists() || binlogFile == null) {
+                writeMetricFile("capture_replay_bytes", "0");
+                return;
+            }
+            String line;
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(hw))) {
+                line = r.readLine();
+            }
+            if (line == null || !line.contains("|")) {
+                writeMetricFile("capture_replay_bytes", "0");
+                return;
+            }
+            String[] parts = line.trim().split("\\|", 2);
+            long replay = 0;
+            // 只在同一个 binlog 文件内比较：跨文件的字节差需要知道中间各文件大小，算不出来也没必要
+            if (parts[0].equals(binlogFile)) {
+                long highWater = Long.parseLong(parts[1].trim());
+                replay = Math.max(0, highWater - binlogPosition);
+            }
+            writeMetricFile("capture_replay_bytes", String.valueOf(replay));
+            if (replay > 0) {
+                logger.warn("本次启动重放放大量 {} 字节（上轮最远位点 {} → 本次起点 {}:{}）",
+                        replay, line.trim(), binlogFile, binlogPosition);
+            }
+        } catch (Exception e) {
+            logger.debug("计算重放放大量失败: {}", e.getMessage());
+        }
+    }
+
+    /** 更新跨重启单调的位点高水位，供下次启动算重放放大量。 */
+    private void saveHighWater() {
+        if (currentBinlogFile == null) return;
+        writeMetricFile("capture_high_water", currentBinlogFile + "|" + currentBinlogPosition);
+    }
+
+    private void writeMetricFile(String name, String content) {
+        try {
+            File dir = new File(outputDir);
+            if (!dir.exists() && !dir.mkdirs()) {
+                return;
+            }
+            try (java.io.FileWriter w = new java.io.FileWriter(new File(dir, name), false)) {
+                w.write(content);
+            }
+        } catch (Exception e) {
+            logger.debug("写指标文件 {} 失败: {}", name, e.getMessage());
+        }
+    }
+
     private void savePosition() {
         if (currentBinlogFile == null) return;
 
-        File positionFile = new File(outputDir, "capture_position.properties");
+        saveHighWater();
         Properties posProps = new Properties();
         posProps.setProperty("binlog.file", currentBinlogFile);
         posProps.setProperty("binlog.position", String.valueOf(currentBinlogPosition));
-        // GTID 连接模式下连接器持续维护已执行集，一并持久化（位点可视化/排障用）
+        // GTID 连接模式下连接器持续维护已执行集，一并持久化（续传 + 位点可视化/排障）
         String currentGtidSet = client != null ? client.getGtidSet() : null;
         if (currentGtidSet != null && !currentGtidSet.isEmpty()) {
             posProps.setProperty("gtid.set", currentGtidSet.replaceAll("\\s+", ""));
         }
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
 
-        try (FileOutputStream fos = new FileOutputStream(positionFile)) {
-            posProps.store(fos, "Capture position for task: " + taskId);
-        } catch (IOException e) {
-            logger.warn("保存捕获位点失败: {}", e.getMessage());
-        }
+        com.migration.common.position.CapturePositionStore.save(
+                outputDir, posProps, "Capture position for task: " + taskId);
     }
 
     public String getCurrentBinlogFile() {

@@ -144,6 +144,13 @@ public class AlertRuleService {
         }
     }
 
+    /**
+     * 取指标当前值。指标全部来自 workflows 表（agent 随状态消息上报），null = 该任务没有这个指标，
+     * 规则本轮直接跳过（不会误报 0）。
+     *
+     * <p>P2-4 之前只有 RPO_MS/RTO_MS 两个指标可告警，其余信号（重放放大、crash-loop、
+     * 冲突、死信、磁盘）只落在日志和文件里，得有人去翻才看得见。
+     */
     private Double extractMetricValue(String metricType, Workflow workflow) {
         switch (metricType) {
             case "RPO_MS":
@@ -157,6 +164,20 @@ public class AlertRuleService {
                 return 0.0;
             case "SYNC_FAILED":
                 return workflow.getErrorMessage() != null ? 1.0 : 0.0;
+            // ===== P2-4 新增 =====
+            case "REPLICATION_LAG_MS":
+                // 绝对延迟：源库空闲时 RPO_MS 恒为 0，只有这个指标能发现"链路整段卡死"
+                return workflow.getReplicationLagMs() != null ? workflow.getReplicationLagMs().doubleValue() : null;
+            case "CAPTURE_REPLAY_BYTES":
+                return workflow.getCaptureReplayBytes() != null ? workflow.getCaptureReplayBytes().doubleValue() : null;
+            case "RESTART_COUNT_10M":
+                return workflow.getRestartCount10m() != null ? workflow.getRestartCount10m().doubleValue() : null;
+            case "CONFLICT_COUNT":
+                return workflow.getConflictCount() != null ? workflow.getConflictCount().doubleValue() : null;
+            case "DEADLETTER_COUNT":
+                return workflow.getDeadletterCount() != null ? workflow.getDeadletterCount().doubleValue() : null;
+            case "DISK_USAGE_BYTES":
+                return workflow.getDiskUsageBytes() != null ? workflow.getDiskUsageBytes().doubleValue() : null;
             default:
                 return null;
         }
