@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT_DIR="$(pwd)"
 
-# ---- JDK 21（Spring Boot 3.2 用 21 最稳，不要用 24）----
+# ---- JDK 21（构建/运行/测试统一钉这一个版本，与线上一致）----
 # 兜底路径与 start.sh / restart_agent.sh 一致：没有它时 set -u 会直接炸在下一行的
 # $JAVA_HOME 上，报 "unbound variable" 而不是"没装 JDK 21"，很难排查。
 if /usr/libexec/java_home -v 21 >/dev/null 2>&1; then

@@ -20,7 +20,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link SchemaEvolutionService} 单元测试。
  *
  * <p>验证 DDL 应用策略、跳过子类型、跨库翻译、失败处理等行为。
- * 使用 H2 内存数据库代替 Mockito mock Connection，避免 JDK 24 上 mock JDK 接口的兼容性问题。
+ * 连接用 H2 内存库（进程内嵌入式，不依赖任何外部数据库服务）：被测的是真实 DDL
+ * 执行后的库内状态，mock 掉 Connection 等于把断言对象也一并 mock 掉，守不住东西。
  */
 @DisplayName("SchemaEvolutionService Schema 演进服务测试")
 class SchemaEvolutionServiceTest {
