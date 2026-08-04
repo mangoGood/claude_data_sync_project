@@ -66,8 +66,32 @@ public class CheckpointVisualizationService {
         String linkStatus = determineLinkStatus(binlogPosition, thlSeqno, checkpoint, gaps);
         result.put("linkStatus", linkStatus);
 
+        // 7. 全量快照点：这次全量对应源端的哪个点（GTID/binlog、LSN、SCN、TSO、clusterTime、复制偏移）。
+        // 各引擎写的是同一个文件契约，所以这里一处读取就覆盖 SQL/Mongo/ES/Redis 全部链路。
+        result.put("fullSnapshot", readFullSnapshot(taskId));
+
         logger.debug("Checkpoint visualization for task {}: status={}", taskId, linkStatus);
         return result;
+    }
+
+    /**
+     * 读取全量快照点（{@code files/<taskId>/full_snapshot_position}）。
+     * 没有该文件 = 这条链路本次没记快照（NONE 档 / 老任务 / 仅增量任务），返回 available=false。
+     */
+    private Map<String, Object> readFullSnapshot(String taskId) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("available", false);
+        com.migration.common.snapshot.SnapshotPosition.Record record =
+                com.migration.common.snapshot.SnapshotPosition.read(taskId);
+        if (record == null) {
+            return snapshot;
+        }
+        snapshot.put("available", true);
+        snapshot.put("mode", record.mode);
+        snapshot.put("dbType", record.dbType);
+        snapshot.put("position", record.position);
+        snapshot.put("timestamp", record.timestamp);
+        return snapshot;
     }
 
     /** 读取 capture 进程的当前 binlog 位点 */

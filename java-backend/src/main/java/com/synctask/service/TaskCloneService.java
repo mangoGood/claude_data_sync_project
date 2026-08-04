@@ -43,7 +43,11 @@ public class TaskCloneService {
                 source.getSourceType(),
                 source.getTargetType(),
                 userId,
-                source.getTaskType()
+                source.getTaskType(),
+                source.getDrMode(),
+                // 克隆连一致性语义一起复制：一致性是链路语义的一部分，
+                // 只复制连接/对象而让副本落回类型默认，会让"克隆出来的任务"跑得和原任务不一样
+                source.getConsistencyMode()
         );
 
         // 复制配置

@@ -1194,6 +1194,120 @@
             background-color: #f5f5f5;
         }
 
+        /* ===== 一致性语义选择（创建任务时选定，之后不可修改） ===== */
+        .consistency-cards {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .consistency-card {
+            border: 2px solid #e8e8e8;
+            border-radius: 8px;
+            padding: 12px 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+            background-color: #fff;
+        }
+
+        .consistency-card:hover {
+            border-color: #1890ff;
+        }
+
+        .consistency-card.selected {
+            border-color: #1890ff;
+            background-color: #e6f7ff;
+        }
+
+        .consistency-card-name {
+            font-size: 14px;
+            font-weight: 500;
+            color: #333;
+        }
+
+        .consistency-card-desc {
+            margin-top: 4px;
+            font-size: 12px;
+            color: #999;
+            line-height: 1.5;
+        }
+
+        /* 小问号：hover 展开说明。纯 CSS，不引第三方 tooltip 库 */
+        .help-tip {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 15px;
+            height: 15px;
+            margin-left: 6px;
+            border-radius: 50%;
+            border: 1px solid #bfbfbf;
+            color: #8c8c8c;
+            font-size: 11px;
+            line-height: 1;
+            cursor: help;
+            position: relative;
+            vertical-align: middle;
+            user-select: none;
+        }
+
+        .help-tip:hover {
+            border-color: #1890ff;
+            color: #1890ff;
+        }
+
+        .help-tip .help-tip-content {
+            display: none;
+            position: absolute;
+            top: 22px;
+            left: -8px;
+            z-index: 1200;
+            width: 340px;
+            padding: 10px 12px;
+            background: #fff;
+            border: 1px solid #e8e8e8;
+            border-radius: 6px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+            color: #444;
+            font-size: 12px;
+            font-weight: normal;
+            line-height: 1.7;
+            text-align: left;
+            cursor: default;
+            white-space: normal;
+        }
+
+        .help-tip:hover .help-tip-content {
+            display: block;
+        }
+
+        .help-tip .help-tip-content b {
+            color: #1890ff;
+        }
+
+        /* 已创建任务上的只读展示 */
+        .consistency-badge {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: normal;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+
+        .consistency-badge.transactional {
+            background: #f9f0ff;
+            color: #722ed1;
+            border: 1px solid #d3adf7;
+        }
+
+        .consistency-badge.eventual {
+            background: #f6ffed;
+            color: #52c41a;
+            border: 1px solid #b7eb8f;
+        }
+
         /* 连接信息区标题旁的数据库类型徽章 */
         .db-type-badge {
             display: inline-block;

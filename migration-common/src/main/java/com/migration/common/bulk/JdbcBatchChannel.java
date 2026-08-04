@@ -1,4 +1,4 @@
-package com.migration.full.migration;
+package com.migration.common.bulk;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,18 +11,19 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 全量写侧的批量装载通道（P2-2）。
+ * 全量写侧的批量装载通道（语句重写档 {@code BATCH} 与 Oracle 直接路径档 {@code DIRECT_PATH}）。
  *
- * <p>装载走的仍然是 {@code PreparedStatement.addBatch/executeBatch}，真正的提速来自
- * 驱动层的<b>批量语句重写</b>：MySQL {@code rewriteBatchedStatements=true} 与 PostgreSQL
+ * <p>装载走的仍然是 {@code PreparedStatement.addBatch/executeBatch}，提速来自驱动层的
+ * <b>批量语句重写</b>：MySQL {@code rewriteBatchedStatements=true} 与 PostgreSQL
  * {@code reWriteBatchedInserts=true} 会把 N 条单行 INSERT 合并成一条多值 INSERT，
- * 往返次数从 N 降到 1（Oracle 驱动的 executeBatch 本身就是数组绑定，无需额外开关）。
+ * 往返次数从 N 降到 1。Oracle 的 {@code executeBatch} 本身就是数组绑定，额外的提速来自
+ * {@code /*+ APPEND_VALUES *&#47;} 直接路径（见 {@link JdbcBulkChannels}）。
  *
- * <p><b>为什么不用 LOAD DATA LOCAL INFILE / COPY FROM STDIN</b>：那两条通道都是<b>文本</b>协议，
- * 值要先被渲染成字符串再由服务端解析，等于绕开 PreparedStatement 的类型绑定——本项目
- * 增量链路正是因为文本管道踩过 5 类值保真缺陷（时间精度、二进制、布尔、NULL、枚举），
- * 后来统一收敛到类型化绑定。为一档吞吐把全量重新退回文本管道不划算，何况 LOAD DATA 还需要
- * 服务端 {@code local_infile=ON} 这种部署侧开关。语句重写通道保留了类型绑定，零协议风险。
+ * <p><b>为什么 MySQL 不用 LOAD DATA LOCAL INFILE</b>：那是<b>文本</b>协议，值要先渲染成字符串再由
+ * 服务端解析，等于绕开 PreparedStatement 的类型绑定——本项目增量链路正是因为文本管道踩过 5 类
+ * 值保真缺陷（时间精度、二进制、布尔、NULL、枚举），后来统一收敛到类型化绑定。何况 LOAD DATA
+ * 还需要服务端 {@code local_infile=ON} 这种部署侧开关。PostgreSQL 那边之所以能再上一档，是因为
+ * {@code COPY} 有<b>二进制</b>格式（见 {@link JdbcCopyChannel}），类型绑定不丢。
  *
  * <p>这个类同时补掉了原先直写 PreparedStatement 的两个坑：
  * <ul>
@@ -33,51 +34,87 @@ import java.util.List;
  *       statement 一起消失，计数却照常推进。这里保留行缓冲，重连后重放。</li>
  * </ul>
  */
-class BatchWriter implements AutoCloseable {
-    private static final Logger logger = LoggerFactory.getLogger(BatchWriter.class);
+public class JdbcBatchChannel implements JdbcBulkChannel {
+    private static final Logger logger = LoggerFactory.getLogger(JdbcBatchChannel.class);
 
-    private final String insertSql;
+    /**
+     * 单批字节上限的默认值。只按行数攒批时，宽行（LOB/长文本）会把重写后的多值 INSERT 顶过
+     * {@code max_allowed_packet}，报错还与"批多大"无关。8MB 远低于 MySQL 默认的 64MB 服务端上限，
+     * 留足了驱动侧的封装开销。
+     */
+    public static final long DEFAULT_BATCH_BYTES = 8L * 1024 * 1024;
+
+    private final String batchSql;
+    /** 逐行重放用的 SQL。Oracle 直接路径档下与 {@link #batchSql} 不同：重放必须去掉 APPEND_VALUES 提示。 */
+    private final String replaySql;
     private final String tableName;
     private final int batchRows;
+    private final long batchBytes;
+    private final BulkLoadOptions.Mode mode;
+    private final BulkLoadStats stats = new BulkLoadStats();
     /** 已 addBatch、尚未成功提交的行；用于批失败按行重放与连接重建后重放。 */
     private final List<Object[]> buffered = new ArrayList<>();
+    private long bufferedBytes;
 
     private Connection conn;
     private PreparedStatement stmt;
     private PreparedStatement singleRowStmt;
 
-    BatchWriter(Connection conn, String insertSql, String tableName, int batchRows) throws SQLException {
-        this.conn = conn;
-        this.insertSql = insertSql;
-        this.tableName = tableName;
-        this.batchRows = Math.max(1, batchRows);
-        this.stmt = conn.prepareStatement(insertSql);
+    public JdbcBatchChannel(Connection conn, String insertSql, String tableName, int batchRows) throws SQLException {
+        this(conn, insertSql, insertSql, tableName, batchRows, DEFAULT_BATCH_BYTES, BulkLoadOptions.Mode.BATCH);
     }
 
-    void add(Object[] row) throws SQLException {
+    JdbcBatchChannel(Connection conn, String batchSql, String replaySql, String tableName,
+                     int batchRows, long batchBytes, BulkLoadOptions.Mode mode) throws SQLException {
+        this.conn = conn;
+        this.batchSql = batchSql;
+        this.replaySql = replaySql;
+        this.tableName = tableName;
+        this.batchRows = Math.max(1, batchRows);
+        this.batchBytes = Math.max(1L, batchBytes);
+        this.mode = mode;
+        this.stmt = conn.prepareStatement(batchSql);
+    }
+
+    @Override
+    public void add(Object[] row) throws SQLException {
         bind(stmt, row);
         stmt.addBatch();
         buffered.add(row);
+        bufferedBytes += estimateRowBytes(row);
     }
 
-    boolean isFull() {
-        return buffered.size() >= batchRows;
+    @Override
+    public boolean isFull() {
+        return buffered.size() >= batchRows || bufferedBytes >= batchBytes;
     }
 
-    boolean isEmpty() {
+    @Override
+    public boolean isEmpty() {
         return buffered.isEmpty();
+    }
+
+    @Override
+    public BulkLoadOptions.Mode mode() {
+        return mode;
+    }
+
+    @Override
+    public BulkLoadStats stats() {
+        return stats;
     }
 
     /**
      * 目标连接已断开时重建写通道：在新连接上重新 prepare，并把尚未落库的缓冲行重新 addBatch。
      * 不重放的话这些行会静默消失（原实现的行为）。
      */
-    void rebind(Connection newConn) throws SQLException {
+    @Override
+    public void rebind(Connection newConn) throws SQLException {
         closeQuietly(stmt);
         closeQuietly(singleRowStmt);
         singleRowStmt = null;
         this.conn = newConn;
-        this.stmt = newConn.prepareStatement(insertSql);
+        this.stmt = newConn.prepareStatement(batchSql);
         for (Object[] row : buffered) {
             bind(stmt, row);
             stmt.addBatch();
@@ -88,26 +125,36 @@ class BatchWriter implements AutoCloseable {
      * 提交缓冲的整批。返回 {成功行数, 失败行数}。
      * 批失败（重写后一行冲突即整批失败）时降级为按行重放，只跳过真正冲突的行。
      */
-    long[] flush() throws SQLException {
+    @Override
+    public long[] flush() throws SQLException {
         if (buffered.isEmpty()) {
             return new long[]{0, 0};
         }
+        long flushedBytes = bufferedBytes;
         try {
             int[] results = stmt.executeBatch();
             long[] counted = countBatchResults(results, buffered.size());
-            buffered.clear();
+            stats.recordBatch(counted[0], counted[1], flushedBytes);
+            clearBuffer();
             return counted;
         } catch (SQLException e) {
             logger.warn("表 {} 批量写入失败（{} 行），降级为逐行重放: {}", tableName, buffered.size(), e.getMessage());
+            stats.recordBatchFailure(buffered.size());
             try {
                 stmt.clearBatch();
             } catch (SQLException ignore) {
                 // 部分驱动在批失败后 clearBatch 也会抛，忽略即可——下面按行重放不依赖它
             }
             long[] replayed = replayRowByRow();
-            buffered.clear();
+            stats.recordBatch(replayed[0], replayed[1], flushedBytes);
+            clearBuffer();
             return replayed;
         }
+    }
+
+    private void clearBuffer() {
+        buffered.clear();
+        bufferedBytes = 0;
     }
 
     /** 按行重放缓冲：主键冲突跳过（不计失败），其余异常计失败。 */
@@ -115,7 +162,7 @@ class BatchWriter implements AutoCloseable {
         long success = 0;
         long fail = 0;
         if (singleRowStmt == null || singleRowStmt.isClosed()) {
-            singleRowStmt = conn.prepareStatement(insertSql);
+            singleRowStmt = conn.prepareStatement(replaySql);
         }
         for (Object[] row : buffered) {
             try {
@@ -144,7 +191,7 @@ class BatchWriter implements AutoCloseable {
      * 若沿用"负数即失败"的老口径，开启重写后每一次全量都会把<b>全部行报成失败</b>。
      * 只有 {@link Statement#EXECUTE_FAILED}（-3）才是真失败。
      */
-    static long[] countBatchResults(int[] results, int submitted) {
+    public static long[] countBatchResults(int[] results, int submitted) {
         long success = 0;
         long fail = 0;
         for (int r : results) {
@@ -167,7 +214,29 @@ class BatchWriter implements AutoCloseable {
         }
     }
 
-    static boolean isDuplicateKeyError(SQLException e) {
+    /**
+     * 估算一行在网络上的字节数。只求量级正确（用于字节阈值攒批），不追求精确：
+     * 字符串按 UTF-8 最坏的 3 字节/字符估，宁可批小一点也不要撞包大小上限。
+     */
+    static long estimateRowBytes(Object[] row) {
+        long size = 0;
+        for (Object v : row) {
+            if (v == null) {
+                size += 1;
+            } else if (v instanceof byte[]) {
+                size += ((byte[]) v).length;
+            } else if (v instanceof CharSequence) {
+                size += ((CharSequence) v).length() * 3L;
+            } else if (v instanceof Number || v instanceof Boolean) {
+                size += 8;
+            } else {
+                size += 24;
+            }
+        }
+        return size;
+    }
+
+    public static boolean isDuplicateKeyError(SQLException e) {
         int errorCode = e.getErrorCode();
         String sqlState = e.getSQLState();
         if (errorCode == 1062 || "23000".equals(sqlState) || "23505".equals(sqlState)) {

@@ -658,6 +658,14 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             return `<div class="cp-kv"><span class="k">${escapeHtml(k)}</span><span class="v">${v === null || v === undefined || v === '' ? '<span style="color:#bbb;">—</span>' : escapeHtml(String(v))}</span></div>`;
         }
 
+        /** 快照档位的中文说明（后端存的是枚举名）。 */
+        function cpSnapshotModeLabel(mode) {
+            if (mode === 'CONSISTENT') return '一致性快照';
+            if (mode === 'GTID_ONLY') return '仅记录位点';
+            if (mode === 'NONE') return '未启用';
+            return mode || null;
+        }
+
         async function cpLoadCheckpoint() {
             if (!__dash.detailTaskId) return;
             const body = document.getElementById('cpCheckpointBody');
@@ -675,6 +683,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             }
 
             const binlog = d.binlog || {}, thl = d.thl || {}, ckpt = d.checkpoint || {}, gaps = d.gaps || {};
+            const snap = d.fullSnapshot || {};
             const pending = gaps.pending_apply != null ? gaps.pending_apply : gaps.pending_events;
 
             let html = `<div style="margin-bottom:12px;font-size:13px;">链路状态：${cpBadge(d.linkStatus)}
@@ -682,6 +691,17 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                     RPO ${d.rpo_ms != null ? d.rpo_ms + ' ms' : '—'} ·
                     RTO ${d.rto_ms != null ? d.rto_ms + ' ms' : '—'}
                 </span></div>`;
+
+            // 0. 全量快照点：这次全量对应源端的哪个点。有它才谈得上"全量完成即校验"，
+            // 排障时也才能回答"目标端这份数据到底是源库哪一刻的样子"。
+            html += `<div class="cp-stage">
+                <div class="cp-stage-title">⓪ 全量快照点${snap.available ? '' : cpBadge('NO_DATA')}</div>
+                ${cpRow('档位', cpSnapshotModeLabel(snap.mode))}
+                ${cpRow('源端类型', snap.dbType)}
+                ${cpRow('位点', snap.position)}
+                ${cpRow('建立时间', snap.timestamp ? new Date(snap.timestamp).toLocaleString() : null)}
+                <div style="font-size:11px;color:#999;margin-top:6px;">全量结束点语义：目标端这份全量数据对应源库的这个位点</div>
+            </div><div class="cp-arrow">↓</div>`;
 
             // 1. capture 捕获位点
             html += `<div class="cp-stage">

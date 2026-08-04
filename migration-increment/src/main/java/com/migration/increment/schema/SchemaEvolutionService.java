@@ -68,6 +68,20 @@ public class SchemaEvolutionService {
     private final java.util.Set<String> includedDatabases = new java.util.HashSet<>();
     /** 列处理配置：仅用于对列处理表的 DDL 告警（DDL 不做列级改写，需人工核对） */
     private final com.migration.config.ColumnProcessingConfig columnProcessing;
+    /** 聚合路由：汇聚下 DDL 要改写到合并后的目标表，且 N 个来源的同一条 DDL 只应用一次 */
+    private final com.migration.common.route.TableRouter router;
+    private final boolean mergeActive;
+    private final boolean splitActive;
+    /**
+     * 已应用过的汇聚 DDL 指纹（改写到目标表后的语句）。N 个源表的同一条 ALTER 改写后完全相同，
+     * 按指纹去重即 FIRST_WINS。有界 LRU：长跑任务的 DDL 数量不设上限，指纹集不能无限涨。
+     */
+    private final Map<String, Boolean> appliedMergeDdl = new LinkedHashMap<String, Boolean>(64, 0.75f, false) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+            return size() > 512;
+        }
+    };
 
     public SchemaEvolutionService(Properties props, Connection targetConnection) {
         this.mappingConfig = SchemaMappingConfig.loadFromProperties(props);
@@ -105,6 +119,12 @@ public class SchemaEvolutionService {
         this.sameEngine = (direction == DdlTranslator.Direction.SAME_ENGINE);
         this.translator = new DdlTranslator(direction, mappingConfig);
         this.onlineDdlService = new OnlineDdlService(props);
+
+        com.migration.common.route.RoutingConfig routing =
+                com.migration.common.route.RoutingConfig.loadFromProperties(props);
+        this.router = routing.router(mappingConfig::mapDatabase);
+        this.mergeActive = routing.getMode() == com.migration.common.route.RoutingConfig.Mode.MERGE;
+        this.splitActive = routing.getMode() == com.migration.common.route.RoutingConfig.Mode.SPLIT;
 
         // 确保日志目录存在
         File logFile = new File(manualDdlLogPath);
@@ -256,6 +276,31 @@ public class SchemaEvolutionService {
         // 表名映射（仅表级同步下发 schema.mapping.table.*）：限定名（db.t）与非限定名
         // （CREATE/ALTER/DROP/TRUNCATE/RENAME TABLE t，库名上下文 = 事件的 sourceDb）都改写。
         // 限定名回退：若限定库名已被上游改成目标库名（跨类型 translate 的正则路径），按源库名重查。
+        // —— 拆分：一条源表 DDL 要广播到全部分片表 ——
+        if (splitActive) {
+            ApplyResult splitResult = applySplitDdl(targetSql, sql, ddlSubType, sourceDb);
+            if (splitResult != null) {
+                return splitResult;
+            }
+        }
+
+        // —— 汇聚：DDL 改写到合并后的目标表，并按指纹去重 ——
+        MergeDdl merge = mergeDdlFor(targetSql, ddlSubType, sourceDb);
+        if (merge != null) {
+            if (merge.skipReason != null) {
+                totalDdlSkipped++;
+                logger.info("汇聚 DDL 跳过（{}）: subtype={} | sql={}", merge.skipReason, ddlSubType, truncate(sql));
+                return ApplyResult.skipped(merge.skipReason);
+            }
+            String fingerprint = merge.applySql.replaceAll("\\s+", " ").trim();
+            if (appliedMergeDdl.put(fingerprint, Boolean.TRUE) != null) {
+                totalDdlSkipped++;
+                logger.info("汇聚 DDL 已由其它来源应用过，跳过（FIRST_WINS）: {}", truncate(merge.applySql));
+                return ApplyResult.skipped("汇聚 DDL 已应用过（FIRST_WINS）");
+            }
+            return executeAndReport(merge.applySql, sql, ddlSubType, sourceDb);
+        }
+
         final String effectiveSourceDb = sourceDb;
         java.util.function.BiFunction<String, String, String> tableMapper = null;
         if (mappingConfig.hasTableMappings()) {
@@ -278,6 +323,12 @@ public class SchemaEvolutionService {
             return ApplyResult.failed("目标库连接为空");
         }
 
+        return executeAndReport(targetSql, sql, ddlSubType, sourceDb);
+    }
+
+    /** 执行目标端 DDL 并统计/记账（汇聚路径与普通路径共用）。 */
+    private ApplyResult executeAndReport(String targetSql, String originalSql,
+                                         String ddlSubType, String sourceDb) {
         try {
             executeDdl(targetSql, sourceDb);
             totalDdlApplied++;
@@ -285,10 +336,152 @@ public class SchemaEvolutionService {
             return ApplyResult.applied(targetSql);
         } catch (SQLException e) {
             totalDdlFailed++;
-            logManualDdl(sql, ddlSubType, sourceDb, "应用失败: " + e.getMessage() + " | 翻译后: " + targetSql);
+            logManualDdl(originalSql, ddlSubType, sourceDb, "应用失败: " + e.getMessage() + " | 翻译后: " + targetSql);
             logger.error("DDL 应用失败: subtype={} | sql={} | error={}", ddlSubType, truncate(targetSql), e.getMessage());
             return ApplyResult.failed("DDL 执行失败: " + e.getMessage(), targetSql);
         }
+    }
+
+    /**
+     * 拆分：把一条源表 DDL 广播到全部分片表；与拆分无关的 DDL 返回 null（走原有路径）。
+     *
+     * <p>破坏性 DDL（DROP TABLE / TRUNCATE / RENAME）不广播——源表被删不该连带删掉
+     * N 张已经在被读写的分片表，留给人工决定。任一分片失败即整条 DDL 失败：
+     * 分片间结构不一致会让后续 DML 在部分分片上持续报错，比早点停下来糟得多。
+     */
+    private ApplyResult applySplitDdl(String targetSql, String originalSql,
+                                      String ddlSubType, String sourceDb) {
+        String table;
+        String schema;
+        try {
+            com.migration.increment.SqlClassifier.ClassificationResult cr =
+                    new com.migration.increment.SqlClassifier().classify(targetSql);
+            table = cr.getTableName();
+            schema = cr.getSchemaName();
+        } catch (Exception e) {
+            return null;
+        }
+        if (table == null || table.isEmpty()) {
+            return null;
+        }
+        String db = (schema != null && !schema.isEmpty()) ? schema : sourceDb;
+        if (!router.matches(db, table)) {
+            return null;
+        }
+
+        String subtype = ddlSubType == null ? "" : ddlSubType.toUpperCase();
+        if (subtype.contains("DROP_TABLE") || subtype.contains("TRUNCATE") || subtype.contains("RENAME")) {
+            totalDdlSkipped++;
+            logger.warn("拆分表的破坏性 DDL 不广播到分片（需人工处置）: subtype={} | {}.{} | sql={}",
+                    ddlSubType, db, table, truncate(targetSql));
+            return ApplyResult.skipped("拆分表不自动广播破坏性 DDL（" + ddlSubType + "）");
+        }
+
+        java.util.List<com.migration.common.route.RouteTarget> targets = router.allTargets(db, table);
+        if (targets.isEmpty() || targets.get(0).isIdentity()) {
+            logger.warn("拆分表 {}.{} 的分片不可枚举，DDL 无法广播，跳过", db, table);
+            totalDdlSkipped++;
+            return ApplyResult.skipped("分片不可枚举（DATE_FORMAT），DDL 未广播");
+        }
+
+        String lastSql = null;
+        int applied = 0;
+        for (com.migration.common.route.RouteTarget target : targets) {
+            String shardSql = DdlIdentifierRewriter.rewrite(targetSql,
+                    d -> target.getDatabase(), (d, t) -> target.getTable(), db);
+            lastSql = shardSql;
+            try {
+                executeDdl(shardSql, sourceDb);
+                applied++;
+            } catch (SQLException e) {
+                totalDdlFailed++;
+                logManualDdl(originalSql, ddlSubType, sourceDb,
+                        "分片 " + target + " 应用失败: " + e.getMessage() + " | 翻译后: " + shardSql);
+                logger.error("拆分 DDL 在分片 {} 上失败（已应用 {} 片，分片间结构已不一致）: {}",
+                        target, applied, e.getMessage());
+                return ApplyResult.failed("拆分 DDL 在分片 " + target + " 上失败: " + e.getMessage(), shardSql);
+            }
+        }
+        totalDdlApplied++;
+        logger.info("拆分 DDL 已广播到 {} 个分片: subtype={} | {}.{}", applied, ddlSubType, db, table);
+        return ApplyResult.applied(lastSql);
+    }
+
+    /** 汇聚 DDL 的处置：{@code applySql} 已改写到汇聚目标表；{@code skipReason} 非空表示不应用。 */
+    private static final class MergeDdl {
+        final String applySql;
+        final String skipReason;
+
+        private MergeDdl(String applySql, String skipReason) {
+            this.applySql = applySql;
+            this.skipReason = skipReason;
+        }
+
+        static MergeDdl apply(String sql) {
+            return new MergeDdl(sql, null);
+        }
+
+        static MergeDdl skip(String reason) {
+            return new MergeDdl(null, reason);
+        }
+    }
+
+    /**
+     * 判定并改写汇聚表的 DDL；返回 null 表示这条 DDL 与汇聚无关（走原有通用改写）。
+     *
+     * <p>两条硬规则：
+     * <ul>
+     *   <li>破坏性 DDL（DROP TABLE / TRUNCATE / RENAME）一律不应用——一个分表被删/清，
+     *       不该把整张汇聚表连同其它几十个来源的数据一起毁掉；</li>
+     *   <li>其余 DDL 改写到汇聚目标表后按指纹去重（N 个来源发同一条 ALTER，只应用第一条）。</li>
+     * </ul>
+     */
+    private MergeDdl mergeDdlFor(String sql, String ddlSubType, String sourceDb) {
+        if (!mergeActive || sql == null || sql.isEmpty()) {
+            return null;
+        }
+        String table;
+        String schema;
+        try {
+            com.migration.increment.SqlClassifier.ClassificationResult cr =
+                    new com.migration.increment.SqlClassifier().classify(sql);
+            table = cr.getTableName();
+            schema = cr.getSchemaName();
+        } catch (Exception e) {
+            logger.warn("汇聚 DDL 解析表名失败，按非汇聚 DDL 处理: {}", truncate(sql));
+            return null;
+        }
+        if (table == null || table.isEmpty()) {
+            return null;
+        }
+        String db = (schema != null && !schema.isEmpty()) ? schema : sourceDb;
+        if (!router.matches(db, table)) {
+            return null;
+        }
+
+        com.migration.common.route.MergeRule rule =
+                ((com.migration.common.route.MergeRouter) router).find(db, table);
+        if (rule.getDdlPolicy() == com.migration.common.route.MergeRule.DdlPolicy.SKIP) {
+            return MergeDdl.skip("汇聚规则的 DDL 策略为 SKIP");
+        }
+        if (rule.getDdlPolicy() == com.migration.common.route.MergeRule.DdlPolicy.MANUAL) {
+            logManualDdl(sql, ddlSubType, sourceDb, "汇聚表 DDL 策略为 MANUAL，需人工应用");
+            totalDdlManual++;
+            return MergeDdl.skip("汇聚规则的 DDL 策略为 MANUAL，已记录到人工日志");
+        }
+
+        String subtype = ddlSubType == null ? "" : ddlSubType.toUpperCase();
+        if (subtype.contains("DROP_TABLE") || subtype.contains("TRUNCATE") || subtype.contains("RENAME")) {
+            logger.warn("汇聚表的破坏性 DDL 不应用（会毁掉其它来源的数据）: subtype={} | {}.{} | sql={}",
+                    ddlSubType, db, table, truncate(sql));
+            return MergeDdl.skip("汇聚表不接受破坏性 DDL（" + ddlSubType + "）");
+        }
+
+        com.migration.common.route.RouteTarget target = router.allTargets(db, table).get(0);
+        String rewritten = DdlIdentifierRewriter.rewrite(sql,
+                d -> target.getDatabase(), (d, t) -> target.getTable(), db);
+        logger.info("汇聚 DDL 改写: {}.{} -> {}.{}", db, table, target.getDatabase(), target.getTable());
+        return MergeDdl.apply(rewritten);
     }
 
     /**

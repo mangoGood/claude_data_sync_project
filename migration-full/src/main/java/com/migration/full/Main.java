@@ -193,6 +193,7 @@ public class Main {
                     continue;
                 }
                 applyTableNameMapping(tables, dbName, config);
+                applyRouting(tables, dbName, config);
 
                 logger.info("数据库 {} 找到 {} 个表需要迁移", dbName, tables.size());
                 for (TableInfo table : tables) {
@@ -200,7 +201,7 @@ public class Main {
                     logger.info("  - {}: {} 行", table.getTableName(), rowCount);
                 }
 
-                migrateTables(config, sourceConn, targetConn, tables, progressManager);
+                migrateTablesRouted(config, sourceConn, targetConn, targetDbName, tables, progressManager);
                 syncStoredRoutinesIfDbLevel(config, sourceConn, targetConn, dbName);
                 logger.info("数据库 {} 迁移完成", dbName);
             } finally {
@@ -301,6 +302,7 @@ public class Main {
                 return;
             }
             applyTableNameMapping(tables, config.getSourceConfig().getDatabase(), config);
+            applyRouting(tables, config.getSourceConfig().getDatabase(), config);
 
             logger.info("找到 {} 个表需要迁移", tables.size());
             for (TableInfo table : tables) {
@@ -308,7 +310,8 @@ public class Main {
                 logger.info("  - {}: {} 行", table.getTableName(), rowCount);
             }
 
-            migrateTables(config, sourceConn, targetConn, tables, progressManager);
+            migrateTablesRouted(config, sourceConn, targetConn, config.getTargetConfig().getDatabase(),
+                    tables, progressManager);
             syncStoredRoutinesIfDbLevel(config, sourceConn, targetConn, config.getSourceConfig().getDatabase());
         } finally {
             sourceConn.close();
@@ -316,7 +319,133 @@ public class Main {
         }
     }
 
-    private static void migrateTables(MigrationConfig config, DatabaseConnection sourceConn, 
+    /**
+     * 聚合路由展开（{@code route.mode=MERGE} 的汇聚部分）：给命中规则的表打上目标库/目标表、
+     * 来源标识列取值与幂等装载标记；未命中的表原样走 1:1 路径。
+     *
+     * <p>源库名对所有表都要写上——多库任务的进度 key 与来源标识列取值都依赖它，
+     * 而它此前只存在于连接配置里、没进到 TableInfo。
+     */
+    private static void applyRouting(List<TableInfo> tables, String sourceDb, MigrationConfig config) {
+        for (TableInfo table : tables) {
+            table.setSourceDatabase(sourceDb);
+        }
+        com.migration.common.route.TableRouter router = config.getTableRouter();
+        if (router.isIdentity()) {
+            return;
+        }
+        if (router.mode() == com.migration.common.route.RoutingConfig.Mode.SPLIT) {
+            applySplitRouting(tables, sourceDb, router);
+            return;
+        }
+        String nodeId = config.getRouteNodeId();
+        int routed = 0;
+        for (TableInfo table : tables) {
+            if (!router.matches(sourceDb, table.getTableName())) {
+                continue;
+            }
+            com.migration.common.route.RouteTarget target =
+                    router.allTargets(sourceDb, table.getTableName()).get(0);
+            com.migration.common.route.MergeRule rule =
+                    ((com.migration.common.route.MergeRouter) router).find(sourceDb, table.getTableName());
+            table.setTargetTableName(target.getTable());
+            table.setTargetDatabase(target.getDatabase());
+            table.setUpsertLoad(true);
+            table.setMergeCompositePk(rule.getPkStrategy()
+                    == com.migration.common.route.MergeRule.PkStrategy.COMPOSITE_SOURCE);
+
+            Map<String, String> tags = new LinkedHashMap<>();
+            for (String col : rule.getTagColumns()) {
+                String value = rule.tagValue(col, nodeId, sourceDb, table.getTableName());
+                if (value != null) {
+                    tags.put(col, value);
+                }
+            }
+            table.setMergeTagValues(tags);
+            routed++;
+            logger.info("汇聚路由: {}.{} -> {}.{}（来源标识 {}，幂等装载）",
+                    sourceDb, table.getTableName(), target.getDatabase(), target.getTable(), tags);
+        }
+        logger.info("汇聚路由展开完成：{} 个表命中规则，{} 个表按原路径迁移",
+                routed, tables.size() - routed);
+    }
+
+    /**
+     * 拆分路由展开：给命中规则的表打上分片键与全部分片落点。
+     *
+     * <p>全量拆分要求分片<b>可枚举</b>——目标表要预建、每个分片要有独立写通道。
+     * {@code DATE_FORMAT} 这类按时间生成表名的分片枚举不出来，全量阶段直接拒绝，
+     * 而不是把整表搬到某一个分片上（那是静默写错地方）。
+     */
+    private static void applySplitRouting(List<TableInfo> tables, String sourceDb,
+                                          com.migration.common.route.TableRouter router) {
+        int routed = 0;
+        for (TableInfo table : tables) {
+            if (!router.matches(sourceDb, table.getTableName())) {
+                continue;
+            }
+            String shardKey = router.shardKeyColumn(sourceDb, table.getTableName());
+            List<com.migration.common.route.RouteTarget> targets =
+                    router.allTargets(sourceDb, table.getTableName());
+            if (targets.isEmpty()) {
+                throw new IllegalStateException("表 " + sourceDb + "." + table.getTableName()
+                        + " 的拆分规则分片不可枚举（DATE_FORMAT），全量阶段无法预建目标表，请改用可枚举的分片算法");
+            }
+            boolean hasShardKey = table.getColumns().stream()
+                    .anyMatch(c -> c.getColumnName().equalsIgnoreCase(shardKey));
+            if (!hasShardKey) {
+                throw new IllegalStateException("表 " + sourceDb + "." + table.getTableName()
+                        + " 没有分片键列 " + shardKey + "，无法按行路由");
+            }
+            table.setShardKeyColumn(shardKey);
+            table.setRouteTargets(targets);
+            routed++;
+            logger.info("拆分路由: {}.{} 按 {} 分成 {} 片 -> {} ... {}",
+                    sourceDb, table.getTableName(), shardKey, targets.size(),
+                    targets.get(0), targets.get(targets.size() - 1));
+        }
+        logger.info("拆分路由展开完成：{} 个表命中规则，{} 个表按原路径迁移",
+                routed, tables.size() - routed);
+    }
+
+    /**
+     * 按<b>目标库</b>分组迁移。汇聚可能把同一源库的表指到不同目标库，而目标连接是绑库的，
+     * 因此先分组、每组用自己的目标连接。未配置路由时只有一组（默认目标库），
+     * 走的仍是原来那一条 {@link #migrateTables} 调用，行为完全不变。
+     */
+    private static void migrateTablesRouted(MigrationConfig config, DatabaseConnection sourceConn,
+                                            DatabaseConnection defaultTargetConn, String defaultTargetDb,
+                                            List<TableInfo> tables, ProgressManager progressManager)
+            throws Exception {
+        Map<String, List<TableInfo>> byTargetDb = new LinkedHashMap<>();
+        for (TableInfo table : tables) {
+            String db = (table.getTargetDatabase() == null || table.getTargetDatabase().isEmpty())
+                    ? defaultTargetDb : table.getTargetDatabase();
+            byTargetDb.computeIfAbsent(db, k -> new ArrayList<>()).add(table);
+        }
+
+        for (Map.Entry<String, List<TableInfo>> entry : byTargetDb.entrySet()) {
+            String targetDb = entry.getKey();
+            if (targetDb == null || targetDb.equals(defaultTargetDb)) {
+                migrateTables(config, sourceConn, defaultTargetConn, entry.getValue(), progressManager);
+                continue;
+            }
+            logger.info("汇聚目标库 {} 与任务默认目标库 {} 不同，另建目标连接", targetDb, defaultTargetDb);
+            DatabaseConnection routedConn =
+                    new DatabaseConnection(createDbConfig(config.getTargetConfig(), targetDb));
+            try {
+                routedConn.ensureDatabaseExists();
+                if (!routedConn.testConnection()) {
+                    throw new SQLException("无法连接到汇聚目标数据库: " + targetDb);
+                }
+                migrateTables(config, sourceConn, routedConn, entry.getValue(), progressManager);
+            } finally {
+                routedConn.close();
+            }
+        }
+    }
+
+    private static void migrateTables(MigrationConfig config, DatabaseConnection sourceConn,
                                        DatabaseConnection targetConn, List<TableInfo> tables,
                                        ProgressManager progressManager) throws Exception {
         if (config.isCreateTables()) {
@@ -328,6 +457,7 @@ public class Main {
                 sourceConn, targetConn, config.isDropTables()
             );
             schemaMigration.setColumnProcessing(config.getColumnProcessingConfig());
+            schemaMigration.setRoutingConfig(config.getRoutingConfig());
             schemaMigration.migrateAllTables(tables);
             logger.info("表结构迁移完成");
         }
@@ -342,8 +472,8 @@ public class Main {
             // 预建读会话数按最坏并发算（表级并行 × 单表分片）——MySQL 的快照绑在会话上，
             // 预建少了会让 worker 排队等连接。
             int readerCount = Math.max(1, parallelism) * (config.isShardEnabled() ? Math.max(1, config.getShardCount()) : 1);
-            try (com.migration.full.snapshot.ConsistentSnapshot snapshot =
-                         com.migration.full.snapshot.ConsistentSnapshot.begin(
+            try (com.migration.common.snapshot.ConsistentSnapshot snapshot =
+                         com.migration.common.snapshot.ConsistentSnapshot.begin(
                                  sourceConn.getConfig(), config.getSnapshotMode(), readerCount, config.getTaskId())) {
                 if (parallelism > 1) {
                     // 表级并行：每个 worker 独立连接对，从共享队列领表（详见 ParallelDataMigration）。
@@ -365,6 +495,9 @@ public class Main {
                     );
                     dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
                     dataMigration.setSnapshot(snapshot);
+                    dataMigration.setBulkLoadOptions(config.getBulkLoadOptions());
+                    dataMigration.setTableRouter(config.getTableRouter());
+                    dataMigration.setRoutingConfig(config.getRoutingConfig());
                     dataMigration.migrateAllData(tables);
                 }
             }

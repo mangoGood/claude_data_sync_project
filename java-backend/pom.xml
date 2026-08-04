@@ -20,14 +20,11 @@
     <properties>
         <java.version>17</java.version>
         <jjwt.version>0.12.3</jjwt.version>
-        <!-- parent 3.2.0 默认 mockito 5.7.0 + byte-buddy 1.14.10，只认到 class file 65
-             （Java 21）。JDK 24（class file 68）下 Mockito 无法 instrument
-             SimpMessagingTemplate / KafkaProducerService，单测全挂。抬到支持 Java 24 的版本，
-             JDK 21 与 24 都能跑。
-             注意：byte-buddy 不只测试期用——hibernate-core 运行期也靠它做实体代理/增强，
-             所以这是一次全局版本抬升，不是纯测试改动。改动后需确认后端能正常启动、JPA 可用。 -->
-        <byte-buddy.version>1.17.5</byte-buddy.version>
-        <mockito.version>5.18.0</mockito.version>
+        <!-- mockito / byte-buddy 一律交给 spring-boot-starter-parent 管理，不在这里覆盖。
+             构建与运行统一钉 JDK 21（见 build.sh / start.sh / test.sh），parent 3.2.0 默认的
+             mockito 5.7.0 + byte-buddy 1.14.10 正好覆盖到 class file 65，无需抬版；
+             而 byte-buddy 还是 hibernate-core 运行期做实体代理/增强的依赖，
+             在这里单独抬版等于顺带改动运行时行为，得不偿失。 -->
     </properties>
 
     <dependencies>

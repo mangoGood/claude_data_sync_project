@@ -26,6 +26,11 @@ public class RecoveryTask implements Serializable {
     private String sourceType;
     private String targetType;
     private String taskType;
+    private String consistencyMode;
+    /** 全量批量装载开关/档位与快照档位：恢复时必须一起带回，否则会退回默认档。 */
+    private Boolean bulkLoadEnabled;
+    private String bulkLoadMode;
+    private String snapshotMode;
     private String drMode;
 
     public String getTaskId() {
@@ -152,6 +157,38 @@ public class RecoveryTask implements Serializable {
         return drMode;
     }
 
+    public String getConsistencyMode() {
+        return consistencyMode;
+    }
+
+    public void setConsistencyMode(String consistencyMode) {
+        this.consistencyMode = consistencyMode;
+    }
+
+    public Boolean getBulkLoadEnabled() {
+        return bulkLoadEnabled;
+    }
+
+    public void setBulkLoadEnabled(Boolean bulkLoadEnabled) {
+        this.bulkLoadEnabled = bulkLoadEnabled;
+    }
+
+    public String getBulkLoadMode() {
+        return bulkLoadMode;
+    }
+
+    public void setBulkLoadMode(String bulkLoadMode) {
+        this.bulkLoadMode = bulkLoadMode;
+    }
+
+    public String getSnapshotMode() {
+        return snapshotMode;
+    }
+
+    public void setSnapshotMode(String snapshotMode) {
+        this.snapshotMode = snapshotMode;
+    }
+
     public void setDrMode(String drMode) {
         this.drMode = drMode;
     }
@@ -171,6 +208,10 @@ public class RecoveryTask implements Serializable {
         message.setTargetType(this.targetType != null ? this.targetType : "mysql");
         message.setTaskType(this.taskType != null ? this.taskType : "SYNC");
         message.setDrMode(this.drMode);
+        message.setConsistencyMode(this.consistencyMode);
+        message.setBulkLoadEnabled(this.bulkLoadEnabled);
+        message.setBulkLoadMode(this.bulkLoadMode);
+        message.setSnapshotMode(this.snapshotMode);
         if (this.syncObjects != null && !this.syncObjects.isEmpty()) {
             try {
                 com.google.gson.Gson gson = new com.google.gson.Gson();

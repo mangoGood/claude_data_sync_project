@@ -13,6 +13,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -72,6 +73,78 @@ final class EsClient {
         if (ops.isEmpty()) {
             return 0;
         }
+        return (int) bulkWithRetry(ops, 0)[1];
+    }
+
+    /**
+     * 带退避重试的 _bulk。
+     *
+     * <p><b>为什么必须退避而不是直接失败</b>：ES 的写入线程池队列满时会返回 429
+     * （{@code es_rejected_execution_exception}），批量装载把写入压满时这几乎是常态——
+     * 它表达的是"现在太忙，稍后再来"，不是"这条数据有问题"。原实现把 429 与真失败同等对待，
+     * 全量在目标端一忙就整任务失败。HTTP 层的 429/503 重投整批，条目级的 429/503 只重投
+     * <b>被拒的那些条目</b>（已成功的条目不能重投，index 动作虽幂等但会白白放大写入）。
+     *
+     * @return {成功条数, 失败条数}
+     */
+    long[] bulkWithRetry(List<String[]> ops, int maxRetries) throws Exception {
+        if (ops.isEmpty()) {
+            return new long[]{0, 0};
+        }
+        List<String[]> pending = new ArrayList<>(ops);
+        long ok = 0;
+        long failed = 0;
+        for (int attempt = 0; ; attempt++) {
+            String resp;
+            try {
+                resp = request("POST", "/_bulk", buildNdjson(pending), "application/x-ndjson");
+            } catch (RetryableEsException e) {
+                if (attempt >= maxRetries) {
+                    throw new RuntimeException("ES _bulk 持续繁忙（重试 " + maxRetries + " 次后仍 "
+                            + e.getMessage() + "）", e);
+                }
+                backoff(attempt, pending.size(), "HTTP " + e.status);
+                continue;
+            }
+            JsonObject json = JsonParser.parseString(resp).getAsJsonObject();
+            if (!json.get("errors").getAsBoolean()) {
+                return new long[]{ok + pending.size(), failed};
+            }
+            List<String[]> retryable = new ArrayList<>();
+            JsonArray items = json.getAsJsonArray("items");
+            for (int i = 0; i < items.size(); i++) {
+                JsonObject item = items.get(i).getAsJsonObject();
+                JsonObject action = item.entrySet().iterator().next().getValue().getAsJsonObject();
+                int status = action.get("status").getAsInt();
+                // delete 目标不存在（404）视作幂等成功
+                if (status < 300 || status == 404) {
+                    ok++;
+                } else if ((status == 429 || status == 503) && attempt < maxRetries) {
+                    retryable.add(pending.get(i));
+                } else {
+                    failed++;
+                    if (failed <= 3) {
+                        logger.warn("bulk 条目失败: {}", action);
+                    }
+                }
+            }
+            if (retryable.isEmpty()) {
+                return new long[]{ok, failed};
+            }
+            backoff(attempt, retryable.size(), "条目级 429/503");
+            pending = retryable;
+        }
+    }
+
+    /** 指数退避（100ms 起、上限 5s），带一点随机抖动避免多任务同步重试。 */
+    private void backoff(int attempt, int size, String reason) throws InterruptedException {
+        long sleep = Math.min(5000L, 100L * (1L << Math.min(attempt, 6)));
+        sleep += (long) (Math.random() * 100);
+        logger.warn("ES 繁忙（{}），{} 条待重投，{}ms 后重试", reason, size, sleep);
+        Thread.sleep(sleep);
+    }
+
+    private static String buildNdjson(List<String[]> ops) {
         StringBuilder body = new StringBuilder();
         for (String[] op : ops) {
             body.append(op[0]).append('\n');
@@ -79,26 +152,59 @@ final class EsClient {
                 body.append(op[1]).append('\n');
             }
         }
-        String resp = request("POST", "/_bulk", body.toString(), "application/x-ndjson");
-        JsonObject json = JsonParser.parseString(resp).getAsJsonObject();
-        if (!json.get("errors").getAsBoolean()) {
-            return 0;
+        return body.toString();
+    }
+
+    /**
+     * 全量装载窗口：关掉刷新与副本，装载结束再恢复。
+     * 这是 ES 侧公认的批量导入手法——每次 refresh 都要生成段并 fsync，副本还要把同一份数据
+     * 再写一遍，全量期间这两件事都是纯开销。返回原设置，供结束后恢复。
+     *
+     * @return {refresh_interval, number_of_replicas}，取不到时对应项为 null
+     */
+    String[] beginLoadWindow(String index) throws Exception {
+        String[] original = readLoadSettings(index);
+        putSettings(index, "{\"index\":{\"refresh_interval\":\"-1\",\"number_of_replicas\":0}}");
+        logger.info("索引 {} 进入装载窗口（refresh_interval=-1, replicas=0；原值 {}/{}）",
+                index, original[0], original[1]);
+        return original;
+    }
+
+    /**
+     * 恢复装载窗口前的设置并刷新可见。<b>失败路径也必须调用</b>——否则任务一异常退出，
+     * 索引就永久停在"不刷新、无副本"状态，查不到数据还没有冗余。
+     */
+    void endLoadWindow(String index, String[] original) {
+        try {
+            String refresh = original != null && original[0] != null ? original[0] : "1s";
+            String replicas = original != null && original[1] != null ? original[1] : "1";
+            putSettings(index, "{\"index\":{\"refresh_interval\":\"" + refresh
+                    + "\",\"number_of_replicas\":" + replicas + "}}");
+            refresh(index);
+            logger.info("索引 {} 退出装载窗口，已恢复 refresh_interval={}, replicas={}", index, refresh, replicas);
+        } catch (Exception e) {
+            logger.error("索引 {} 恢复装载窗口设置失败（请手工检查 refresh_interval/number_of_replicas）: {}",
+                    index, e.getMessage());
         }
-        int failed = 0;
-        JsonArray items = json.getAsJsonArray("items");
-        for (int i = 0; i < items.size(); i++) {
-            JsonObject item = items.get(i).getAsJsonObject();
-            JsonObject action = item.entrySet().iterator().next().getValue().getAsJsonObject();
-            int status = action.get("status").getAsInt();
-            // delete 目标不存在（404）视作幂等成功
-            if (status >= 300 && status != 404) {
-                failed++;
-                if (failed <= 3) {
-                    logger.warn("bulk 条目失败: {}", action);
-                }
-            }
+    }
+
+    private String[] readLoadSettings(String index) {
+        try {
+            String resp = request("GET", "/" + index + "/_settings", null);
+            JsonObject root = JsonParser.parseString(resp).getAsJsonObject();
+            JsonObject idx = root.getAsJsonObject(root.keySet().iterator().next())
+                    .getAsJsonObject("settings").getAsJsonObject("index");
+            String refresh = idx.has("refresh_interval") ? idx.get("refresh_interval").getAsString() : null;
+            String replicas = idx.has("number_of_replicas") ? idx.get("number_of_replicas").getAsString() : null;
+            return new String[]{refresh, replicas};
+        } catch (Exception e) {
+            logger.warn("读取索引 {} 设置失败，装载窗口结束后按默认值恢复: {}", index, e.getMessage());
+            return new String[]{null, null};
         }
-        return failed;
+    }
+
+    private void putSettings(String index, String body) throws Exception {
+        request("PUT", "/" + index + "/_settings", body);
     }
 
     void refresh(String index) throws Exception {
@@ -151,10 +257,24 @@ final class EsClient {
                 : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)).build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() >= 300) {
+            // 429（队列满）/503（暂不可用）是"稍后再来"，与真正的数据错误分开，供调用方退避重试
+            if (resp.statusCode() == 429 || resp.statusCode() == 503) {
+                throw new RetryableEsException(resp.statusCode(), truncate(resp.body()));
+            }
             throw new RuntimeException("ES " + method + " " + path + " -> HTTP " + resp.statusCode()
                     + ": " + truncate(resp.body()));
         }
         return resp.body();
+    }
+
+    /** ES 侧的背压信号（429/503）：可重试，不是数据错误。 */
+    static final class RetryableEsException extends RuntimeException {
+        final int status;
+
+        RetryableEsException(int status, String body) {
+            super("HTTP " + status + ": " + body);
+            this.status = status;
+        }
     }
 
     private static String truncate(String s) {

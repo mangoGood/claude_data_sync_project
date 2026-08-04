@@ -130,7 +130,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 return `<div class="table-row" data-task-id="${task.id}">
                     <div class="table-cell col-name">
                         <div>
-                            <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">灾备</span>${escapeHtml(task.name)}</div>
+                            <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">灾备</span>${escapeHtml(task.name)}${window.consistencyBadgeHtml(task.consistency_mode)}</div>
                             <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${task.status === 'CONFIGURING' ? `openDrConfig('${task.id}', '${task.source_type || 'mysql'}')` : `showDrTaskDetail('${task.id}')`}">${task.id}</div>
                         </div>
                     </div>
@@ -325,7 +325,36 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             document.getElementById('drSourceTestResult').textContent = '';
             document.getElementById('drTargetTestResult').textContent = '';
             drConnectionTestStatus = { source: false, target: false };
+            drResetFullLoadOptions();
             document.getElementById('drConfigModal').classList.add('show');
+        }
+
+        function drSelectValue(id, fallback) {
+            const el = document.getElementById(id);
+            return (el && el.value) ? el.value : fallback;
+        }
+
+        /**
+         * 装载/快照档位复位到该源端的默认值，并写清楚代价。
+         * MySQL 的真快照要 RELOAD 权限 + 一段全局读锁，故默认只记位点；
+         * PG（导出快照）与 MongoDB（快照会话）都不加锁，默认给真快照。
+         */
+        function drResetFullLoadOptions() {
+            const bulk = document.getElementById('drBulkLoadMode');
+            if (bulk) bulk.value = 'AUTO';
+            const snapshot = document.getElementById('drSnapshotMode');
+            const hint = document.getElementById('drSnapshotHint');
+            let mode = 'GTID_ONLY';
+            let text = '一致性快照需要主库 RELOAD 权限，建立期间有一段全局读锁（主库短暂只读），故默认只记位点。';
+            if (currentDrDbType === 'postgresql') {
+                mode = 'CONSISTENT';
+                text = 'PostgreSQL 走导出快照（pg_export_snapshot），不加锁，默认启用。';
+            } else if (currentDrDbType === 'mongodb') {
+                mode = 'CONSISTENT';
+                text = 'MongoDB 走快照会话（5.0+），不加锁；受 minSnapshotHistoryWindowInSeconds 限制（默认仅 300 秒），不满足时引擎自动降级为只记位点。';
+            }
+            if (snapshot) snapshot.value = mode;
+            if (hint) hint.textContent = text;
         }
 
         // 灾备方向选择（单向/双向）：切换选中态高亮
@@ -367,6 +396,8 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             document.getElementById('drTaskName').value = '';
             selectDrMode('UNIDIRECTIONAL');
             selectDrDbType('mysql');
+            // 灾备默认事务一致性：倒换后备库不应读到半个事务
+            window.resetConsistencyMode('dr', 'TRANSACTIONAL');
             document.getElementById('createDrTaskModal').classList.add('show');
         });
 
@@ -388,7 +419,11 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 const response = await fetchWithAuth(`${API_BASE_URL}/workflows`, {
                     method: 'POST',
                     headers: getAuthHeaders(),
-                    body: JSON.stringify({ name: name, sourceType: dbType, targetType: dbType, taskType: 'DR', drMode: drMode })
+                    body: JSON.stringify({
+                        name: name, sourceType: dbType, targetType: dbType, taskType: 'DR', drMode: drMode,
+                        // 创建后不可修改；双向灾备的反向影子任务由后端继承同一语义
+                        consistencyMode: window.getConsistencyMode('dr', 'TRANSACTIONAL')
+                    })
                 });
                 const result = await response.json();
                 if (result.success) {
@@ -503,7 +538,10 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                         migrationMode: 'fullAndIncre',
                         syncObjects: '{}',
                         sourceType: currentDrDbType,
-                        targetType: currentDrDbType
+                        targetType: currentDrDbType,
+                        // 灾备的全量走的就是同步那几条链路，装载/快照档位同样可选（任务未启动前）
+                        bulkLoadMode: drSelectValue('drBulkLoadMode', 'AUTO'),
+                        snapshotMode: drSelectValue('drSnapshotMode', 'GTID_ONLY')
                     })
                 });
                 const result = await response.json();

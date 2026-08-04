@@ -191,6 +191,7 @@ public class AgentClusterService {
         m.setSourceDbName(w.getSourceDbName());
         m.setTargetDbName(w.getTargetDbName());
         m.setTaskType(w.getTaskType());
+        m.setConsistencyMode(w.getConsistencyMode());
         m.setDrMode(w.getDrMode());
         m.setTargetAgentId(agentId);
         return m;

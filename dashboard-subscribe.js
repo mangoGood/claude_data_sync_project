@@ -85,7 +85,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 </div>
                 <div class="table-cell col-name">
                     <div>
-                        <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">订阅</span>${escapeHtml(task.name)}</div>
+                        <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">订阅</span>${escapeHtml(task.name)}${window.consistencyBadgeHtml(task.consistency_mode)}</div>
                         <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${task.status === 'CONFIGURING' ? `openSubscribeConfig('${task.id}', '${task.source_type || 'mysql'}', '${escapeAttr(task.name)}')` : `showSubscribeDetail('${task.id}')`}">${task.id}</div>
                     </div>
                 </div>
@@ -207,6 +207,8 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
         function openSubscribeModal() {
             document.getElementById('subscribeEntryTaskName').value = '';
             subEntrySelectSourceType('mysql');
+            // 订阅默认事务一致性：下游要能按源事务边界重组消息
+            window.resetConsistencyMode('sub', 'TRANSACTIONAL');
             document.getElementById('createSubscribeEntryModal').classList.add('show');
         }
 
@@ -238,7 +240,9 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                         name: name,
                         sourceType: subEntrySelectedSourceType,
                         targetType: subEntrySelectedSourceType,
-                        taskType: 'SUBSCRIBE'
+                        taskType: 'SUBSCRIBE',
+                        // 创建后不可修改；事务一致会同时打开事务标记 topic 供下游重组源事务
+                        consistencyMode: window.getConsistencyMode('sub', 'TRANSACTIONAL')
                     })
                 });
                 const result = await response.json();

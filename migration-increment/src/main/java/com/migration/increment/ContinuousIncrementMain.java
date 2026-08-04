@@ -88,14 +88,36 @@ public class ContinuousIncrementMain {
 
     /**
      * 增量并行应用并发度（increment.apply.parallelism，默认 1=原串行路径不动）。
-     * >1 时按表 hash 分片到 N 个 worker（各自独立目标连接），同表事件保序、跨表并发。
-     * 跨表乱序由 FOREIGN_KEY_CHECKS=0 + 幂等 upsert 兜底（与全量并行、resume 整段重放同一套保证）。
+     * >1 时按<b>冲突键</b>分片到 N 个 worker（各自独立目标连接），冲突键相同的事件保序、不相干的并发。
+     * 冲突键的粒度见 {@link #rowLevelConflict}。
+     * 跨键乱序由 FOREIGN_KEY_CHECKS=0 + 幂等 upsert 兜底（与全量并行、resume 整段重放同一套保证）。
      * DDL/心跳/被裁决跳过等非行事件作 barrier（先 drain 当前批，再串行处理）。
      */
     private int applyParallelism = 1;
     /** 单个并行批的事件数上限（increment.apply.batch.size）：批越大并行度利用越充分，但失败回退与内存占用越大。 */
     private int applyBatchSize = 500;
-    /** 并行应用执行器（懒初始化，仅 applyParallelism>1 时创建；进程停止时关闭）。 */
+    /**
+     * 单个 worker 一次目标事务里最多攒多少条 SQL 再提交（increment.apply.commit.batch.sql，默认 1）。
+     *
+     * <p>只在最终一致（EVENT）模式下生效——那里允许把源事务打散/合并，攒批提交是主要的吞吐来源
+     * （每条 DML 一次 fsync 会把吞吐压死）。>1 意味着一次崩溃会丢掉最多这么多条<b>未提交</b>的 SQL，
+     * 位点相应退回本次未提交块的第一条，重放靠应用侧幂等语义收敛。
+     */
+    private int commitBatchSql = 1;
+    /**
+     * 冲突矩阵的粒度（increment.apply.conflict.granularity=ROW|TABLE，最终一致模式默认 ROW）。
+     *
+     * <p>ROW：冲突键 = 库.表 + 主键值。不同表的 DML、同表不同主键的 DML 都能并发；
+     * 同表同主键的 INSERT/UPDATE/DELETE 落到同一个 worker 上严格保序。
+     * 拿不到主键的事件（无主键表、走文本路径的事件）会把<b>整张表</b>降级成表级键，
+     * 保证"行级键"和"表级键"不会在同一张表上并存而漏掉冲突。
+     *
+     * <p>TABLE：冲突键 = 库.表（历史行为）。当目标表带业务唯一索引、且流量里存在
+     * "删一行再插一行复用同一唯一键"的模式时用它——行级并发可能把这两条颠倒，
+     * 后到的 INSERT 撞唯一键会被当成重复键忽略掉。
+     */
+    private boolean rowLevelConflict = false;
+    /** 并行/攒批应用执行器（懒初始化，仅 applyParallelism>1 或 commitBatchSql>1 时创建；进程停止时关闭）。 */
     private ParallelApplyExecutor parallelExecutor;
 
     // ==================== 事务一致性投递（apply.transaction.mode=TRANSACTION） ====================
@@ -284,9 +306,32 @@ public class ContinuousIncrementMain {
                 props.getProperty("apply.transaction.mode", "EVENT").trim());
         txMaxRows = Math.max(1, Long.parseLong(props.getProperty("apply.transaction.max.rows", "50000")));
         txIdleFlushMs = Math.max(100, Long.parseLong(props.getProperty("apply.transaction.idle.flush.ms", "3000")));
+
+        // 冲突矩阵：最终一致模式默认行级（表+主键），事务一致模式恒为表级
+        // （事务一致的分片单位是"事务"，行级键无法保住同一事务的原子性）。
+        rowLevelConflict = !txApplyMode && !"TABLE".equalsIgnoreCase(
+                props.getProperty("increment.apply.conflict.granularity", "ROW").trim());
+        commitBatchSql = txApplyMode ? 1
+                : Math.max(1, Integer.parseInt(props.getProperty("increment.apply.commit.batch.sql", "1")));
+
         if (txApplyMode) {
-            logger.info("事务一致性投递已启用: 源事务 → 目标事务 1:1（单事务行数上限={}, 空闲兜底提交={}ms）",
-                    txMaxRows, txIdleFlushMs);
+            // 事务一致的口径是"目标库提交顺序 = 源库事务提交顺序"。多 worker 并发提交只能保住
+            // 每个连通分量内部的先后，全局提交顺序必然乱——所以这里强制串行。
+            // 只想要"每个源事务在目标端是一个原子事务"、不在意全局提交顺序的，
+            // 可以显式关掉 apply.transaction.strict.order 换回按表连通分量的并发投递。
+            boolean strictOrder = Boolean.parseBoolean(
+                    props.getProperty("apply.transaction.strict.order", "true").trim());
+            if (strictOrder && applyParallelism > 1) {
+                logger.warn("事务一致性投递要求目标提交顺序与源事务一致，忽略 increment.apply.parallelism={}，"
+                        + "按串行应用（需要并发投递请显式设置 apply.transaction.strict.order=false）", applyParallelism);
+                applyParallelism = 1;
+            }
+            logger.info("事务一致性投递已启用: 源事务 → 目标事务 1:1，按源提交顺序{}提交"
+                            + "（单事务行数上限={}, 空闲兜底提交={}ms）",
+                    applyParallelism == 1 ? "串行" : "分片并发", txMaxRows, txIdleFlushMs);
+        } else {
+            logger.info("最终一致投递: 冲突矩阵粒度={}，单次提交 SQL 上限={}（源事务可被打散/合并）",
+                    rowLevelConflict ? "ROW（库.表+主键）" : "TABLE（库.表）", commitBatchSql);
         }
 
         convertDeadLetter = "DEAD_LETTER".equalsIgnoreCase(
@@ -304,7 +349,8 @@ public class ContinuousIncrementMain {
             logger.info("增量并行应用已启用: 并发度={}, 批大小={}（{}）",
                     applyParallelism, applyBatchSize,
                     txApplyMode ? "按事务分片，同事务同连接整体提交，跨事务并发"
-                                : "按表分片，同表保序，跨表并发");
+                                : (rowLevelConflict ? "按 表+主键 冲突矩阵分片：同表不同主键并发，同表同主键保序"
+                                                    : "按表分片，同表保序，跨表并发"));
         }
         ensureDirExists(tableLatencyDir);
         // 初始化 THL 加密服务
@@ -544,8 +590,10 @@ public class ContinuousIncrementMain {
             return;
         }
 
-        // 并行应用（opt-in）：默认 applyParallelism=1 时不进入此分支，串行路径完全不变
-        if (applyParallelism > 1) {
+        // 并行/攒批应用（opt-in）：两者都不开时走原串行路径，行为完全不变。
+        // commitBatchSql>1 也要走这条路——攒批提交实现在 worker 循环里，
+        // 并发度为 1 时它就是"单线程 + 攒批提交"，不至于让配了攒批却没配并发的任务白配。
+        if (applyParallelism > 1 || commitBatchSql > 1) {
             processThlFileParallel(thlFile, isLatestFile);
             return;
         }
@@ -573,6 +621,7 @@ public class ContinuousIncrementMain {
             while ((event = reader.readEventAfter(applyCursor())) != null) {
                 if (!running.get()) { aborted = true; break; }
                 touchLiveness();  // 逐事件刷新活性：单文件大积压追平（碰不到心跳事件）时也不误判僵死
+                writeRouteMetric();   // 路由命中分布（自带 5s 限流）
 
                 // TRANSACTION 模式的事务边界：本事件不属于手里这个源事务（换了 tx_id，
                 // 或是心跳/DDL 这类不带 tx_id 的事件）→ 先把手里的提交掉再处理它。
@@ -642,6 +691,18 @@ public class ContinuousIncrementMain {
                 List<String> sqlStatements;
                 try {
                     typedDmls = typedDmlConverter.convert(event);
+                    // 汇聚表的 DML 绝不能回退文本路径：文本路径不带来源标识列，
+                    // UPDATE/DELETE 只按源主键定位，会改到/删掉同一张汇聚表里其它来源的同主键行。
+                    // 宁可停任务，也不能让它静默改坏别的来源的数据。
+                    if (typedDmls == null && typedDmlConverter.requiresTypedPipeline(event)) {
+                        logger.error("汇聚表事件无法走类型化管道（seqno={}），停止应用以免写坏其它来源的数据",
+                                event.getSeqno());
+                        writeErrorStatus("E3013",
+                                "汇聚表事件缺少类型化值（rows_typed），无法安全生成带来源标识的 DML", event);
+                        aborted = true;
+                        running.set(false);
+                        break;
+                    }
                     sqlStatements = (typedDmls == null)
                             ? sqlConverter.convertToSql(event)
                             : java.util.Collections.emptyList();
@@ -946,10 +1007,13 @@ public class ContinuousIncrementMain {
         THLEvent last = pendingTxLastEvent;
         try {
             targetConnection.commit();
+            // 跨实例拆分：本批还写了别的目标实例，一并提交（跨连接不原子，见 commitNodeConnections）
+            commitNodeConnections();
         } catch (SQLException e) {
             logger.error("目标事务提交失败 (txId={}, rows={}, 触发={}): {}",
                     pendingTxId, pendingTxRows, reason, e.getMessage());
             try { targetConnection.rollback(); } catch (SQLException ignored) {}
+            rollbackNodeConnections();
             if (last != null) {
                 writeErrorStatus("E3004", "目标事务提交失败: " + e.getMessage(), last);
             }
@@ -973,6 +1037,7 @@ public class ContinuousIncrementMain {
         }
         try {
             targetConnection.rollback();
+            rollbackNodeConnections();   // 跨实例分片连接一并回滚
             logger.warn("事务回滚 (txId={}, seqno={}, 已应用 {} 行全部作废)",
                     pendingTxId, event != null ? event.getSeqno() : -1, pendingTxRows);
         } catch (SQLException e) {
@@ -1110,11 +1175,100 @@ public class ContinuousIncrementMain {
      * 类型化值管道：以 PreparedStatement 参数绑定执行单条 DML（值永不拼接进 SQL 文本）。
      * 事务边界由调用方控制。
      */
+    /**
+     * 跨实例拆分的目标实例连接池：{@code 组名#序号} → 连接。限定表名只能跨库、跨不了实例，
+     * 所以分片落在别的实例上时必须换连接执行。
+     */
+    private final Map<String, Connection> nodeConnections = new java.util.LinkedHashMap<>();
+
+    /**
+     * 取某条 DML 该走的连接。默认实例走主连接；跨实例分片按 route.node.* 建连接并缓存，
+     * 与主连接同样关自动提交——它们要在同一批里一起提交。
+     */
+    private Connection connectionFor(ParameterizedDml dml) throws SQLException {
+        String nodeId = dml.getTargetNodeId();
+        if (nodeId == null || nodeId.isEmpty()) {
+            return targetConnection;
+        }
+        Connection conn = nodeConnections.get(nodeId);
+        if (conn != null && !conn.isClosed()) {
+            return conn;
+        }
+        com.migration.common.route.RouteNode node =
+                com.migration.common.route.RoutingConfig.loadFromProperties(props).getNode(nodeId);
+        if (node == null) {
+            throw new SQLException("路由指向未配置的目标实例: " + nodeId);
+        }
+        String url = isPostgresql
+                ? "jdbc:postgresql://" + node.getHost() + ":" + node.getPort() + "/"
+                    + (node.getDatabase() == null || node.getDatabase().isEmpty()
+                        ? targetDatabase : node.getDatabase()) + "?stringtype=unspecified"
+                : "jdbc:mysql://" + node.getHost() + ":" + node.getPort() + "/"
+                    + (node.getDatabase() == null || node.getDatabase().isEmpty()
+                        ? targetDatabase : node.getDatabase())
+                    + "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+        conn = ConnectionPoolManager.getConnection(url,
+                node.getUsername() != null ? node.getUsername() : targetUser,
+                node.getPassword() != null ? node.getPassword() : targetPassword);
+        conn.setAutoCommit(false);
+        if (!isPostgresql) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("SET FOREIGN_KEY_CHECKS=0");
+            } catch (SQLException e) {
+                logger.warn("目标实例 {} 设置 FOREIGN_KEY_CHECKS=0 失败（继续）: {}", nodeId, e.getMessage());
+            }
+        }
+        nodeConnections.put(nodeId, conn);
+        logger.info("跨实例拆分：已连接目标实例 {} ({}:{})", nodeId, node.getHost(), node.getPort());
+        return conn;
+    }
+
+    /**
+     * 提交跨实例分片连接。<b>跨连接提交不是原子的</b>：主连接与各实例连接依次提交，
+     * 中途崩溃会留下"一部分实例已提交"的状态。靠的是应用本身幂等（INSERT 走 upsert、
+     * UPDATE/DELETE 按主键定位）—— 位点只在全部提交成功后才推进，重放会把缺的那部分补上。
+     * 任一实例提交失败即抛出，调用方按事务失败处理（不推进位点）。
+     */
+    private void commitNodeConnections() throws SQLException {
+        SQLException first = null;
+        for (Map.Entry<String, Connection> e : nodeConnections.entrySet()) {
+            try {
+                Connection c = e.getValue();
+                if (!c.isClosed() && !c.getAutoCommit()) {
+                    c.commit();
+                }
+            } catch (SQLException ex) {
+                logger.error("目标实例 {} 提交失败: {}", e.getKey(), ex.getMessage());
+                if (first == null) {
+                    first = ex;
+                }
+            }
+        }
+        if (first != null) {
+            throw first;
+        }
+    }
+
+    /** 回滚跨实例分片连接（主连接的回滚由原有逻辑负责）。 */
+    private void rollbackNodeConnections() {
+        for (Map.Entry<String, Connection> e : nodeConnections.entrySet()) {
+            try {
+                Connection c = e.getValue();
+                if (!c.isClosed() && !c.getAutoCommit()) {
+                    c.rollback();
+                }
+            } catch (SQLException ex) {
+                logger.warn("目标实例 {} 回滚失败: {}", e.getKey(), ex.getMessage());
+            }
+        }
+    }
+
     private int executeTypedInTransaction(ParameterizedDml dml) throws SQLException {
-        if (targetConnection == null || targetConnection.isClosed()) {
+        Connection conn = connectionFor(dml);
+        if (conn == null || conn.isClosed()) {
             throw new SQLException("目标数据库连接不可用");
         }
-        return executeTypedOn(targetConnection, dml.getSql(), dml.getParams());
+        return executeTypedOn(conn, dml.getSql(), dml.getParams());
     }
 
     private static int executeTypedOn(Connection conn, String sql, List<Object> params) throws SQLException {
@@ -1461,6 +1615,57 @@ public class ContinuousIncrementMain {
         }
     }
 
+    /** 上次写路由指标的时刻（限流，避免逐事件写盘） */
+    private volatile long lastRouteMetricWriteMs = 0;
+
+    /**
+     * 路由命中分布落盘：{@code files/<task>/binlog_output/route_metric}。
+     * 分片是否均匀、有没有热点片、有多少行算不出分片、跨分片搬迁多频繁——
+     * 这几件事只看总吞吐是看不出来的，必须按落点分开记。
+     */
+    private void writeRouteMetric() {
+        if (typedDmlConverter == null || !typedDmlConverter.isRouting()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastRouteMetricWriteMs < 5000) {
+            return;
+        }
+        lastRouteMetricWriteMs = now;
+        File dir = new File("./files/" + taskId + "/binlog_output");
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        Map<String, Object> snapshot = typedDmlConverter.routeMetricsSnapshot();
+        try (PrintWriter pw = new PrintWriter(new FileWriter(new File(dir, "route_metric"), false))) {
+            pw.println(toRouteMetricJson(snapshot, now));
+        } catch (IOException e) {
+            logger.debug("写路由指标失败: {}", e.getMessage());
+        }
+    }
+
+    /** 手写 JSON：migration-increment 不依赖 gson，为一个五字段的指标文件引一个库不值当。 */
+    @SuppressWarnings("unchecked")
+    private String toRouteMetricJson(Map<String, Object> snapshot, long ts) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"ts\":").append(ts)
+          .append(",\"mode\":\"").append(snapshot.get("mode")).append('"')
+          .append(",\"unrouted\":").append(snapshot.get("unrouted"))
+          .append(",\"crossShardMoves\":").append(snapshot.get("crossShardMoves"))
+          .append(",\"hits\":{");
+        Map<String, Long> hits = (Map<String, Long>) snapshot.get("hits");
+        boolean first = true;
+        if (hits != null) {
+            for (Map.Entry<String, Long> e : hits.entrySet()) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('"').append(e.getKey().replace("\\", "\\\\").replace("\"", "\\\""))
+                  .append("\":").append(e.getValue());
+            }
+        }
+        return sb.append("}}").toString();
+    }
+
     private void writeRtoMetric(long rtoMs) {
         String metricsDir = "./files/" + taskId + "/binlog_output";
         File dir = new File(metricsDir);
@@ -1664,7 +1869,7 @@ public class ContinuousIncrementMain {
 
     private void processThlFileParallel(File thlFile, boolean isLatestFile) {
         String fileName = thlFile.getName();
-        logger.info("处理THL文件(并行 x{}): {}", applyParallelism, fileName);
+        logger.info("处理THL文件(并发 x{}, 单事务 SQL 上限 {}): {}", applyParallelism, commitBatchSql, fileName);
         boolean aborted = false;
 
         try {
@@ -1692,11 +1897,13 @@ public class ContinuousIncrementMain {
                         || (!skipSeqnos.isEmpty() && skipSeqnos.contains(event.getSeqno()));
 
                 // barrier：心跳 / 被裁决跳过 / 非并行化（DDL、无表名）——先 drain 当前批再串行处理。
-                // TRANSACTION 模式下 BEGIN/COMMIT 也走这里，但它们<b>不能</b>各自 drain 一次：
-                // 那样每个源事务都要独占一批，跨事务并发就没了。改为只记录边界、不打断批。
+                // BEGIN/COMMIT 也落在"非并行化"里，但它们<b>绝不能</b>各自 drain 一次：
+                // binlog 里每个事务都夹着一对，按 barrier 处理等于每条 DML 独占一批，并发全没了
+                // （两种模式都一样——TRANSACTION 下是每个源事务独占一批，EVENT 下是每个事件独占一批）。
                 if (event.getType() == THLEvent.HEARTBEAT_EVENT || isSkip || !isParallelizable(event)) {
-                    if (txApplyMode && !isSkip && isTxBoundaryOnlyEvent(event)) {
-                        // BEGIN/COMMIT 本身没有要落库的 DML，事务归属已写在各 DML 的 tx_id 上。
+                    if (!isSkip && isTxBoundaryOnlyEvent(event)) {
+                        // BEGIN/COMMIT 本身没有要落库的 DML（应用侧一律跳过 COMMIT 语句），
+                        // TRANSACTION 模式下事务归属也已写在各 DML 的 tx_id 上，所以直接略过。
                         // 批空时说明之前的都已提交，可以安全把位点推到这里（否则纯边界事件不推位点，
                         // 别的库的事务刷屏时本任务的 checkpoint 会长时间停着不动）。
                         if (batch.isEmpty()) {
@@ -1812,22 +2019,7 @@ public class ContinuousIncrementMain {
         for (int i = 0; i < n; i++) {
             final List<TxGroup> shard = shards.get(i);
             final Connection conn = parallelExecutor.conns[i];
-            futures.add(parallelExecutor.pool.submit((Callable<Long>) () -> {
-                for (TxGroup group : shard) {
-                    try {
-                        applyGroupTx(group, conn);
-                        for (WorkItem wi : group.items) {
-                            recordTableLatency(wi.event, determineOpTypeFromEvent(wi.event, wi.sqlStatements));
-                        }
-                    } catch (SQLException e) {
-                        logger.error("并行 worker 应用失败 (txId={}, seqno={}..{}): {}",
-                                group.txId, group.firstSeqno, group.lastSeqno(), e.getMessage());
-                        // 整组已回滚，低水位必须退到本组<b>第一条</b>之前，否则重启会跳过组内前半段
-                        return group.firstSeqno;
-                    }
-                }
-                return Long.MAX_VALUE; // 无失败
-            }));
+            futures.add(parallelExecutor.pool.submit((Callable<Long>) () -> runShard(shard, conn)));
         }
 
         long minFailed = Long.MAX_VALUE;
@@ -1881,6 +2073,8 @@ public class ContinuousIncrementMain {
         final String txId;
         final List<WorkItem> items = new ArrayList<>();
         final java.util.LinkedHashSet<String> tables = new java.util.LinkedHashSet<>();
+        /** 本组触及的冲突键（表级或 表+主键 级），由 shardBatch 计算，同键必须同片且保序。 */
+        final java.util.LinkedHashSet<String> conflictKeys = new java.util.LinkedHashSet<>();
         long firstSeqno = Long.MAX_VALUE;
 
         TxGroup(String txId) {
@@ -1896,6 +2090,16 @@ public class ContinuousIncrementMain {
 
         long lastSeqno() {
             return items.isEmpty() ? -1 : items.get(items.size() - 1).event.getSeqno();
+        }
+
+        /** 本组要执行的 SQL 条数（攒批提交按它计数）。 */
+        int sqlCount() {
+            int n = 0;
+            for (WorkItem wi : items) {
+                n += (wi.typedDmls != null) ? wi.typedDmls.size()
+                        : (wi.sqlStatements != null ? wi.sqlStatements.size() : 0);
+            }
+            return n;
         }
     }
 
@@ -1922,16 +2126,22 @@ public class ContinuousIncrementMain {
     }
 
     /**
-     * 把一批事件切成 N 个 worker 的执行队列。
+     * 把一批事件切成 N 个 worker 的执行队列——冲突矩阵调度的落点。
      *
-     * <p>EVENT 模式：每个事件自成一组，按<b>表名</b> hash 分片——同表保序、跨表并发（原行为）。
+     * <p><b>EVENT / 最终一致</b>：每个事件自成一组。冲突键默认取<b>库.表 + 主键值</b>：
+     * 不同表的 DML、同表不同主键的 DML 分到不同 worker 并发执行；同表同主键的
+     * INSERT/UPDATE/DELETE 冲突键相同，必然落到同一个 worker 上按 seqno 顺序执行。
+     * 拿不到主键的事件（无主键表、走文本路径）把整张表降级成表级键，见
+     * {@link #conflictKeysOfBatch}。granularity=TABLE 时退回历史的按表分片。
      *
-     * <p>TRANSACTION 模式：先按 tx_id 聚成事务组，再按"<b>有表相交的事务必须同片</b>"分片。
+     * <p><b>TRANSACTION / 事务一致</b>：先按 tx_id 聚成事务组，再按"<b>有表相交的事务必须同片</b>"分片。
      * 只按 tx_id hash 分是不够的——tx1 插入 X、tx2 紧接着更新 X，两个事务落到不同 worker
      * 就可能乱序执行，UPDATE 先跑会"未影响任何行"被吞掉，最终留下 INSERT 的旧值。
      * 这里用并查集把共享任一张表的事务并到同一组，同时保住了两条性质：
      * 同一事务只在一个连接上（原子性），同一张表的事件严格有序（正确性）。
      * 并发度退化为"互不相交的表集合数"，单表压测下等于串行——这是原子性必须付的代价。
+     * （默认配置下事务一致恒串行，见 {@code apply.transaction.strict.order}，这条路径
+     * 只有显式关掉严格顺序才会走到。）
      */
     List<List<TxGroup>> shardBatch(List<WorkItem> batch, int n) {
         List<TxGroup> groups = new ArrayList<>();
@@ -1953,25 +2163,87 @@ public class ContinuousIncrementMain {
             }
         }
 
-        // 并查集：把同一事务触及的所有表并起来，得到"表连通分量"
+        // 每组的冲突键（表级或行级）
+        java.util.Set<String> degraded = rowLevelConflict ? degradedTablesOf(batch) : null;
+        for (TxGroup g : groups) {
+            conflictKeysOfBatch(g, degraded);
+        }
+
+        // 并查集：把同一组触及的所有冲突键并起来，得到"冲突连通分量"。
+        // 一个组横跨多个键（多表事务 / 一个事件改多行）时，这些键必须整体同片，
+        // 否则同一组会被拆到两个连接上。
         Map<String, String> parent = new HashMap<>();
         for (TxGroup g : groups) {
             String first = null;
-            for (String t : g.tables) {
-                if (first == null) first = t;
-                else union(parent, first, t);
+            for (String k : g.conflictKeys) {
+                if (first == null) first = k;
+                else union(parent, first, k);
             }
         }
 
         List<List<TxGroup>> shards = new ArrayList<>(n);
         for (int i = 0; i < n; i++) shards.add(new ArrayList<>());
         for (TxGroup g : groups) {
-            String key = g.tables.isEmpty()
+            String key = g.conflictKeys.isEmpty()
                     ? String.valueOf(g.txId)
-                    : find(parent, g.tables.iterator().next());
+                    : find(parent, g.conflictKeys.iterator().next());
             shards.get(Math.floorMod(key.hashCode(), n)).add(g);
         }
         return shards;
+    }
+
+    /**
+     * 需要降级成表级冲突键的表集合。
+     *
+     * <p>行级键只有在<b>整张表的所有 DML 都能算出主键</b>时才安全：只要有一条算不出
+     * （无主键表、走文本路径的事件、列数不齐回退），它就可能改到任意一行，
+     * 与该表任何行级键都冲突。此时把这张表上的全部事件统一压回表级键，
+     * 让它们回到同一个 worker 上保序——比"行级键 + 表级键混用"漏掉冲突安全得多。
+     */
+    private java.util.Set<String> degradedTablesOf(List<WorkItem> batch) {
+        java.util.Set<String> degraded = new java.util.HashSet<>();
+        for (WorkItem wi : batch) {
+            String tableId = tableIdOf(wi.event);
+            if (wi.typedDmls == null) {
+                degraded.add(tableId);   // 文本路径：SQL 已经拼好，拿不到结构化主键
+                continue;
+            }
+            for (ParameterizedDml dml : wi.typedDmls) {
+                if (dml.getRowKey() == null || dml.getRowKey().isEmpty()) {
+                    degraded.add(tableId);
+                    break;
+                }
+            }
+        }
+        return degraded;
+    }
+
+    /** 计算一个执行组的冲突键集合（写进 {@link TxGroup#conflictKeys}）。 */
+    private void conflictKeysOfBatch(TxGroup g, java.util.Set<String> degraded) {
+        for (WorkItem wi : g.items) {
+            String tableId = tableIdOf(wi.event);
+            if (degraded == null || degraded.contains(tableId) || wi.typedDmls == null) {
+                g.conflictKeys.add("T|" + tableId);
+                continue;
+            }
+            for (ParameterizedDml dml : wi.typedDmls) {
+                g.conflictKeys.add("R|" + tableId + "|" + dml.getRowKey());
+            }
+        }
+    }
+
+    /**
+     * 冲突键里的"表"身份：源端 库.表。
+     *
+     * <p>用源端标识而不是目标表名，是为了让文本路径（只有源表名）与类型化路径算出同一个键。
+     * 表名映射把<b>两张</b>源表合并到同一张目标表时，这两张源表会被判为不冲突——
+     * 这个取舍与改动前的按表分片一致（那时也只看 table_name）。
+     */
+    private String tableIdOf(THLEvent event) {
+        Object db = event.getMetadata("database_name");
+        Object t = event.getMetadata("table_name");
+        String table = t == null ? "" : t.toString();
+        return (db == null || db.toString().isEmpty()) ? table : db + "." + table;
     }
 
     private String find(Map<String, String> parent, String x) {
@@ -1992,6 +2264,105 @@ public class ContinuousIncrementMain {
             if (ra.compareTo(rb) <= 0) parent.put(rb, ra);
             else parent.put(ra, rb);
         }
+    }
+
+    /**
+     * 一个 worker 跑完自己分片上的全部执行组。返回 {@code Long.MAX_VALUE} 表示全部成功，
+     * 否则返回<b>已回滚、需要重放</b>的最小 seqno（调用方按它把位点退回去）。
+     *
+     * <p>{@code commitBatchSql == 1} 时逐组一个目标事务（历史行为）。
+     * >1 时（最终一致模式的攒批提交）多个组共用一个目标事务，攒够 N 条 SQL 才提交：
+     * 源事务被打散/合并正是最终一致允许的代价，换来的是少掉 N−1 次 fsync。
+     * 失败时整块回滚，返回<b>本块第一条</b>的 seqno——块内已执行但未提交的都作废了。
+     */
+    private long runShard(List<TxGroup> shard, Connection conn) {
+        if (commitBatchSql <= 1) {
+            for (TxGroup group : shard) {
+                try {
+                    applyGroupTx(group, conn);
+                    for (WorkItem wi : group.items) {
+                        recordTableLatency(wi.event, determineOpTypeFromEvent(wi.event, wi.sqlStatements));
+                    }
+                } catch (SQLException e) {
+                    logger.error("并行 worker 应用失败 (txId={}, seqno={}..{}): {}",
+                            group.txId, group.firstSeqno, group.lastSeqno(), e.getMessage());
+                    // 整组已回滚，低水位必须退到本组<b>第一条</b>之前，否则重启会跳过组内前半段
+                    return group.firstSeqno;
+                }
+            }
+            return Long.MAX_VALUE;
+        }
+
+        long chunkFirstSeqno = Long.MAX_VALUE;
+        int pendingSql = 0;
+        List<WorkItem> pendingLatency = new ArrayList<>();
+        boolean origAuto;
+        try {
+            origAuto = conn.getAutoCommit();
+            if (origAuto) conn.setAutoCommit(false);
+        } catch (SQLException e) {
+            logger.error("并行 worker 关闭自动提交失败: {}", e.getMessage());
+            return shard.isEmpty() ? Long.MAX_VALUE : shard.get(0).firstSeqno;
+        }
+
+        try {
+            for (TxGroup group : shard) {
+                if (pendingSql == 0) {
+                    chunkFirstSeqno = group.firstSeqno;
+                    if (bidirectionalEnabled) {
+                        // 双向防回环：每个目标事务写一次 origin 标记（攒批后一个事务覆盖多组）
+                        WorkItem firstData = firstDataItem(group);
+                        if (firstData != null) {
+                            try { writeOriginMarkerOn(conn, firstData.event.getSeqno()); }
+                            catch (SQLException me) { logger.warn("写 origin 标记失败: {}", me.getMessage()); }
+                        }
+                    }
+                }
+                try {
+                    for (WorkItem wi : group.items) {
+                        applyEventDmls(wi.event, conn, wi.typedDmls, wi.sqlStatements);
+                    }
+                    pendingSql += group.sqlCount();
+                    pendingLatency.addAll(group.items);
+                    if (pendingSql >= commitBatchSql) {
+                        conn.commit();
+                        for (WorkItem wi : pendingLatency) {
+                            recordTableLatency(wi.event, determineOpTypeFromEvent(wi.event, wi.sqlStatements));
+                        }
+                        pendingLatency.clear();
+                        pendingSql = 0;
+                    }
+                } catch (SQLException e) {
+                    logger.error("并行 worker 应用失败 (seqno={}..{}, 未提交块起点={}): {}",
+                            group.firstSeqno, group.lastSeqno(), chunkFirstSeqno, e.getMessage());
+                    try { conn.rollback(); } catch (SQLException ignored) {}
+                    return chunkFirstSeqno;
+                }
+            }
+            if (pendingSql > 0) {
+                try {
+                    conn.commit();
+                    for (WorkItem wi : pendingLatency) {
+                        recordTableLatency(wi.event, determineOpTypeFromEvent(wi.event, wi.sqlStatements));
+                    }
+                } catch (SQLException e) {
+                    logger.error("并行 worker 收尾提交失败 (未提交块起点={}): {}", chunkFirstSeqno, e.getMessage());
+                    try { conn.rollback(); } catch (SQLException ignored) {}
+                    return chunkFirstSeqno;
+                }
+            }
+            return Long.MAX_VALUE;
+        } finally {
+            try { if (origAuto) conn.setAutoCommit(true); } catch (SQLException ignored) {}
+        }
+    }
+
+    /** 组内第一个数据变更事件（写 origin 标记用）。 */
+    private WorkItem firstDataItem(TxGroup group) {
+        for (WorkItem wi : group.items) {
+            if (isDataChangeEvent(wi.event)) return wi;
+        }
+        return null;
     }
 
     /** 在一个连接上以<b>单个目标事务</b>应用整组事件；任一条失败即整组回滚。 */

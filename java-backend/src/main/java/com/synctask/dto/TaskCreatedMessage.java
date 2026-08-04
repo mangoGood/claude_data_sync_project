@@ -19,6 +19,17 @@ public class TaskCreatedMessage {
     private String sourceType;
     private String targetType;
     private String taskType;
+    /**
+     * 一致性语义（TRANSACTIONAL / EVENTUAL），创建任务时选定、之后不可修改。
+     * agent 据此编排增量投递：事务一致=串行按源事务提交；最终一致=按 表+主键 冲突矩阵并发。
+     */
+    private String consistencyMode;
+    /** 全量批量装载开关（migration.full.bulk.enabled）。 */
+    private Boolean bulkLoadEnabled;
+    /** 批量装载档位 AUTO/BATCH/COPY/DIRECT_PATH（migration.full.bulk.mode）。 */
+    private String bulkLoadMode;
+    /** 全量一致性快照档位 NONE/GTID_ONLY/CONSISTENT（migration.full.snapshot.mode）。 */
+    private String snapshotMode;
     private String drMode;
     private String kafkaBootstrapServers;
     private String kafkaTopicPrefix;
@@ -34,6 +45,10 @@ public class TaskCreatedMessage {
     private Boolean syncAccountSuperPrivilege;
     /** 指派执行本任务的 agent（集群化）。为空=广播语义，任一 agent 都可接（兼容旧行为） */
     private String targetAgentId;
+    /** 聚合路由配置 JSON（汇聚/拆分规则）；空 = 1:1 同步 */
+    private String routeConfig;
+    /** 本条管线的来源实例标识（跨实例汇聚的 leg 用，写进来源标识列） */
+    private String routeNodeId;
 
     public String getTargetAgentId() {
         return targetAgentId;
@@ -45,6 +60,38 @@ public class TaskCreatedMessage {
 
     public TaskCreatedMessage() {
         this.messageType = "TASK_CREATED";
+    }
+
+    public String getConsistencyMode() {
+        return consistencyMode;
+    }
+
+    public void setConsistencyMode(String consistencyMode) {
+        this.consistencyMode = consistencyMode;
+    }
+
+    public Boolean getBulkLoadEnabled() {
+        return bulkLoadEnabled;
+    }
+
+    public void setBulkLoadEnabled(Boolean bulkLoadEnabled) {
+        this.bulkLoadEnabled = bulkLoadEnabled;
+    }
+
+    public String getBulkLoadMode() {
+        return bulkLoadMode;
+    }
+
+    public void setBulkLoadMode(String bulkLoadMode) {
+        this.bulkLoadMode = bulkLoadMode;
+    }
+
+    public String getSnapshotMode() {
+        return snapshotMode;
+    }
+
+    public void setSnapshotMode(String snapshotMode) {
+        this.snapshotMode = snapshotMode;
     }
 
     public String getDrMode() {
@@ -238,4 +285,9 @@ public class TaskCreatedMessage {
     public void setSyncAccountSuperPrivilege(Boolean syncAccountSuperPrivilege) {
         this.syncAccountSuperPrivilege = syncAccountSuperPrivilege;
     }
+
+    public String getRouteConfig() { return routeConfig; }
+    public void setRouteConfig(String routeConfig) { this.routeConfig = routeConfig; }
+    public String getRouteNodeId() { return routeNodeId; }
+    public void setRouteNodeId(String routeNodeId) { this.routeNodeId = routeNodeId; }
 }

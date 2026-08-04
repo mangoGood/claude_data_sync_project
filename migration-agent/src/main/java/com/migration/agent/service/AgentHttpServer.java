@@ -79,6 +79,7 @@ public class AgentHttpServer {
             server.createContext("/api/metrics", this::handleMetrics);
             server.createContext("/api/checkpoint", this::handleCheckpointVisualization);
             server.createContext("/api/table-latency", this::handleTableLatency);
+            server.createContext("/api/route-metrics", this::handleRouteMetrics);
             server.createContext("/api/fanout", this::handleFanout);
             server.createContext("/api/diagnostics", this::handleDiagnostics);
             server.createContext("/api/agent/deadletter", this::handleDeadletter);
@@ -465,6 +466,43 @@ public class AgentHttpServer {
             }
         } catch (Exception e) {
             logger.error("Error handling table latency request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    /**
+     * 分片路由指标：GET /api/route-metrics/{taskId}
+     * —— 每个落点应用了多少行（热点/空片一眼可见）、多少行算不出分片、跨分片搬迁多少次。
+     * 数据由增量进程写在 files/{taskId}/binlog_output/route_metric，这里只做读取转发。
+     */
+    private void handleRouteMetrics(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+        try {
+            String[] parts = exchange.getRequestURI().getPath().split("/");
+            if (parts.length < 4 || parts[3].isEmpty()) {
+                sendResponse(exchange, 400, Map.of("success", false, "message", "taskId is required in path"));
+                return;
+            }
+            String taskId = parts[3];
+            java.io.File f = new java.io.File("./files/" + taskId + "/binlog_output/route_metric");
+            if (!f.exists()) {
+                // 未配路由、或增量还没跑起来：不是错误，前端据此显示"暂无数据"
+                sendResponse(exchange, 200, Map.of("success", true, "data",
+                        Map.of("mode", "NONE", "hits", Map.of(), "unrouted", 0, "crossShardMoves", 0)));
+                return;
+            }
+            String json = new String(java.nio.file.Files.readAllBytes(f.toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8).trim();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = new com.google.gson.Gson().fromJson(json, Map.class);
+            sendResponse(exchange, 200, Map.of("success", true, "data", data == null ? Map.of() : data));
+        } catch (Exception e) {
+            logger.error("Error handling route metrics request", e);
             sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
         }
     }

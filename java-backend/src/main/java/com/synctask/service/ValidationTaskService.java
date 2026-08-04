@@ -166,6 +166,14 @@ public class ValidationTaskService {
                     "源端与目标端数据不再一一对应，无法进行内容对比和行数对比");
         }
 
+        // 聚合路由任务：行数对比按路由后的落点统计（已支持），但内容对比要逐行比字段，
+        // 汇聚表多了来源标识列、拆分后一张源表散在 N 张表里，逐行比对没有可靠口径，先拒绝。
+        if ("CONTENT".equals(compareType)
+                && !"NONE".equals(RouteCompareSupport.modeOf(workflow.getRouteConfig()))) {
+            throw new RuntimeException("该任务配置了分库分表路由（汇聚/拆分），"
+                    + "源端与目标端不是一一对应的表，暂不支持内容对比，请使用行数对比");
+        }
+
         if ("CONTENT".equals(compareType)) {
             if (workflow.getTargetConnection().startsWith("elastic")) {
                 throw new RuntimeException("Elasticsearch 任务暂不支持内容对比，请使用行数对比（按索引文档数）");
@@ -837,6 +845,11 @@ public class ValidationTaskService {
                 }
             }
 
+            // 聚合路由（汇聚/拆分）：对比要按路由后的真实落点统计。
+            // 来源实例标识与引擎侧同一套兜底规则：路由配置里写了就用它，否则源实例 host:port。
+            String routeConfig = routeConfigOf(task);
+            String routeNodeId = routeNodeIdOf(routeConfig, sourceConn);
+
             // 表名映射（表级同步）：目标端行数按映射后的表名统计
             Map<String, Map<String, String>> tableMappings = parseTableMappings(task.getSyncObjects());
             // 库名映射：多库任务目标库按源库逐一解析（entry.targetDb ＞ 连接串库名 ＞ 同名）
@@ -854,14 +867,30 @@ public class ValidationTaskService {
                 for (String tableName : tables) {
                     String targetTableName = dbTableMapping.getOrDefault(tableName, tableName);
                     totalTables++;
+                    // 路由感知：汇聚的目标是合并表里属于本源表的那部分行，拆分的目标是全部分片之和。
+                    // 不解析路由的话，对比会拿源表名去目标端找同名表——汇聚/拆分下那张表根本不存在，
+                    // 结果是"目标端 0 行"，看着像数据全丢了。
+                    RouteCompareSupport.MergeTarget mergeTarget = RouteCompareSupport.mergeTargetOf(
+                            routeConfig, sourceDbName, tableName, targetDbName, routeNodeId);
+                    RouteCompareSupport.SplitTargets splitTargets = RouteCompareSupport.splitTargetsOf(
+                            routeConfig, sourceDbName, tableName, targetDbName);
+                    if (mergeTarget != null) {
+                        targetDbName = mergeTarget.database;
+                        targetTableName = mergeTarget.table;
+                    }
                     boolean renamed = !targetTableName.equals(tableName) || !targetDbName.equals(sourceDbName);
                     addLog(taskId, ValidationTaskLog.LogLevel.INFO,
                         "行数对比表: " + sourceDbName + "." + tableName
-                            + (renamed ? " → " + targetDbName + "." + targetTableName : ""));
+                            + (splitTargets != null
+                                ? " → " + splitTargets.shards.size() + " 个分片之和"
+                                : (renamed ? " → " + targetDbName + "." + targetTableName : ""))
+                            + (mergeTarget != null && !mergeTarget.tagFilters.isEmpty()
+                                ? "（按来源标识 " + mergeTarget.tagFilters + " 切片）" : ""));
 
                     try {
-                        TableDiffResult diff = compareTableData(
-                            sourceDb, targetDb, sourceDbName, targetDbName, tableName, targetTableName);
+                        TableDiffResult diff = compareTableDataRouted(
+                            sourceDb, targetDb, sourceDbName, targetDbName, tableName, targetTableName,
+                            mergeTarget, splitTargets);
 
                         totalRows += diff.totalRows;
                         mismatchedRows += diff.mismatchedRows;
@@ -1432,6 +1461,114 @@ public class ValidationTaskService {
         long sourceRowCount;
         long targetRowCount;
         String error;
+    }
+
+    /** 对比任务所属同步任务的路由配置；取不到返回 null（按 1:1 对比）。 */
+    private String routeConfigOf(ValidationTask task) {
+        if (task.getWorkflowId() == null) {
+            return null;
+        }
+        return workflowRepository.findById(task.getWorkflowId())
+                .map(Workflow::getRouteConfig).orElse(null);
+    }
+
+    /**
+     * 来源实例标识。必须与引擎写进 {@code _src_node} 列的值一致，否则汇聚对比的过滤条件
+     * 一行都命中不了（看着像目标端 0 行）。规则与 {@code MigrationConfig#getRouteNodeId} 相同：
+     * 路由配置里显式写了就用它（跨实例 leg），否则源实例 {@code host:port}。
+     */
+    @SuppressWarnings("unchecked")
+    private String routeNodeIdOf(String routeConfig, ParsedConnection sourceConn) {
+        if (routeConfig != null && !routeConfig.isEmpty()) {
+            try {
+                Map<String, Object> root = new com.google.gson.Gson().fromJson(routeConfig, Map.class);
+                Object nodeId = root == null ? null : root.get("nodeId");
+                if (nodeId != null && !String.valueOf(nodeId).trim().isEmpty()) {
+                    return String.valueOf(nodeId).trim();
+                }
+            } catch (RuntimeException e) {
+                logger.warn("解析路由配置的 nodeId 失败: {}", e.getMessage());
+            }
+        }
+        return sourceConn == null ? "" : sourceConn.host + ":" + sourceConn.port;
+    }
+
+    /**
+     * 路由感知的行数对比：
+     * <ul>
+     *   <li>汇聚：目标行数 = 合并表里 {@code _src_*} 等于本源表的那部分行；</li>
+     *   <li>拆分：目标行数 = 全部分片表行数之和；</li>
+     *   <li>未路由：与原来完全一致。</li>
+     * </ul>
+     */
+    private TableDiffResult compareTableDataRouted(Connection sourceDb, Connection targetDb,
+            String sourceDbName, String targetDbName, String tableName, String targetTableName,
+            RouteCompareSupport.MergeTarget mergeTarget, RouteCompareSupport.SplitTargets splitTargets) {
+        if (mergeTarget == null && splitTargets == null) {
+            return compareTableData(sourceDb, targetDb, sourceDbName, targetDbName, tableName, targetTableName);
+        }
+        TableDiffResult result = new TableDiffResult();
+        try {
+            boolean sourceIsPg = isPostgresqlConnection(sourceDb);
+            boolean targetIsPg = isPostgresqlConnection(targetDb);
+            long sourceRowCount = getRowCountSafe(sourceDb, sourceDbName, tableName, sourceIsPg);
+            long targetRowCount;
+            if (splitTargets != null) {
+                targetRowCount = 0;
+                for (String[] shard : splitTargets.shards) {
+                    long shardRows = getRowCountSafe(targetDb, shard[0], shard[1], targetIsPg);
+                    if (shardRows < 0) {
+                        result.error = "分片 " + shard[0] + "." + shard[1] + " 行数获取失败";
+                        return result;
+                    }
+                    targetRowCount += shardRows;
+                }
+            } else {
+                targetRowCount = getMergedRowCount(targetDb, mergeTarget, targetIsPg);
+            }
+            if (sourceRowCount < 0 || targetRowCount < 0) {
+                result.error = "获取行数失败";
+                return result;
+            }
+            result.sourceRowCount = sourceRowCount;
+            result.targetRowCount = targetRowCount;
+            result.totalRows = sourceRowCount;
+            result.mismatchedRows = sourceRowCount == targetRowCount
+                    ? 0 : Math.abs(sourceRowCount - targetRowCount);
+        } catch (Exception e) {
+            result.error = e.getMessage();
+        }
+        return result;
+    }
+
+    /** 汇聚表里属于某个源表的行数（按来源标识列过滤）。 */
+    private long getMergedRowCount(Connection targetDb, RouteCompareSupport.MergeTarget target, boolean isPg) {
+        String qualified = isPg ? quoteId(target.table, true)
+                : quoteId(target.database, false) + "." + quoteId(target.table, false);
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM ").append(qualified);
+        List<String> values = new ArrayList<>();
+        int i = 0;
+        for (Map.Entry<String, String> filter : target.tagFilters.entrySet()) {
+            sql.append(i++ == 0 ? " WHERE " : " AND ")
+               .append(quoteId(filter.getKey(), isPg)).append("=?");
+            values.add(filter.getValue());
+        }
+        try (java.sql.PreparedStatement ps = targetDb.prepareStatement(sql.toString())) {
+            for (int p = 0; p < values.size(); p++) {
+                ps.setString(p + 1, values.get(p));
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        } catch (SQLException e) {
+            String msg = e.getMessage() == null ? "" : e.getMessage();
+            if (msg.contains("doesn't exist") || msg.contains("does not exist")) {
+                logger.info("汇聚目标表 {}.{} 不存在，视为 0 行", target.database, target.table);
+                return 0;
+            }
+            logger.warn("汇聚目标表 {}.{} 行数获取失败: {}", target.database, target.table, msg);
+            return -1;
+        }
     }
 
     private TableDiffResult compareTableData(Connection sourceDb, Connection targetDb,

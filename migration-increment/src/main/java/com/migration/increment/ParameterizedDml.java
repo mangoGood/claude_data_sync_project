@@ -16,6 +16,11 @@ public class ParameterizedDml {
     private String rowKey;
     /** INSERT / UPDATE / DELETE，仅供冲突消解与死信记录使用。 */
     private String opType;
+    /**
+     * 目标实例标识（跨实例拆分：{@code 组名#序号}）；null = 任务默认目标实例。
+     * 应用侧据此挑连接——限定表名只能跨库，跨不了实例。
+     */
+    private String targetNodeId;
 
     public ParameterizedDml(String sql, List<Object> params) {
         this.sql = sql;
@@ -47,6 +52,16 @@ public class ParameterizedDml {
 
     public String getOpType() {
         return opType;
+    }
+
+    public String getTargetNodeId() {
+        return targetNodeId;
+    }
+
+    /** 链式设置目标实例（跨实例拆分用）。 */
+    public ParameterizedDml onNode(String targetNodeId) {
+        this.targetNodeId = targetNodeId;
+        return this;
     }
 
     /**

@@ -20,7 +20,7 @@ KAFKA_SUB_COMPOSE_FILE="docker-compose-synctask-kafka-sub.yml"
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# ---- JDK 21（Spring Boot 3.1/3.2 用 21 最稳，不要用 24）----
+# ---- JDK 21（构建/运行/测试统一钉这一个版本，与线上一致）----
 if /usr/libexec/java_home -v 21 >/dev/null 2>&1; then
   export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
 else

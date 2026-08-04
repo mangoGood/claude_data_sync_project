@@ -1,4 +1,4 @@
-package com.migration.full.snapshot;
+package com.migration.common.snapshot;
 
 import com.migration.config.DatabaseConfig;
 import org.junit.jupiter.api.DisplayName;
@@ -58,5 +58,30 @@ class ConsistentSnapshotTest {
         try (ConsistentSnapshot s = ConsistentSnapshot.begin(unreachable(), "GTID_ONLY", 4, null)) {
             assertFalse(s.providesReaders());
         }
+    }
+
+    @Test
+    @DisplayName("TiDB 源同样降级而不是报错（快照手法不同，兜底哲学一致）")
+    void tidbAlsoDegrades() {
+        DatabaseConfig tidb = unreachable();
+        tidb.setFlavor("tidb");
+        try (ConsistentSnapshot s = ConsistentSnapshot.begin(tidb, "CONSISTENT", 4, null)) {
+            assertEquals(ConsistentSnapshot.Mode.NONE, s.getMode());
+            assertFalse(s.providesReaders(), "TiDB 是逐查询历史读，任何情况下都不借固定读会话");
+            assertEquals("`t`", s.decorateTable("`t`"), "降级后不得再往 SQL 里塞 AS OF TIMESTAMP");
+        }
+    }
+
+    @Test
+    @DisplayName("解析 TiDB 的 GC 生命期（Go 风格时长）：ms 不能被当成 m")
+    void parsesTidbGcLifeTime() {
+        assertEquals(600, ConsistentSnapshot.parseGoDuration("10m0s"));
+        assertEquals(86400, ConsistentSnapshot.parseGoDuration("24h"));
+        assertEquals(5400, ConsistentSnapshot.parseGoDuration("1h30m"));
+        // "500ms" 若按 "500m" 解析会得到 30000 秒，于是本该降级的短 GC 被判成"够长"，
+        // 全量跑到一半才因历史版本被回收而失败
+        assertEquals(0, ConsistentSnapshot.parseGoDuration("500ms"));
+        assertEquals(-1, ConsistentSnapshot.parseGoDuration("unknown"));
+        assertEquals(-1, ConsistentSnapshot.parseGoDuration(null));
     }
 }
