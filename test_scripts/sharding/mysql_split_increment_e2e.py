@@ -269,6 +269,28 @@ def main():
         record("分片表都还在（破坏性 DDL 不广播）", left == str(SHARDS), f"实际 {left}")
         skipped = "拆分表的破坏性 DDL 不广播" in increment_log()
         record("破坏性 DDL 被记为跳过", skipped, "" if skipped else "日志里没有跳过记录")
+
+        print("== 分片命中分布指标 ==")
+        metric_path = os.path.join(PROJECT_ROOT, "files", TASK, "binlog_output", "route_metric")
+        metric = ""
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                with open(metric_path, encoding="utf-8") as f:
+                    metric = f.read().strip()
+                if metric:
+                    break
+            except OSError:
+                pass
+            time.sleep(2)
+        record("route_metric 已落盘", bool(metric), metric[:100])
+        if metric:
+            import json as _json
+            data = _json.loads(metric)
+            record("指标里是 SPLIT 模式且有分片命中", data.get("mode") == "SPLIT" and data.get("hits"),
+                   str(data.get("hits"))[:80])
+            record("跨分片搬迁被计数", int(data.get("crossShardMoves", 0)) >= 1,
+                   f"crossShardMoves={data.get('crossShardMoves')}")
     finally:
         stop_all()
 

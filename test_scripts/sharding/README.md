@@ -22,12 +22,18 @@ mvn clean install -DskipTests -pl migration-common,migration-full -am
 | `mysql_split_increment_e2e.py` | 拆分增量（B4b）：按分片键路由 INSERT/UPDATE/DELETE；改分片键触发跨分片搬迁（旧片删、新片插、全局只剩一份）；ALTER 广播到全部分片；源表 DROP 不连带删分片表 |
 
 | `api_merge_legs_e2e.py` | 跨实例汇聚的后端链路（B3b+B5）：路由配置存取与校验、派生隐藏 MERGE_LEG 子任务、route.* 下发到 config.properties、两条通道数据都汇进目标表。需先 `./start.sh` |
+| `mysql_split_cross_instance_e2e.py` | 跨实例拆分：分片表建到两个实例上、行按分片键落到对的实例、改分片键触发跨实例搬迁、与事务一致档位互斥。第二个实例 `synctask-mysql-b`(33307) 由脚本自动拉起 |
+| `api_route_compare_e2e.py` | 路由感知的行数对比：汇聚按来源标识切片、拆分按分片求和、路由任务拒绝内容对比。需先 `./start.sh` |
 
 ```bash
 python3 test_scripts/sharding/mysql_merge_full_e2e.py
 python3 test_scripts/sharding/mysql_merge_increment_e2e.py
 python3 test_scripts/sharding/mysql_split_full_e2e.py
 python3 test_scripts/sharding/mysql_split_increment_e2e.py
+python3 test_scripts/sharding/mysql_split_cross_instance_e2e.py
+# 下面两个需要先 ./start.sh（后端 38080 + agent）
+python3 test_scripts/sharding/api_merge_legs_e2e.py
+python3 test_scripts/sharding/api_route_compare_e2e.py
 ```
 
 增量脚本会拉起三个后台 JVM，跑完自行收尸；日志留在 `files/mrg-mysql-inc/{capture,extract,increment}.log`。

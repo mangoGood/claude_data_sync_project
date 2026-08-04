@@ -1215,6 +1215,12 @@ public class WorkflowService {
         return callAgentJson("/api/table-latency/" + id, "查询表级延迟失败（agent 不可达或未运行）", id);
     }
 
+    /** 分片路由指标：代理 agent 的 /api/route-metrics/{taskId}（先做属主校验）。 */
+    public Map<String, Object> getRouteMetrics(String id, Long userId) {
+        getWorkflowById(id, userId);
+        return callAgentJson("/api/route-metrics/" + id, "查询分片路由指标失败（agent 不可达或未运行）", id);
+    }
+
     /** 一对多分发状态：代理 agent 的 /api/fanout/{taskId}（先做属主校验）。 */
     public Map<String, Object> getFanoutStatus(String id, Long userId) {
         getWorkflowById(id, userId);

@@ -31,6 +31,10 @@ public class SchemaMigration {
     private com.migration.config.ColumnProcessingConfig columnProcessing;
     /** 汇聚：本进程内已建好的目标表（小写），保证 N 个源表只建一次 */
     private final java.util.Set<String> mergeCreatedTargets = new java.util.HashSet<>();
+    /** 路由配置（跨实例拆分：分片表要建到各自实例上） */
+    private com.migration.common.route.RoutingConfig routingConfig;
+    /** 跨实例分片的建表连接（nodeId → 连接） */
+    private final java.util.Map<String, DatabaseConnection> shardNodeConnections = new java.util.LinkedHashMap<>();
 
     public SchemaMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection, boolean dropTables) {
         this.sourceConnection = sourceConnection;
@@ -190,16 +194,19 @@ public class SchemaMigration {
         int created = 0;
         for (com.migration.common.route.RouteTarget target : table.getRouteTargets()) {
             String db = target.getDatabase();
-            if (!targetIsPostgresql && db != null && !db.isEmpty() && ensuredDbs.add(db)) {
-                targetConnection.execute("CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(db));
+            // 跨实例拆分：分片表要建在它自己所属的实例上
+            DatabaseConnection conn = shardConnection(target);
+            String ensureKey = (target.getNodeId() == null ? "" : target.getNodeId()) + "/" + db;
+            if (!targetIsPostgresql && db != null && !db.isEmpty() && ensuredDbs.add(ensureKey)) {
+                conn.execute("CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(db));
             }
             if (dropTables) {
-                targetConnection.execute("DROP TABLE IF EXISTS " + shardRef(db, target.getTable()));
+                conn.execute("DROP TABLE IF EXISTS " + shardRef(db, target.getTable()));
             }
             String shardSql = com.migration.common.route.SplitDdlRewriter.retargetCreateTable(
                     createSql, db, target.getTable(), targetIsPostgresql);
             try {
-                targetConnection.execute(shardSql);
+                conn.execute(shardSql);
                 created++;
             } catch (SQLException e) {
                 // 已存在视为幂等（重跑/续跑）；其余错误如实抛出——建表失败那一片会整片丢数据
@@ -213,6 +220,42 @@ public class SchemaMigration {
         }
         logger.info("表 {} 预建分片表完成：{} 张（共 {} 个分片落点）",
                 table.getTableName(), created, table.getRouteTargets().size());
+    }
+
+    /** 注入路由配置（跨实例拆分要按 route.node.* 在各实例上建分片表）。 */
+    public void setRoutingConfig(com.migration.common.route.RoutingConfig routingConfig) {
+        this.routingConfig = routingConfig;
+    }
+
+    /** 分片所在实例的连接：默认实例直接用目标连接，跨实例按 nodeId 建连接并缓存。 */
+    private DatabaseConnection shardConnection(com.migration.common.route.RouteTarget target)
+            throws SQLException {
+        if (target.getNodeId() == null) {
+            return targetConnection;
+        }
+        DatabaseConnection cached = shardNodeConnections.get(target.getNodeId());
+        if (cached != null) {
+            return cached;
+        }
+        com.migration.common.route.RouteNode node =
+                routingConfig == null ? null : routingConfig.getNode(target.getNodeId());
+        if (node == null) {
+            throw new SQLException("路由指向未配置的目标实例: " + target.getNodeId());
+        }
+        com.migration.config.DatabaseConfig base = targetConnection.getConfig();
+        com.migration.config.DatabaseConfig cfg = new com.migration.config.DatabaseConfig(
+                node.getHost(), node.getPort(),
+                node.getDatabase() != null && !node.getDatabase().isEmpty()
+                        ? node.getDatabase() : base.getDatabase(),
+                node.getUsername() != null ? node.getUsername() : base.getUsername(),
+                node.getPassword() != null ? node.getPassword() : base.getPassword(),
+                base.getDbType());
+        cfg.copyJdbcOptionsFrom(base);
+        DatabaseConnection conn = new DatabaseConnection(cfg);
+        shardNodeConnections.put(target.getNodeId(), conn);
+        logger.info("跨实例拆分：在目标实例 {} ({}:{}) 上预建分片表",
+                target.getNodeId(), node.getHost(), node.getPort());
+        return conn;
     }
 
     /** 分片表的目标端引用（MySQL 带库名限定；PG 一条连接跨不了库，只用表名）。 */

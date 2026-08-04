@@ -129,10 +129,17 @@ public final class ShardedJdbcBulkChannel implements JdbcBulkChannel {
         return new long[]{ok, fail};
     }
 
+    /**
+     * 目标连接断开后重建：<b>只重绑默认实例上的子通道</b>。跨实例分片的子通道各自连着
+     * 自己的实例，把它们一并绑到默认连接上会让那些分片的数据写错实例（且不报错）。
+     */
     @Override
     public void rebind(Connection newConn) throws SQLException {
-        for (JdbcBulkChannel child : children.values()) {
-            child.rebind(newConn);
+        for (Map.Entry<String, JdbcBulkChannel> e : children.entrySet()) {
+            RouteTarget target = childTargets.get(e.getKey());
+            if (target == null || target.getNodeId() == null) {
+                e.getValue().rebind(newConn);
+            }
         }
     }
 

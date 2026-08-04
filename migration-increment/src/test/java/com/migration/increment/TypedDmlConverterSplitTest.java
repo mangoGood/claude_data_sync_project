@@ -158,22 +158,71 @@ class TypedDmlConverterSplitTest {
         assertTrue(converter().convert(e).get(0).getSql().startsWith("INSERT INTO `app`.`users` "));
     }
 
-    @Test
-    @DisplayName("跨实例目标组：增量尚未支持，构造即抛（不半通不通地跑）")
-    void crossInstanceSplitRejected() {
+    /** 跨实例拆分：2 片分别落在两个目标实例上 */
+    private Properties crossInstanceProps() {
         Properties props = new Properties();
         props.setProperty("source.db.type", "mysql");
         props.setProperty("target.db.type", "mysql");
+        props.setProperty("target.db.database", "app");
         props.setProperty("route.mode", "SPLIT");
         props.setProperty("route.split.1.match", "app.orders");
         props.setProperty("route.split.1.shard.key", "user_id");
         props.setProperty("route.split.1.algo", "HASH_MOD");
         props.setProperty("route.split.1.count", "2");
+        props.setProperty("route.split.1.target.db", "dw");
         props.setProperty("route.split.1.target.table", "orders_${shard}");
         props.setProperty("route.split.1.target.group", "g1");
+        props.setProperty("route.split.1.target.node", "${shard}");
         props.setProperty("route.node.g1.0.host", "10.0.0.1");
         props.setProperty("route.node.g1.0.port", "3306");
+        props.setProperty("route.node.g1.1.host", "10.0.0.2");
+        props.setProperty("route.node.g1.1.port", "3306");
+        return props;
+    }
 
-        assertThrows(IllegalStateException.class, () -> new TypedDmlConverter(props));
+    @Test
+    @DisplayName("跨实例拆分：DML 带上目标实例标识（应用侧据此换连接）")
+    void crossInstanceDmlCarriesNodeId() {
+        THLEvent e = event("INSERT", "orders");
+        e.addMetadata("rows_typed", rows(1L, 3L, 10));   // 3 % 2 = 1 → 实例 g1#1
+
+        ParameterizedDml dml = new TypedDmlConverter(crossInstanceProps()).convert(e).get(0);
+        assertEquals("g1#1", dml.getTargetNodeId());
+        assertTrue(dml.getSql().startsWith("INSERT INTO `dw`.`orders_1` "), dml.getSql());
+
+        THLEvent e0 = event("INSERT", "orders");
+        e0.addMetadata("rows_typed", rows(2L, 4L, 20));  // 4 % 2 = 0 → 实例 g1#0
+        assertEquals("g1#0", new TypedDmlConverter(crossInstanceProps()).convert(e0).get(0).getTargetNodeId());
+    }
+
+    @Test
+    @DisplayName("跨实例拆分 + 事务一致语义：构造即抛（跨连接提交无法原子，不给不实的承诺）")
+    void crossInstanceRejectsTransactionalMode() {
+        Properties props = crossInstanceProps();
+        props.setProperty("sync.consistency.mode", "TRANSACTIONAL");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> new TypedDmlConverter(props));
+        assertTrue(e.getMessage().contains("EVENTUAL"), e.getMessage());
+    }
+
+    @Test
+    @DisplayName("单实例拆分不受一致性档位限制（所有分片在同一连接上，事务性不受影响）")
+    void singleInstanceAllowsTransactionalMode() {
+        Properties props = new Properties();
+        props.setProperty("source.db.type", "mysql");
+        props.setProperty("target.db.type", "mysql");
+        props.setProperty("target.db.database", "app");
+        props.setProperty("sync.consistency.mode", "TRANSACTIONAL");
+        props.setProperty("route.mode", "SPLIT");
+        props.setProperty("route.split.1.match", "app.orders");
+        props.setProperty("route.split.1.shard.key", "user_id");
+        props.setProperty("route.split.1.algo", "HASH_MOD");
+        props.setProperty("route.split.1.count", "4");
+        props.setProperty("route.split.1.target.table", "orders_${shard}");
+
+        THLEvent e = event("INSERT", "orders");
+        e.addMetadata("rows_typed", rows(1L, 5L, 10));
+        ParameterizedDml dml = new TypedDmlConverter(props).convert(e).get(0);
+        assertEquals(null, dml.getTargetNodeId(), "单实例分片不该带实例标识");
     }
 }

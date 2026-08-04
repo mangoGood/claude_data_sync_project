@@ -62,6 +62,38 @@ public class TypedDmlConverter {
     private final String routeNodeId;
     /** 汇聚上下文缓存："源库.源表" → 落点（每事件都要用，别重复解析规则） */
     private final Map<String, MergeCtx> mergeCtxCache = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 路由命中分布："目标库.目标表" → 落到该处的行数。热点分片、空分片一眼可见 */
+    private final Map<String, java.util.concurrent.atomic.LongAdder> routeHits =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** 算不出分片而未应用的行数（死信策略下的丢弃量，必须报出去） */
+    private final java.util.concurrent.atomic.LongAdder unroutedRows = new java.util.concurrent.atomic.LongAdder();
+    /** 分片键被改动而触发的跨分片搬迁次数（旧片删 + 新片插） */
+    private final java.util.concurrent.atomic.LongAdder crossShardMoves = new java.util.concurrent.atomic.LongAdder();
+
+    private void recordRouteHit(com.migration.common.route.RouteTarget target) {
+        routeHits.computeIfAbsent(target.getDatabase() + "." + target.getTable(),
+                k -> new java.util.concurrent.atomic.LongAdder()).increment();
+    }
+
+    /**
+     * 路由指标快照：{@code {"hits":{"db.tbl":行数,...},"unrouted":n,"crossShardMoves":n}}。
+     * 调用方（增量主循环）定期落盘，供监控页展示分片分布。
+     */
+    public Map<String, Object> routeMetricsSnapshot() {
+        Map<String, Object> snapshot = new java.util.LinkedHashMap<>();
+        Map<String, Long> hits = new java.util.LinkedHashMap<>();
+        routeHits.forEach((k, v) -> hits.put(k, v.sum()));
+        snapshot.put("mode", mergeActive ? "MERGE" : (splitActive ? "SPLIT" : "NONE"));
+        snapshot.put("hits", hits);
+        snapshot.put("unrouted", unroutedRows.sum());
+        snapshot.put("crossShardMoves", crossShardMoves.sum());
+        return snapshot;
+    }
+
+    /** 是否配置了路由（未配置时调用方不必落盘路由指标）。 */
+    public boolean isRouting() {
+        return mergeActive || splitActive;
+    }
 
     /**
      * 一张源表的汇聚落点。{@code tagValues} 是<b>有序</b>的来源标识列 → 值，
@@ -138,15 +170,22 @@ public class TypedDmlConverter {
         this.mergeActive = routing.getMode() == com.migration.common.route.RoutingConfig.Mode.MERGE;
         this.splitActive = routing.getMode() == com.migration.common.route.RoutingConfig.Mode.SPLIT;
         this.routeNodeId = props.getProperty("route.node.id", "");
-        // 跨实例拆分的增量写入要跨连接，事务与位点都要另做一套（低水位 checkpoint），
-        // 首版不支持——与其让它半通不通地跑，不如在启动时就说清楚
+        // 跨实例拆分：写入要跨连接，一个源事务无法在多个实例上原子提交。
+        // 靠"幂等重放 + 全部提交成功才推进位点"保证不丢，但这不是事务一致语义，
+        // 因此与 TRANSACTIONAL 档位互斥——给出不实的一致性承诺比不支持更糟。
+        boolean crossInstanceSplit = false;
         if (splitActive) {
             for (com.migration.common.route.SplitRule rule : routing.getSplitRules()) {
                 if (rule.getNodeGroup() != null) {
-                    throw new IllegalStateException("拆分规则 " + rule.getId()
-                            + " 配了跨实例目标组，增量的跨实例写入尚未实现（单实例分库分表可用）");
+                    crossInstanceSplit = true;
+                    break;
                 }
             }
+        }
+        if (crossInstanceSplit
+                && "TRANSACTIONAL".equalsIgnoreCase(props.getProperty("sync.consistency.mode", ""))) {
+            throw new IllegalStateException("跨实例拆分的写入分布在多个目标实例上，"
+                    + "无法在一个事务里原子提交，请使用最终一致（EVENTUAL）语义");
         }
 
         logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={}, tableMappings={}, columnProcessing={}, merge={})",
@@ -469,6 +508,10 @@ public class TypedDmlConverter {
             if (ctx != null) {
                 params = new ArrayList<>(row);
                 params.addAll(ctx.tagValues.values());
+                // 汇聚的"命中分布"记的是每个来源贡献了多少行（key 用来源，不是目标——
+                // 目标只有一张表，记目标看不出哪个分库偏斜）
+                routeHits.computeIfAbsent(srcDb + "." + srcTable,
+                        k -> new java.util.concurrent.atomic.LongAdder()).increment();
             }
             out.add(new ParameterizedDml(insertSql, params, table,
                     mergeRowKey(rowKeyOf(cols, row, pkSet(metadata)), ctx), "INSERT"));
@@ -495,14 +538,17 @@ public class TypedDmlConverter {
             }
             List<com.migration.common.route.RouteTarget> targets = routeRow(srcDb, srcTable, keyIdx, row);
             if (targets.isEmpty()) {
+                unroutedRows.increment();
                 logger.warn("表 {}.{} 的 INSERT 行算不出分片（分片键 {}），按死信策略未应用",
                         srcDb, srcTable, shardKey);
                 continue;
             }
             for (com.migration.common.route.RouteTarget target : targets) {
+                recordRouteHit(target);
                 out.add(new ParameterizedDml(
                         buildInsertSqlForRef(metadata, splitRef(target), sqlCols), row,
-                        target.getTable(), rowKeyOf(cols, row, pks), "INSERT"));
+                        target.getTable(), rowKeyOf(cols, row, pks), "INSERT")
+                        .onNode(target.getNodeId()));
             }
         }
         return out;
@@ -527,6 +573,7 @@ public class TypedDmlConverter {
             }
             List<com.migration.common.route.RouteTarget> targets = routeRow(srcDb, srcTable, keyIdx, row);
             if (targets.isEmpty()) {
+                unroutedRows.increment();
                 logger.warn("表 {}.{} 的 DELETE 行算不出分片，按死信策略未应用", srcDb, srcTable);
                 continue;
             }
@@ -537,7 +584,7 @@ public class TypedDmlConverter {
                     return null;
                 }
                 out.add(new ParameterizedDml(sql.toString(), params, target.getTable(),
-                        rowKeyOf(cols, row, pks), "DELETE"));
+                        rowKeyOf(cols, row, pks), "DELETE").onNode(target.getNodeId()));
             }
         }
         return out;
@@ -573,12 +620,14 @@ public class TypedDmlConverter {
             List<com.migration.common.route.RouteTarget> newTargets =
                     routeRow(srcDb, srcTable, afterIdx, after);
             if (oldTargets.isEmpty() && newTargets.isEmpty()) {
+                unroutedRows.increment();
                 logger.warn("表 {}.{} 的 UPDATE 行前后镜像都算不出分片，按死信策略未应用", srcDb, srcTable);
                 continue;
             }
 
             if (!oldTargets.isEmpty() && sameTargets(oldTargets, newTargets)) {
                 for (com.migration.common.route.RouteTarget target : newTargets) {
+                    recordRouteHit(target);
                     StringBuilder sql = new StringBuilder("UPDATE ").append(splitRef(target)).append(" SET ");
                     List<Object> params = new ArrayList<>();
                     for (int i = 0; i < sqlSetCols.length; i++) {
@@ -590,12 +639,13 @@ public class TypedDmlConverter {
                         return null;
                     }
                     out.add(new ParameterizedDml(sql.toString(), params, target.getTable(),
-                            rowKeyOf(whereCols, before, pks), "UPDATE"));
+                            rowKeyOf(whereCols, before, pks), "UPDATE").onNode(target.getNodeId()));
                 }
                 continue;
             }
 
             // 跨分片搬迁：先把旧分片那一行删掉，再往新分片插整行
+            crossShardMoves.increment();
             logger.info("表 {}.{} 分片键变更，跨分片搬迁: {} -> {}", srcDb, srcTable, oldTargets, newTargets);
             for (com.migration.common.route.RouteTarget target : oldTargets) {
                 StringBuilder del = new StringBuilder("DELETE FROM ").append(splitRef(target));
@@ -604,12 +654,14 @@ public class TypedDmlConverter {
                     return null;
                 }
                 out.add(new ParameterizedDml(del.toString(), params, target.getTable(),
-                        rowKeyOf(whereCols, before, pks), "DELETE"));
+                        rowKeyOf(whereCols, before, pks), "DELETE").onNode(target.getNodeId()));
             }
             for (com.migration.common.route.RouteTarget target : newTargets) {
+                recordRouteHit(target);
                 out.add(new ParameterizedDml(
                         buildInsertSqlForRef(metadata, splitRef(target), sqlSetCols), after,
-                        target.getTable(), rowKeyOf(setCols, after, pks), "INSERT"));
+                        target.getTable(), rowKeyOf(setCols, after, pks), "INSERT")
+                        .onNode(target.getNodeId()));
             }
         }
         return out;

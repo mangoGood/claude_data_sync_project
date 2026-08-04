@@ -420,6 +420,17 @@ public class WorkflowController {
         }
     }
 
+    /** 分片路由指标：每个落点的行数分布、未路由行数、跨分片搬迁次数（代理 agent）。 */
+    @GetMapping("/{id}/route-metrics")
+    public ResponseEntity<?> getRouteMetrics(@PathVariable String id, Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getRouteMetrics(id, userPrincipal.getId()));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     /** 一对多分发状态（代理 agent）。 */
     @GetMapping("/{id}/fanout")
     public ResponseEntity<?> getFanoutStatus(

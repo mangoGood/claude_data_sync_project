@@ -55,6 +55,10 @@ public class DataMigration {
     private com.migration.common.snapshot.ConsistentSnapshot snapshot;
     // 表级路由（拆分按行分发）；未注入 = 不拆分
     private com.migration.common.route.TableRouter router;
+    // 路由配置（跨实例拆分按它解析目标实例连接）
+    private com.migration.common.route.RoutingConfig routingConfig;
+    // 跨实例分片的目标实例连接（nodeId → 连接），表迁移收尾时统一关闭
+    private final java.util.Map<String, DatabaseConnection> nodeConnections = new java.util.LinkedHashMap<>();
     // 批量装载档位（BATCH / PG 二进制 COPY / Oracle direct-path）；未注入 = AUTO（即 BATCH）
     private com.migration.common.bulk.BulkLoadOptions bulkLoadOptions =
             com.migration.common.bulk.BulkLoadOptions.of(true, com.migration.common.bulk.BulkLoadOptions.Mode.AUTO, 0, 0);
@@ -110,6 +114,51 @@ public class DataMigration {
         this.router = router;
     }
 
+    /** 注入路由配置（跨实例拆分要按 route.node.* 建目标实例连接）。 */
+    public void setRoutingConfig(com.migration.common.route.RoutingConfig routingConfig) {
+        this.routingConfig = routingConfig;
+    }
+
+    /**
+     * 取跨实例分片的目标实例连接（按 nodeId 缓存）。库名由分片模板决定，
+     * 连接本身连到实例默认库即可——写入一律用 {@code 库.表} 限定名。
+     */
+    private Connection nodeConnection(String nodeId) throws SQLException {
+        DatabaseConnection existing = nodeConnections.get(nodeId);
+        if (existing != null) {
+            return existing.getConnection();
+        }
+        com.migration.common.route.RouteNode node =
+                routingConfig == null ? null : routingConfig.getNode(nodeId);
+        if (node == null) {
+            throw new SQLException("路由指向未配置的目标实例: " + nodeId);
+        }
+        DatabaseConfig base = targetConnection.getConfig();
+        DatabaseConfig cfg = new DatabaseConfig(node.getHost(), node.getPort(),
+                node.getDatabase() != null && !node.getDatabase().isEmpty()
+                        ? node.getDatabase() : base.getDatabase(),
+                node.getUsername() != null ? node.getUsername() : base.getUsername(),
+                node.getPassword() != null ? node.getPassword() : base.getPassword(),
+                base.getDbType());
+        cfg.copyJdbcOptionsFrom(base);
+        DatabaseConnection conn = new DatabaseConnection(cfg);
+        nodeConnections.put(nodeId, conn);
+        logger.info("跨实例拆分：已连接目标实例 {} ({}:{})", nodeId, node.getHost(), node.getPort());
+        return acquireTargetConnection(conn);
+    }
+
+    /** 关闭跨实例分片连接（表迁移收尾时调用）。 */
+    private void closeNodeConnections() {
+        for (DatabaseConnection conn : nodeConnections.values()) {
+            try {
+                conn.close();
+            } catch (RuntimeException e) {
+                logger.warn("关闭目标实例连接失败: {}", e.getMessage());
+            }
+        }
+        nodeConnections.clear();
+    }
+
     /** 分片键在行值数组里的下标（行值按 {@link #buildSourceQuotedColumnList} 的列序）。 */
     private int shardKeyIndexOf(TableInfo table) {
         List<ColumnInfo> columns = table.getColumns();
@@ -150,8 +199,11 @@ public class DataMigration {
                         String ref = shardTableRef(target);
                         String sql = "INSERT INTO " + ref + " (" + String.join(", ", targetColumns)
                                 + ") VALUES (" + String.join(", ", createPlaceholders(targetColumns.size())) + ")";
+                        // 跨实例拆分：分片落在别的实例上时换连接——限定表名跨得了库、跨不了实例
+                        Connection conn = target.getNodeId() == null
+                                ? targetConn : nodeConnection(target.getNodeId());
                         return com.migration.common.bulk.JdbcBulkChannels.open(
-                                targetConn, sql, ref, columnList, tableName,
+                                conn, sql, ref, columnList, tableName,
                                 targetConnection.getConfig().getDbType(), bulkLoadOptions,
                                 batchSize, exclusiveWriter);
                     });
@@ -314,6 +366,7 @@ public class DataMigration {
             }
         }
         
+        closeNodeConnections();
         logger.info("数据迁移完成，总成功: {}, 总失败: {}", totalSuccessCount, totalFailCount);
     }
 

@@ -90,6 +90,7 @@ public class ParallelDataMigration {
                     dataMigration.setSnapshot(snapshot);
                     dataMigration.setBulkLoadOptions(config.getBulkLoadOptions());
                     dataMigration.setTableRouter(config.getTableRouter());
+                    dataMigration.setRoutingConfig(config.getRoutingConfig());
 
                     TableInfo table;
                     while ((table = queue.poll()) != null) {

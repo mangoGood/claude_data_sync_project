@@ -2141,6 +2141,7 @@
                                 <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'latency')">延迟热力图</div>
                                 <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'ddl')">在线DDL</div>
                                 <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'fanout')">多目标分发</div>
+                                <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'route')">分片分布</div>
                             </div>
                             <div class="adv-tab-content active" id="advTab-checkpoint">
                                 <div class="adv-empty"><div class="adv-empty-icon">○</div>加载中...</div>
@@ -2148,6 +2149,7 @@
                             <div class="adv-tab-content" id="advTab-latency"></div>
                             <div class="adv-tab-content" id="advTab-ddl"></div>
                             <div class="adv-tab-content" id="advTab-fanout"></div>
+                            <div class="adv-tab-content" id="advTab-route"></div>
                         </div>
                     `;
                     
@@ -2180,7 +2182,7 @@
             stopAdvRefresh();
             _advCurrentTab = tabName;
             const tabs = document.querySelectorAll('.adv-tab');
-            const tabMap = { checkpoint: 0, latency: 1, ddl: 2, fanout: 3 };
+            const tabMap = { checkpoint: 0, latency: 1, ddl: 2, fanout: 3, route: 4 };
             tabs.forEach(t => t.classList.remove('active'));
             if (tabs[tabMap[tabName]]) tabs[tabMap[tabName]].classList.add('active');
             document.querySelectorAll('.adv-tab-content').forEach(c => c.classList.remove('active'));
@@ -2197,6 +2199,8 @@
                 renderDdlHistory(_currentDetailLogs);
             } else if (tabName === 'fanout') {
                 await loadFanout(taskId);
+            } else if (tabName === 'route') {
+                await loadRouteMetrics(taskId);
             }
             startAdvRefresh(taskId, tabName);
         }
@@ -2208,6 +2212,7 @@
                 if (tabName === 'checkpoint') await loadCheckpoint(taskId);
                 else if (tabName === 'latency') await loadLatency(taskId);
                 else if (tabName === 'fanout') await loadFanout(taskId);
+                else if (tabName === 'route') await loadRouteMetrics(taskId);
             }, 10000);
         }
 
@@ -2521,6 +2526,65 @@
         }
 
         // ---- 多目标库分发 ----
+        /** 分片路由指标：每个落点的行数分布 + 未路由行数 + 跨分片搬迁次数。 */
+        async function loadRouteMetrics(taskId) {
+            const el = document.getElementById('advTab-route');
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/route-metrics`);
+                if (!resp) return;
+                const data = await resp.json();
+                renderRouteMetrics(data);
+            } catch (e) {
+                el.innerHTML = `<div class="adv-empty"><div class="adv-empty-icon">⚠</div>加载失败: ${escapeHtml(e.message)}<br><span style="font-size:11px;color:#ccc;">请确认 Agent (端口8083) 正在运行</span></div>`;
+            }
+        }
+
+        function renderRouteMetrics(payload) {
+            const el = document.getElementById('advTab-route');
+            const d = (payload && (payload.data || payload)) || {};
+            const hits = d.hits || {};
+            const entries = Object.keys(hits).map(k => [k, Number(hits[k]) || 0]).sort((a, b) => b[1] - a[1]);
+            if (!d.mode || d.mode === 'NONE' || entries.length === 0) {
+                el.innerHTML = `
+                    <div class="adv-empty"><div class="adv-empty-icon">○</div>该任务未配置分库分表路由，或增量尚未应用数据</div>
+                    <div style="font-size:12px;color:#999;padding:0 12px;">在任务配置的「分库分表路由」页签启用汇聚或拆分后，这里会显示每个落点的行数分布。</div>
+                `;
+                return;
+            }
+            const total = entries.reduce((sum, e) => sum + e[1], 0);
+            const max = entries[0][1] || 1;
+            const isSplit = d.mode === 'SPLIT';
+            // 分布是否偏斜：最大落点占比明显高于均值时点出来（热点分片是拆分最常见的运维问题）
+            const avg = total / entries.length;
+            const skewed = entries[0][1] > avg * 2 && entries.length > 1;
+            const rows = entries.map(([name, count]) => {
+                const pct = total > 0 ? (count / total * 100) : 0;
+                const width = Math.max(2, count / max * 100);
+                return `
+                    <div style="display:flex;align-items:center;gap:10px;padding:5px 12px;font-size:12px;">
+                        <span style="width:230px;color:#333;" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+                        <span style="flex:1;background:#f0f0f0;border-radius:3px;height:14px;position:relative;">
+                            <span style="display:block;width:${width}%;height:100%;border-radius:3px;background:${count === max && skewed ? '#fa8c16' : '#1890ff'};"></span>
+                        </span>
+                        <span style="width:110px;text-align:right;color:#666;">${count.toLocaleString()} 行 (${pct.toFixed(1)}%)</span>
+                    </div>`;
+            }).join('');
+            el.innerHTML = `
+                <div style="padding:10px 12px;font-size:12px;color:#666;">
+                    模式: <b>${d.mode === 'MERGE' ? '汇聚（按来源统计）' : '拆分（按分片统计）'}</b>
+                    ・共 ${entries.length} 个${isSplit ? '分片' : '来源'}
+                    ・累计 ${total.toLocaleString()} 行
+                    ・未路由 <b style="color:${Number(d.unrouted) > 0 ? '#fa8c16' : '#666'};">${Number(d.unrouted) || 0}</b> 行
+                    ${isSplit ? `・跨分片搬迁 ${Number(d.crossShardMoves) || 0} 次` : ''}
+                </div>
+                ${skewed ? `<div style="margin:0 12px 8px;padding:6px 10px;background:#fffbe6;border:1px solid #ffe58f;border-radius:4px;font-size:12px;color:#fa8c16;">
+                    分布偏斜：最大的${isSplit ? '分片' : '来源'}行数超过均值 2 倍，${isSplit ? '分片键可能选得不均匀' : '某个分库数据量明显更大'}。
+                </div>` : ''}
+                ${rows}
+                <div style="font-size:11px;color:#bbb;padding:8px 12px;">数据来自增量应用进程，每 5 秒刷新一次；仅统计增量阶段应用的行。</div>
+            `;
+        }
+
         async function loadFanout(taskId) {
             const el = document.getElementById('advTab-fanout');
             try {

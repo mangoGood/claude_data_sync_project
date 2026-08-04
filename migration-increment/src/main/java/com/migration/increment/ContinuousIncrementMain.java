@@ -621,6 +621,7 @@ public class ContinuousIncrementMain {
             while ((event = reader.readEventAfter(applyCursor())) != null) {
                 if (!running.get()) { aborted = true; break; }
                 touchLiveness();  // 逐事件刷新活性：单文件大积压追平（碰不到心跳事件）时也不误判僵死
+                writeRouteMetric();   // 路由命中分布（自带 5s 限流）
 
                 // TRANSACTION 模式的事务边界：本事件不属于手里这个源事务（换了 tx_id，
                 // 或是心跳/DDL 这类不带 tx_id 的事件）→ 先把手里的提交掉再处理它。
@@ -1006,10 +1007,13 @@ public class ContinuousIncrementMain {
         THLEvent last = pendingTxLastEvent;
         try {
             targetConnection.commit();
+            // 跨实例拆分：本批还写了别的目标实例，一并提交（跨连接不原子，见 commitNodeConnections）
+            commitNodeConnections();
         } catch (SQLException e) {
             logger.error("目标事务提交失败 (txId={}, rows={}, 触发={}): {}",
                     pendingTxId, pendingTxRows, reason, e.getMessage());
             try { targetConnection.rollback(); } catch (SQLException ignored) {}
+            rollbackNodeConnections();
             if (last != null) {
                 writeErrorStatus("E3004", "目标事务提交失败: " + e.getMessage(), last);
             }
@@ -1033,6 +1037,7 @@ public class ContinuousIncrementMain {
         }
         try {
             targetConnection.rollback();
+            rollbackNodeConnections();   // 跨实例分片连接一并回滚
             logger.warn("事务回滚 (txId={}, seqno={}, 已应用 {} 行全部作废)",
                     pendingTxId, event != null ? event.getSeqno() : -1, pendingTxRows);
         } catch (SQLException e) {
@@ -1170,11 +1175,100 @@ public class ContinuousIncrementMain {
      * 类型化值管道：以 PreparedStatement 参数绑定执行单条 DML（值永不拼接进 SQL 文本）。
      * 事务边界由调用方控制。
      */
+    /**
+     * 跨实例拆分的目标实例连接池：{@code 组名#序号} → 连接。限定表名只能跨库、跨不了实例，
+     * 所以分片落在别的实例上时必须换连接执行。
+     */
+    private final Map<String, Connection> nodeConnections = new java.util.LinkedHashMap<>();
+
+    /**
+     * 取某条 DML 该走的连接。默认实例走主连接；跨实例分片按 route.node.* 建连接并缓存，
+     * 与主连接同样关自动提交——它们要在同一批里一起提交。
+     */
+    private Connection connectionFor(ParameterizedDml dml) throws SQLException {
+        String nodeId = dml.getTargetNodeId();
+        if (nodeId == null || nodeId.isEmpty()) {
+            return targetConnection;
+        }
+        Connection conn = nodeConnections.get(nodeId);
+        if (conn != null && !conn.isClosed()) {
+            return conn;
+        }
+        com.migration.common.route.RouteNode node =
+                com.migration.common.route.RoutingConfig.loadFromProperties(props).getNode(nodeId);
+        if (node == null) {
+            throw new SQLException("路由指向未配置的目标实例: " + nodeId);
+        }
+        String url = isPostgresql
+                ? "jdbc:postgresql://" + node.getHost() + ":" + node.getPort() + "/"
+                    + (node.getDatabase() == null || node.getDatabase().isEmpty()
+                        ? targetDatabase : node.getDatabase()) + "?stringtype=unspecified"
+                : "jdbc:mysql://" + node.getHost() + ":" + node.getPort() + "/"
+                    + (node.getDatabase() == null || node.getDatabase().isEmpty()
+                        ? targetDatabase : node.getDatabase())
+                    + "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+        conn = ConnectionPoolManager.getConnection(url,
+                node.getUsername() != null ? node.getUsername() : targetUser,
+                node.getPassword() != null ? node.getPassword() : targetPassword);
+        conn.setAutoCommit(false);
+        if (!isPostgresql) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("SET FOREIGN_KEY_CHECKS=0");
+            } catch (SQLException e) {
+                logger.warn("目标实例 {} 设置 FOREIGN_KEY_CHECKS=0 失败（继续）: {}", nodeId, e.getMessage());
+            }
+        }
+        nodeConnections.put(nodeId, conn);
+        logger.info("跨实例拆分：已连接目标实例 {} ({}:{})", nodeId, node.getHost(), node.getPort());
+        return conn;
+    }
+
+    /**
+     * 提交跨实例分片连接。<b>跨连接提交不是原子的</b>：主连接与各实例连接依次提交，
+     * 中途崩溃会留下"一部分实例已提交"的状态。靠的是应用本身幂等（INSERT 走 upsert、
+     * UPDATE/DELETE 按主键定位）—— 位点只在全部提交成功后才推进，重放会把缺的那部分补上。
+     * 任一实例提交失败即抛出，调用方按事务失败处理（不推进位点）。
+     */
+    private void commitNodeConnections() throws SQLException {
+        SQLException first = null;
+        for (Map.Entry<String, Connection> e : nodeConnections.entrySet()) {
+            try {
+                Connection c = e.getValue();
+                if (!c.isClosed() && !c.getAutoCommit()) {
+                    c.commit();
+                }
+            } catch (SQLException ex) {
+                logger.error("目标实例 {} 提交失败: {}", e.getKey(), ex.getMessage());
+                if (first == null) {
+                    first = ex;
+                }
+            }
+        }
+        if (first != null) {
+            throw first;
+        }
+    }
+
+    /** 回滚跨实例分片连接（主连接的回滚由原有逻辑负责）。 */
+    private void rollbackNodeConnections() {
+        for (Map.Entry<String, Connection> e : nodeConnections.entrySet()) {
+            try {
+                Connection c = e.getValue();
+                if (!c.isClosed() && !c.getAutoCommit()) {
+                    c.rollback();
+                }
+            } catch (SQLException ex) {
+                logger.warn("目标实例 {} 回滚失败: {}", e.getKey(), ex.getMessage());
+            }
+        }
+    }
+
     private int executeTypedInTransaction(ParameterizedDml dml) throws SQLException {
-        if (targetConnection == null || targetConnection.isClosed()) {
+        Connection conn = connectionFor(dml);
+        if (conn == null || conn.isClosed()) {
             throw new SQLException("目标数据库连接不可用");
         }
-        return executeTypedOn(targetConnection, dml.getSql(), dml.getParams());
+        return executeTypedOn(conn, dml.getSql(), dml.getParams());
     }
 
     private static int executeTypedOn(Connection conn, String sql, List<Object> params) throws SQLException {
@@ -1519,6 +1613,57 @@ public class ContinuousIncrementMain {
         } catch (IOException e) {
             logger.debug("写 increment_liveness 失败: {}", e.getMessage());
         }
+    }
+
+    /** 上次写路由指标的时刻（限流，避免逐事件写盘） */
+    private volatile long lastRouteMetricWriteMs = 0;
+
+    /**
+     * 路由命中分布落盘：{@code files/<task>/binlog_output/route_metric}。
+     * 分片是否均匀、有没有热点片、有多少行算不出分片、跨分片搬迁多频繁——
+     * 这几件事只看总吞吐是看不出来的，必须按落点分开记。
+     */
+    private void writeRouteMetric() {
+        if (typedDmlConverter == null || !typedDmlConverter.isRouting()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastRouteMetricWriteMs < 5000) {
+            return;
+        }
+        lastRouteMetricWriteMs = now;
+        File dir = new File("./files/" + taskId + "/binlog_output");
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        Map<String, Object> snapshot = typedDmlConverter.routeMetricsSnapshot();
+        try (PrintWriter pw = new PrintWriter(new FileWriter(new File(dir, "route_metric"), false))) {
+            pw.println(toRouteMetricJson(snapshot, now));
+        } catch (IOException e) {
+            logger.debug("写路由指标失败: {}", e.getMessage());
+        }
+    }
+
+    /** 手写 JSON：migration-increment 不依赖 gson，为一个五字段的指标文件引一个库不值当。 */
+    @SuppressWarnings("unchecked")
+    private String toRouteMetricJson(Map<String, Object> snapshot, long ts) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"ts\":").append(ts)
+          .append(",\"mode\":\"").append(snapshot.get("mode")).append('"')
+          .append(",\"unrouted\":").append(snapshot.get("unrouted"))
+          .append(",\"crossShardMoves\":").append(snapshot.get("crossShardMoves"))
+          .append(",\"hits\":{");
+        Map<String, Long> hits = (Map<String, Long>) snapshot.get("hits");
+        boolean first = true;
+        if (hits != null) {
+            for (Map.Entry<String, Long> e : hits.entrySet()) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('"').append(e.getKey().replace("\\", "\\\\").replace("\"", "\\\""))
+                  .append("\":").append(e.getValue());
+            }
+        }
+        return sb.append("}}").toString();
     }
 
     private void writeRtoMetric(long rtoMs) {

@@ -391,12 +391,6 @@ public class Main {
                 throw new IllegalStateException("表 " + sourceDb + "." + table.getTableName()
                         + " 的拆分规则分片不可枚举（DATE_FORMAT），全量阶段无法预建目标表，请改用可枚举的分片算法");
             }
-            for (com.migration.common.route.RouteTarget target : targets) {
-                if (target.getNodeId() != null) {
-                    throw new UnsupportedOperationException("表 " + sourceDb + "." + table.getTableName()
-                            + " 配了跨实例目标组，拆分全量的跨实例写入尚未实现（单实例分库分表可用）");
-                }
-            }
             boolean hasShardKey = table.getColumns().stream()
                     .anyMatch(c -> c.getColumnName().equalsIgnoreCase(shardKey));
             if (!hasShardKey) {
@@ -463,6 +457,7 @@ public class Main {
                 sourceConn, targetConn, config.isDropTables()
             );
             schemaMigration.setColumnProcessing(config.getColumnProcessingConfig());
+            schemaMigration.setRoutingConfig(config.getRoutingConfig());
             schemaMigration.migrateAllTables(tables);
             logger.info("表结构迁移完成");
         }
@@ -502,6 +497,7 @@ public class Main {
                     dataMigration.setSnapshot(snapshot);
                     dataMigration.setBulkLoadOptions(config.getBulkLoadOptions());
                     dataMigration.setTableRouter(config.getTableRouter());
+                    dataMigration.setRoutingConfig(config.getRoutingConfig());
                     dataMigration.migrateAllData(tables);
                 }
             }
