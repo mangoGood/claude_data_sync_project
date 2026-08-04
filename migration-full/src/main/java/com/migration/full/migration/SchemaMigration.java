@@ -29,6 +29,8 @@ public class SchemaMigration {
     private TypeTranslator translator;
     // 列处理（仅表级同步、mysql→mysql）：建表期列名改写 + 附加列（DEFAULT 子句承载时间/来源语义）
     private com.migration.config.ColumnProcessingConfig columnProcessing;
+    /** 汇聚：本进程内已建好的目标表（小写），保证 N 个源表只建一次 */
+    private final java.util.Set<String> mergeCreatedTargets = new java.util.HashSet<>();
 
     public SchemaMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection, boolean dropTables) {
         this.sourceConnection = sourceConnection;
@@ -98,6 +100,12 @@ public class SchemaMigration {
                 logger.info("表 {} 结构迁移成功", table.getTableName());
             } catch (SQLException e) {
                 failCount++;
+                // 汇聚表的结构问题（列缺失/无主键）必须 fail-stop：继续跑下去的结果是
+                // 这个来源的数据整列丢失或被同主键行覆盖，而任务照样报完成
+                if (isMergeTable(table)) {
+                    logger.error("汇聚表 {} 结构迁移失败，终止任务", table.getTableName(), e);
+                    throw e;
+                }
                 logger.error("表 {} 结构迁移失败，已忽略该错误继续执行", table.getTableName(), e);
             }
         }
@@ -109,11 +117,147 @@ public class SchemaMigration {
         // 表名映射：目标端建表/删表一律用目标表名（未配置映射时 = 源表名）
         String targetTableName = table.getTargetTableName();
 
+        // 拆分：一张源表预建出 N 张分片表（分库时先建库）
+        if (table.isSplitRouted()) {
+            createShardTables(table);
+            return;
+        }
+
+        // 汇聚：N 个源表落到同一张目标表，只由第一个源表建表，其余源表只做结构一致性校验。
+        // 目标表已存在（上一轮任务或跨实例的另一条 leg 建的）同样只校验不重建——
+        // 重建会把别的来源已经搬进去的数据一起抹掉。
+        if (isMergeTable(table)) {
+            String key = targetTableName.toLowerCase();
+            if (!mergeCreatedTargets.add(key)) {
+                verifyMergeCompatibility(table);
+                return;
+            }
+            if (tableExists(targetTableName)) {
+                logger.info("汇聚目标表 {} 已存在，跳过建表，仅做结构一致性校验", targetTableName);
+                verifyMergeCompatibility(table);
+                return;
+            }
+            try {
+                createTable(table);
+            } catch (SQLException e) {
+                // 跨实例汇聚下，多条来源通道是各自独立的进程，"查存在→建表"之间必然有竞态：
+                // 两条同时查到不存在、同时 CREATE，输的那条会拿到 already exists。
+                // 这与"表已存在"是同一种情况，按已存在处理即可，不能让整条通道失败。
+                String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+                if (msg.contains("already exists") || msg.contains("已经存在")) {
+                    logger.info("汇聚目标表 {} 已被另一条来源通道建出，改为结构一致性校验", targetTableName);
+                    verifyMergeCompatibility(table);
+                } else {
+                    throw e;
+                }
+            }
+            return;
+        }
+
         if (dropTables) {
             dropTableIfExists(targetTableName);
         }
 
         createTable(table);
+    }
+
+    /** 是否为汇聚目标表（由路由层打标）。 */
+    private boolean isMergeTable(TableInfo table) {
+        return table.isUpsertLoad() && !table.getMergeTagValues().isEmpty();
+    }
+
+    /**
+     * 拆分：按分片落点预建目标表（分库时先建库）。
+     *
+     * <p>由我们预建而不是要求用户提前建好——128 张分片表手工建一次不现实，
+     * 且建错一张的后果是那一片的数据全量失败。建表语句从源表结构派生，
+     * 逐分片改名 + <b>剥掉 AUTO_INCREMENT</b>（每片各自发号必然撞主键）。
+     */
+    private void createShardTables(TableInfo table) throws SQLException {
+        String createSql = table.getCreateSql();
+        if (createSql == null || createSql.isEmpty()) {
+            throw new SQLException("表 " + table.getTableName() + " 没有建表语句，无法预建分片表");
+        }
+        createSql = cleanCreateSql(createSql);
+        if (columnProcessingApplicable()) {
+            String srcDb = sourceConnection.getConfig().getDatabase();
+            createSql = rewriteColumnNamesInCreateSql(createSql, srcDb, table.getTableName());
+            createSql = appendExtraColumnsToCreateSql(createSql, srcDb, table.getTableName());
+        }
+        createSql = com.migration.common.route.SplitDdlRewriter.stripAutoIncrement(createSql);
+
+        java.util.Set<String> ensuredDbs = new java.util.HashSet<>();
+        int created = 0;
+        for (com.migration.common.route.RouteTarget target : table.getRouteTargets()) {
+            String db = target.getDatabase();
+            if (!targetIsPostgresql && db != null && !db.isEmpty() && ensuredDbs.add(db)) {
+                targetConnection.execute("CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(db));
+            }
+            if (dropTables) {
+                targetConnection.execute("DROP TABLE IF EXISTS " + shardRef(db, target.getTable()));
+            }
+            String shardSql = com.migration.common.route.SplitDdlRewriter.retargetCreateTable(
+                    createSql, db, target.getTable(), targetIsPostgresql);
+            try {
+                targetConnection.execute(shardSql);
+                created++;
+            } catch (SQLException e) {
+                // 已存在视为幂等（重跑/续跑）；其余错误如实抛出——建表失败那一片会整片丢数据
+                String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+                if (msg.contains("already exists") || msg.contains("已经存在")) {
+                    logger.info("分片表已存在，跳过建表: {}", shardRef(db, target.getTable()));
+                } else {
+                    throw e;
+                }
+            }
+        }
+        logger.info("表 {} 预建分片表完成：{} 张（共 {} 个分片落点）",
+                table.getTableName(), created, table.getRouteTargets().size());
+    }
+
+    /** 分片表的目标端引用（MySQL 带库名限定；PG 一条连接跨不了库，只用表名）。 */
+    private String shardRef(String db, String tableName) {
+        if (targetIsPostgresql || db == null || db.isEmpty()) {
+            return quoteIdentifier(tableName);
+        }
+        return quoteIdentifier(db) + "." + quoteIdentifier(tableName);
+    }
+
+    /**
+     * 汇聚结构一致性校验：后续源表的列集必须被已建好的目标表覆盖。
+     * 少一列就意味着这个源的数据会整列丢失，属于必须拦下的错误；类型差异只告警
+     * （同一分表族的列类型微差在真实环境里很常见，且写入时按目标类型绑定）。
+     */
+    private void verifyMergeCompatibility(TableInfo table) throws SQLException {
+        java.util.Set<String> targetColumns = new java.util.HashSet<>();
+        String targetTable = table.getTargetTableName();
+        String schema = targetIsPostgresql ? targetConnection.getConfig().getSchema() : null;
+        if (targetIsPostgresql && (schema == null || schema.isEmpty())) {
+            schema = "public";
+        }
+        try (java.sql.ResultSet cols = targetConnection.getConnection().getMetaData()
+                .getColumns(null, schema, targetTable, null)) {
+            while (cols.next()) {
+                targetColumns.add(cols.getString("COLUMN_NAME").toLowerCase());
+            }
+        }
+        if (targetColumns.isEmpty()) {
+            logger.warn("汇聚目标表 {} 未读到列信息，跳过结构一致性校验", targetTable);
+            return;
+        }
+        java.util.List<String> missing = new java.util.ArrayList<>();
+        for (com.migration.model.ColumnInfo col : table.getColumns()) {
+            if (!targetColumns.contains(col.getColumnName().toLowerCase())) {
+                missing.add(col.getColumnName());
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw new SQLException("汇聚结构不一致：源表 " + table.getSourceDatabase() + "."
+                    + table.getTableName() + " 的列 " + missing + " 在目标表 " + targetTable
+                    + " 上不存在，这些列的数据会整列丢失");
+        }
+        logger.info("汇聚结构一致性校验通过: {}.{} -> {}",
+                table.getSourceDatabase(), table.getTableName(), targetTable);
     }
 
     private void dropTableIfExists(String tableName) throws SQLException {
@@ -148,8 +292,38 @@ public class SchemaMigration {
             createSql = rewriteColumnNamesInCreateSql(createSql, srcDb, table.getTableName());
             createSql = appendExtraColumnsToCreateSql(createSql, srcDb, table.getTableName());
         }
+        createSql = applyMergeTagColumns(createSql, table);
         targetConnection.execute(createSql);
         logger.debug("已创建表: {}", table.getTargetTableName());
+    }
+
+    /**
+     * 汇聚：在建表语句里追加来源标识列，并（COMPOSITE_SOURCE 策略下）把它们并入主键。
+     *
+     * <p>并入主键不是可选项——汇聚全量走幂等 upsert，冲突目标就是目标表主键；
+     * 只加列不并主键的话，两个分表里主键相同的行会互相覆盖，数据只会少、不会报错。
+     * 因此无主键的源表在汇聚下直接拒绝，让问题停在建表阶段而不是搬完之后。
+     */
+    private String applyMergeTagColumns(String createSql, TableInfo table) throws SQLException {
+        java.util.Map<String, String> tags = table.getMergeTagValues();
+        if (!table.isUpsertLoad() || tags.isEmpty()) {
+            return createSql;
+        }
+        java.util.List<String> tagColumns = new java.util.ArrayList<>(tags.keySet());
+        String rewritten = com.migration.common.route.MergeDdlRewriter.appendTagColumns(
+                createSql, tagColumns, targetIsPostgresql);
+        if (table.isMergeCompositePk()) {
+            if (!com.migration.common.route.MergeDdlRewriter.hasPrimaryKey(rewritten)) {
+                throw new SQLException("汇聚要求目标表有主键：源表 " + table.getSourceDatabase() + "."
+                        + table.getTableName() + " 无主键，幂等装载无冲突目标可用，"
+                        + "请改用有主键的表或换 KEEP 主键策略并自建唯一约束");
+            }
+            rewritten = com.migration.common.route.MergeDdlRewriter.extendPrimaryKey(
+                    rewritten, tagColumns, targetIsPostgresql);
+        }
+        logger.info("汇聚建表: {} 追加来源标识列 {}{}", table.getTargetTableName(), tagColumns,
+                table.isMergeCompositePk() ? "（已并入主键）" : "");
+        return rewritten;
     }
 
     /**

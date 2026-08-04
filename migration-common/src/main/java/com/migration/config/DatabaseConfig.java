@@ -11,11 +11,18 @@ public class DatabaseConfig {
     private String username;
     private String password;
     private String dbType = "mysql";
+    /**
+     * 同一 dbType 下的具体实现（source.db.flavor / target.db.flavor）。目前只用于 TiDB：
+     * TiDB 走 MySQL 协议、dbType 归一成 mysql（别去改那 89 处 mysql 分支），但一致性快照的
+     * 手法完全不同——TiDB 是 MVCC 的 {@code AS OF TIMESTAMP} 无锁快照，不是 MySQL 的
+     * FLUSH TABLES WITH READ LOCK。null/空 = 与 dbType 相同。
+     */
+    private String flavor;
     private String schema;
     /**
      * 追加到 JDBC URL 上的驱动参数（仅 MySQL / PostgreSQL；Oracle 的 thin URL 不带查询串）。
      * 目前用于全量写侧的批量语句重写（rewriteBatchedStatements / reWriteBatchedInserts），
-     * 见 {@code BatchWriter}。按连接对象逐个设置，不影响其它链路的连接。
+     * 见 {@code JdbcBatchChannel}。按连接对象逐个设置，不影响其它链路的连接。
      */
     private final Map<String, String> extraJdbcOptions = new LinkedHashMap<>();
 
@@ -62,6 +69,15 @@ public class DatabaseConfig {
 
     public void setDbType(String dbType) {
         this.dbType = dbType != null ? dbType : "mysql";
+    }
+
+    /** 具体实现（如 tidb）；未设置时回落到 dbType。 */
+    public String getFlavor() {
+        return flavor != null && !flavor.trim().isEmpty() ? flavor : dbType;
+    }
+
+    public void setFlavor(String flavor) {
+        this.flavor = flavor;
     }
 
     public String getSchema() {

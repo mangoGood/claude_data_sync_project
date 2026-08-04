@@ -77,6 +77,10 @@ public final class ElasticSyncMain {
     private final Map<String, List<String>> syncObjects;
     private final Path progressPath;
     private final Path positionPath;
+    /** 全量 _bulk 装载配置（与 SQL/Mongo/Redis 各链路共用同一组 migration.full.bulk.* 键）。 */
+    private final com.migration.common.bulk.BulkLoadOptions bulkOptions;
+    /** 全量一致性快照档位（migration.full.snapshot.mode）。 */
+    private final String snapshotMode;
 
     /** 表元数据缓存：db.table -> meta（DDL 事件时失效） */
     private final Map<String, TableMeta> metaCache = new ConcurrentHashMap<>();
@@ -98,6 +102,8 @@ public final class ElasticSyncMain {
         this.syncObjects = parseSyncObjects(props.getProperty("migration.sync.objects", ""));
         this.progressPath = Paths.get("files", taskId, "elastic_progress.json");
         this.positionPath = Paths.get("files", taskId, "checkpoint", "elastic_binlog_position.json");
+        this.bulkOptions = com.migration.common.bulk.BulkLoadOptions.from(props);
+        this.snapshotMode = props.getProperty("migration.full.snapshot.mode", "GTID_ONLY").trim().toUpperCase();
     }
 
     public static void main(String[] args) throws Exception {
@@ -150,14 +156,27 @@ public final class ElasticSyncMain {
         boolean resumedFromCheckpoint = position != null;
 
         try (Connection conn = openMysql()) {
-            if (fullAndIncre && position == null) {
-                position = currentMasterPosition(conn);
-                logger.info("已记录增量起始位点（全量开始前）: {}:{}", position.file, position.position);
-            }
-            if (!resumedFromCheckpoint) {
-                runFullCopy(conn);
-            } else {
+            if (resumedFromCheckpoint) {
                 logger.info("检测到 binlog checkpoint，跳过全量，直接从 {}:{} 续传增量", position.file, position.position);
+            } else {
+                // 全量一致性快照。源就是 MySQL，直接复用 SQL 全量那套：
+                //   CONSISTENT → FTWRL 期间开好快照读会话，全量的所有 SELECT 都走它，
+                //                位点即快照点，增量从这个点接上，中间没有窗口；
+                //   GTID_ONLY/NONE → 保持原行为（快照前记一次 master 位点）。
+                try (com.migration.common.snapshot.ConsistentSnapshot snapshot =
+                             com.migration.common.snapshot.ConsistentSnapshot.begin(
+                                     sourceDbConfig(), snapshotMode, 1, taskId)) {
+                    if (fullAndIncre) {
+                        position = snapshotPosition(snapshot);
+                        if (position == null) {
+                            position = currentMasterPosition(conn);
+                            logger.info("已记录增量起始位点（全量开始前）: {}:{}", position.file, position.position);
+                        } else {
+                            logger.info("增量起点取自全量快照点: {}:{}", position.file, position.position);
+                        }
+                    }
+                    runFullCopy(conn, snapshot);
+                }
             }
         }
 
@@ -175,26 +194,62 @@ public final class ElasticSyncMain {
 
     // ==================== 全量 ====================
 
-    private void runFullCopy(Connection conn) throws Exception {
+    private void runFullCopy(Connection conn, com.migration.common.snapshot.ConsistentSnapshot snapshot)
+            throws Exception {
         Map<String, List<String>> resolved = resolveTables(conn);
         totalTables = resolved.values().stream().mapToInt(List::size).sum();
         writeProgress();
         logger.info("全量开始: {} 个表", totalTables);
 
-        for (Map.Entry<String, List<String>> e : resolved.entrySet()) {
-            for (String table : e.getValue()) {
-                currentTable = e.getKey() + "." + table;
-                writeProgress();
-                copyTable(conn, e.getKey(), table);
-                completedTables++;
-                writeProgress();
-                logger.info("表 {} 全量完成 ({}/{})", currentTable, completedTables, totalTables);
+        // 快照读会话：CONSISTENT 下所有表的数据 SELECT 必须走同一个快照会话，否则各表看到的是
+        // 各自时刻的库。元数据查询（表清单/列信息）留在原连接上，与快照语义无关。
+        boolean snapshotReads = snapshot != null && snapshot.providesReaders();
+        Connection readConn = snapshotReads ? snapshot.borrowReader() : conn;
+        try {
+            for (Map.Entry<String, List<String>> e : resolved.entrySet()) {
+                for (String table : e.getValue()) {
+                    currentTable = e.getKey() + "." + table;
+                    writeProgress();
+                    copyTable(conn, readConn, e.getKey(), table);
+                    completedTables++;
+                    writeProgress();
+                    logger.info("表 {} 全量完成 ({}/{})", currentTable, completedTables, totalTables);
+                }
+            }
+        } finally {
+            if (snapshotReads) {
+                snapshot.releaseReader(readConn);
             }
         }
         logger.info("全量完成: {} 个表, 共 {} 行", totalTables, copiedRows);
     }
 
-    private void copyTable(Connection conn, String db, String table) throws Exception {
+    /** 全量快照点 → binlog 坐标；快照未取到坐标（GTID_ONLY 未开 binlog 等）时返回 null。 */
+    private BinlogPosition snapshotPosition(com.migration.common.snapshot.ConsistentSnapshot snapshot) {
+        if (snapshot == null || snapshot.getBinlogFile() == null || snapshot.getBinlogPosition() < 0) {
+            return null;
+        }
+        return new BinlogPosition(snapshot.getBinlogFile(), snapshot.getBinlogPosition());
+    }
+
+    /** 源库连接配置（供一致性快照自建会话用）。 */
+    private com.migration.config.DatabaseConfig sourceDbConfig() {
+        com.migration.config.DatabaseConfig cfg = new com.migration.config.DatabaseConfig(
+                props.getProperty("source.db.host", "localhost"),
+                Integer.parseInt(props.getProperty("source.db.port", "3306")),
+                props.getProperty("source.db.database", ""),
+                props.getProperty("source.db.username", ""),
+                com.migration.common.crypto.CredentialCipher.decrypt(props.getProperty("source.db.password", "")),
+                "mysql");
+        cfg.setFlavor(props.getProperty("source.db.flavor"));
+        return cfg;
+    }
+
+    /**
+     * @param conn     元数据连接（列信息）
+     * @param readConn 数据读连接；一致性快照下是快照会话，否则与 conn 相同
+     */
+    private void copyTable(Connection conn, Connection readConn, String db, String table) throws Exception {
         TableMeta meta = tableMeta(conn, db, table);
         String index = indexName(db, table);
         es.createIndexIfAbsent(index);
@@ -202,38 +257,43 @@ public final class ElasticSyncMain {
             logger.warn("表 {}.{} 无主键：全量按自动 _id 写入，增量 UPDATE/DELETE 将被跳过", db, table);
         }
 
-        List<String[]> batch = new ArrayList<>(FULL_BATCH_SIZE);
-        // 流式读取：MySQL 驱动需 fetchSize=Integer.MIN_VALUE 才逐行拉取，避免大表 OOM
-        try (Statement stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-            stmt.setFetchSize(Integer.MIN_VALUE);
-            try (ResultSet rs = stmt.executeQuery("SELECT * FROM `" + db + "`.`" + table + "`")) {
-                ResultSetMetaData rsMeta = rs.getMetaData();
-                int cols = rsMeta.getColumnCount();
-                while (rs.next()) {
-                    Map<String, Object> doc = new LinkedHashMap<>();
-                    for (int i = 1; i <= cols; i++) {
-                        doc.put(rsMeta.getColumnName(i), convertJdbcValue(rs.getObject(i)));
-                    }
-                    batch.add(EsClient.indexOp(index, docId(meta, doc), doc));
-                    if (batch.size() >= FULL_BATCH_SIZE) {
-                        flushBulk(batch);
+        // 装载窗口：关刷新与副本装完再恢复。finally 兜底，异常退出也不会把索引留在该状态。
+        String[] originalSettings = es.beginLoadWindow(index);
+        try (EsBulkChannel channel = new EsBulkChannel(es, bulkOptions)) {
+            // 流式读取：MySQL 驱动需 fetchSize=Integer.MIN_VALUE 才逐行拉取，避免大表 OOM
+            try (Statement stmt = readConn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
+                stmt.setFetchSize(Integer.MIN_VALUE);
+                try (ResultSet rs = stmt.executeQuery("SELECT * FROM `" + db + "`.`" + table + "`")) {
+                    ResultSetMetaData rsMeta = rs.getMetaData();
+                    int cols = rsMeta.getColumnCount();
+                    while (rs.next()) {
+                        Map<String, Object> doc = new LinkedHashMap<>();
+                        for (int i = 1; i <= cols; i++) {
+                            doc.put(rsMeta.getColumnName(i), convertJdbcValue(rs.getObject(i)));
+                        }
+                        channel.add(EsClient.indexOp(index, docId(meta, doc), doc));
+                        if (channel.isFull()) {
+                            flushBulk(channel);
+                        }
                     }
                 }
             }
+            flushBulk(channel);
+            logger.info("表 {}.{} 装载完成: {}", db, table, channel.stats().summary());
+        } finally {
+            es.endLoadWindow(index, originalSettings);
         }
-        flushBulk(batch);
     }
 
-    private void flushBulk(List<String[]> batch) throws Exception {
-        if (batch.isEmpty()) {
+    private void flushBulk(EsBulkChannel channel) throws Exception {
+        if (channel.isEmpty()) {
             return;
         }
-        int failed = es.bulk(batch);
-        if (failed > 0) {
-            throw new RuntimeException("bulk 写入有 " + failed + " 条失败");
+        long[] r = channel.flush();
+        if (r[1] > 0) {
+            throw new RuntimeException("bulk 写入有 " + r[1] + " 条失败");
         }
-        copiedRows += batch.size();
-        batch.clear();
+        copiedRows += r[0];
         writeProgress();
     }
 

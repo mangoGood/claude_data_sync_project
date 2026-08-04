@@ -19,7 +19,6 @@ import redis.clients.jedis.DefaultJedisClientConfig;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.commands.ProtocolCommand;
-import redis.clients.jedis.params.RestoreParams;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -105,6 +104,8 @@ public final class RedisSyncMain {
     private final Path progressPath;
 
     private Jedis target;
+    /** 全量批量装载通道（pipeline 批量 RESTORE）；增量命令流仍逐条转发以保序。 */
+    private RedisRestoreChannel restoreChannel;
     private int targetSelectedDb = -1;
     /** 增量命令流当前所在源库（源端 SELECT 驱动）。 */
     private long streamDb = 0;
@@ -169,6 +170,10 @@ public final class RedisSyncMain {
                 selectedDbs == null ? "ALL" : selectedDbs);
 
         target = buildJedis("target");
+        com.migration.common.bulk.BulkLoadOptions bulkOptions =
+                com.migration.common.bulk.BulkLoadOptions.from(props);
+        restoreChannel = new RedisRestoreChannel(target, bulkOptions);
+        logger.info("全量批量装载通道: {}", bulkOptions);
         totalKeys = computeTotalKeys();
         writeProgress();
 
@@ -249,27 +254,48 @@ public final class RedisSyncMain {
         byte[] key = (byte[]) k;
         byte[] dump = (byte[]) v;
 
+        // 逻辑库切换必须先把缓冲批落库：pipeline 与 SELECT 走同一条连接，
+        // 缓冲里的键属于切换前那个库，晚一步 flush 就会被写进新库。
+        if (targetSelectedDb != (int) db) {
+            flushRestoreBatch();
+        }
         selectTarget(db);
-        RestoreParams params = RestoreParams.restoreParams().replace();
+
         long ttl = 0;
+        boolean absTtl = false;
         Long expiredMs = kv.getExpiredMs();
         if (expiredMs != null) {
             // ABSTTL：直接用绝对过期时间（毫秒），避免与源库的时钟差；已过期的键 RESTORE 会即刻不可见。
-            params.absTtl();
+            absTtl = true;
             ttl = expiredMs;
         }
-        target.restore(key, ttl, dump, params);
-
-        copiedKeys++;
+        restoreChannel.add(new RedisRestoreChannel.Entry(key, dump, ttl, absTtl));
         currentDb = db;
-        if (++sinceFlush >= PROGRESS_FLUSH_EVERY) {
+        if (restoreChannel.isFull()) {
+            flushRestoreBatch();
+        }
+    }
+
+    /** 提交缓冲的一批 RESTORE，并按实际落库条数推进进度。 */
+    private void flushRestoreBatch() {
+        if (restoreChannel == null || restoreChannel.isEmpty()) {
+            return;
+        }
+        long[] r = restoreChannel.flush();
+        copiedKeys += r[0];
+        sinceFlush += r[0] + r[1];
+        if (sinceFlush >= PROGRESS_FLUSH_EVERY) {
             writeProgress();
             sinceFlush = 0;
         }
     }
 
     private void onFullDone(Replicator rep) {
-        logger.info("全量完成: 共复制 {} 个键", copiedKeys);
+        // 收尾批必须在"全量完成"之前落库：否则最后不满一批的键会随进程停在缓冲里，
+        // 任务却已标记全量完成——目标端静默少键。
+        flushRestoreBatch();
+        persistSnapshotPosition(rep);
+        logger.info("全量完成: 共复制 {} 个键（{}）", copiedKeys, restoreChannel.stats().summary());
         if (!fullAndIncre) {
             phase = "DONE";
             writeProgress();
@@ -278,6 +304,25 @@ public final class RedisSyncMain {
             phase = "INCREMENT";
             writeProgress();
             logger.info("进入增量（PSYNC 复制命令流）");
+        }
+    }
+
+    /**
+     * 落盘全量快照位点。
+     *
+     * <p>Redis 这条链路<b>天生就是一致性快照</b>：全量走的是 PSYNC 拿到的 RDB，那本来就是源库在
+     * 某个复制偏移上的完整镜像，随后的复制命令流严格从该偏移接续——不存在 SQL 侧"各页看到各自
+     * 时刻的库"的问题，也就不需要额外的快照机制。缺的只是把这个点<b>按统一格式暴露出来</b>，
+     * 让它与其它链路一样可观测（复制 ID + 偏移，等价于 MySQL 的 GTID / PG 的 LSN）。
+     */
+    private void persistSnapshotPosition(Replicator rep) {
+        try {
+            com.moilioncircle.redis.replicator.Configuration conf = rep.getConfiguration();
+            String position = "replid:" + conf.getReplId() + ";offset:" + conf.getReplOffset();
+            com.migration.common.snapshot.SnapshotPosition.write(taskId, "CONSISTENT", "redis", position);
+            logger.info("全量快照位点（RDB 天然一致）: {}", position);
+        } catch (Exception e) {
+            logger.debug("记录 Redis 快照位点失败: {}", e.getMessage());
         }
     }
 

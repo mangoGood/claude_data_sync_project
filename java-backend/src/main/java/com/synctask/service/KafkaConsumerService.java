@@ -34,7 +34,12 @@ public class KafkaConsumerService {
 
     @Autowired
     private KafkaProducerService kafkaProducerService;
-    
+
+    /** 跨实例汇聚的父任务聚合要走 WorkflowService（那边有日志与事务边界） */
+    @Autowired
+    @org.springframework.context.annotation.Lazy
+    private WorkflowService workflowService;
+
     private long serviceStartTime;
 
     @PostConstruct
@@ -243,6 +248,7 @@ public class KafkaConsumerService {
 
             maybeLaunchBidiShadow(workflow, newStatus);
             maybePropagateShadowFailure(workflow, newStatus);
+            maybeAggregateMergeParent(workflow);
 
             String logMessage = buildStatusLogMessage(newStatus, oldStatus, progress, 
                 workflow.getErrorMessage(), errorCode,
@@ -333,6 +339,21 @@ public class KafkaConsumerService {
             logger.error("双向灾备反向通道启动失败: primary={}", primary.getId(), e);
             addLog(primary.getId(), WorkflowLog.LogLevel.WARNING,
                     "双向灾备：反向同步通道启动失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 跨实例汇聚：某条来源采集通道（MERGE_LEG）状态变化后，重算父任务的聚合进度/状态。
+     * 用户看到的是父任务——leg 的进度不聚合上去，父任务就会一直停在自己那条通道的进度上。
+     */
+    private void maybeAggregateMergeParent(Workflow workflow) {
+        if (!"MERGE_LEG".equals(workflow.getTaskType()) || workflow.getMergeParentId() == null) {
+            return;
+        }
+        try {
+            workflowService.aggregateMergeParent(workflow.getMergeParentId());
+        } catch (Exception e) {
+            logger.warn("汇聚父任务 {} 聚合失败: {}", workflow.getMergeParentId(), e.getMessage());
         }
     }
 

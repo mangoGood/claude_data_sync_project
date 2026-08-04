@@ -116,6 +116,37 @@ public class Workflow {
     @Column(name = "task_type", length = 20)
     private String taskType = "SYNC";
 
+    /**
+     * 增量投递的一致性语义，创建任务时选定、之后不可修改（updateConfig 显式拒绝改动）。
+     * TRANSACTIONAL=事务一致（目标提交顺序 = 源事务提交顺序，串行应用）；
+     * EVENTUAL=最终一致（按 表+主键 冲突矩阵并发应用，源事务可被打散/合并）。
+     * 默认按任务类型给：订阅/灾备 TRANSACTIONAL，同步 EVENTUAL（见 WorkflowService.defaultConsistencyMode）。
+     */
+    @Column(name = "consistency_mode", length = 20)
+    private String consistencyMode = "EVENTUAL";
+
+    /**
+     * 全量批量装载是否启用。关掉即退回逐条写入，只在排障（怀疑批量语义导致数据问题）时用。
+     */
+    @Column(name = "bulk_load_enabled")
+    private Boolean bulkLoadEnabled = true;
+
+    /**
+     * 批量装载档位：AUTO（各目标端的零风险默认）/ BATCH（驱动语句重写）/
+     * COPY（PostgreSQL 二进制 COPY）/ DIRECT_PATH（Oracle 直接路径）。
+     * 档位与目标端不匹配时由引擎侧降级为 BATCH，不会让任务失败。
+     */
+    @Column(name = "bulk_load_mode", length = 20)
+    private String bulkLoadMode = "AUTO";
+
+    /**
+     * 全量一致性快照档位：NONE / GTID_ONLY（只记位点）/ CONSISTENT（真快照）。
+     * 创建时按<b>源端</b>给默认值（见 WorkflowService.defaultSnapshotMode），
+     * 任务启动前可改（updateConfig 只在 CONFIGURING 状态放行）。
+     */
+    @Column(name = "snapshot_mode", length = 20)
+    private String snapshotMode = "GTID_ONLY";
+
     @Column(name = "dr_status", length = 20)
     private String drStatus;
 
@@ -150,6 +181,16 @@ public class Workflow {
     @Column(name = "target_connections", columnDefinition = "TEXT")
     @Convert(converter = com.synctask.security.EncryptedStringConverter.class)
     private String targetConnections;
+
+    // 聚合路由配置 JSON（汇聚/拆分规则 + 跨实例源 leg）：leg 里带库口令，同样落库前加密。
+    // 为空 = 现状 1:1 同步。
+    @Column(name = "route_config", columnDefinition = "TEXT")
+    @Convert(converter = com.synctask.security.EncryptedStringConverter.class)
+    private String routeConfig;
+
+    /** 跨实例汇聚的父任务 id；非空表示本行是隐藏的 MERGE_LEG 子任务 */
+    @Column(name = "merge_parent_id", length = 36)
+    private String mergeParentId;
 
     @Column(name = "fanout_enabled")
     private Boolean fanoutEnabled = false;
@@ -466,6 +507,38 @@ public class Workflow {
         this.taskType = taskType;
     }
 
+    public String getConsistencyMode() {
+        return consistencyMode;
+    }
+
+    public void setConsistencyMode(String consistencyMode) {
+        this.consistencyMode = consistencyMode;
+    }
+
+    public Boolean getBulkLoadEnabled() {
+        return bulkLoadEnabled;
+    }
+
+    public void setBulkLoadEnabled(Boolean bulkLoadEnabled) {
+        this.bulkLoadEnabled = bulkLoadEnabled;
+    }
+
+    public String getBulkLoadMode() {
+        return bulkLoadMode;
+    }
+
+    public void setBulkLoadMode(String bulkLoadMode) {
+        this.bulkLoadMode = bulkLoadMode;
+    }
+
+    public String getSnapshotMode() {
+        return snapshotMode;
+    }
+
+    public void setSnapshotMode(String snapshotMode) {
+        this.snapshotMode = snapshotMode;
+    }
+
     public String getDrStatus() {
         return drStatus;
     }
@@ -552,6 +625,22 @@ public class Workflow {
 
     public void setTargetConnections(String targetConnections) {
         this.targetConnections = targetConnections;
+    }
+
+    public String getRouteConfig() {
+        return routeConfig;
+    }
+
+    public void setRouteConfig(String routeConfig) {
+        this.routeConfig = routeConfig;
+    }
+
+    public String getMergeParentId() {
+        return mergeParentId;
+    }
+
+    public void setMergeParentId(String mergeParentId) {
+        this.mergeParentId = mergeParentId;
     }
 
     public Boolean getFanoutEnabled() {

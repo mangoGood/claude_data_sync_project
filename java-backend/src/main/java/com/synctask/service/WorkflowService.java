@@ -23,6 +23,7 @@ import java.lang.reflect.Type;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -134,12 +135,92 @@ public class WorkflowService {
 
     @Transactional
     public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId, String taskType) {
-        return createWorkflow(name, sourceType, targetType, userId, taskType, null);
+        return createWorkflow(name, sourceType, targetType, userId, taskType, null, null);
     }
 
     @Transactional
     public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId,
                                    String taskType, String drMode) {
+        return createWorkflow(name, sourceType, targetType, userId, taskType, drMode, null);
+    }
+
+    /**
+     * 一致性语义的类型默认值：订阅与灾备默认<b>事务一致</b>（下游/备库不能读到半个事务），
+     * 普通同步默认<b>最终一致</b>（吞吐优先，源事务可被打散合并）。
+     */
+    public static String defaultConsistencyMode(String taskType) {
+        if ("SUBSCRIBE".equals(taskType) || "DR".equals(taskType) || "DR_SHADOW".equals(taskType)) {
+            return "TRANSACTIONAL";
+        }
+        return "EVENTUAL";
+    }
+
+    /**
+     * 全量一致性快照的默认档位，按<b>源端</b>给——各家的真快照代价差得远：
+     *
+     * <ul>
+     *   <li>MySQL 的真快照要 {@code RELOAD} 权限，且要在 {@code FLUSH TABLES WITH READ LOCK}
+     *       期间把所有读会话开出来（期间源库只读）。这个代价不该默认替用户承担，故默认只记位点。</li>
+     *   <li>TiDB（MVCC 历史读）、PostgreSQL（导出快照）、Oracle（闪回查询）、
+     *       MongoDB（快照会话）、Redis（PSYNC 拿到的 RDB 本来就是快照）都<b>不需要全局锁</b>，
+     *       默认就给真快照，让"全量结束点"这个语义默认可用。</li>
+     * </ul>
+     */
+    public static String defaultSnapshotMode(String sourceType) {
+        if (sourceType == null) {
+            return "GTID_ONLY";
+        }
+        switch (sourceType.trim().toLowerCase()) {
+            case "tidb":
+            case "postgresql":
+            case "oracle":
+            case "mongodb":
+            case "redis":
+                return "CONSISTENT";
+            default:
+                return "GTID_ONLY";
+        }
+    }
+
+    /** 归一化快照档位：空值走源端默认，非法值直接拒绝。 */
+    private String resolveSnapshotMode(String requested, String sourceType) {
+        if (requested == null || requested.trim().isEmpty()) {
+            return defaultSnapshotMode(sourceType);
+        }
+        String v = requested.trim().toUpperCase();
+        if (!"NONE".equals(v) && !"GTID_ONLY".equals(v) && !"CONSISTENT".equals(v)) {
+            throw new RuntimeException("快照档位取值非法（应为 NONE / GTID_ONLY / CONSISTENT）: " + requested);
+        }
+        return v;
+    }
+
+    /** 归一化批量装载档位：空值走 AUTO，非法值直接拒绝。 */
+    private String resolveBulkLoadMode(String requested) {
+        if (requested == null || requested.trim().isEmpty()) {
+            return "AUTO";
+        }
+        String v = requested.trim().toUpperCase();
+        if (!"AUTO".equals(v) && !"BATCH".equals(v) && !"COPY".equals(v) && !"DIRECT_PATH".equals(v)) {
+            throw new RuntimeException("批量装载档位取值非法（应为 AUTO / BATCH / COPY / DIRECT_PATH）: " + requested);
+        }
+        return v;
+    }
+
+    /** 归一化用户选择：空值走类型默认，非法值直接拒绝（免得静默落成默认值，用户以为选上了）。 */
+    private String resolveConsistencyMode(String requested, String taskType) {
+        if (requested == null || requested.trim().isEmpty()) {
+            return defaultConsistencyMode(taskType);
+        }
+        String v = requested.trim().toUpperCase();
+        if (!"TRANSACTIONAL".equals(v) && !"EVENTUAL".equals(v)) {
+            throw new RuntimeException("一致性模式取值非法（应为 TRANSACTIONAL 或 EVENTUAL）: " + requested);
+        }
+        return v;
+    }
+
+    @Transactional
+    public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId,
+                                   String taskType, String drMode, String consistencyMode) {
         String effectiveTaskType = taskType != null ? taskType : "SYNC";
         String effectiveName = name != null ? name.trim() : name;
         validateTaskName(effectiveName);
@@ -161,6 +242,12 @@ public class WorkflowService {
         workflow.setProgress(0);
         workflow.setIsBilling(false);
         workflow.setTaskType(effectiveTaskType);
+        // 一致性语义只在这里写一次：创建后不可修改（updateConfig 显式拒绝改动）
+        workflow.setConsistencyMode(resolveConsistencyMode(consistencyMode, effectiveTaskType));
+        // 全量装载/快照档位：按源端给默认，任务启动前可在配置页修改
+        workflow.setBulkLoadEnabled(true);
+        workflow.setBulkLoadMode("AUTO");
+        workflow.setSnapshotMode(defaultSnapshotMode(effectiveSourceType));
 
         if ("DR".equals(taskType)) {
             workflow.setMigrationMode("fullAndIncre");
@@ -184,6 +271,11 @@ public class WorkflowService {
 
         Workflow savedWorkflow = workflowRepository.save(workflow);
         addLog(savedWorkflow.getId(), WorkflowLog.LogLevel.INFO, "任务创建成功，状态: 配置中");
+        addLog(savedWorkflow.getId(), WorkflowLog.LogLevel.INFO,
+                "一致性语义: " + ("TRANSACTIONAL".equals(savedWorkflow.getConsistencyMode())
+                        ? "事务一致（目标提交顺序与源事务一致，增量串行应用）"
+                        : "最终一致（按 表+主键 冲突矩阵并发应用，源事务可被打散合并）")
+                        + "，创建后不可修改");
         return savedWorkflow;
     }
 
@@ -195,10 +287,71 @@ public class WorkflowService {
                                   String kafkaTopicStrategy, String subscribeFormat,
                                   Boolean fanoutEnabled, String targetConnections,
                                   Boolean syncAccount, Boolean syncAccountSuperPrivilege) {
+        return updateConfig(workflowId, userId, sourceConnection, targetConnection, migrationMode, syncObjects,
+                sourceDbName, targetDbName, sourceType, targetType, kafkaBootstrapServers, kafkaTopicPrefix,
+                kafkaTopicStrategy, subscribeFormat, fanoutEnabled, targetConnections,
+                syncAccount, syncAccountSuperPrivilege, null);
+    }
+
+    /**
+     * 全量装载/快照档位。与一致性语义不同，这两项<b>任务启动前都可以改</b>——
+     * 它们只影响全量怎么读、怎么写，不改变增量的投递语义，因此没有"前后半段语义不一致"的问题。
+     * 启动后不可改由 {@link #updateConfig} 的 CONFIGURING 状态校验统一挡住。
+     */
+    public static class FullLoadOptions {
+        private final Boolean bulkLoadEnabled;
+        private final String bulkLoadMode;
+        private final String snapshotMode;
+
+        public FullLoadOptions(Boolean bulkLoadEnabled, String bulkLoadMode, String snapshotMode) {
+            this.bulkLoadEnabled = bulkLoadEnabled;
+            this.bulkLoadMode = bulkLoadMode;
+            this.snapshotMode = snapshotMode;
+        }
+
+        boolean isEmpty() {
+            return bulkLoadEnabled == null
+                    && (bulkLoadMode == null || bulkLoadMode.trim().isEmpty())
+                    && (snapshotMode == null || snapshotMode.trim().isEmpty());
+        }
+    }
+
+    @Transactional
+    public Workflow updateConfig(String workflowId, Long userId, String sourceConnection, String targetConnection,
+                                  String migrationMode, String syncObjects, String sourceDbName,
+                                  String targetDbName, String sourceType, String targetType,
+                                  String kafkaBootstrapServers, String kafkaTopicPrefix,
+                                  String kafkaTopicStrategy, String subscribeFormat,
+                                  Boolean fanoutEnabled, String targetConnections,
+                                  Boolean syncAccount, Boolean syncAccountSuperPrivilege,
+                                  String consistencyMode) {
+        return updateConfig(workflowId, userId, sourceConnection, targetConnection, migrationMode, syncObjects,
+                sourceDbName, targetDbName, sourceType, targetType, kafkaBootstrapServers, kafkaTopicPrefix,
+                kafkaTopicStrategy, subscribeFormat, fanoutEnabled, targetConnections,
+                syncAccount, syncAccountSuperPrivilege, consistencyMode, null);
+    }
+
+    @Transactional
+    public Workflow updateConfig(String workflowId, Long userId, String sourceConnection, String targetConnection,
+                                  String migrationMode, String syncObjects, String sourceDbName,
+                                  String targetDbName, String sourceType, String targetType,
+                                  String kafkaBootstrapServers, String kafkaTopicPrefix,
+                                  String kafkaTopicStrategy, String subscribeFormat,
+                                  Boolean fanoutEnabled, String targetConnections,
+                                  Boolean syncAccount, Boolean syncAccountSuperPrivilege,
+                                  String consistencyMode, FullLoadOptions fullLoad) {
         Workflow workflow = getWorkflowById(workflowId, userId);
 
         if (workflow.getStatus() != WorkflowStatus.CONFIGURING) {
             throw new RuntimeException("只能修改配置中的任务，当前状态: " + workflow.getStatus().name());
+        }
+
+        // 一致性语义创建即定死：管线（串行事务投递 vs 冲突矩阵并发）与位点语义都按它编排，
+        // 中途改会让同一条链路前后半段语义不一致。前端只读展示，这里再挡一道防绕过接口改。
+        if (consistencyMode != null && !consistencyMode.trim().isEmpty()
+                && !consistencyMode.trim().toUpperCase().equals(workflow.getConsistencyMode())) {
+            throw new RuntimeException("一致性模式在任务创建时确定，创建后不可修改（当前: "
+                    + workflow.getConsistencyMode() + "）");
         }
 
         String newSourceType = sourceType != null ? sourceType : workflow.getSourceType();
@@ -230,8 +383,192 @@ public class WorkflowService {
             }
         }
 
+        // 全量装载/快照档位：只在 CONFIGURING（未启动）状态放行，上面的状态校验已经挡过一次
+        if (fullLoad != null && !fullLoad.isEmpty()) {
+            if (fullLoad.bulkLoadEnabled != null) {
+                workflow.setBulkLoadEnabled(fullLoad.bulkLoadEnabled);
+            }
+            if (fullLoad.bulkLoadMode != null && !fullLoad.bulkLoadMode.trim().isEmpty()) {
+                workflow.setBulkLoadMode(resolveBulkLoadMode(fullLoad.bulkLoadMode));
+            }
+            if (fullLoad.snapshotMode != null && !fullLoad.snapshotMode.trim().isEmpty()) {
+                workflow.setSnapshotMode(resolveSnapshotMode(fullLoad.snapshotMode, newSourceType));
+            }
+            addLog(workflowId, WorkflowLog.LogLevel.INFO, String.format(
+                    "全量装载档位: %s（批量装载%s），快照档位: %s",
+                    workflow.getBulkLoadMode(),
+                    Boolean.FALSE.equals(workflow.getBulkLoadEnabled()) ? "已关闭" : "启用",
+                    workflow.getSnapshotMode()));
+        }
+
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务配置已更新");
         return workflowRepository.save(workflow);
+    }
+
+    /**
+     * 保存聚合路由配置（分库分表汇聚/拆分）。只在 CONFIGURING 放行——路由决定数据写到哪张表，
+     * 启动后再改会让前后两段数据落在不同地方。
+     *
+     * @param routeConfig 路由配置 JSON；空串/null = 清除路由，回到 1:1
+     */
+    @Transactional
+    public Workflow updateRouteConfig(String workflowId, Long userId, String routeConfig) {
+        Workflow workflow = getWorkflowById(workflowId, userId);
+        if (workflow.getStatus() != WorkflowStatus.CONFIGURING) {
+            throw new RuntimeException("只能修改配置中的任务的路由配置，当前状态: " + workflow.getStatus().name());
+        }
+        String normalized = RouteConfigValidator.validate(routeConfig);
+        workflow.setRouteConfig(normalized);
+        addLog(workflowId, WorkflowLog.LogLevel.INFO,
+                normalized == null ? "聚合路由已清除（回到 1:1 同步）" : "聚合路由配置已更新");
+        return workflowRepository.save(workflow);
+    }
+
+    /**
+     * 跨实例汇聚：为 {@code routeConfig.legs} 里的每个额外源实例派生一个隐藏子任务（MERGE_LEG）。
+     *
+     * <p>每条 leg 是一条<b>完整独立</b>的采集管线（自己的 capture/位点/进度），只是目标端和
+     * 路由规则与父任务相同，且带自己的 {@code nodeId} 写进来源标识列。父任务本身也是一条 leg
+     * （用它自己的源连接），所以 N 个额外实例派生 N 个子任务。
+     *
+     * <p>沿用双向灾备 DR_SHADOW 那套"隐藏子任务"模式：列表里不展示，状态与进度由父任务聚合。
+     *
+     * @return 派生出的子任务
+     */
+    @Transactional
+    public List<Workflow> createMergeLegs(Workflow parent) {
+        List<Workflow> legs = new ArrayList<>();
+        String routeConfig = parent.getRouteConfig();
+        if (routeConfig == null || routeConfig.isEmpty() || parent.getMergeParentId() != null) {
+            return legs;
+        }
+        Map<String, Object> root;
+        try {
+            root = new com.google.gson.Gson().fromJson(routeConfig, Map.class);
+        } catch (RuntimeException e) {
+            return legs;
+        }
+        if (root == null || !"MERGE".equalsIgnoreCase(String.valueOf(root.get("mode")))) {
+            return legs;
+        }
+        Object legsObj = root.get("legs");
+        if (!(legsObj instanceof List) || ((List<?>) legsObj).isEmpty()) {
+            return legs;
+        }
+        // 已经派生过就不再重复（重复启动/重试）
+        if (!workflowRepository.findByMergeParentId(parent.getId()).isEmpty()) {
+            return legs;
+        }
+
+        com.google.gson.Gson gson = new com.google.gson.Gson();
+        for (Object o : (List<?>) legsObj) {
+            if (!(o instanceof Map)) {
+                continue;
+            }
+            Map<?, ?> leg = (Map<?, ?>) o;
+            String nodeId = String.valueOf(leg.get("nodeId"));
+            Workflow child = new Workflow();
+            child.setId(UUID.randomUUID().toString());
+            child.setName(parent.getName() + "-" + nodeId);
+            child.setTaskType("MERGE_LEG");
+            child.setMergeParentId(parent.getId());
+            child.setUserId(parent.getUserId());
+            child.setStatus(WorkflowStatus.CONFIGURING);
+            child.setProgress(0);
+            child.setIsBilling(false);
+            child.setMigrationMode(parent.getMigrationMode());
+            // 源连接换成这条 leg 的实例；目标端、同步对象、路由规则与父任务一致
+            child.setSourceConnection(legConnectionString(leg, parent.getSourceType()));
+            child.setTargetConnection(parent.getTargetConnection());
+            child.setSourceType(parent.getSourceType());
+            child.setTargetType(parent.getTargetType());
+            child.setSourceDbName(parent.getSourceDbName());
+            child.setTargetDbName(parent.getTargetDbName());
+            child.setConsistencyMode(parent.getConsistencyMode());
+            child.setBulkLoadEnabled(parent.getBulkLoadEnabled());
+            child.setBulkLoadMode(parent.getBulkLoadMode());
+            child.setSnapshotMode(parent.getSnapshotMode());
+            Object legSyncObjects = leg.get("syncObjects");
+            child.setSyncObjects(legSyncObjects != null ? gson.toJson(legSyncObjects) : parent.getSyncObjects());
+            // 子任务的路由配置不再带 legs（否则会递归派生），并钉上自己的 nodeId
+            Map<String, Object> childRoute = new LinkedHashMap<>(root);
+            childRoute.remove("legs");
+            childRoute.put("nodeId", nodeId);
+            child.setRouteConfig(gson.toJson(childRoute));
+            workflowRepository.save(child);
+            legs.add(child);
+            addLog(parent.getId(), WorkflowLog.LogLevel.INFO,
+                    "跨实例汇聚：已创建来源实例 " + nodeId + " 的采集通道（子任务 " + child.getId() + "）");
+        }
+        return legs;
+    }
+
+    /**
+     * leg 的连接串。必须与其它任务同一格式（{@code mysql://user:pass@host:port/db}）——
+     * agent 侧的 ConnectionStringParser 只认这个，给它 JSON 会直接 "Invalid connection string format"。
+     */
+    private static String legConnectionString(Map<?, ?> leg, String sourceType) {
+        String scheme = sourceType == null || sourceType.trim().isEmpty()
+                ? "mysql" : sourceType.trim().toLowerCase();
+        if ("tidb".equals(scheme)) {
+            scheme = "mysql";   // TiDB 讲 MySQL 协议，连接串同构
+        }
+        String user = str(leg.get("username"));
+        String password = str(leg.get("password"));
+        String host = str(leg.get("host"));
+        String port = str(leg.get("port"));
+        if (port.endsWith(".0")) {
+            port = port.substring(0, port.length() - 2);   // gson 把整数解成 Double
+        }
+        String database = str(leg.get("database"));
+        return scheme + "://" + user + ":" + password + "@" + host + ":" + port
+                + (database.isEmpty() ? "" : "/" + database);
+    }
+
+    private static String str(Object o) {
+        return o == null ? "" : String.valueOf(o).trim();
+    }
+
+    /**
+     * 跨实例汇聚的父任务聚合：进度取各 leg 的最小值（最慢那条决定整体可用性），
+     * 状态取"最差"的那个（任一 leg 失败即父任务失败）。
+     *
+     * <p>取最小而不是平均：汇聚表要等所有来源都搬完才算完整，平均值会给出"80% 完成"
+     * 这种让人误以为快好了的假象。
+     */
+    @Transactional
+    public void aggregateMergeParent(String parentId) {
+        Workflow parent = workflowRepository.findById(parentId).orElse(null);
+        if (parent == null) {
+            return;
+        }
+        List<Workflow> legs = workflowRepository.findByMergeParentId(parentId);
+        if (legs.isEmpty()) {
+            return;
+        }
+        int minProgress = 100;
+        WorkflowStatus worst = null;
+        for (Workflow leg : legs) {
+            minProgress = Math.min(minProgress, leg.getProgress() == null ? 0 : leg.getProgress());
+            worst = worseStatus(worst, leg.getStatus());
+        }
+        // 父任务自己也是一条采集通道，它的进度同样计入
+        minProgress = Math.min(minProgress, parent.getProgress() == null ? 0 : parent.getProgress());
+        parent.setProgress(minProgress);
+        if (worst == WorkflowStatus.FAILED && parent.getStatus() != WorkflowStatus.FAILED) {
+            parent.setStatus(WorkflowStatus.FAILED);
+            parent.setErrorMessage("跨实例汇聚的某条来源通道失败，详见子任务");
+            addLog(parentId, WorkflowLog.LogLevel.ERROR, "某条来源采集通道失败，父任务标记失败");
+        }
+        workflowRepository.save(parent);
+    }
+
+    /** 谁更"差"：FAILED 最差，其余保持先到的那个（父任务只关心有没有失败）。 */
+    private static WorkflowStatus worseStatus(WorkflowStatus current, WorkflowStatus candidate) {
+        if (candidate == WorkflowStatus.FAILED) {
+            return WorkflowStatus.FAILED;
+        }
+        return current != null ? current : candidate;
     }
 
     @Transactional
@@ -300,6 +637,14 @@ public class WorkflowService {
             shadow.setTargetType(workflow.getSourceType());
             shadow.setSourceDbName(workflow.getTargetDbName());
             shadow.setTargetDbName(workflow.getSourceDbName());
+            // 反向通道必须与正向同一套一致性语义：两个方向语义不同的双活，
+            // 一边保事务、一边打散并发，冲突裁决的输入就不是同一个"事务视图"了
+            shadow.setConsistencyMode(workflow.getConsistencyMode());
+            // 装载/快照档位一并继承。影子通道是仅增量的（不跑全量），快照档位对它无实际作用，
+            // 但保持两条通道配置一致，排障时不用怀疑"两边是不是设得不一样"
+            shadow.setBulkLoadEnabled(workflow.getBulkLoadEnabled());
+            shadow.setBulkLoadMode(workflow.getBulkLoadMode());
+            shadow.setSnapshotMode(workflow.getSnapshotMode());
             // 反向通道镜像正向的同步对象集（灾备两端库名/表集一致）；为空则由 agent 在
             // 反向源库上自动发现——继承可避免把 B 实例上无关的库卷进反向同步
             shadow.setSyncObjects(workflow.getSyncObjects());
@@ -308,6 +653,9 @@ public class WorkflowService {
             addLog(workflowId, WorkflowLog.LogLevel.INFO,
                     "双向灾备：已创建反向同步通道（影子任务 " + shadow.getId() + "），将在正向进入增量同步后自动启动");
         }
+
+        // 跨实例汇聚：为每个额外源实例派生一条隐藏的采集通道（MERGE_LEG）
+        List<Workflow> mergeLegs = createMergeLegs(workflow);
 
         workflow.setStatus(WorkflowStatus.PENDING);
         workflow.setIsBilling(true);
@@ -319,14 +667,28 @@ public class WorkflowService {
         workflowRepository.save(workflow);
 
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务启动中，状态: 启动中");
-        
+
         try {
             kafkaProducerService.sendTaskCreatedMessage(workflow);
             addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务消息已发送到 Kafka topic: sync-task-created，等待任务执行服务处理");
         } catch (Exception e) {
             addLog(workflowId, WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
         }
-        
+
+        // 各条 leg 与父任务同时启动：它们是彼此独立的采集管线，没有先后依赖
+        // （与双向灾备的影子任务不同——那条要等正向进增量才能起，否则会把未初始化的数据反灌回去）
+        for (Workflow leg : mergeLegs) {
+            leg.setStatus(WorkflowStatus.PENDING);
+            agentClusterService.assign(leg);
+            workflowRepository.save(leg);
+            try {
+                kafkaProducerService.sendTaskCreatedMessage(leg);
+            } catch (Exception e) {
+                addLog(workflowId, WorkflowLog.LogLevel.WARNING,
+                        "来源通道 " + leg.getName() + " 的 Kafka 消息发送失败: " + e.getMessage());
+            }
+        }
+
         return workflow;
     }
 
@@ -412,9 +774,11 @@ public class WorkflowService {
     }
     
     public List<Workflow> getFailedWorkflowsByUserId(Long userId) {
-        // DR_SHADOW 是双向灾备的隐藏反向通道，不在任何列表中直接展示。
+        // DR_SHADOW（双向灾备反向通道）与 MERGE_LEG（跨实例汇聚的来源采集通道）都是隐藏子任务，
+        // 不在任何列表中直接展示——它们的失败由各自的父任务聚合上报。
         // 过滤下推到 DB 查询，避免先全量取回再内存 filter。
-        return workflowRepository.findByUserIdAndStatusExcludingTaskType(userId, WorkflowStatus.FAILED, "DR_SHADOW");
+        return workflowRepository.findByUserIdAndStatusExcludingTaskTypes(
+                userId, WorkflowStatus.FAILED, List.of("DR_SHADOW", "MERGE_LEG"));
     }
     
     private String mapSortField(String sortBy) {
@@ -465,6 +829,7 @@ public class WorkflowService {
         message.setSourceDbName(w.getSourceDbName());
         message.setTargetDbName(w.getTargetDbName());
         message.setTaskType(w.getTaskType());
+        message.setConsistencyMode(w.getConsistencyMode());
         message.setDrMode(w.getDrMode());
         message.setSyncObjects(parseSyncObjects(w.getSyncObjects()));
         // 控制消息（stop/resume/terminate/delete）同样定向：任务在哪台 agent 上跑，就只让那台处理
@@ -570,6 +935,8 @@ public class WorkflowService {
         message.setCurrentStatus(currentStatus);
         message.setSourceType(workflow.getSourceType());
         message.setTargetType(workflow.getTargetType());
+        message.setTaskType(workflow.getTaskType());
+        message.setConsistencyMode(workflow.getConsistencyMode());
 
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -611,6 +978,7 @@ public class WorkflowService {
         message.setSourceDbName(workflow.getSourceDbName());
         message.setTargetDbName(workflow.getTargetDbName());
         message.setTaskType(workflow.getTaskType());
+        message.setConsistencyMode(workflow.getConsistencyMode());
         
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -637,6 +1005,8 @@ public class WorkflowService {
         message.setCurrentStatus(workflow.getStatus().name());
         message.setSourceType(workflow.getSourceType());
         message.setTargetType(workflow.getTargetType());
+        message.setTaskType(workflow.getTaskType());
+        message.setConsistencyMode(workflow.getConsistencyMode());
         
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -740,6 +1110,8 @@ public class WorkflowService {
         message.setCurrentStatus("INCREMENT_RUNNING");
         message.setSourceType(workflow.getSourceType());
         message.setTargetType(workflow.getTargetType());
+        message.setTaskType(workflow.getTaskType());
+        message.setConsistencyMode(workflow.getConsistencyMode());
         if (skipSeqnos != null && !skipSeqnos.isEmpty()) {
             message.setSkipSeqnos(skipSeqnos);
         }
@@ -1101,6 +1473,7 @@ public class WorkflowService {
         message.setSourceType(workflow.getSourceType());
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
+        message.setConsistencyMode(workflow.getConsistencyMode());
 
         final String logWorkflowId = workflowId;
         org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(

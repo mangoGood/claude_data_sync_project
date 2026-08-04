@@ -54,6 +54,33 @@ public class TypedDmlConverter {
     private final com.migration.config.ColumnProcessingConfig columnProcessing;
     /** 列处理是否生效（有配置且源/目标均为 MySQL） */
     private final boolean columnProcessingActive;
+    /** 聚合路由：汇聚改写到合并表并带来源标识列；拆分按行路由到分片表 */
+    private final com.migration.common.route.TableRouter router;
+    private final boolean mergeActive;
+    private final boolean splitActive;
+    /** 本条管线的来源实例标识（route.node.id）：跨实例汇聚时用它区分同名库表 */
+    private final String routeNodeId;
+    /** 汇聚上下文缓存："源库.源表" → 落点（每事件都要用，别重复解析规则） */
+    private final Map<String, MergeCtx> mergeCtxCache = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 一张源表的汇聚落点。{@code tagValues} 是<b>有序</b>的来源标识列 → 值，
+     * INSERT 按此序补在列尾，UPDATE/DELETE 的 WHERE 按此序追加条件。
+     */
+    private static final class MergeCtx {
+        final String targetDb;
+        final String targetTable;
+        final java.util.LinkedHashMap<String, String> tagValues;
+        final boolean compositePk;
+
+        MergeCtx(String targetDb, String targetTable,
+                 java.util.LinkedHashMap<String, String> tagValues, boolean compositePk) {
+            this.targetDb = targetDb;
+            this.targetTable = targetTable;
+            this.tagValues = tagValues;
+            this.compositePk = compositePk;
+        }
+    }
 
     public TypedDmlConverter(Properties props) {
         String source = props.getProperty("source.db.type", "mysql").toLowerCase();
@@ -103,8 +130,153 @@ public class TypedDmlConverter {
                 && (("mysql".equals(source) && "mysql".equals(target))
                     || ("postgresql".equals(source) && "postgresql".equals(target)));
 
-        logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={}, tableMappings={}, columnProcessing={})",
-                enabled, source, target, switchOn, tableNameMapping.size(), columnProcessingActive);
+        // 聚合路由：汇聚下 DML 要改写到合并目标表并带来源标识列。放在最后初始化——
+        // 默认目标库解析复用本类既有的 per-db 映射（mapTargetDatabase），依赖上面那些字段。
+        com.migration.common.route.RoutingConfig routing =
+                com.migration.common.route.RoutingConfig.loadFromProperties(props);
+        this.router = routing.router(this::mapTargetDatabase);
+        this.mergeActive = routing.getMode() == com.migration.common.route.RoutingConfig.Mode.MERGE;
+        this.splitActive = routing.getMode() == com.migration.common.route.RoutingConfig.Mode.SPLIT;
+        this.routeNodeId = props.getProperty("route.node.id", "");
+        // 跨实例拆分的增量写入要跨连接，事务与位点都要另做一套（低水位 checkpoint），
+        // 首版不支持——与其让它半通不通地跑，不如在启动时就说清楚
+        if (splitActive) {
+            for (com.migration.common.route.SplitRule rule : routing.getSplitRules()) {
+                if (rule.getNodeGroup() != null) {
+                    throw new IllegalStateException("拆分规则 " + rule.getId()
+                            + " 配了跨实例目标组，增量的跨实例写入尚未实现（单实例分库分表可用）");
+                }
+            }
+        }
+
+        logger.info("TypedDmlConverter enabled={} (source={}, target={}, switch={}, tableMappings={}, columnProcessing={}, merge={})",
+                enabled, source, target, switchOn, tableNameMapping.size(), columnProcessingActive, mergeActive);
+    }
+
+    /**
+     * 该事件是否必须走类型化管道。汇聚表的 DML 一旦回退文本路径就会<b>写错行</b>——
+     * 文本路径不带来源标识列，UPDATE/DELETE 的 WHERE 只有源主键，会命中同一张汇聚表里
+     * 其它来源的同主键行。调用方据此 fail-stop，而不是让它悄悄改坏别的来源的数据。
+     */
+    public boolean requiresTypedPipeline(THLEvent event) {
+        if ((!mergeActive && !splitActive) || event == null || event.getMetadata() == null) {
+            return false;
+        }
+        Map<String, Object> metadata = event.getMetadata();
+        String eventType = (String) metadata.get("event_type");
+        if (eventType == null || !isRowEvent(eventType)) {
+            return false;
+        }
+        String srcDb = (String) metadata.getOrDefault("database_name", "");
+        String srcTable = (String) metadata.getOrDefault("table_name", "");
+        return !srcTable.isEmpty() && router.matches(srcDb, srcTable);
+    }
+
+    private static boolean isRowEvent(String eventType) {
+        switch (eventType) {
+            case "INSERT": case "WRITE_ROWS": case "EXT_WRITE_ROWS":
+            case "UPDATE": case "UPDATE_ROWS": case "EXT_UPDATE_ROWS":
+            case "DELETE": case "DELETE_ROWS": case "EXT_DELETE_ROWS":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** 该源表的汇聚落点；未命中规则返回 null（走原 1:1 路径）。 */
+    private MergeCtx mergeCtxOf(String srcDb, String srcTable) {
+        if (!mergeActive || srcTable == null || srcTable.isEmpty()) {
+            return null;
+        }
+        String key = srcDb + "." + srcTable;
+        MergeCtx cached = mergeCtxCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        if (!router.matches(srcDb, srcTable)) {
+            return null;
+        }
+        com.migration.common.route.RouteTarget target = router.allTargets(srcDb, srcTable).get(0);
+        com.migration.common.route.MergeRule rule =
+                ((com.migration.common.route.MergeRouter) router).find(srcDb, srcTable);
+        java.util.LinkedHashMap<String, String> tags = new java.util.LinkedHashMap<>();
+        for (String col : rule.getTagColumns()) {
+            String value = rule.tagValue(col, routeNodeId, srcDb, srcTable);
+            if (value != null) {
+                tags.put(col, value);
+            }
+        }
+        MergeCtx ctx = new MergeCtx(target.getDatabase(), target.getTable(), tags,
+                rule.getPkStrategy() == com.migration.common.route.MergeRule.PkStrategy.COMPOSITE_SOURCE);
+        mergeCtxCache.put(key, ctx);
+        logger.info("汇聚路由（增量）: {}.{} -> {}.{}，来源标识 {}",
+                srcDb, srcTable, ctx.targetDb, ctx.targetTable, tags);
+        return ctx;
+    }
+
+    /** 该源表是否走拆分路由。 */
+    private boolean isSplit(String srcDb, String srcTable) {
+        return splitActive && router.matches(srcDb, srcTable);
+    }
+
+    /** 分片落点的目标表引用（MySQL 带库名限定——同实例跨库写限定名即可；PG 只用表名）。 */
+    private String splitRef(com.migration.common.route.RouteTarget target) {
+        if (!targetIsMysql || target.getDatabase() == null || target.getDatabase().isEmpty()) {
+            return quote(target.getTable());
+        }
+        return quote(target.getDatabase()) + "." + quote(target.getTable());
+    }
+
+    /** 列名数组里找某一列的下标（大小写不敏感）；找不到返回 -1。 */
+    private int indexOfColumn(String[] cols, String name) {
+        if (cols == null || name == null) {
+            return -1;
+        }
+        for (int i = 0; i < cols.length; i++) {
+            if (cols[i] != null && cols[i].trim().equalsIgnoreCase(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 按行算落点。分片键取不到值（列不在事件里 / 值为 NULL）时由规则的 unrouted 策略决定：
+     * 广播到全部分片、返回空列表（调用方记死信）、或抛异常。
+     */
+    private List<com.migration.common.route.RouteTarget> routeRow(String srcDb, String srcTable,
+                                                                  int shardKeyIndex, List<Object> row) {
+        Object value = (shardKeyIndex >= 0 && row != null && shardKeyIndex < row.size())
+                ? row.get(shardKeyIndex) : null;
+        return router.route(srcDb, srcTable, value);
+    }
+
+    /** 两组落点是否完全相同（判断 UPDATE 是否跨分片）。 */
+    private boolean sameTargets(List<com.migration.common.route.RouteTarget> a,
+                                List<com.migration.common.route.RouteTarget> b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (int i = 0; i < a.size(); i++) {
+            if (!a.get(i).key().equals(b.get(i).key())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 追加来源标识列的 WHERE 条件。<b>UPDATE/DELETE 必须调用</b>：汇聚表里源主键不唯一，
+     * 只按源主键定位会命中其它来源的同主键行——改错、删错，且不会报任何错。
+     */
+    private void appendMergeTagWhere(StringBuilder sql, List<Object> params, MergeCtx ctx) {
+        if (ctx == null) {
+            return;
+        }
+        for (Map.Entry<String, String> tag : ctx.tagValues.entrySet()) {
+            sql.append(" AND ").append(quote(tag.getKey())).append("=?");
+            params.add(tag.getValue());
+        }
     }
 
     public boolean isEnabled() {
@@ -145,6 +317,12 @@ public class TypedDmlConverter {
             if (mapped != null) {
                 table = mapped;
             }
+        }
+        // 汇聚：命中规则的源表一律落到合并后的目标表（优先级高于表名映射——
+        // 两者不会同时配置，路由规则是更具体的那个）
+        MergeCtx mergeCtx = mergeCtxOf(srcDb, srcTable);
+        if (mergeCtx != null) {
+            table = mergeCtx.targetTable;
         }
 
         switch (eventType) {
@@ -219,12 +397,24 @@ public class TypedDmlConverter {
 
     /** 目标表引用：MySQL 目标带库名限定（按事件源库做 per-db 解析），PG 目标裸表名（schema 由连接串决定）。 */
     private String tableRef(Map<String, Object> metadata, String table) {
-        if (targetIsMysql) {
-            String srcDb = (String) metadata.getOrDefault("database_name", "");
-            String db = mapTargetDatabase(srcDb);
-            return db.isEmpty() ? quote(table) : quote(db) + "." + quote(table);
+        return tableRef(metadata, table, null);
+    }
+
+    /**
+     * 目标表引用。汇聚落点直接用规则里的目标库（不再按源库解析），
+     * PG 目标仍是裸表名——PG 一条连接跨不了库，汇聚目标库必须等于任务目标库。
+     */
+    private String tableRef(Map<String, Object> metadata, String table, MergeCtx ctx) {
+        if (!targetIsMysql) {
+            return quote(table);
         }
-        return quote(table);
+        if (ctx != null) {
+            return ctx.targetDb == null || ctx.targetDb.isEmpty()
+                    ? quote(table) : quote(ctx.targetDb) + "." + quote(table);
+        }
+        String srcDb = (String) metadata.getOrDefault("database_name", "");
+        String db = mapTargetDatabase(srcDb);
+        return db.isEmpty() ? quote(table) : quote(db) + "." + quote(table);
     }
 
     /**
@@ -259,6 +449,10 @@ public class TypedDmlConverter {
         if (cols == null) {
             return null;
         }
+        if (isSplit(srcDb, srcTable)) {
+            return convertInsertSplit(metadata, srcDb, srcTable, cols, rows);
+        }
+        MergeCtx ctx = mergeCtxOf(srcDb, srcTable);
         String insertSql = buildInsertSql(metadata, srcDb, srcTable, table, cols);
 
         List<ParameterizedDml> out = new ArrayList<>();
@@ -271,17 +465,196 @@ public class TypedDmlConverter {
                 logger.debug("列过滤跳过 INSERT 行: {}.{}", srcDb, srcTable);
                 continue;
             }
-            out.add(new ParameterizedDml(insertSql, row, table,
-                    rowKeyOf(cols, row, pkSet(metadata)), "INSERT"));
+            List<Object> params = row;
+            if (ctx != null) {
+                params = new ArrayList<>(row);
+                params.addAll(ctx.tagValues.values());
+            }
+            out.add(new ParameterizedDml(insertSql, params, table,
+                    mergeRowKey(rowKeyOf(cols, row, pkSet(metadata)), ctx), "INSERT"));
         }
         return out;
+    }
+
+    /** 拆分 INSERT：每行按分片键路由到对应分片表。 */
+    private List<ParameterizedDml> convertInsertSplit(Map<String, Object> metadata, String srcDb,
+                                                      String srcTable, String[] cols,
+                                                      List<ArrayList<Object>> rows) {
+        String shardKey = router.shardKeyColumn(srcDb, srcTable);
+        int keyIdx = indexOfColumn(cols, shardKey);
+        String[] sqlCols = mapColumns(srcDb, srcTable, cols);
+        java.util.Set<String> pks = pkSet(metadata);
+
+        List<ParameterizedDml> out = new ArrayList<>();
+        for (ArrayList<Object> row : rows) {
+            if (row.size() != cols.length) {
+                return null;
+            }
+            if (rowExcluded(srcDb, srcTable, cols, row)) {
+                continue;
+            }
+            List<com.migration.common.route.RouteTarget> targets = routeRow(srcDb, srcTable, keyIdx, row);
+            if (targets.isEmpty()) {
+                logger.warn("表 {}.{} 的 INSERT 行算不出分片（分片键 {}），按死信策略未应用",
+                        srcDb, srcTable, shardKey);
+                continue;
+            }
+            for (com.migration.common.route.RouteTarget target : targets) {
+                out.add(new ParameterizedDml(
+                        buildInsertSqlForRef(metadata, splitRef(target), sqlCols), row,
+                        target.getTable(), rowKeyOf(cols, row, pks), "INSERT"));
+            }
+        }
+        return out;
+    }
+
+    /** 拆分 DELETE：按<b>前镜像</b>的分片键定位（DELETE 事件只有前镜像）。 */
+    private List<ParameterizedDml> convertDeleteSplit(Map<String, Object> metadata, String srcDb,
+                                                      String srcTable, String[] cols,
+                                                      List<ArrayList<Object>> rows) {
+        String shardKey = router.shardKeyColumn(srcDb, srcTable);
+        int keyIdx = indexOfColumn(cols, shardKey);
+        String[] sqlCols = mapColumns(srcDb, srcTable, cols);
+        java.util.Set<String> pks = pkSet(metadata);
+
+        List<ParameterizedDml> out = new ArrayList<>();
+        for (ArrayList<Object> row : rows) {
+            if (row.size() != cols.length) {
+                return null;
+            }
+            if (rowExcluded(srcDb, srcTable, cols, row)) {
+                continue;
+            }
+            List<com.migration.common.route.RouteTarget> targets = routeRow(srcDb, srcTable, keyIdx, row);
+            if (targets.isEmpty()) {
+                logger.warn("表 {}.{} 的 DELETE 行算不出分片，按死信策略未应用", srcDb, srcTable);
+                continue;
+            }
+            for (com.migration.common.route.RouteTarget target : targets) {
+                StringBuilder sql = new StringBuilder("DELETE FROM ").append(splitRef(target));
+                List<Object> params = new ArrayList<>();
+                if (!appendWhere(sql, params, cols, sqlCols, row, pks)) {
+                    return null;
+                }
+                out.add(new ParameterizedDml(sql.toString(), params, target.getTable(),
+                        rowKeyOf(cols, row, pks), "DELETE"));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 拆分 UPDATE：前后镜像各自算分片。
+     *
+     * <p>分片键<b>被改掉</b>时这一行要跨分片搬迁——旧分片 DELETE（按前镜像定位）+
+     * 新分片 INSERT（后镜像整行）。只发 UPDATE 的话，旧分片留着一条陈行、新分片一条都没有，
+     * 而且两边都不报错。
+     */
+    private List<ParameterizedDml> convertUpdateSplit(Map<String, Object> metadata, String srcDb,
+                                                      String srcTable, String[] setCols, String[] whereCols,
+                                                      List<ArrayList<Object>> afterRows,
+                                                      List<ArrayList<Object>> beforeRows) {
+        String shardKey = router.shardKeyColumn(srcDb, srcTable);
+        int afterIdx = indexOfColumn(setCols, shardKey);
+        int beforeIdx = indexOfColumn(whereCols, shardKey);
+        String[] sqlSetCols = mapColumns(srcDb, srcTable, setCols);
+        String[] sqlWhereCols = mapColumns(srcDb, srcTable, whereCols);
+        java.util.Set<String> pks = pkSet(metadata);
+
+        List<ParameterizedDml> out = new ArrayList<>();
+        for (int r = 0; r < afterRows.size(); r++) {
+            ArrayList<Object> after = afterRows.get(r);
+            ArrayList<Object> before = beforeRows.get(r);
+            if (after.size() != setCols.length || before.size() != whereCols.length) {
+                return null;
+            }
+            List<com.migration.common.route.RouteTarget> oldTargets =
+                    routeRow(srcDb, srcTable, beforeIdx, before);
+            List<com.migration.common.route.RouteTarget> newTargets =
+                    routeRow(srcDb, srcTable, afterIdx, after);
+            if (oldTargets.isEmpty() && newTargets.isEmpty()) {
+                logger.warn("表 {}.{} 的 UPDATE 行前后镜像都算不出分片，按死信策略未应用", srcDb, srcTable);
+                continue;
+            }
+
+            if (!oldTargets.isEmpty() && sameTargets(oldTargets, newTargets)) {
+                for (com.migration.common.route.RouteTarget target : newTargets) {
+                    StringBuilder sql = new StringBuilder("UPDATE ").append(splitRef(target)).append(" SET ");
+                    List<Object> params = new ArrayList<>();
+                    for (int i = 0; i < sqlSetCols.length; i++) {
+                        if (i > 0) sql.append(", ");
+                        sql.append(quote(sqlSetCols[i])).append("=?");
+                        params.add(after.get(i));
+                    }
+                    if (!appendWhere(sql, params, whereCols, sqlWhereCols, before, pks)) {
+                        return null;
+                    }
+                    out.add(new ParameterizedDml(sql.toString(), params, target.getTable(),
+                            rowKeyOf(whereCols, before, pks), "UPDATE"));
+                }
+                continue;
+            }
+
+            // 跨分片搬迁：先把旧分片那一行删掉，再往新分片插整行
+            logger.info("表 {}.{} 分片键变更，跨分片搬迁: {} -> {}", srcDb, srcTable, oldTargets, newTargets);
+            for (com.migration.common.route.RouteTarget target : oldTargets) {
+                StringBuilder del = new StringBuilder("DELETE FROM ").append(splitRef(target));
+                List<Object> params = new ArrayList<>();
+                if (!appendWhere(del, params, whereCols, sqlWhereCols, before, pks)) {
+                    return null;
+                }
+                out.add(new ParameterizedDml(del.toString(), params, target.getTable(),
+                        rowKeyOf(whereCols, before, pks), "DELETE"));
+            }
+            for (com.migration.common.route.RouteTarget target : newTargets) {
+                out.add(new ParameterizedDml(
+                        buildInsertSqlForRef(metadata, splitRef(target), sqlSetCols), after,
+                        target.getTable(), rowKeyOf(setCols, after, pks), "INSERT"));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 汇聚下的行标识：拼上来源标识，否则双向冲突消解会把不同来源的同主键行当成同一行。
+     * 未汇聚时原样返回。
+     */
+    private String mergeRowKey(String rowKey, MergeCtx ctx) {
+        if (ctx == null || rowKey == null) {
+            return rowKey;
+        }
+        StringBuilder key = new StringBuilder(rowKey);
+        for (String v : ctx.tagValues.values()) {
+            key.append('').append(v);
+        }
+        return key.toString();
     }
 
     /** 生成 INSERT（含幂等子句）SQL：列名经列名映射改写；供 INSERT 与 UPDATE 升级插入共用。 */
     private String buildInsertSql(Map<String, Object> metadata, String srcDb, String srcTable,
                                   String table, String[] cols) {
+        MergeCtx ctx = mergeCtxOf(srcDb, srcTable);
         String[] sqlCols = mapColumns(srcDb, srcTable, cols);
-        StringBuilder sql = new StringBuilder("INSERT INTO ").append(tableRef(metadata, table)).append(" (");
+        if (ctx != null) {
+            // 汇聚：来源标识列补在列尾，顺序与 convertInsert 的补值顺序一致
+            String[] withTags = java.util.Arrays.copyOf(sqlCols, sqlCols.length + ctx.tagValues.size());
+            int i = sqlCols.length;
+            for (String tag : ctx.tagValues.keySet()) {
+                withTags[i++] = tag;
+            }
+            sqlCols = withTags;
+        }
+        return buildInsertSqlForRef(metadata, tableRef(metadata, table, ctx), sqlCols, ctx);
+    }
+
+    /** 目标表引用已定时的 INSERT 生成（拆分按行给出分片表引用；汇聚/1:1 由上面那个入口算出引用）。 */
+    private String buildInsertSqlForRef(Map<String, Object> metadata, String ref, String[] sqlCols) {
+        return buildInsertSqlForRef(metadata, ref, sqlCols, null);
+    }
+
+    private String buildInsertSqlForRef(Map<String, Object> metadata, String ref,
+                                        String[] sqlCols, MergeCtx ctx) {
+        StringBuilder sql = new StringBuilder("INSERT INTO ").append(ref).append(" (");
         StringBuilder ph = new StringBuilder();
         for (int i = 0; i < sqlCols.length; i++) {
             if (i > 0) { sql.append(", "); ph.append(", "); }
@@ -306,6 +679,13 @@ public class TypedDmlConverter {
                     if (i > 0) sql.append(", ");
                     sql.append(quote(pks[i]));
                 }
+                // 汇聚且复合主键：冲突目标必须带上来源标识列，否则不同来源的同主键行
+                // 会被判成冲突而 DO NOTHING 掉（这一行就此丢失）
+                if (ctx != null && ctx.compositePk) {
+                    for (String tag : ctx.tagValues.keySet()) {
+                        sql.append(", ").append(quote(tag));
+                    }
+                }
                 sql.append(") DO NOTHING");
             }
         }
@@ -321,9 +701,13 @@ public class TypedDmlConverter {
         if (setCols == null || whereCols == null) {
             return null;
         }
+        if (isSplit(srcDb, srcTable)) {
+            return convertUpdateSplit(metadata, srcDb, srcTable, setCols, whereCols, afterRows, beforeRows);
+        }
         java.util.Set<String> pks = pkSet(metadata);
         String[] sqlSetCols = mapColumns(srcDb, srcTable, setCols);
         String[] sqlWhereCols = mapColumns(srcDb, srcTable, whereCols);
+        MergeCtx ctx = mergeCtxOf(srcDb, srcTable);
 
         List<ParameterizedDml> out = new ArrayList<>();
         for (int r = 0; r < afterRows.size(); r++) {
@@ -342,27 +726,33 @@ public class TypedDmlConverter {
                 boolean afterExcluded = rowExcluded(srcDb, srcTable, setCols, after);
                 if (afterExcluded) {
                     if (!beforeExcluded) {
-                        StringBuilder del = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table));
+                        StringBuilder del = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table, ctx));
                         List<Object> delParams = new ArrayList<>();
                         if (!appendWhere(del, delParams, whereCols, sqlWhereCols, before, pks)) {
                             return null;
                         }
+                        appendMergeTagWhere(del, delParams, ctx);
                         out.add(new ParameterizedDml(del.toString(), delParams, table,
-                                rowKeyOf(whereCols, before, pks), "DELETE"));
+                                mergeRowKey(rowKeyOf(whereCols, before, pks), ctx), "DELETE"));
                         logger.debug("列过滤将 UPDATE 转为 DELETE: {}.{}", srcDb, srcTable);
                     }
                     continue;
                 }
                 if (beforeExcluded) {
                     String insertSql = buildInsertSql(metadata, srcDb, srcTable, table, setCols);
-                    out.add(new ParameterizedDml(insertSql, after, table,
-                            rowKeyOf(setCols, after, pks), "INSERT"));
+                    List<Object> insParams = after;
+                    if (ctx != null) {
+                        insParams = new ArrayList<>(after);
+                        insParams.addAll(ctx.tagValues.values());
+                    }
+                    out.add(new ParameterizedDml(insertSql, insParams, table,
+                            mergeRowKey(rowKeyOf(setCols, after, pks), ctx), "INSERT"));
                     logger.debug("列过滤将 UPDATE 转为 INSERT: {}.{}", srcDb, srcTable);
                     continue;
                 }
             }
 
-            StringBuilder sql = new StringBuilder("UPDATE ").append(tableRef(metadata, table)).append(" SET ");
+            StringBuilder sql = new StringBuilder("UPDATE ").append(tableRef(metadata, table, ctx)).append(" SET ");
             List<Object> params = new ArrayList<>(after.size() + before.size());
             for (int i = 0; i < sqlSetCols.length; i++) {
                 if (i > 0) sql.append(", ");
@@ -375,16 +765,19 @@ public class TypedDmlConverter {
             if (!appendWhere(pkOnly, pkOnlyParams, whereCols, sqlWhereCols, before, pks)) {
                 return null;
             }
+            // 汇聚：源主键在合并表里不唯一，两种 WHERE 都必须补来源标识列
+            appendMergeTagWhere(pkOnly, pkOnlyParams, ctx);
             if (guardWithBeforeImage) {
                 if (!appendBeforeImageWhere(sql, params, whereCols, sqlWhereCols, before, pks)) {
                     return null;
                 }
+                appendMergeTagWhere(sql, params, ctx);
             } else {
                 sql = pkOnly;
                 params = pkOnlyParams;
             }
             ParameterizedDml dml = new ParameterizedDml(sql.toString(), params, table,
-                    rowKeyOf(whereCols, before, pks), "UPDATE");
+                    mergeRowKey(rowKeyOf(whereCols, before, pks), ctx), "UPDATE");
             if (guardWithBeforeImage) {
                 dml.withOverride(pkOnly.toString(), pkOnlyParams);
             }
@@ -399,8 +792,12 @@ public class TypedDmlConverter {
         if (cols == null) {
             return null;
         }
+        if (isSplit(srcDb, srcTable)) {
+            return convertDeleteSplit(metadata, srcDb, srcTable, cols, rows);
+        }
         java.util.Set<String> pks = pkSet(metadata);
         String[] sqlCols = mapColumns(srcDb, srcTable, cols);
+        MergeCtx ctx = mergeCtxOf(srcDb, srcTable);
 
         List<ParameterizedDml> out = new ArrayList<>();
         for (ArrayList<Object> row : rows) {
@@ -412,13 +809,15 @@ public class TypedDmlConverter {
                 logger.debug("列过滤跳过 DELETE 行: {}.{}", srcDb, srcTable);
                 continue;
             }
-            StringBuilder sql = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table));
+            StringBuilder sql = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table, ctx));
             List<Object> params = new ArrayList<>();
             if (!appendWhere(sql, params, cols, sqlCols, row, pks)) {
                 return null;
             }
+            // 汇聚：不带来源标识的 DELETE 会连同其它来源的同主键行一起删掉
+            appendMergeTagWhere(sql, params, ctx);
             out.add(new ParameterizedDml(sql.toString(), params, table,
-                    rowKeyOf(cols, row, pks), "DELETE"));
+                    mergeRowKey(rowKeyOf(cols, row, pks), ctx), "DELETE"));
         }
         return out;
     }

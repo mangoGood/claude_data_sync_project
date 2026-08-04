@@ -14,9 +14,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
-import com.mongodb.client.model.ReplaceOneModel;
 import com.mongodb.client.model.ReplaceOptions;
-import com.mongodb.client.model.WriteModel;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.changestream.FullDocument;
 import com.mongodb.client.model.changestream.OperationType;
@@ -75,6 +73,10 @@ public final class MongoSyncMain {
     private final MongoDocumentProcessor processor;
     private final Path progressPath;
     private final Path tokenPath;
+    /** 全量 bulkWrite 装载配置（与 SQL/ES/Redis 各链路共用同一组 migration.full.bulk.* 键）。 */
+    private final com.migration.common.bulk.BulkLoadOptions bulkOptions;
+    /** 全量一致性快照档位（migration.full.snapshot.mode）。 */
+    private final String snapshotMode;
     /** 灾备任务（含双向的反向影子通道）：同步对象可留空由本进程在源实例上自动发现。 */
     private final boolean drTask;
     /**
@@ -107,6 +109,8 @@ public final class MongoSyncMain {
         this.processor = MongoDocumentProcessor.fromProperties(props);
         this.progressPath = Paths.get("files", taskId, "mongo_progress.json");
         this.tokenPath = Paths.get("files", taskId, "checkpoint", "mongo_resume_token.json");
+        this.bulkOptions = com.migration.common.bulk.BulkLoadOptions.from(props);
+        this.snapshotMode = props.getProperty("migration.full.snapshot.mode", "GTID_ONLY").trim().toUpperCase();
         this.drTask = "DR".equals(props.getProperty("task.type", ""));
         this.incrementOnly = Boolean.parseBoolean(props.getProperty("migration.increment.only", "false"));
         this.bidiEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
@@ -267,23 +271,118 @@ public final class MongoSyncMain {
         writeProgress();
         logger.info("全量开始: {} 个集合", totalCollections);
 
-        for (Map.Entry<String, List<String>> e : resolved.entrySet()) {
-            String dbName = e.getKey();
-            MongoDatabase srcDb = source.getDatabase(dbName);
-            MongoDatabase tgtDb = target.getDatabase(dbName);
-            for (String collName : e.getValue()) {
-                currentCollection = dbName + "." + collName;
-                writeProgress();
-                copyCollection(dbName, collName, srcDb.getCollection(collName), tgtDb.getCollection(collName));
-                completedCollections++;
-                writeProgress();
-                logger.info("集合 {} 全量完成 ({}/{})", currentCollection, completedCollections, totalCollections);
+        // 一致性快照会话：CONSISTENT 且 minSnapshotHistoryWindowInSeconds 足够大时开出来，
+        // 所有集合的读都走它 —— 各集合因此看到<b>同一个 clusterTime</b> 的库，而不是各自时刻的库。
+        try (com.mongodb.client.ClientSession snapshotSession = beginFullSnapshot(source)) {
+            for (Map.Entry<String, List<String>> e : resolved.entrySet()) {
+                String dbName = e.getKey();
+                MongoDatabase srcDb = source.getDatabase(dbName);
+                MongoDatabase tgtDb = target.getDatabase(dbName);
+                for (String collName : e.getValue()) {
+                    currentCollection = dbName + "." + collName;
+                    writeProgress();
+                    copyCollection(dbName, collName, srcDb.getCollection(collName),
+                            tgtDb.getCollection(collName), snapshotSession);
+                    completedCollections++;
+                    writeProgress();
+                    logger.info("集合 {} 全量完成 ({}/{})", currentCollection, completedCollections, totalCollections);
+                }
             }
+        } catch (com.mongodb.MongoCommandException e) {
+            if (e.getErrorCode() == SNAPSHOT_TOO_OLD || e.getErrorCode() == SNAPSHOT_UNAVAILABLE) {
+                throw new RuntimeException("全量快照在搬运过程中失效（历史窗口不够长）。"
+                        + "请调大 minSnapshotHistoryWindowInSeconds 后重跑，或把快照档位改为只记位点。原因: "
+                        + e.getMessage(), e);
+            }
+            throw e;
         }
         logger.info("全量完成: {} 个集合, 共 {} 文档", totalCollections, copiedDocs);
     }
 
-    private void copyCollection(String db, String coll, MongoCollection<Document> src, MongoCollection<Document> tgt) {
+    /** MongoDB 快照相关错误码：历史版本已被回收 / 快照当前不可用。 */
+    private static final int SNAPSHOT_TOO_OLD = 239;
+    private static final int SNAPSHOT_UNAVAILABLE = 246;
+    /** 真快照要求的最小历史窗口：默认只有 300s，撑不住一次正经全量。 */
+    private static final long MIN_SNAPSHOT_WINDOW_SECONDS = 3600;
+
+    /**
+     * 建立全量一致性快照。
+     *
+     * <p>MongoDB 这边的"快照"是<b>快照会话</b>（{@code ClientSessionOptions.snapshot(true)}，
+     * 5.0+）：会话在第一次读时钉住一个 clusterTime，之后该会话的所有读都在那个时间点上。
+     * 与 MySQL 不同，它不需要任何锁；但历史版本受 {@code minSnapshotHistoryWindowInSeconds}
+     * 限制（默认 300 秒），窗口内搬不完就会读失败。因此窗口太小时<b>降级为只记位点</b>，
+     * 并把该调的参数写进日志——与 SQL 侧"快照是增强项、不能让全量起不来"的原则一致。
+     *
+     * @return 快照会话；未开启真快照时返回 null（调用方按不带 session 的原路径读）
+     */
+    private com.mongodb.client.ClientSession beginFullSnapshot(MongoClient source) {
+        if ("NONE".equals(snapshotMode)) {
+            return null;
+        }
+        String position = readClusterTime(source);
+        com.mongodb.client.ClientSession session = null;
+        String effectiveMode = "GTID_ONLY";
+        if ("CONSISTENT".equals(snapshotMode)) {
+            long window = readSnapshotHistoryWindowSeconds(source);
+            if (window >= 0 && window < MIN_SNAPSHOT_WINDOW_SECONDS) {
+                logger.warn("MongoDB 快照历史窗口仅 {}s，短于一次全量的常见耗时，搬到一半会失效；"
+                                + "本次降级为只记位点。要用真快照请先调大："
+                                + "db.adminCommand({{setParameter:1, minSnapshotHistoryWindowInSeconds:86400}})",
+                        window);
+            } else {
+                try {
+                    session = source.startSession(com.mongodb.ClientSessionOptions.builder()
+                            .snapshot(true).build());
+                    effectiveMode = "CONSISTENT";
+                    if (window < 0) {
+                        logger.warn("未能读取 minSnapshotHistoryWindowInSeconds（缺权限？），"
+                                + "已按真快照启动；若中途报快照失效，请调大该参数或改用只记位点");
+                    }
+                } catch (Exception e) {
+                    logger.warn("开启 MongoDB 快照会话失败（需要 5.0+ 副本集），降级为只记位点: {}", e.getMessage());
+                }
+            }
+        }
+        com.migration.common.snapshot.SnapshotPosition.write(taskId, effectiveMode, "mongodb", position);
+        logger.info("全量快照: mode={}, clusterTime={}", effectiveMode, position);
+        return session;
+    }
+
+    /** 当前 clusterTime（{@code hello} 回包的 operationTime），作为本次全量的位点。 */
+    private String readClusterTime(MongoClient source) {
+        try {
+            Document reply = source.getDatabase("admin").runCommand(new Document("hello", 1));
+            Object ts = reply.get("operationTime");
+            if (ts instanceof org.bson.BsonTimestamp bt) {
+                return "clusterTime:" + bt.getTime() + "." + bt.getInc();
+            }
+            if (ts != null) {
+                return "clusterTime:" + ts;
+            }
+        } catch (Exception e) {
+            logger.debug("读取 clusterTime 失败: {}", e.getMessage());
+        }
+        return "unknown";
+    }
+
+    /** 读 {@code minSnapshotHistoryWindowInSeconds}；读不到返回 -1（按"未知"处理，不降级）。 */
+    private long readSnapshotHistoryWindowSeconds(MongoClient source) {
+        try {
+            Document reply = source.getDatabase("admin").runCommand(
+                    new Document("getParameter", 1).append("minSnapshotHistoryWindowInSeconds", 1));
+            Object v = reply.get("minSnapshotHistoryWindowInSeconds");
+            if (v instanceof Number n) {
+                return n.longValue();
+            }
+        } catch (Exception e) {
+            logger.debug("读取 minSnapshotHistoryWindowInSeconds 失败: {}", e.getMessage());
+        }
+        return -1;
+    }
+
+    private void copyCollection(String db, String coll, MongoCollection<Document> src, MongoCollection<Document> tgt,
+                                com.mongodb.client.ClientSession snapshotSession) {
         boolean active = processor.isActive(db, coll);
         // 索引先行（跳过默认 _id_），保证数据落入后即有约束/查询性能。
         // 列名映射时索引 key 字段也随之改写（源 note 上的唯一索引 → 目标 remark 上）。
@@ -314,27 +413,33 @@ public final class MongoSyncMain {
             }
         }
 
-        List<WriteModel<Document>> batch = new ArrayList<>(FULL_BATCH_SIZE);
-        ReplaceOptions upsert = new ReplaceOptions().upsert(true);
-        try (MongoCursor<Document> cursor = src.find().batchSize(FULL_BATCH_SIZE).iterator()) {
+        // 目标集合为空才走 insertMany 快路径。用 countDocuments(limit 1) 而不是
+        // estimatedDocumentCount()——后者读的是元数据估算值，非正常关闭后可能报 0，
+        // 据此走 insert 会让续搬的每一条都撞重复键。
+        boolean emptyTarget = tgt.countDocuments(new Document(),
+                new com.mongodb.client.model.CountOptions().limit(1)) == 0;
+        // 快照会话下的读会钉在同一个 clusterTime 上；无快照时是原来的即时读
+        com.mongodb.client.FindIterable<Document> find = snapshotSession != null
+                ? src.find(snapshotSession)
+                : src.find();
+        try (MongoBulkChannel channel = new MongoBulkChannel(tgt, bulkOptions, emptyTarget);
+             MongoCursor<Document> cursor = find.batchSize(FULL_BATCH_SIZE).iterator()) {
             while (cursor.hasNext()) {
                 Document doc = cursor.next();
                 if (active && processor.excluded(db, coll, doc)) {
                     continue; // 命中列过滤，跳过不同步
                 }
-                Document out = active ? processor.transform(db, coll, doc) : doc;
-                batch.add(new ReplaceOneModel<>(new Document("_id", out.get("_id")), out, upsert));
-                if (batch.size() >= FULL_BATCH_SIZE) {
-                    tgt.bulkWrite(batch, new com.mongodb.client.model.BulkWriteOptions().ordered(false));
-                    copiedDocs += batch.size();
-                    batch.clear();
+                channel.add(active ? processor.transform(db, coll, doc) : doc);
+                if (channel.isFull()) {
+                    copiedDocs += channel.flush()[0];
                     writeProgress();
                 }
             }
-            if (!batch.isEmpty()) {
-                tgt.bulkWrite(batch, new com.mongodb.client.model.BulkWriteOptions().ordered(false));
-                copiedDocs += batch.size();
+            if (!channel.isEmpty()) {
+                copiedDocs += channel.flush()[0];
             }
+            logger.info("集合 {}.{} 装载完成（{}）: {}", db, coll,
+                    emptyTarget ? "insertMany 快路径" : "ReplaceOne upsert", channel.stats().summary());
         }
     }
 

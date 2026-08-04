@@ -640,7 +640,7 @@
                 </div>
                 <div class="table-cell col-name">
                     <div>
-                        <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">同步</span>${escapeHtml(workflow.name)}</div>
+                        <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">同步</span>${escapeHtml(workflow.name)}${consistencyBadgeHtml(workflow.consistency_mode)}</div>
                         <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${workflow.status === 'CONFIGURING' ? `openTaskConfig('${workflow.id}')` : `showTaskDetail('${workflow.id}')`}">${workflow.id}</div>
                     </div>
                 </div>
@@ -2044,6 +2044,14 @@
                             
                             <div style="font-size: 13px; color: #666;">同步模式:</div>
                             <div style="font-size: 13px;">${task.migration_mode === 'fullAndIncre' ? '全量+增量' : '仅全量'}</div>
+
+                            <div style="font-size: 13px; color: #666;">一致性语义:</div>
+                            <div style="font-size: 13px;">
+                                ${task.consistency_mode === 'TRANSACTIONAL'
+                                    ? '事务一致性<span style="color:#999;">（目标库按源库事务提交顺序逐个提交，事务内容一致）</span>'
+                                    : '最终一致性<span style="color:#999;">（按 表+主键 冲突矩阵并发写入，源事务可被打散合并）</span>'}
+                                <span style="color:#999;">· 创建后不可修改</span>
+                            </div>
                             
                             <div style="font-size: 13px; color: #666;">当前状态:</div>
                             <div>
@@ -2673,10 +2681,95 @@
             }, 3000);
         }
         
+        // ===== 一致性语义（创建任务时选定，创建后不可修改）=====
+        // 三个创建入口（同步/订阅/灾备）共用这组函数，前缀区分弹窗：sync / sub / dr。
+        // 默认值写在 HTML 的 data-mode 上：同步=EVENTUAL，订阅/灾备=TRANSACTIONAL。
+        const CONSISTENCY_MODES = ['TRANSACTIONAL', 'EVENTUAL'];
+
+        function selectConsistencyMode(prefix, mode) {
+            if (CONSISTENCY_MODES.indexOf(mode) < 0) return;
+            const container = document.getElementById(prefix + 'ConsistencyCards');
+            if (!container) return;
+            container.dataset.mode = mode;
+            CONSISTENCY_MODES.forEach(m => {
+                const card = document.getElementById(prefix + 'Consistency' + m);
+                if (card) card.classList.toggle('selected', m === mode);
+            });
+        }
+
+        function getConsistencyMode(prefix, fallback) {
+            const container = document.getElementById(prefix + 'ConsistencyCards');
+            const mode = container && container.dataset.mode;
+            return CONSISTENCY_MODES.indexOf(mode) >= 0 ? mode : (fallback || 'EVENTUAL');
+        }
+
+        /** 打开创建弹窗时复位到该任务类型的默认值（上一次的选择不该粘在下一个新任务上）。 */
+        function resetConsistencyMode(prefix, defaultMode) {
+            selectConsistencyMode(prefix, defaultMode);
+        }
+
+        // ===== 全量装载通道 / 全量一致性快照（任务未启动前可改）=====
+        // 与一致性语义不同，这两项只影响全量怎么读、怎么写，不改变增量投递语义，
+        // 因此放在任务配置页而不是创建弹窗；启动后配置页整体只读，后端也只在 CONFIGURING 放行。
+
+        /** 各源端的快照说明：代价差别很大，直接写清楚，别让用户去猜。 */
+        function cfgSnapshotHintText(sourceType) {
+            switch (sourceType) {
+                case 'mysql':
+                    return '一致性快照需要源库 RELOAD 权限，建立期间会有一段全局读锁（源库短暂只读），故默认只记位点。';
+                case 'tidb':
+                    return 'TiDB 走 MVCC 历史读，全程不加锁；但要求 GC 生命期长于全量耗时（tidb_gc_life_time，默认仅 10 分钟），不满足时引擎会自动降级为只记位点。';
+                case 'postgresql':
+                    return 'PostgreSQL 走导出快照（pg_export_snapshot），不加锁。';
+                case 'oracle':
+                    return 'Oracle 走闪回查询（AS OF SCN），不加锁；需要 undo 保留时间覆盖全量耗时。';
+                case 'mongodb':
+                    return 'MongoDB 走快照会话（5.0+），不加锁；受 minSnapshotHistoryWindowInSeconds 限制（默认仅 300 秒），不满足时引擎会自动降级为只记位点。';
+                case 'redis':
+                    return 'Redis 全量走 PSYNC 拿到的 RDB，本身就是某个复制偏移上的一致快照，这里只决定是否把该位点记录下来。';
+                default:
+                    return '快照只影响全量阶段的读取语义；建立失败时引擎一律降级，不会让任务起不来。';
+            }
+        }
+
+        /** 打开配置页时把已保存的档位回填到控件上。 */
+        function cfgInitFullLoadOptions(task) {
+            const bulkMode = document.getElementById('cfgBulkLoadMode');
+            const bulkEnabled = document.getElementById('cfgBulkLoadEnabled');
+            const snapshot = document.getElementById('cfgSnapshotMode');
+            if (bulkMode) bulkMode.value = task.bulk_load_mode || 'AUTO';
+            if (bulkEnabled) bulkEnabled.checked = task.bulk_load_enabled !== false;
+            if (snapshot) snapshot.value = task.snapshot_mode || 'GTID_ONLY';
+            const hint = document.getElementById('cfgSnapshotHint');
+            if (hint) hint.textContent = cfgSnapshotHintText(task.source_type || 'mysql');
+        }
+
+        function cfgReadSelect(id, fallback) {
+            const el = document.getElementById(id);
+            return (el && el.value) ? el.value : fallback;
+        }
+
+        function cfgReadBulkLoadEnabled() {
+            const el = document.getElementById('cfgBulkLoadEnabled');
+            return el ? !!el.checked : true;
+        }
+
+        /** 已创建任务上的只读徽章——一致性模式不可修改，只展示。 */
+        function consistencyBadgeHtml(mode) {
+            if (mode === 'TRANSACTIONAL') {
+                return '<span class="consistency-badge transactional" title="目标库按源库事务提交顺序逐个提交，事务内容一致；创建后不可修改">事务一致</span>';
+            }
+            if (mode === 'EVENTUAL') {
+                return '<span class="consistency-badge eventual" title="按 表+主键 冲突矩阵并发写入，源事务可被打散合并，目标库最终一致；创建后不可修改">最终一致</span>';
+            }
+            return '';
+        }
+
         // 打开模态框
         function openModal() {
             document.getElementById('createTaskModal').classList.add('show');
             updateTargetTypeCards();
+            resetConsistencyMode('sync', 'EVENTUAL');
         }
 
         function closeModal() {
@@ -2695,6 +2788,7 @@
             document.getElementById('targetTypePg').className = 'db-type-card';
             document.getElementById('targetTypeMongo').className = 'db-type-card disabled';
             document.getElementById('targetTypeEs').className = 'db-type-card';
+            resetConsistencyMode('sync', 'EVENTUAL');
         }
 
         let cfgCurrentStep = 1;
@@ -2882,8 +2976,192 @@
             cfgRenderExtraList();
         }
 
+        // ==================== 分库分表路由（步骤3 的第四个页签） ====================
+        // 结构与后端 route_config JSON 一一对应：{mode, merge:[...], split:[...], legs:[...]}
+        let cfgRouteConfig = { mode: 'NONE', merge: [], split: [], legs: [] };
+
+        window.cfgOnRouteModeChange = function() {
+            cfgRouteConfig.mode = document.getElementById('cfgRouteMode').value;
+            document.getElementById('cfgRouteMergeBody').style.display =
+                cfgRouteConfig.mode === 'MERGE' ? 'block' : 'none';
+            document.getElementById('cfgRouteSplitBody').style.display =
+                cfgRouteConfig.mode === 'SPLIT' ? 'block' : 'none';
+        };
+
+        window.cfgAddMergeRule = function() {
+            const match = document.getElementById('cfgMergeMatch').value.trim();
+            const target = document.getElementById('cfgMergeTarget').value.trim();
+            if (!match || !target) {
+                showNotification('请填写匹配式与目标表', 'error');
+                return;
+            }
+            cfgRouteConfig.merge.push({
+                match: match,
+                target: target,
+                pkStrategy: document.getElementById('cfgMergePk').value,
+                ddlPolicy: document.getElementById('cfgMergeDdl').value
+            });
+            document.getElementById('cfgMergeMatch').value = '';
+            document.getElementById('cfgMergeTarget').value = '';
+            cfgRenderRouteConfig();
+        };
+
+        window.cfgAddSplitRule = function() {
+            const match = document.getElementById('cfgSplitMatch').value.trim();
+            const shardKey = document.getElementById('cfgSplitShardKey').value.trim();
+            const algo = document.getElementById('cfgSplitAlgo').value;
+            const count = parseInt(document.getElementById('cfgSplitCount').value.trim(), 10);
+            const targetDb = document.getElementById('cfgSplitTargetDb').value.trim();
+            const targetTable = document.getElementById('cfgSplitTargetTable').value.trim();
+            const extra = document.getElementById('cfgSplitExtra').value.trim();
+            if (!match || !shardKey) {
+                showNotification('请填写源表与分片键', 'error');
+                return;
+            }
+            if (!targetDb.includes('${shard') && !targetTable.includes('${shard')) {
+                showNotification('目标库或目标表模板必须含 ${shard}，否则所有分片会写进同一张表', 'error');
+                return;
+            }
+            const rule = { match, shardKey, algo, targetDb, targetTable,
+                unrouted: document.getElementById('cfgSplitUnrouted').value };
+            if (algo === 'HASH_MOD') {
+                if (!(count > 0)) {
+                    showNotification('哈希取模必须填写分片数', 'error');
+                    return;
+                }
+                rule.count = count;
+            } else if (algo === 'RANGE') {
+                if (!extra) { showNotification('区间分片必须填写区间表，如 0:1000,1000:5000', 'error'); return; }
+                rule.range = extra;
+            } else if (algo === 'LIST') {
+                if (!extra) { showNotification('枚举分片必须填写枚举表，如 CN:0,US:1', 'error'); return; }
+                rule.list = extra;
+            }
+            cfgRouteConfig.split.push(rule);
+            ['cfgSplitMatch', 'cfgSplitShardKey', 'cfgSplitCount', 'cfgSplitExtra'].forEach(
+                id => document.getElementById(id).value = '');
+            cfgRenderRouteConfig();
+        };
+
+        window.cfgAddRouteLeg = function() {
+            const nodeId = document.getElementById('cfgLegNodeId').value.trim();
+            const host = document.getElementById('cfgLegHost').value.trim();
+            const port = parseInt(document.getElementById('cfgLegPort').value.trim(), 10);
+            if (!nodeId || !host || !(port > 0)) {
+                showNotification('跨实例来源需要实例标识、host 和 port', 'error');
+                return;
+            }
+            if (cfgRouteConfig.legs.some(l => l.nodeId === nodeId)) {
+                showNotification('实例标识重复：来源标识列靠它区分同名库表', 'error');
+                return;
+            }
+            cfgRouteConfig.legs.push({
+                nodeId: nodeId, host: host, port: port,
+                username: document.getElementById('cfgLegUser').value.trim(),
+                password: document.getElementById('cfgLegPassword').value
+            });
+            ['cfgLegNodeId', 'cfgLegHost', 'cfgLegPort', 'cfgLegUser', 'cfgLegPassword'].forEach(
+                id => document.getElementById(id).value = '');
+            cfgRenderRouteConfig();
+        };
+
+        window.cfgRemoveRouteItem = function(kind, index) {
+            cfgRouteConfig[kind].splice(index, 1);
+            cfgRenderRouteConfig();
+        };
+
+        function cfgRenderRouteConfig() {
+            const row = (text, kind, i) =>
+                `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border:1px solid #e8e8e8;border-radius:4px;margin-bottom:6px;">
+                    <span>${escapeHtml(text)}</span>
+                    <span style="color:#ff4d4f;cursor:pointer;" onclick="cfgRemoveRouteItem('${kind}', ${i})">删除</span>
+                 </div>`;
+            const mergeList = document.getElementById('cfgMergeRuleList');
+            if (mergeList) {
+                mergeList.innerHTML = cfgRouteConfig.merge.length === 0
+                    ? '<div style="color:#999;">暂无汇聚规则</div>'
+                    : cfgRouteConfig.merge.map((r, i) => row(
+                        `${r.match} → ${r.target}（主键: ${r.pkStrategy === 'KEEP' ? '沿用源主键' : '主键+来源列'}，DDL: ${r.ddlPolicy}）`,
+                        'merge', i)).join('');
+            }
+            const splitList = document.getElementById('cfgSplitRuleList');
+            if (splitList) {
+                splitList.innerHTML = cfgRouteConfig.split.length === 0
+                    ? '<div style="color:#999;">暂无拆分规则</div>'
+                    : cfgRouteConfig.split.map((r, i) => row(
+                        `${r.match} 按 ${r.shardKey}/${r.algo}${r.count ? ' ' + r.count + ' 片' : ''} → ${r.targetDb || '<默认库>'}.${r.targetTable || '<源表名>'}（未路由: ${r.unrouted}）`,
+                        'split', i)).join('');
+            }
+            const legList = document.getElementById('cfgRouteLegList');
+            if (legList) {
+                legList.innerHTML = cfgRouteConfig.legs.length === 0
+                    ? '<div style="color:#999;">未配置跨实例来源（只汇聚当前源实例上的库表）</div>'
+                    : cfgRouteConfig.legs.map((l, i) => row(
+                        `${l.nodeId} — ${l.host}:${l.port}`, 'legs', i)).join('');
+            }
+        }
+
+        /** 保存路由配置到后端（校验不过时后端会把原因原样返回）。 */
+        window.cfgSaveRouteConfig = async function(silent) {
+            if (!cfgWorkflowId) return true;
+            cfgRouteConfig.mode = document.getElementById('cfgRouteMode').value;
+            const payload = cfgRouteConfig.mode === 'NONE' ? null : {
+                mode: cfgRouteConfig.mode,
+                merge: cfgRouteConfig.mode === 'MERGE' ? cfgRouteConfig.merge : [],
+                split: cfgRouteConfig.mode === 'SPLIT' ? cfgRouteConfig.split : [],
+                legs: cfgRouteConfig.mode === 'MERGE' ? cfgRouteConfig.legs : []
+            };
+            try {
+                const response = await fetchWithAuth(`${API_BASE_URL}/workflows/${cfgWorkflowId}/route-config`, {
+                    method: 'PUT',
+                    headers: getAuthHeaders(),
+                    body: JSON.stringify({ routeConfig: payload })
+                });
+                const result = await response.json();
+                if (!result.success) {
+                    showNotification('路由配置保存失败: ' + result.message, 'error');
+                    return false;
+                }
+                if (!silent) showNotification('路由配置已保存', 'success');
+                return true;
+            } catch (e) {
+                showNotification('路由配置保存失败: ' + e.message, 'error');
+                return false;
+            }
+        };
+
+        /** 打开配置向导时回填已保存的路由配置。 */
+        async function cfgLoadRouteConfig() {
+            cfgRouteConfig = { mode: 'NONE', merge: [], split: [], legs: [] };
+            if (cfgWorkflowId) {
+                try {
+                    const response = await fetchWithAuth(`${API_BASE_URL}/workflows/${cfgWorkflowId}/route-config`);
+                    const result = await response.json();
+                    if (result.success && result.data && result.data.routeConfig) {
+                        const saved = JSON.parse(result.data.routeConfig);
+                        cfgRouteConfig = {
+                            mode: saved.mode || 'NONE',
+                            merge: saved.merge || [],
+                            split: saved.split || [],
+                            legs: saved.legs || []
+                        };
+                    }
+                } catch (e) {
+                    // 回填失败不阻塞向导，用户重新配即可
+                }
+            }
+            const modeSelect = document.getElementById('cfgRouteMode');
+            if (modeSelect) {
+                modeSelect.value = cfgRouteConfig.mode;
+                cfgOnRouteModeChange();
+            }
+            cfgRenderRouteConfig();
+        }
+        window.cfgLoadRouteConfig = cfgLoadRouteConfig;
+        // ==================== 分库分表路由结束 ====================
+
         window.cfgSwitchColTab = function(tab) {
-            ['filter', 'mapping', 'extra'].forEach(t => {
+            ['filter', 'mapping', 'extra', 'route'].forEach(t => {
                 const btn = document.getElementById('cfgColTab' + t.charAt(0).toUpperCase() + t.slice(1) + 'Btn');
                 const pane = document.getElementById('cfgColPane' + t.charAt(0).toUpperCase() + t.slice(1));
                 btn.className = 'colproc-tab' + (t === tab ? ' active' : '');
@@ -3207,7 +3485,9 @@
                     body: JSON.stringify({
                         name: name,
                         sourceType: selectedSourceType,
-                        targetType: selectedTargetType
+                        targetType: selectedTargetType,
+                        // 一致性语义随创建请求一次性定死，后端不接受后续修改
+                        consistencyMode: getConsistencyMode('sync', 'EVENTUAL')
                     })
                 });
                 
@@ -3271,7 +3551,10 @@
                     granularityGroup.style.display = (cfgSourceType === 'mysql' && cfgTargetType === 'mysql') ? '' : 'none';
                 }
                 
-                document.getElementById('configPageTitle').textContent = '任务配置 - ' + task.name;
+                document.getElementById('configPageTitle').innerHTML =
+                        '任务配置 - ' + escapeHtml(task.name) + consistencyBadgeHtml(task.consistency_mode);
+
+                cfgInitFullLoadOptions(task);
                 
                 if (task.source_connection) {
                     cfgParseConnectionString('source', task.source_connection);
@@ -3657,10 +3940,15 @@
             if ((cfgCurrentStep === 3 || cfgCurrentStep === 4) && step > cfgCurrentStep) {
                 cfgSaveConfig();
             }
+            // 离开列处理/路由这一步时把路由配置一并落库（silent：只在失败时提示）
+            if (cfgCurrentStep === 3 && step !== 3) {
+                cfgSaveRouteConfig(true);
+            }
 
             cfgCurrentStep = step;
             if (step === 3) {
                 cfgRenderColProcPage();
+                cfgLoadRouteConfig();
             }
             if (step === 4) {
                 cfgRenderAccountSyncPage();
@@ -3812,7 +4100,11 @@
                         sourceType: cfgSourceType,
                         targetType: cfgTargetType,
                         syncAccount,
-                        syncAccountSuperPrivilege
+                        syncAccountSuperPrivilege,
+                        // 全量装载/快照档位：任务未启动前可改（后端只在 CONFIGURING 状态放行）
+                        bulkLoadEnabled: cfgReadBulkLoadEnabled(),
+                        bulkLoadMode: cfgReadSelect('cfgBulkLoadMode', 'AUTO'),
+                        snapshotMode: cfgReadSelect('cfgSnapshotMode', 'GTID_ONLY')
                     })
                 });
             } catch (error) {
@@ -6290,7 +6582,8 @@
     auditPrevPage, cfgAddPgTable, cfgAddTable, cfgGoToStep, cfgNextStep, cfgOnConnectionFieldChange,
     cfgPrevStep, cfgRefreshObjects, cfgRemoveTable, cfgRunValidation, cfgSelectAllPgTables, cfgSelectAllTables,
     cfgTestConnection, cfgToggleDatabase, cfgTogglePgSchema, closeChartModal, closeConfigModal, closeDetailModal,
-    createTaskFromModal, createValidationTask, deleteValidationTask, downloadDiagnosticsBundle, escapeAttr, escapeHtml,
+    consistencyBadgeHtml, createTaskFromModal, createValidationTask, deleteValidationTask, downloadDiagnosticsBundle, escapeAttr, escapeHtml,
+    getConsistencyMode, resetConsistencyMode, selectConsistencyMode,
     fetchAuditLogs, goToPage, goToValidationPage, handleSort, handleTokenExpired, launchTask,
     logout, onMetricsTimeRangeChange, openAccountSettings, openChartModal, openCreateValidationModal, openTaskConfig,
     refreshMetrics, removeFilterTag, removeTable, renderValidationWorkflowOptions, repairValidationTaskAction, selectAllPgTables,

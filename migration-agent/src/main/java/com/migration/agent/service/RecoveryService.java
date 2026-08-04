@@ -28,7 +28,8 @@ public class RecoveryService {
         
         String sql = "SELECT id, name, user_id, source_connection, target_connection, " +
                      "migration_mode, status, progress, created_at, sync_objects, source_db_name, target_db_name, " +
-                     "source_type, target_type, task_type, dr_mode " +
+                     "source_type, target_type, task_type, dr_mode, consistency_mode, " +
+                     "bulk_load_enabled, bulk_load_mode, snapshot_mode " +
                      "FROM workflows " +
                      "WHERE status IN ('STARTING', 'FULL_MIGRATING', 'FULL_COMPLETED', 'INCREMENT_RUNNING', 'SUBSCRIBE_RUNNING', 'SWITCHING') " +
                      "AND is_deleted = 0 " +
@@ -58,7 +59,8 @@ public class RecoveryService {
     public RecoveryTask getTaskById(String taskId) {
         String sql = "SELECT id, name, user_id, source_connection, target_connection, " +
                      "migration_mode, status, progress, created_at, sync_objects, source_db_name, target_db_name, " +
-                     "source_type, target_type, task_type, dr_mode " +
+                     "source_type, target_type, task_type, dr_mode, consistency_mode, " +
+                     "bulk_load_enabled, bulk_load_mode, snapshot_mode " +
                      "FROM workflows WHERE id = ?";
         
         try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
@@ -126,6 +128,28 @@ public class RecoveryService {
             task.setDrMode(rs.getString("dr_mode"));
         } catch (SQLException e) {
             logger.debug("dr_mode column not found in workflows table, leaving null");
+        }
+
+        try {
+            // 一致性语义：恢复时必须一起带回来，否则 agent 重写 config 会让任务从
+            // "事务一致串行投递"悄悄退回默认的最终一致并发路径（反之亦然）
+            String cm = rs.getString("consistency_mode");
+            task.setConsistencyMode(cm != null && !cm.isEmpty() ? cm : null);
+        } catch (SQLException e) {
+            logger.debug("consistency_mode column not found in workflows table, leaving null");
+        }
+
+        try {
+            // 全量装载/快照档位：同理，恢复时不带回来，agent 重写 config 会把用户选的
+            // COPY / DIRECT_PATH / CONSISTENT 悄悄退回默认档
+            Object enabled = rs.getObject("bulk_load_enabled");
+            task.setBulkLoadEnabled(enabled == null ? null : rs.getBoolean("bulk_load_enabled"));
+            String bm = rs.getString("bulk_load_mode");
+            task.setBulkLoadMode(bm != null && !bm.isEmpty() ? bm : null);
+            String sm = rs.getString("snapshot_mode");
+            task.setSnapshotMode(sm != null && !sm.isEmpty() ? sm : null);
+        } catch (SQLException e) {
+            logger.debug("bulk_load_*/snapshot_mode columns not found in workflows table, leaving null");
         }
         
         return task;

@@ -373,6 +373,10 @@ public class ConfigService {
             }
         }
 
+        // 聚合路由（分库分表汇聚/拆分）：JSON 展开成 route.*，并用引擎的解析器当场校验。
+        // 配置非法直接抛——路由错了就是数据写错地方，不能让任务带着坏规则起来。
+        RouteConfigExpander.expand(props, taskMessage.getRouteConfig(), taskMessage.getRouteNodeId());
+
         String rawSourceType = taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql";
         String targetType = taskMessage.getTargetType() != null ? taskMessage.getTargetType() : "mysql";
         // TiDB 讲 MySQL 协议：驱动、方言、类型映射、全量迁移、增量应用全部与 mysql→mysql 同构，
@@ -624,6 +628,11 @@ public class ConfigService {
         mergeSkipListProperty(props, "increment.skip.event.ids", taskMessage.getSkipEventIds());
         mergeSkipListProperty(props, "increment.skip.seqnos", taskMessage.getSkipSeqnos());
 
+        // 一致性语义（用户在创建任务时选定）→ 增量投递参数。必须写在下面这批 env 覆盖之前：
+        // 任务级选择是基线，agent 级 env 仍可覆盖（灰度/排障）。
+        applyConsistencyMode(props, taskMessage);
+        applyFullLoadOptions(props, taskMessage);
+
         // 增量并行应用（引擎级执行调优，非向导字段）：agent 级 env/系统属性开关，随 config 落盘、
         // resume 时重写保持生效。默认不写=增量子进程按串行（parallelism=1）运行。
         writeIntPropFromEnv(props, "increment.apply.parallelism", "INCREMENT_APPLY_PARALLELISM");
@@ -694,6 +703,144 @@ public class ConfigService {
                 props.getProperty("capture.ticdc.api.url"),
                 props.getProperty("capture.ticdc.kafka.sink.bootstrap"),
                 props.getProperty("capture.ticdc.kafka.bootstrap"), sanitized);
+    }
+
+    /**
+     * 全量一致性快照的默认档位（后端 WorkflowService.defaultSnapshotMode 有同一套规则）：
+     * MySQL 源只记位点（真快照要 RELOAD 权限 + 全局读锁），其余源端的快照不需要全局锁，默认给真快照。
+     */
+    static String defaultSnapshotMode(String sourceType) {
+        if (sourceType == null) {
+            return "GTID_ONLY";
+        }
+        switch (sourceType.trim().toLowerCase()) {
+            case "tidb":
+            case "postgresql":
+            case "oracle":
+            case "mongodb":
+            case "redis":
+                return "CONSISTENT";
+            default:
+                return "GTID_ONLY";
+        }
+    }
+
+    /**
+     * 把任务级的"全量装载 + 快照"档位翻译成引擎参数。
+     *
+     * <p>这两组键<b>所有引擎共用</b>：SQL 全量（migration-full）、Mongo、ES、Redis 都从
+     * 同一份 config.properties 里读 {@code migration.full.bulk.*} 与
+     * {@code migration.full.snapshot.mode}，同步任务与灾备任务走的也是同一段代码——
+     * 灾备的全量本来就是 migration-full/Mongo 那几条链路，没有第二套。
+     *
+     * <p>老后端不下发这些字段时按默认值写（装载 AUTO + 按源端定的快照档位），
+     * 与升级前的实际行为一致。
+     */
+    private void applyFullLoadOptions(Properties props, TaskMessage taskMessage) {
+        boolean bulkEnabled = !Boolean.FALSE.equals(taskMessage.getBulkLoadEnabled());
+        String bulkMode = taskMessage.getBulkLoadMode();
+        if (bulkMode == null || bulkMode.trim().isEmpty()) {
+            bulkMode = "AUTO";
+        }
+        bulkMode = bulkMode.trim().toUpperCase();
+        props.setProperty("migration.full.bulk.enabled", String.valueOf(bulkEnabled));
+        props.setProperty("migration.full.bulk.mode", bulkMode);
+
+        String sourceType = taskMessage.getSourceType();
+        String snapshotMode = taskMessage.getSnapshotMode();
+        if (snapshotMode == null || snapshotMode.trim().isEmpty()) {
+            snapshotMode = defaultSnapshotMode(sourceType);
+            logger.info("任务未携带快照档位，按源端 {} 取默认: {}", sourceType, snapshotMode);
+        }
+        snapshotMode = snapshotMode.trim().toUpperCase();
+        if (!"NONE".equals(snapshotMode) && !"GTID_ONLY".equals(snapshotMode)
+                && !"CONSISTENT".equals(snapshotMode)) {
+            logger.warn("快照档位取值非法（{}），按 {} 处理", snapshotMode, defaultSnapshotMode(sourceType));
+            snapshotMode = defaultSnapshotMode(sourceType);
+        }
+        props.setProperty("migration.full.snapshot.mode", snapshotMode);
+
+        logger.info("全量装载: enabled={}, mode={}；一致性快照: mode={}（源端 {}）",
+                bulkEnabled, bulkMode, snapshotMode, sourceType);
+    }
+
+    /** 一致性语义的默认值（后端也有同名规则）：订阅/灾备事务一致，普通同步最终一致。 */
+    static String defaultConsistencyMode(String taskType) {
+        if ("SUBSCRIBE".equals(taskType) || "DR".equals(taskType) || "DR_SHADOW".equals(taskType)) {
+            return "TRANSACTIONAL";
+        }
+        return "EVENTUAL";
+    }
+
+    /**
+     * 把任务级的一致性语义翻译成引擎参数，写进任务自己的 config.properties。
+     *
+     * <p><b>TRANSACTIONAL（事务一致）</b>：{@code apply.transaction.mode=TRANSACTION} +
+     * {@code increment.apply.parallelism=1}。串行是刚性要求而不是保守取值——
+     * 用户要的是"目标库提交顺序 = 源库事务提交顺序"，多 worker 各自提交只能保住
+     * 每个连通分量内部有序，全局提交顺序必然乱。订阅链路额外打开事务标记 topic，
+     * 下游据此把行消息重组回源事务。
+     *
+     * <p><b>EVENTUAL（最终一致）</b>：{@code apply.transaction.mode=EVENT} + 冲突矩阵并发
+     * （不同表、同表不同主键并发；同表同主键严格保序），源事务可被打散/合并。
+     * 三个并发参数都给默认值并落到每个任务的配置文件里，用户可按链路改：
+     * 线程数 {@code increment.apply.parallelism}、单次提交 SQL 上限
+     * {@code increment.apply.commit.batch.sql}、单批读入事件数 {@code increment.apply.batch.size}。
+     */
+    private void applyConsistencyMode(Properties props, TaskMessage taskMessage) {
+        String taskType = taskMessage.getTaskType();
+        String mode = taskMessage.getConsistencyMode();
+        if (mode == null || mode.trim().isEmpty()) {
+            // 老 backend / 老消息没有这个字段：按任务类型取默认，与后端建任务时同一套规则
+            mode = defaultConsistencyMode(taskType);
+            logger.info("任务未携带一致性语义，按任务类型 {} 取默认: {}", taskType, mode);
+        }
+        mode = mode.trim().toUpperCase();
+        if (!"TRANSACTIONAL".equals(mode) && !"EVENTUAL".equals(mode)) {
+            logger.warn("一致性语义取值非法（{}），按 {} 处理", mode, defaultConsistencyMode(taskType));
+            mode = defaultConsistencyMode(taskType);
+        }
+        props.setProperty("sync.consistency.mode", mode);
+
+        if ("TRANSACTIONAL".equals(mode)) {
+            props.setProperty("apply.transaction.mode", "TRANSACTION");
+            props.setProperty("increment.apply.parallelism", "1");
+            props.setProperty("subscribe.transaction.topic.enabled", "true");
+            logger.info("一致性语义=事务一致: apply.transaction.mode=TRANSACTION, 增量串行应用"
+                    + "（目标提交顺序与源事务提交顺序一致）");
+        } else {
+            props.setProperty("apply.transaction.mode", "EVENT");
+            props.setProperty("increment.apply.parallelism",
+                    String.valueOf(defaultIntFromEnv("SYNC_EVENTUAL_APPLY_PARALLELISM", 4, 1, 64)));
+            props.setProperty("increment.apply.commit.batch.sql",
+                    String.valueOf(defaultIntFromEnv("SYNC_EVENTUAL_COMMIT_BATCH_SQL", 200, 1, 100000)));
+            props.setProperty("increment.apply.batch.size",
+                    String.valueOf(defaultIntFromEnv("SYNC_EVENTUAL_APPLY_BATCH_SIZE", 500, 1, 100000)));
+            props.setProperty("increment.apply.conflict.granularity", "ROW");
+            props.setProperty("subscribe.transaction.topic.enabled", "false");
+            logger.info("一致性语义=最终一致: 冲突矩阵并发应用 线程数={}, 单次提交SQL上限={}, 批大小={}",
+                    props.getProperty("increment.apply.parallelism"),
+                    props.getProperty("increment.apply.commit.batch.sql"),
+                    props.getProperty("increment.apply.batch.size"));
+        }
+    }
+
+    /** 取 env/系统属性里的整数默认值（非法或越界时回退内置默认），用于最终一致模式的并发参数。 */
+    private int defaultIntFromEnv(String envName, int fallback, int min, int max) {
+        String v = System.getenv(envName);
+        if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);
+        if (v == null || v.trim().isEmpty()) return fallback;
+        try {
+            int n = Integer.parseInt(v.trim());
+            if (n < min || n > max) {
+                logger.warn("{}={} 超出允许范围 [{},{}]，用默认 {}", envName, n, min, max, fallback);
+                return fallback;
+            }
+            return n;
+        } catch (NumberFormatException e) {
+            logger.warn("{}={} 非法整数，用默认 {}", envName, v, fallback);
+            return fallback;
+        }
     }
 
     /** 节点标识：host:port/db。双向冲突消解靠它区分两端，库名相同也不会撞。 */

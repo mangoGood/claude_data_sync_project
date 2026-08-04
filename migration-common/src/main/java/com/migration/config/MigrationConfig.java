@@ -24,6 +24,8 @@ public class MigrationConfig {
     private boolean bulkLoadEnabled;
     /** 单批提交行数（migration.full.bulk.rows，默认 batchSize×5）。 */
     private int bulkBatchRows;
+    /** 批量装载的完整配置（档位/行阈值/字节阈值），与 Mongo/ES/Redis 各链路共用同一组键。 */
+    private com.migration.common.bulk.BulkLoadOptions bulkLoadOptions;
     /** 全量一致性快照模式（migration.full.snapshot.mode）：NONE / GTID_ONLY / CONSISTENT。 */
     private String snapshotMode;
     private Set<String> includedDatabases;
@@ -35,6 +37,12 @@ public class MigrationConfig {
     private Map<String, String> databaseMapping;
     /** 列处理配置（列过滤/列名映射/附加列，仅表级同步下发；无配置时为空实例） */
     private ColumnProcessingConfig columnProcessingConfig;
+    /** 聚合路由配置（分库分表汇聚/拆分；未下发 route.mode 时为 NONE） */
+    private com.migration.common.route.RoutingConfig routingConfig;
+    /** 路由器（懒构造，校验失败时构造即抛） */
+    private transient com.migration.common.route.TableRouter tableRouter;
+    /** 本条管线的来源实例标识（route.node.id）：汇聚的 _src_node 来源标识列取它 */
+    private String routeNodeId;
     private String checkpointDbPath;
     private String taskId;
     private String sourceDbType;
@@ -73,6 +81,10 @@ public class MigrationConfig {
             sourceDbType
         );
 
+        // flavor：TiDB 归一成 dbType=mysql，快照手法却完全不同（MVCC 无锁 vs FTWRL），
+        // 故单独带一个 flavor 传给一致性快照
+        sourceConfig.setFlavor(props.getProperty("source.db.flavor"));
+
         String sourceSchema = props.getProperty("source.db.schema");
         if (sourceSchema != null && !sourceSchema.isEmpty()) {
             sourceConfig.setSchema(sourceSchema);
@@ -86,6 +98,8 @@ public class MigrationConfig {
             props.getProperty("target.db.password"),
             targetDbType
         );
+
+        targetConfig.setFlavor(props.getProperty("target.db.flavor"));
 
         String targetSchema = props.getProperty("target.db.schema");
         if (targetSchema != null && !targetSchema.isEmpty()) {
@@ -116,15 +130,14 @@ public class MigrationConfig {
             shardCount = 1;
         }
 
-        // 批量装载（P2-2）：让驱动把 executeBatch 重写成一条多值 INSERT，往返次数从 N 降到 1。
+        // 批量装载：AUTO/BATCH 档让驱动把 executeBatch 重写成一条多值 INSERT，往返次数从 N 降到 1；
+        // COPY（PG 二进制）/ DIRECT_PATH（Oracle 直接路径）由 migration.full.bulk.mode 显式选中。
         // 只加驱动参数、不改协议（仍是 PreparedStatement 类型绑定），故默认开启。
-        bulkLoadEnabled = Boolean.parseBoolean(props.getProperty("migration.full.bulk.enabled", "true"));
-        bulkBatchRows = Integer.parseInt(props.getProperty("migration.full.bulk.rows", "0"));
-        if (bulkBatchRows <= 0) {
-            // 未显式配置时按 batchSize 放大：重写后的多值 INSERT 每批越大往返越少，
-            // 但单条语句过大会撞 max_allowed_packet，取 5 倍是实测的稳妥档位
-            bulkBatchRows = bulkLoadEnabled ? batchSize * 5 : batchSize;
-        }
+        bulkLoadOptions = com.migration.common.bulk.BulkLoadOptions.from(props);
+        bulkLoadEnabled = bulkLoadOptions.isEnabled();
+        // 未显式配置行阈值时按 batchSize 放大：重写后的多值 INSERT 每批越大往返越少，
+        // 但单条语句过大会撞 max_allowed_packet，取 5 倍是实测的稳妥档位（另有字节阈值兜底）
+        bulkBatchRows = bulkLoadOptions.rows(batchSize * 5);
         if (bulkLoadEnabled) {
             applyBulkJdbcOptions(targetConfig, targetDbType);
         }
@@ -162,6 +175,16 @@ public class MigrationConfig {
         
         // 列处理（仅表级同步下发，mysql→mysql）：column.filter./column.mapping./column.extra.<源库>.<源表>
         columnProcessingConfig = ColumnProcessingConfig.loadFromProperties(props);
+
+        // 聚合路由（分库分表汇聚 / 拆分）：route.mode + route.merge.*/route.split.*/route.node.*。
+        // 未下发 route.mode 时为 NONE，全链路走原 1:1 路径。
+        routingConfig = com.migration.common.route.RoutingConfig.loadFromProperties(props);
+        // 本条管线的来源实例标识：跨实例汇聚时由 agent 按 leg 下发，用于 _src_node 来源标识列。
+        // 未下发时退回源实例地址——同名库表来自不同实例时，这是唯一能区分它们的东西。
+        routeNodeId = props.getProperty("route.node.id", "").trim();
+        if (routeNodeId.isEmpty()) {
+            routeNodeId = sourceConfig.getHost() + ":" + sourceConfig.getPort();
+        }
 
         // 账号同步（仅 mysql→mysql）：sync.account.enabled 打开后全量阶段同步存量账号，
         // sync.account.super 决定是否连同超级/管理权限一并同步
@@ -219,7 +242,7 @@ public class MigrationConfig {
      * 合并成一条多值 INSERT；Oracle 的 executeBatch 本身即数组绑定，无需参数。
      *
      * <p>注意：开了重写之后 executeBatch 返回的是 {@code SUCCESS_NO_INFO(-2)} 而非逐行影响数，
-     * 计数口径必须同步改（见 {@code BatchWriter.count}），否则全量会把所有行报成失败。
+     * 计数口径必须同步改（见 {@code JdbcBatchChannel.countBatchResults}），否则全量会把所有行报成失败。
      */
     private static void applyBulkJdbcOptions(DatabaseConfig target, String targetDbType) {
         if ("mysql".equalsIgnoreCase(targetDbType) || "tidb".equalsIgnoreCase(targetDbType)) {
@@ -237,6 +260,13 @@ public class MigrationConfig {
     /** 单批提交行数。 */
     public int getBulkBatchRows() {
         return bulkBatchRows;
+    }
+
+    /** 批量装载的完整配置（档位/行阈值/字节阈值）。 */
+    public com.migration.common.bulk.BulkLoadOptions getBulkLoadOptions() {
+        return bulkLoadOptions != null
+                ? bulkLoadOptions
+                : com.migration.common.bulk.BulkLoadOptions.of(true, com.migration.common.bulk.BulkLoadOptions.Mode.AUTO, 0, 0);
     }
 
     /** 全量一致性快照模式：NONE / GTID_ONLY / CONSISTENT。 */
@@ -298,6 +328,29 @@ public class MigrationConfig {
     /** 列处理配置（列过滤/列名映射/附加列）；未配置返回空实例。 */
     public ColumnProcessingConfig getColumnProcessingConfig() {
         return columnProcessingConfig != null ? columnProcessingConfig : new ColumnProcessingConfig();
+    }
+
+    /** 本条管线的来源实例标识（跨实例汇聚的 leg 标识；未下发时为源实例 host:port）。 */
+    public String getRouteNodeId() {
+        return routeNodeId == null ? "" : routeNodeId;
+    }
+
+    /** 聚合路由配置；未配置返回 NONE 实例。 */
+    public com.migration.common.route.RoutingConfig getRoutingConfig() {
+        return routingConfig != null ? routingConfig : com.migration.common.route.RoutingConfig.none();
+    }
+
+    /**
+     * 表级路由器（汇聚/拆分/1:1 的统一入口）。未写目标库的规则沿用既有库名映射解析，
+     * 不在路由层重复实现一遍。
+     *
+     * @throws IllegalStateException 路由配置有校验错误——路由错了就是数据写错地方，必须 fail-stop
+     */
+    public com.migration.common.route.TableRouter getTableRouter() {
+        if (tableRouter == null) {
+            tableRouter = getRoutingConfig().router(this::getTargetDatabaseFor);
+        }
+        return tableRouter;
     }
 
     /**

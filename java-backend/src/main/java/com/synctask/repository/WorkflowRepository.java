@@ -19,6 +19,9 @@ public interface WorkflowRepository extends JpaRepository<Workflow, String>, Jpa
     
     List<Workflow> findByUserId(Long userId);
     List<Workflow> findByUserIdAndStatus(Long userId, WorkflowStatus status);
+
+    /** 跨实例汇聚：某父任务派生出的全部 MERGE_LEG 子任务。 */
+    List<Workflow> findByMergeParentId(String mergeParentId);
     
     List<Workflow> findByUserIdAndIsDeletedFalse(Long userId);
     
@@ -39,12 +42,15 @@ public interface WorkflowRepository extends JpaRepository<Workflow, String>, Jpa
     
     List<Workflow> findByUserIdAndStatusAndIsDeletedFalse(Long userId, WorkflowStatus status);
 
-    /** 按状态取任务，排除指定 taskType（用于异常任务列表过滤掉 DR_SHADOW 隐藏影子任务），下推到 DB 查询。 */
+    /**
+     * 按状态取任务，排除指定 taskType（异常任务列表要滤掉 DR_SHADOW 反向通道与
+     * MERGE_LEG 汇聚采集通道这些隐藏子任务），下推到 DB 查询。
+     */
     @Query("SELECT w FROM Workflow w WHERE w.userId = :userId AND w.isDeleted = false " +
-           "AND w.status = :status AND w.taskType <> :excludeTaskType")
-    List<Workflow> findByUserIdAndStatusExcludingTaskType(@Param("userId") Long userId,
-                                                          @Param("status") WorkflowStatus status,
-                                                          @Param("excludeTaskType") String excludeTaskType);
+           "AND w.status = :status AND w.taskType NOT IN :excludeTaskTypes")
+    List<Workflow> findByUserIdAndStatusExcludingTaskTypes(@Param("userId") Long userId,
+                                                           @Param("status") WorkflowStatus status,
+                                                           @Param("excludeTaskTypes") List<String> excludeTaskTypes);
 
     @Query("SELECT w FROM Workflow w WHERE w.userId = :userId AND w.isDeleted = false AND w.taskType = :taskType")
     Page<Workflow> findByUserIdAndTaskType(@Param("userId") Long userId, @Param("taskType") String taskType, Pageable pageable);

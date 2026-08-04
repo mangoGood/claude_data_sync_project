@@ -47,7 +47,7 @@ public class ParallelDataMigration {
     private final com.migration.config.DatabaseConfig targetCfg;
     private final ProgressManager progressManager;
     /** 全量一致性快照（可为 null = 无快照）；所有 worker 共用同一个快照。 */
-    private com.migration.full.snapshot.ConsistentSnapshot snapshot;
+    private com.migration.common.snapshot.ConsistentSnapshot snapshot;
 
     public ParallelDataMigration(MigrationConfig config,
                                  com.migration.config.DatabaseConfig sourceCfg,
@@ -59,7 +59,7 @@ public class ParallelDataMigration {
         this.progressManager = progressManager;
     }
 
-    public ParallelDataMigration setSnapshot(com.migration.full.snapshot.ConsistentSnapshot snapshot) {
+    public ParallelDataMigration setSnapshot(com.migration.common.snapshot.ConsistentSnapshot snapshot) {
         this.snapshot = snapshot;
         return this;
     }
@@ -88,6 +88,8 @@ public class ParallelDataMigration {
                             config.isShardEnabled(), config.getShardMinRows(), config.getShardCount());
                     dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
                     dataMigration.setSnapshot(snapshot);
+                    dataMigration.setBulkLoadOptions(config.getBulkLoadOptions());
+                    dataMigration.setTableRouter(config.getTableRouter());
 
                     TableInfo table;
                     while ((table = queue.poll()) != null) {

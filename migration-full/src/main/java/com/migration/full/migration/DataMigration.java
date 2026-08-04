@@ -52,7 +52,12 @@ public class DataMigration {
     // 列处理（仅表级同步、mysql→mysql）：SELECT 行过滤 + INSERT 列名映射；附加列由建表 DEFAULT 承载
     private com.migration.config.ColumnProcessingConfig columnProcessing;
     // 全量一致性快照（P2-3）：未注入 = 旧行为（每页新建源连接、无快照语义）
-    private com.migration.full.snapshot.ConsistentSnapshot snapshot;
+    private com.migration.common.snapshot.ConsistentSnapshot snapshot;
+    // 表级路由（拆分按行分发）；未注入 = 不拆分
+    private com.migration.common.route.TableRouter router;
+    // 批量装载档位（BATCH / PG 二进制 COPY / Oracle direct-path）；未注入 = AUTO（即 BATCH）
+    private com.migration.common.bulk.BulkLoadOptions bulkLoadOptions =
+            com.migration.common.bulk.BulkLoadOptions.of(true, com.migration.common.bulk.BulkLoadOptions.Mode.AUTO, 0, 0);
 
     public DataMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection,
                         int batchSize, boolean continueOnError, ProgressManager progressManager) {
@@ -89,8 +94,78 @@ public class DataMigration {
     }
 
     /** 注入一致性快照（未注入 = 无快照，读取路径与旧行为一致）。 */
-    public void setSnapshot(com.migration.full.snapshot.ConsistentSnapshot snapshot) {
+    public void setSnapshot(com.migration.common.snapshot.ConsistentSnapshot snapshot) {
         this.snapshot = snapshot;
+    }
+
+    /** 注入批量装载档位（未注入 = AUTO，即驱动语句重写，与既有行为一致）。 */
+    public void setBulkLoadOptions(com.migration.common.bulk.BulkLoadOptions bulkLoadOptions) {
+        if (bulkLoadOptions != null) {
+            this.bulkLoadOptions = bulkLoadOptions;
+        }
+    }
+
+    /** 注入表级路由（拆分按行分发要用；未注入 = 不拆分，行为与既有一致）。 */
+    public void setTableRouter(com.migration.common.route.TableRouter router) {
+        this.router = router;
+    }
+
+    /** 分片键在行值数组里的下标（行值按 {@link #buildSourceQuotedColumnList} 的列序）。 */
+    private int shardKeyIndexOf(TableInfo table) {
+        List<ColumnInfo> columns = table.getColumns();
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).getColumnName().equalsIgnoreCase(table.getShardKeyColumn())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** 分片落点的目标端表引用（MySQL 带库名限定；PG 一条连接跨不了库，只用表名）。 */
+    private String shardTableRef(com.migration.common.route.RouteTarget target) {
+        String table = targetQuoteIdentifier(target.getTable());
+        if (targetIsPostgresql || target.getDatabase() == null || target.getDatabase().isEmpty()) {
+            return table;
+        }
+        return quoteIdentifier(target.getDatabase()) + "." + table;
+    }
+
+    /**
+     * 打开目标端装载通道。
+     *
+     * @param exclusiveWriter 本通道是否为该表唯一的写入者——单表 PK 分片并行时为 false，
+     *                        Oracle direct-path 会据此降级（表级排他锁下并发写同表只会互相阻塞）
+     */
+    private com.migration.common.bulk.JdbcBulkChannel openBulkChannel(
+            Connection targetConn, String insertSql, TableInfo table, String columnList,
+            String tableName, boolean exclusiveWriter) throws SQLException {
+        // 拆分：每行按分片键路由到对应分片的子通道；对上层仍是一条普通装载通道，
+        // 分页/断点/重连/进度那一整套循环不用改
+        if (table.isSplitRouted() && router != null) {
+            int shardKeyIndex = shardKeyIndexOf(table);
+            List<String> targetColumns = getColumnNames(table);
+            return new com.migration.common.bulk.ShardedJdbcBulkChannel(
+                    router, table.getSourceDatabase(), table.getTableName(), shardKeyIndex,
+                    target -> {
+                        String ref = shardTableRef(target);
+                        String sql = "INSERT INTO " + ref + " (" + String.join(", ", targetColumns)
+                                + ") VALUES (" + String.join(", ", createPlaceholders(targetColumns.size())) + ")";
+                        return com.migration.common.bulk.JdbcBulkChannels.open(
+                                targetConn, sql, ref, columnList, tableName,
+                                targetConnection.getConfig().getDbType(), bulkLoadOptions,
+                                batchSize, exclusiveWriter);
+                    });
+        }
+        com.migration.common.bulk.BulkLoadOptions options = bulkLoadOptions;
+        if (table.isUpsertLoad()) {
+            // 幂等装载（汇聚）：PG 二进制 COPY 与 Oracle direct-path 都没有 upsert 语义，
+            // 用它们装载重复行会直接冲突失败，必须退回驱动语句重写的 BATCH 档
+            options = options.withMode(com.migration.common.bulk.BulkLoadOptions.Mode.BATCH);
+        }
+        return com.migration.common.bulk.JdbcBulkChannels.open(
+                targetConn, insertSql,
+                targetQuoteIdentifier(table.getTargetTableName()), columnList, tableName,
+                targetConnection.getConfig().getDbType(), options, batchSize, exclusiveWriter);
     }
 
     /**
@@ -119,15 +194,59 @@ public class DataMigration {
         return snapshot != null ? snapshot.decorateTable(quotedTable) : quotedTable;
     }
 
-    /** 读一行并按源→目标库对做值转换，返回可直接绑定到 INSERT 的值数组。 */
+    /**
+     * 读一行并按源→目标库对做值转换，返回可直接绑定到 INSERT 的值数组。
+     * 汇聚时在末尾补上来源标识列的值（顺序与 {@link #getColumnNames} 一致）。
+     */
     private Object[] readRowValues(ResultSet rs, ResultSetMetaData metaData, int columnCount, TableInfo table)
             throws SQLException {
-        Object[] values = new Object[columnCount];
+        java.util.Collection<String> tagValues = table.getMergeTagValues().values();
+        Object[] values = new Object[columnCount + tagValues.size()];
         for (int i = 1; i <= columnCount; i++) {
             Object value = readColumnValue(rs, i, metaData, table);
             values[i - 1] = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
         }
+        int idx = columnCount;
+        for (String tag : tagValues) {
+            values[idx++] = tag;
+        }
         return values;
+    }
+
+    /**
+     * 目标端写入语句。汇聚（{@code upsertLoad}）走幂等 upsert——冲突目标是目标表主键
+     * （含并入主键的来源标识列）；多个源表写同一张目标表时，"没搬完就清表重搬"会清掉
+     * 其它源已搬完的数据，幂等重写是唯一安全的续传方式。
+     *
+     * <p>目标端不支持 upsert（非 MySQL/PG）或主键缺失时退回普通 INSERT 并告警，
+     * 不拼一条跑不通的语句。
+     */
+    private String buildWriteSql(TableInfo table, List<String> targetColumns) {
+        String plainInsert = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName())
+                + " (" + String.join(", ", targetColumns) + ") VALUES ("
+                + String.join(", ", createPlaceholders(targetColumns.size())) + ")";
+        if (!table.isUpsertLoad()) {
+            return plainInsert;
+        }
+        List<String> pkColumns = new ArrayList<>();
+        for (ColumnInfo column : table.getColumns()) {
+            if (column.isPrimaryKey()) {
+                pkColumns.add(column.getColumnName());
+            }
+        }
+        if (table.isMergeCompositePk()) {
+            pkColumns.addAll(table.getMergeTagValues().keySet());
+        }
+        String upsert = com.migration.common.route.UpsertSqlBuilder.build(
+                targetConnection.getConfig().getDbType(),
+                targetQuoteIdentifier(table.getTargetTableName()), targetColumns, pkColumns);
+        if (upsert == null) {
+            logger.warn("表 {} 需要幂等装载，但目标端 {} 或主键条件不满足（主键列: {}），退回普通 INSERT——"
+                            + "断点续传下重复行会因主键冲突被跳过", table.getTargetTableName(),
+                    targetConnection.getConfig().getDbType(), pkColumns);
+            return plainInsert;
+        }
+        return upsert;
     }
 
     /**
@@ -187,7 +306,7 @@ public class DataMigration {
             } catch (SQLException e) {
                 logger.error("表 {} 数据迁移失败", table.getTableName(), e);
                 if (progressManager != null && progressManager.isEnabled()) {
-                    progressManager.failMigration(table.getTableName(), e.getMessage());
+                    progressManager.failMigration(table.getProgressKey(), e.getMessage());
                 }
                 if (!continueOnError) {
                     throw e;
@@ -221,7 +340,7 @@ public class DataMigration {
         String primaryKeyColumn = getPrimaryKeyColumn(table);
 
         if (shardEnabled && shardCount > 1 && primaryKeyColumn != null && totalRows >= shardMinRows
-                && !hasUnresumableProgress(tableName)) {
+                && !hasUnresumableProgress(table.getProgressKey())) {
             long[] bounds = queryNumericPkBounds(tableName, primaryKeyColumn);
             if (bounds != null) {
                 return migrateTableDataSharded(table, columnList, totalRows, primaryKeyColumn, bounds[0], bounds[1]);
@@ -243,24 +362,43 @@ public class DataMigration {
             return;
         }
         String tableName = table.getTableName();
+        String progressKey = table.getProgressKey();
         try {
-            MigrationProgress existing = progressManager.getProgress(tableName);
+            MigrationProgress existing = progressManager.getProgress(progressKey);
             if (existing == null || "COMPLETED".equals(existing.getStatus())) {
                 return;
             }
-            logger.warn("表 {} 上次为未完成的全量迁移，续搬不安全（非幂等 INSERT）：清空目标表后从头重搬", tableName);
-            String truncateSql = "TRUNCATE TABLE " + targetQuoteIdentifier(table.getTargetTableName());
-            try {
-                targetConnection.execute(truncateSql);
-            } catch (SQLException e) {
-                // 个别库/权限不支持 TRUNCATE 时退回 DELETE
-                logger.warn("TRUNCATE 失败（{}），改用 DELETE 清空目标表 {}", e.getMessage(), table.getTargetTableName());
-                targetConnection.execute("DELETE FROM " + targetQuoteIdentifier(table.getTargetTableName()));
+            // 幂等装载（汇聚）：绝不能清目标表——同一张汇聚表里还有其它源已经搬完的数据。
+            // upsert 重写同值是安全的，只需丢掉旧进度让本表从头重搬。
+            if (table.isUpsertLoad()) {
+                logger.warn("表 {} 上次为未完成的全量迁移；幂等装载下从头重搬（不清目标表，"
+                        + "避免清掉同一汇聚表里其它来源的数据）", tableName);
+                progressManager.deleteProgress(progressKey);
+                return;
             }
-            progressManager.deleteProgress(tableName);
+            logger.warn("表 {} 上次为未完成的全量迁移，续搬不安全（非幂等 INSERT）：清空目标表后从头重搬", tableName);
+            // 拆分：一张源表散在 N 张分片表里，只清其中一张等于留下另外 N-1 张的半截数据
+            if (table.isSplitRouted()) {
+                for (com.migration.common.route.RouteTarget target : table.getRouteTargets()) {
+                    truncateTarget(shardTableRef(target));
+                }
+            } else {
+                truncateTarget(targetQuoteIdentifier(table.getTargetTableName()));
+            }
+            progressManager.deleteProgress(progressKey);
             logger.info("表 {} 目标已清空、进度已重置，将从头重新迁移", tableName);
         } catch (SQLException e) {
             logger.error("表 {} 分片续传纠偏失败（继续按原逻辑，可能残留不一致）: {}", tableName, e.getMessage());
+        }
+    }
+
+    /** 清空一张目标表；TRUNCATE 不可用（权限/引擎）时退回 DELETE。 */
+    private void truncateTarget(String quotedRef) throws SQLException {
+        try {
+            targetConnection.execute("TRUNCATE TABLE " + quotedRef);
+        } catch (SQLException e) {
+            logger.warn("TRUNCATE 失败（{}），改用 DELETE 清空目标表 {}", e.getMessage(), quotedRef);
+            targetConnection.execute("DELETE FROM " + quotedRef);
         }
     }
 
@@ -313,6 +451,8 @@ public class DataMigration {
     private int[] migrateTableDataSharded(TableInfo table, String columnList, long totalRows,
                                           String primaryKeyColumn, long minId, long maxId) throws SQLException {
         String tableName = table.getTableName();
+        // 进度 key：汇聚下带源库名，避免多个源库的同名分表共用一条进度记录
+        final String progressKey = table.getProgressKey();
         long span = maxId - minId + 1;
         int shards = (int) Math.max(1, Math.min(shardCount, span));
         long width = (span + shards - 1) / shards;
@@ -322,7 +462,7 @@ public class DataMigration {
 
         if (progressManager != null && progressManager.isEnabled()) {
             try {
-                progressManager.startMigration(tableName, totalRows);
+                progressManager.startMigration(progressKey, totalRows);
             } catch (SQLException e) {
                 logger.error("获取迁移进度失败", e);
             }
@@ -356,7 +496,7 @@ public class DataMigration {
                 }
                 if (progressManager != null && progressManager.isEnabled()) {
                     try {
-                        progressManager.updateProgress(tableName, aggregateRows.get(), SHARDED_LAST_ID_SENTINEL);
+                        progressManager.updateProgress(progressKey, aggregateRows.get(), SHARDED_LAST_ID_SENTINEL);
                     } catch (SQLException e) {
                         logger.error("更新进度失败", e);
                     }
@@ -407,7 +547,7 @@ public class DataMigration {
         SQLException error = firstError.get();
         if (error != null) {
             if (progressManager != null && progressManager.isEnabled()) {
-                try { progressManager.failMigration(tableName, error.getMessage()); } catch (SQLException ignore) { }
+                try { progressManager.failMigration(progressKey, error.getMessage()); } catch (SQLException ignore) { }
             }
             throw error;
         }
@@ -415,8 +555,8 @@ public class DataMigration {
         logger.info("表 {} 分片并行迁移完成，成功: {}, 失败: {}", tableName, successCount.get(), failCount.get());
         if (progressManager != null && progressManager.isEnabled()) {
             try {
-                progressManager.updateProgress(tableName, aggregateRows.get(), SHARDED_LAST_ID_SENTINEL);
-                progressManager.completeMigration(tableName);
+                progressManager.updateProgress(progressKey, aggregateRows.get(), SHARDED_LAST_ID_SENTINEL);
+                progressManager.completeMigration(progressKey);
             } catch (SQLException e) { logger.error("标记迁移完成失败", e); }
         }
         return new int[]{successCount.get(), failCount.get()};
@@ -431,11 +571,12 @@ public class DataMigration {
         long failCount = 0;
         String sourceQuoteColumnList = buildSourceQuotedColumnList(table);
         // 表名映射：目标端 INSERT 用目标表名；源端 SELECT 与进度 key 仍用源表名
-        String insertSql = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName()) + " (" + columnList + ") VALUES (" +
-                String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
+        String insertSql = buildWriteSql(table, getColumnNames(table));
 
         Connection targetConn = acquireTargetConnection(shardTgt);
-        BatchWriter writer = new BatchWriter(targetConn, insertSql, tableName, batchSize);
+        // 分片路径：同一张表有多个 worker 并发写，故 exclusiveWriter=false
+        com.migration.common.bulk.JdbcBulkChannel writer =
+                openBulkChannel(targetConn, insertSql, table, columnList, tableName, false);
         final int pageSize = 1000;
         long currentLastId = lowerExclusive;
 
@@ -522,6 +663,8 @@ public class DataMigration {
 
     private int[] migrateDataBatch(TableInfo table, String columnList, long totalRows, String primaryKeyColumn) throws SQLException {
         String tableName = table.getTableName();
+        // 进度 key：汇聚下带源库名，避免多个源库的同名分表共用一条进度记录
+        final String progressKey = table.getProgressKey();
         long successCount = 0;
         long failCount = 0;
 
@@ -531,7 +674,7 @@ public class DataMigration {
         
         if (progressManager != null && progressManager.isEnabled()) {
             try {
-                progress = progressManager.startMigration(tableName, totalRows);
+                progress = progressManager.startMigration(progressKey, totalRows);
                 if (progress != null && progress.getLastMigratedId() != 0) {
                     lastMigratedId = progress.getLastMigratedId();
                     startOffset = progress.getMigratedRows();
@@ -544,11 +687,12 @@ public class DataMigration {
         
         String sourceQuoteColumnList = buildSourceQuotedColumnList(table);
         // 表名映射：目标端 INSERT 用目标表名；源端 SELECT 与进度 key 仍用源表名
-        String insertSql = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName()) + " (" + columnList + ") VALUES (" +
-                          String.join(", ", createPlaceholders(table.getColumns().size())) + ")";
+        String insertSql = buildWriteSql(table, getColumnNames(table));
 
         Connection targetConn = acquireTargetConnection(targetConnection);
-        BatchWriter writer = new BatchWriter(targetConn, insertSql, tableName, batchSize);
+        // 串行路径：本通道是该表唯一写入者，Oracle direct-path 可用
+        com.migration.common.bulk.JdbcBulkChannel writer =
+                openBulkChannel(targetConn, insertSql, table, columnList, tableName, true);
 
         // 分页大小：有主键时启用分页查询，避免大结果集（尤其含 LOB）占用源端 PGA 导致 ORA-04036
         final int pageSize = 1000;
@@ -619,7 +763,7 @@ public class DataMigration {
                                 successCount += r[0];
                                 failCount += r[1];
                                 if (progressManager != null && progressManager.isEnabled()) {
-                                    progressManager.updateProgress(tableName, processedRows, currentLastId);
+                                    progressManager.updateProgress(progressKey, processedRows, currentLastId);
                                 }
                             }
                             processedRows++;
@@ -628,7 +772,7 @@ public class DataMigration {
                             failCount++;
                             logger.error("读取/写入数据失败，表: {}, 行: {}", tableName, processedRows, e);
                             if (progressManager != null && progressManager.isEnabled()) {
-                                try { progressManager.updateProgress(tableName, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
+                                try { progressManager.updateProgress(progressKey, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
                             }
                             if (!continueOnError) { throw e; }
                             try {
@@ -645,7 +789,7 @@ public class DataMigration {
                         failCount += r[1];
                     }
                     if (progressManager != null && progressManager.isEnabled()) {
-                        try { progressManager.updateProgress(tableName, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
+                        try { progressManager.updateProgress(progressKey, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
                     }
                     rs.close();
                     selectStmt.close();
@@ -683,7 +827,7 @@ public class DataMigration {
                             successCount += r[0];
                             failCount += r[1];
                             if (progressManager != null && progressManager.isEnabled()) {
-                                progressManager.updateProgress(tableName, processedRows, currentLastId);
+                                progressManager.updateProgress(progressKey, processedRows, currentLastId);
                             }
                         }
                         processedRows++;
@@ -714,7 +858,7 @@ public class DataMigration {
 
             logger.info("表 {} 数据迁移完成，成功: {}, 失败: {}", tableName, successCount, failCount);
             if (progressManager != null && progressManager.isEnabled()) {
-                try { progressManager.completeMigration(tableName); } catch (SQLException e) { logger.error("标记迁移完成失败", e); }
+                try { progressManager.completeMigration(progressKey); } catch (SQLException e) { logger.error("标记迁移完成失败", e); }
             }
         } finally {
             writer.close();
@@ -861,6 +1005,10 @@ public class DataMigration {
             }
             columns.add(quoteIdentifier(colName));
         }
+        // 汇聚来源标识列排在末尾：与 readRowValues 的补值顺序严格对应
+        for (String tagColumn : table.getMergeTagValues().keySet()) {
+            columns.add(quoteIdentifier(tagColumn));
+        }
         return columns;
     }
 
@@ -891,7 +1039,7 @@ public class DataMigration {
         return placeholders;
     }
 
-    // countSuccess / countFailures / isDuplicateKeyError → 已随批量装载通道收敛到 BatchWriter：
+    // countSuccess / countFailures / isDuplicateKeyError → 已随批量装载通道收敛到 JdbcBatchChannel：
     // 批结果码的判定（SUCCESS_NO_INFO 必须算成功）与冲突跳过必须和装载方式绑在一起，分开写必错。
 
     private String quoteIdentifier(String identifier) {

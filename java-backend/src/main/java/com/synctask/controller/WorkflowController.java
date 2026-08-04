@@ -49,7 +49,8 @@ public class WorkflowController {
                     request.getTargetType(),
                     userPrincipal.getId(),
                     taskType,
-                    request.getDrMode()
+                    request.getDrMode(),
+                    request.getConsistencyMode()
             );
             // 审计日志
             auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.CREATE_TASK,
@@ -89,7 +90,12 @@ public class WorkflowController {
                     request.getFanoutEnabled(),
                     request.getTargetConnections(),
                     request.getSyncAccount(),
-                    request.getSyncAccountSuperPrivilege()
+                    request.getSyncAccountSuperPrivilege(),
+                    request.getConsistencyMode(),
+                    new WorkflowService.FullLoadOptions(
+                            request.getBulkLoadEnabled(),
+                            request.getBulkLoadMode(),
+                            request.getSnapshotMode())
             );
             auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.UPDATE_CONFIG,
                     id, AuditLogService.buildDetails(workflow.getName(),
@@ -375,6 +381,45 @@ public class WorkflowController {
         }
     }
 
+    /**
+     * 聚合路由配置（分库分表汇聚/拆分）。只在任务未启动时可改——路由决定数据写到哪张表。
+     * body 为路由配置 JSON；传空对象/空串即清除路由，回到 1:1 同步。
+     */
+    @PutMapping("/{id}/route-config")
+    public ResponseEntity<?> updateRouteConfig(
+            @PathVariable String id,
+            @RequestBody(required = false) Map<String, Object> body,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            Object routeConfig = body == null ? null : body.get("routeConfig");
+            String json = routeConfig == null ? null
+                    : (routeConfig instanceof String ? (String) routeConfig
+                            : new com.google.gson.Gson().toJson(routeConfig));
+            Workflow workflow = workflowService.updateRouteConfig(id, userPrincipal.getId(), json);
+            Map<String, Object> data = new HashMap<>();
+            data.put("id", workflow.getId());
+            data.put("routeConfig", workflow.getRouteConfig());
+            return ResponseEntity.ok(new ApiResponse(true, "路由配置已保存", data));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /** 取任务的聚合路由配置（向导回填用）。 */
+    @GetMapping("/{id}/route-config")
+    public ResponseEntity<?> getRouteConfig(@PathVariable String id, Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            Workflow workflow = workflowService.getWorkflowById(id, userPrincipal.getId());
+            Map<String, Object> data = new HashMap<>();
+            data.put("routeConfig", workflow.getRouteConfig());
+            return ResponseEntity.ok(new ApiResponse(true, "ok", data));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     /** 一对多分发状态（代理 agent）。 */
     @GetMapping("/{id}/fanout")
     public ResponseEntity<?> getFanoutStatus(
@@ -507,6 +552,10 @@ public class WorkflowController {
         map.put("deadletter_count", workflow.getDeadletterCount());
         map.put("disk_usage_bytes", workflow.getDiskUsageBytes());
         map.put("task_type", workflow.getTaskType());
+        map.put("consistency_mode", workflow.getConsistencyMode());
+        map.put("bulk_load_enabled", workflow.getBulkLoadEnabled());
+        map.put("bulk_load_mode", workflow.getBulkLoadMode());
+        map.put("snapshot_mode", workflow.getSnapshotMode());
         map.put("dr_status", workflow.getDrStatus());
         map.put("dr_mode", workflow.getDrMode());
         map.put("dr_peer_workflow_id", workflow.getDrPeerWorkflowId());
@@ -524,6 +573,8 @@ public class WorkflowController {
         private String targetType;
         private String taskType;
         private String drMode;
+        /** 一致性语义（TRANSACTIONAL/EVENTUAL）；不传则按任务类型取默认（订阅/灾备事务一致，同步最终一致）。 */
+        private String consistencyMode;
 
         public String getName() { return name; }
         public void setName(String name) { this.name = name; }
@@ -535,6 +586,8 @@ public class WorkflowController {
         public void setTaskType(String taskType) { this.taskType = taskType; }
         public String getDrMode() { return drMode; }
         public void setDrMode(String drMode) { this.drMode = drMode; }
+        public String getConsistencyMode() { return consistencyMode; }
+        public void setConsistencyMode(String consistencyMode) { this.consistencyMode = consistencyMode; }
     }
 
     public static class UpdateConfigRequest {
@@ -554,7 +607,23 @@ public class WorkflowController {
         private String targetConnections;
         private Boolean syncAccount;
         private Boolean syncAccountSuperPrivilege;
+        /** 只读回传：与已保存值不同即报错（一致性模式创建后不可修改），不传则不校验。 */
+        private String consistencyMode;
+        /** 全量批量装载开关；不传 = 不改动。 */
+        private Boolean bulkLoadEnabled;
+        /** 批量装载档位 AUTO/BATCH/COPY/DIRECT_PATH；不传 = 不改动。 */
+        private String bulkLoadMode;
+        /** 全量快照档位 NONE/GTID_ONLY/CONSISTENT；不传 = 不改动。任务启动后整个接口都不可用。 */
+        private String snapshotMode;
 
+        public String getConsistencyMode() { return consistencyMode; }
+        public void setConsistencyMode(String consistencyMode) { this.consistencyMode = consistencyMode; }
+        public Boolean getBulkLoadEnabled() { return bulkLoadEnabled; }
+        public void setBulkLoadEnabled(Boolean bulkLoadEnabled) { this.bulkLoadEnabled = bulkLoadEnabled; }
+        public String getBulkLoadMode() { return bulkLoadMode; }
+        public void setBulkLoadMode(String bulkLoadMode) { this.bulkLoadMode = bulkLoadMode; }
+        public String getSnapshotMode() { return snapshotMode; }
+        public void setSnapshotMode(String snapshotMode) { this.snapshotMode = snapshotMode; }
         public String getSourceConnection() { return sourceConnection; }
         public void setSourceConnection(String sourceConnection) { this.sourceConnection = sourceConnection; }
         public String getTargetConnection() { return targetConnection; }

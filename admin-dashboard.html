@@ -901,6 +901,20 @@
                         </div>
                     </div>
                 </div>
+                <div class="db-type-section">
+                    <div class="db-type-section-title">一致性语义<span class="help-tip">?<span class="help-tip-content"><b>事务一致性</b>：增量数据按<b>源库事务提交的先后顺序</b>逐个提交到目标库，每个源事务在目标端仍是一个完整事务，内容与源库一致（不拆开、不合并）。目标库任何时刻都读不到"半个事务"（例如转账已扣款、未入账）。代价是增量只能串行应用，吞吐低于最终一致性。<br><br><b>最终一致性</b>：只保证目标库<b>最终</b>与源库数据一致。源库事务允许被打散、合并，增量按「表 + 主键」冲突矩阵并发写入——不同表、同表不同主键的变更并发执行，同表同主键的 INSERT/UPDATE/DELETE 严格保序。吞吐远高于事务一致性，但追平之前的中间时刻可能读到某个源事务的一部分。<br><br>线程数与单次提交 SQL 条数可在任务配置文件中调整。<b>该选择在创建任务时确定，创建后不可修改。</b></span></span></div>
+                    <div class="consistency-cards" id="syncConsistencyCards" data-mode="EVENTUAL">
+                        <div class="consistency-card" id="syncConsistencyTRANSACTIONAL" onclick="selectConsistencyMode('sync', 'TRANSACTIONAL')">
+                            <div class="consistency-card-name">事务一致性</div>
+                            <div class="consistency-card-desc">按源库事务提交顺序逐个提交，事务内容与源库一致；增量串行应用，吞吐较低。</div>
+                        </div>
+                        <div class="consistency-card selected" id="syncConsistencyEVENTUAL" onclick="selectConsistencyMode('sync', 'EVENTUAL')">
+                            <div class="consistency-card-name">最终一致性</div>
+                            <div class="consistency-card-desc">按「表 + 主键」冲突矩阵并发写入，吞吐最高；源事务可被打散合并，目标库最终一致。</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 8px; font-size: 12px; color: #999;">同步任务默认最终一致性（吞吐优先）。创建后不可修改，请谨慎选择</div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn-cancel" id="cancelBtn">取消</button>
@@ -985,6 +999,36 @@
                             </label>
                         </div>
                     </div>
+                    <div class="form-group">
+                        <label class="form-label">全量装载通道</label>
+                        <div style="display: flex; gap: 12px; align-items: center; margin-top: 8px; flex-wrap: wrap;">
+                            <select class="form-input" id="cfgBulkLoadMode" style="max-width: 260px;">
+                                <option value="AUTO">自动（推荐）</option>
+                                <option value="BATCH">批量语句重写</option>
+                                <option value="COPY">二进制 COPY（PostgreSQL 目标）</option>
+                                <option value="DIRECT_PATH">直接路径装载（Oracle 目标）</option>
+                            </select>
+                            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px;">
+                                <input type="checkbox" id="cfgBulkLoadEnabled" checked>
+                                <span>启用批量装载</span>
+                            </label>
+                        </div>
+                        <div id="cfgBulkLoadHint" style="font-size: 11px; color: #999; margin-top: 6px;">
+                            自动：各目标端选零协议风险的通道（关系库走驱动语句重写，Mongo/ES/Redis 走原生批量接口）。
+                            COPY / 直接路径与目标端不匹配时会自动降级，不会让任务失败；关闭批量装载会退回逐条写入，仅排障用。
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">全量一致性快照</label>
+                        <div style="margin-top: 8px;">
+                            <select class="form-input" id="cfgSnapshotMode" style="max-width: 260px;">
+                                <option value="GTID_ONLY">仅记录位点（不加锁）</option>
+                                <option value="CONSISTENT">一致性快照</option>
+                                <option value="NONE">不启用</option>
+                            </select>
+                        </div>
+                        <div id="cfgSnapshotHint" style="font-size: 11px; color: #999; margin-top: 6px;"></div>
+                    </div>
                 </div>
 
                 <div class="step-content" id="cfgStep2Content">
@@ -1034,6 +1078,7 @@
                             <div class="colproc-tab active" id="cfgColTabFilterBtn" onclick="cfgSwitchColTab('filter')">列名过滤</div>
                             <div class="colproc-tab" id="cfgColTabMappingBtn" onclick="cfgSwitchColTab('mapping')">列名映射</div>
                             <div class="colproc-tab" id="cfgColTabExtraBtn" onclick="cfgSwitchColTab('extra')">新增附加列</div>
+                            <div class="colproc-tab" id="cfgColTabRouteBtn" onclick="cfgSwitchColTab('route')">分库分表路由</div>
                         </div>
 
                         <!-- 列名过滤 -->
@@ -1087,6 +1132,87 @@
                                 <button type="button" class="btn-test" onclick="cfgAddExtraColumn()">添加</button>
                             </div>
                             <div id="cfgExtraList" style="font-size: 13px;"></div>
+                        </div>
+
+                        <!-- 分库分表路由（汇聚 N:1 / 拆分 1:N）；不启用 = 与原有 1:1 同步完全一致 -->
+                        <div class="colproc-pane" id="cfgColPaneRoute">
+                            <div style="font-size: 12px; color: #999; margin-bottom: 10px;">
+                                把多个分库分表<b>汇聚</b>到一张目标表，或把一张源表按分片键<b>拆分</b>到多个目标库表。
+                                不启用则与原有 1:1 同步完全一致。
+                            </div>
+                            <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 12px;">
+                                <span style="font-size: 13px;">路由模式</span>
+                                <select class="form-input" id="cfgRouteMode" style="width: 200px; height: 34px;" onchange="cfgOnRouteModeChange()">
+                                    <option value="NONE">不启用（1:1 同步）</option>
+                                    <option value="MERGE">汇聚（多表 → 一张表）</option>
+                                    <option value="SPLIT">拆分（一张表 → 多表）</option>
+                                </select>
+                                <button type="button" class="btn-test" onclick="cfgSaveRouteConfig()">保存路由配置</button>
+                            </div>
+
+                            <div id="cfgRouteMergeBody" style="display: none;">
+                                <div style="font-size: 12px; color: #fa8c16; margin-bottom: 8px;">
+                                    汇聚会给目标表加来源标识列（_src_node/_src_db/_src_table）并并入主键——
+                                    否则不同分表里主键相同的行会互相覆盖。源表必须有主键。
+                                </div>
+                                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+                                    <input type="text" class="form-input" id="cfgMergeMatch" placeholder="匹配式，如 shard_db_*.order_*" style="width: 240px; height: 34px;">
+                                    <input type="text" class="form-input" id="cfgMergeTarget" placeholder="目标表，如 dw.order_all" style="width: 200px; height: 34px;">
+                                    <select class="form-input" id="cfgMergePk" style="width: 190px; height: 34px;">
+                                        <option value="COMPOSITE_SOURCE">主键+来源列（推荐）</option>
+                                        <option value="KEEP">沿用源主键（需全局唯一）</option>
+                                    </select>
+                                    <select class="form-input" id="cfgMergeDdl" style="width: 150px; height: 34px;">
+                                        <option value="FIRST_WINS">DDL 首个生效</option>
+                                        <option value="SKIP">DDL 不同步</option>
+                                        <option value="MANUAL">DDL 人工处理</option>
+                                    </select>
+                                    <button type="button" class="btn-test" onclick="cfgAddMergeRule()">添加规则</button>
+                                </div>
+                                <div id="cfgMergeRuleList" style="font-size: 13px; margin-bottom: 16px;"></div>
+
+                                <div style="font-size: 13px; margin-bottom: 6px;"><b>跨实例来源</b>（可选）</div>
+                                <div style="font-size: 12px; color: #999; margin-bottom: 8px;">
+                                    分库分布在多个实例上时在此添加；每个实例会派生一条独立采集通道，
+                                    实例标识写进 _src_node 列用于区分同名库表。
+                                </div>
+                                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+                                    <input type="text" class="form-input" id="cfgLegNodeId" placeholder="实例标识，如 inst-b" style="width: 150px; height: 34px;">
+                                    <input type="text" class="form-input" id="cfgLegHost" placeholder="host" style="width: 150px; height: 34px;">
+                                    <input type="text" class="form-input" id="cfgLegPort" placeholder="port" style="width: 90px; height: 34px;">
+                                    <input type="text" class="form-input" id="cfgLegUser" placeholder="用户名" style="width: 120px; height: 34px;">
+                                    <input type="password" class="form-input" id="cfgLegPassword" placeholder="密码" style="width: 130px; height: 34px;">
+                                    <button type="button" class="btn-test" onclick="cfgAddRouteLeg()">添加实例</button>
+                                </div>
+                                <div id="cfgRouteLegList" style="font-size: 13px;"></div>
+                            </div>
+
+                            <div id="cfgRouteSplitBody" style="display: none;">
+                                <div style="font-size: 12px; color: #fa8c16; margin-bottom: 8px;">
+                                    目标分片表由系统按模板预建（并剥掉 AUTO_INCREMENT，各分片自增会撞主键）。
+                                    分片数在任务启动后不可改——改了要重新分布数据。
+                                </div>
+                                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+                                    <input type="text" class="form-input" id="cfgSplitMatch" placeholder="源表，如 app.orders" style="width: 180px; height: 34px;">
+                                    <input type="text" class="form-input" id="cfgSplitShardKey" placeholder="分片键列" style="width: 120px; height: 34px;">
+                                    <select class="form-input" id="cfgSplitAlgo" style="width: 130px; height: 34px;">
+                                        <option value="HASH_MOD">哈希取模</option>
+                                        <option value="RANGE">数值区间</option>
+                                        <option value="LIST">枚举映射</option>
+                                    </select>
+                                    <input type="text" class="form-input" id="cfgSplitCount" placeholder="分片数" style="width: 80px; height: 34px;">
+                                    <input type="text" class="form-input" id="cfgSplitTargetDb" placeholder="目标库模板，如 dw_${shard/4}" style="width: 190px; height: 34px;">
+                                    <input type="text" class="form-input" id="cfgSplitTargetTable" placeholder="目标表模板，如 orders_${shard}" style="width: 190px; height: 34px;">
+                                    <select class="form-input" id="cfgSplitUnrouted" style="width: 175px; height: 34px;">
+                                        <option value="BROADCAST">算不出分片：广播到全部</option>
+                                        <option value="DEADLETTER">算不出分片：投递死信</option>
+                                        <option value="ERROR">算不出分片：停任务</option>
+                                    </select>
+                                    <input type="text" class="form-input" id="cfgSplitExtra" placeholder="区间/枚举表（RANGE/LIST 用）" style="width: 210px; height: 34px;">
+                                    <button type="button" class="btn-test" onclick="cfgAddSplitRule()">添加规则</button>
+                                </div>
+                                <div id="cfgSplitRuleList" style="font-size: 13px;"></div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1348,6 +1474,20 @@
                     </div>
                     <div style="margin-top: 8px; font-size: 12px; color: #999;">创建任务后源库类型将不可修改，请谨慎选择</div>
                 </div>
+                <div class="db-type-section">
+                    <div class="db-type-section-title">一致性语义<span class="help-tip">?<span class="help-tip-content"><b>事务一致性</b>：增量数据按<b>源库事务提交的先后顺序</b>逐个提交到目标库，每个源事务在目标端仍是一个完整事务，内容与源库一致（不拆开、不合并）。目标库任何时刻都读不到"半个事务"（例如转账已扣款、未入账）。代价是增量只能串行应用，吞吐低于最终一致性。<br><br><b>最终一致性</b>：只保证目标库<b>最终</b>与源库数据一致。源库事务允许被打散、合并，增量按「表 + 主键」冲突矩阵并发写入——不同表、同表不同主键的变更并发执行，同表同主键的 INSERT/UPDATE/DELETE 严格保序。吞吐远高于事务一致性，但追平之前的中间时刻可能读到某个源事务的一部分。<br><br>线程数与单次提交 SQL 条数可在任务配置文件中调整。<b>该选择在创建任务时确定，创建后不可修改。</b></span></span></div>
+                    <div class="consistency-cards" id="subConsistencyCards" data-mode="TRANSACTIONAL">
+                        <div class="consistency-card selected" id="subConsistencyTRANSACTIONAL" onclick="selectConsistencyMode('sub', 'TRANSACTIONAL')">
+                            <div class="consistency-card-name">事务一致性</div>
+                            <div class="consistency-card-desc">按源库事务提交顺序逐个提交，事务内容与源库一致；增量串行应用，吞吐较低。</div>
+                        </div>
+                        <div class="consistency-card" id="subConsistencyEVENTUAL" onclick="selectConsistencyMode('sub', 'EVENTUAL')">
+                            <div class="consistency-card-name">最终一致性</div>
+                            <div class="consistency-card-desc">按「表 + 主键」冲突矩阵并发写入，吞吐最高；源事务可被打散合并，目标库最终一致。</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 8px; font-size: 12px; color: #999;">订阅任务默认事务一致性：下游可按源事务边界重组消息。创建后不可修改</div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn-cancel" id="cancelSubscribeEntryBtn">取消</button>
@@ -1460,6 +1600,20 @@
                     </div>
                     <div style="margin-top: 8px; font-size: 12px; color: #999;">双向灾备支持 MySQL 与 PostgreSQL（同构）；两库均可读写，无需主备倒换</div>
                 </div>
+                <div class="db-type-section">
+                    <div class="db-type-section-title">一致性语义<span class="help-tip">?<span class="help-tip-content"><b>事务一致性</b>：增量数据按<b>源库事务提交的先后顺序</b>逐个提交到目标库，每个源事务在目标端仍是一个完整事务，内容与源库一致（不拆开、不合并）。目标库任何时刻都读不到"半个事务"（例如转账已扣款、未入账）。代价是增量只能串行应用，吞吐低于最终一致性。<br><br><b>最终一致性</b>：只保证目标库<b>最终</b>与源库数据一致。源库事务允许被打散、合并，增量按「表 + 主键」冲突矩阵并发写入——不同表、同表不同主键的变更并发执行，同表同主键的 INSERT/UPDATE/DELETE 严格保序。吞吐远高于事务一致性，但追平之前的中间时刻可能读到某个源事务的一部分。<br><br>线程数与单次提交 SQL 条数可在任务配置文件中调整。<b>该选择在创建任务时确定，创建后不可修改。</b></span></span></div>
+                    <div class="consistency-cards" id="drConsistencyCards" data-mode="TRANSACTIONAL">
+                        <div class="consistency-card selected" id="drConsistencyTRANSACTIONAL" onclick="selectConsistencyMode('dr', 'TRANSACTIONAL')">
+                            <div class="consistency-card-name">事务一致性</div>
+                            <div class="consistency-card-desc">按源库事务提交顺序逐个提交，事务内容与源库一致；增量串行应用，吞吐较低。</div>
+                        </div>
+                        <div class="consistency-card" id="drConsistencyEVENTUAL" onclick="selectConsistencyMode('dr', 'EVENTUAL')">
+                            <div class="consistency-card-name">最终一致性</div>
+                            <div class="consistency-card-desc">按「表 + 主键」冲突矩阵并发写入，吞吐最高；源事务可被打散合并，目标库最终一致。</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 8px; font-size: 12px; color: #999;">灾备任务默认事务一致性：倒换后备库不会读到半个事务。创建后不可修改</div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn-cancel" id="cancelCreateDrBtn">取消</button>
@@ -1530,6 +1684,29 @@
                         <button class="btn btn-default" id="drTestTargetBtn" style="font-size: 12px;">测试连接</button>
                         <span id="drTargetTestResult" style="margin-left: 8px; font-size: 12px;"></span>
                     </div>
+                </div>
+                <div style="margin-top: 16px;">
+                    <div style="font-size: 13px; font-weight: 500; margin-bottom: 8px;">全量装载与快照</div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 4px; font-size: 12px; color: #666;">批量装载通道</label>
+                            <select id="drBulkLoadMode" style="width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; box-sizing: border-box;">
+                                <option value="AUTO">自动（推荐）</option>
+                                <option value="BATCH">批量语句重写</option>
+                                <option value="COPY">二进制 COPY（PostgreSQL 备库）</option>
+                                <option value="DIRECT_PATH">直接路径装载（Oracle 备库）</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display: block; margin-bottom: 4px; font-size: 12px; color: #666;">全量一致性快照</label>
+                            <select id="drSnapshotMode" style="width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; box-sizing: border-box;">
+                                <option value="GTID_ONLY">仅记录位点（不加锁）</option>
+                                <option value="CONSISTENT">一致性快照</option>
+                                <option value="NONE">不启用</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="drSnapshotHint" style="font-size: 11px; color: #999; margin-top: 6px;"></div>
                 </div>
             </div>
             <div class="modal-footer">
