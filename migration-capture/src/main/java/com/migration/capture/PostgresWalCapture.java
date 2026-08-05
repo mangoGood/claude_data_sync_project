@@ -49,6 +49,10 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
     private volatile long currentLsnNumeric;
     /** 本次启动是否从已落盘 LSN 续传（false 表示首次启动，用 checkpoint 的起始 LSN）。 */
     private boolean resumedFromPersisted;
+    /** 复制槽保留状态的在线巡检：槽被删/被判 lost 时重连不会报错，只会静默丢数据，必须主动看。 */
+    private boolean retentionCheckEnabled = true;
+    private long retentionCheckIntervalMs = 60000;
+    private volatile long lastRetentionCheckMs = 0;
 
     // 背压控制：extract 通过信号文件通知 capture 暂停/恢复
     private volatile boolean backpressurePaused = false;
@@ -76,6 +80,10 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         startLsn = com.migration.common.position.CapturePositionStore.prefer(
                 persisted, "wal.lsn", props.getProperty("capture.wal.lsn", ""), "WAL LSN");
         taskId = props.getProperty("task.id", "unknown");
+        retentionCheckEnabled = Boolean.parseBoolean(
+                props.getProperty("capture.position.health.enabled", "true"));
+        retentionCheckIntervalMs = Long.parseLong(
+                props.getProperty("capture.position.health.interval.ms", "60000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         slotName = props.getProperty("capture.wal.slot.name", "migration_slot_" + taskId.replaceAll("[^a-z0-9_]", "_"));
         publicationName = props.getProperty("capture.wal.publication.name", "migration_pub_" + taskId.replaceAll("[^a-z0-9_]", "_"));
@@ -643,6 +651,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 logger.info("Captured {} WAL events, current LSN: {}", count, currentLsn);
                 savePosition();
             }
+            checkRetentionQuietly();
         } catch (Exception e) {
             logger.error("Error processing WAL message: {}", e.getMessage(), e);
         }
@@ -1165,6 +1174,82 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         logger.info("Rotated to new capture output file after {} events", maxEventsPerFile);
     }
 
+    /**
+     * 复制槽保留状态的在线巡检。
+     *
+     * <p>PG 这条链路的失效方式比 MySQL 更隐蔽：槽被人删掉、或 {@code max_slot_wal_keep_size}
+     * 把槽判成 {@code lost} 之后，重新 START_REPLICATION <b>不会报错</b>，而是从槽当前位置开始发，
+     * 中间那段变更静默消失。所以运行中就要盯住 {@code wal_status}，别等重启。
+     *
+     * <p>{@code wal_status} 是 PG13+ 才有的列；更老的版本查不到，如实记 UNKNOWN 而不是猜一个状态。
+     */
+    private void checkRetentionQuietly() {
+        if (!retentionCheckEnabled) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastRetentionCheckMs < retentionCheckIntervalMs) {
+            return;
+        }
+        lastRetentionCheckMs = now;
+
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        try (Connection conn = DriverManager.getConnection(url, user, password);
+             Statement stmt = conn.createStatement()) {
+            String walStatus = null;
+            long lagBytes = -1;
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT wal_status, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint AS lag "
+                            + "FROM pg_replication_slots WHERE slot_name = '" + slotName + "'")) {
+                if (!rs.next()) {
+                    com.migration.common.position.RetentionStatus.write(outputDir,
+                            com.migration.common.position.RetentionStatus.State.LOST, 0,
+                            "复制槽 " + slotName + " 已不存在");
+                    logger.error("位点保留期告警：复制槽 {} 已不存在，重连将从新位置开始、中间变更会静默丢失",
+                            slotName);
+                    return;
+                }
+                walStatus = rs.getString("wal_status");
+                lagBytes = rs.getLong("lag");
+            } catch (SQLException noWalStatus) {
+                // PG12 及更早没有 wal_status 列：退一步只取落后字节数
+                try (ResultSet rs = stmt.executeQuery(
+                        "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint AS lag "
+                                + "FROM pg_replication_slots WHERE slot_name = '" + slotName + "'")) {
+                    if (rs.next()) {
+                        lagBytes = rs.getLong("lag");
+                    }
+                }
+            }
+
+            if ("lost".equalsIgnoreCase(walStatus)) {
+                com.migration.common.position.RetentionStatus.write(outputDir,
+                        com.migration.common.position.RetentionStatus.State.LOST, 0,
+                        "复制槽 " + slotName + " wal_status=lost，所需 WAL 已被回收");
+                logger.error("位点保留期告警：复制槽 {} 已被判为 lost，位点不可用，需重做全量", slotName);
+            } else if ("unreserved".equalsIgnoreCase(walStatus)) {
+                com.migration.common.position.RetentionStatus.write(outputDir,
+                        com.migration.common.position.RetentionStatus.State.WARN, lagBytes,
+                        "复制槽 " + slotName + " wal_status=unreserved，已超出保留配额，随时可能变成 lost");
+                logger.warn("位点保留期告警：复制槽 {} wal_status=unreserved（落后 {} 字节），"
+                        + "请尽快让消费追平或调大 max_slot_wal_keep_size", slotName, lagBytes);
+            } else if (walStatus == null) {
+                com.migration.common.position.RetentionStatus.write(outputDir,
+                        com.migration.common.position.RetentionStatus.State.UNKNOWN, lagBytes,
+                        "当前 PG 版本无 wal_status 列，仅记录落后字节数");
+            } else {
+                com.migration.common.position.RetentionStatus.write(outputDir,
+                        com.migration.common.position.RetentionStatus.State.OK, lagBytes,
+                        "复制槽 " + slotName + " wal_status=" + walStatus + "，落后 " + lagBytes + " 字节");
+            }
+        } catch (Exception e) {
+            com.migration.common.position.RetentionStatus.write(outputDir,
+                    com.migration.common.position.RetentionStatus.State.UNKNOWN, -1,
+                    "巡检查询失败: " + e.getMessage());
+            logger.debug("复制槽保留状态巡检跳过: {}", e.getMessage());
+        }
+    }
+
     /** 落盘 WAL 位点，原子写（tmp+fsync+rename），崩溃重启后据此续传而非从任务起始 LSN 重放。 */
     private void savePosition() {
         if (currentLsn == null) return;
@@ -1175,7 +1260,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
 
         com.migration.common.position.CapturePositionStore.save(
-                outputDir, posProps, "WAL Capture position for task: " + taskId);
+                outputDir, posProps, "WAL Capture position for task: " + taskId, taskId);
     }
 
     public String getCurrentLsn() {

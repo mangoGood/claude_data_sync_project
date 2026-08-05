@@ -329,6 +329,54 @@ public class WorkflowController {
         }
     }
 
+    /** 位点历史：采样点 + 重置/倒换审计，位点回溯（PITR）的数据来源。直接读中心库，不经 agent。 */
+    @GetMapping("/{id}/checkpoint/history")
+    public ResponseEntity<?> getCheckpointHistory(
+            @PathVariable String id,
+            @RequestParam(required = false) String stage,
+            @RequestParam(required = false, defaultValue = "100") int limit,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            return ResponseEntity.ok(workflowService.getCheckpointHistory(id, userPrincipal.getId(), stage, limit));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /**
+     * 位点重置（PITR）：把某一段的位点退回历史上的某个点，任务下次启动时强制按它续传。
+     *
+     * <p>这是全平台<b>唯一允许位点倒退</b>的入口——正常路径上单调守卫会拒绝一切回退——
+     * 所以要求任务已停止、记审计、并打 {@code reset_at} 让 agent 覆盖本地位点。
+     *
+     * <p>请求体：{@code {stage, streamKey?, target: {type: HISTORY_ID|TIMESTAMP|RAW, value}}}
+     */
+    @PostMapping("/{id}/checkpoint/reset")
+    public ResponseEntity<?> resetCheckpoint(
+            @PathVariable String id,
+            @RequestBody Map<String, Object> body,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        try {
+            String stage = String.valueOf(body.getOrDefault("stage", "CAPTURE"));
+            String streamKey = body.get("streamKey") == null ? "-" : String.valueOf(body.get("streamKey"));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> target = (Map<String, Object>) body.get("target");
+            if (target == null) {
+                return ResponseEntity.badRequest().body(new ApiResponse(false, "缺少 target"));
+            }
+            Map<String, Object> result = workflowService.resetCheckpoint(
+                    id, userPrincipal.getId(), stage, streamKey, target, userPrincipal.getUsername());
+            auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.RETRY_TASK, id,
+                    "重置位点 stage=" + stage + " -> " + result.get("payload"));
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            auditLogService.logFailure(userPrincipal.getId(), AuditLog.Action.RETRY_TASK, id, null, e.getMessage());
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
     /** 单任务实时监控指标（代理 agent，服务端持 AGENT_API_TOKEN）。 */
     @GetMapping("/{id}/metrics")
     public ResponseEntity<?> getTaskMetrics(

@@ -58,6 +58,10 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
     private volatile int lastAddedLogSeq = -1;
     /** 本次启动是否从已落盘 SCN 续传（false 表示首次启动，用 checkpoint 的起始 SCN）。 */
     private boolean resumedFromPersisted;
+    /** redo/归档保留状态的在线巡检：被清理后 LogMiner 静默不返回数据，不主动看就只能等重启才发现。 */
+    private boolean retentionCheckEnabled = true;
+    private long retentionCheckIntervalMs = 60000;
+    private volatile long lastRetentionCheckMs = 0;
 
     /**
      * Oracle PDB 中无法执行 DBMS_LOGMNR.ADD_LOGFILE / START_LOGMNR（ORA-65040），
@@ -114,6 +118,10 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                 persisted, "redo.scn", props.getProperty("capture.redo.scn", ""), "redo SCN");
         resumedFromPersisted = !persisted.isEmpty();
         taskId = props.getProperty("task.id", "unknown");
+        retentionCheckEnabled = Boolean.parseBoolean(
+                props.getProperty("capture.position.health.enabled", "true"));
+        retentionCheckIntervalMs = Long.parseLong(
+                props.getProperty("capture.position.health.interval.ms", "60000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         scanIntervalMs = Long.parseLong(props.getProperty("capture.redo.scan.interval", "1000"));
         queryBatchSize = Integer.parseInt(props.getProperty("capture.redo.batch.size", "1000"));
@@ -693,6 +701,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                     logger.info("Captured {} Oracle redo events, current SCN: {}", total, currentScn);
                     savePosition();
                 }
+                checkRetentionQuietly();
             }
         } finally {
             if (rs != null) try { rs.close(); } catch (SQLException e) { /* ignore */ }
@@ -1271,6 +1280,73 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         logger.info("Rotated to new capture output file after {} events", maxEventsPerFile);
     }
 
+    /**
+     * redo/归档日志保留状态的在线巡检：当前 SCN 之前还留着几个日志。
+     *
+     * <p>在线 redo 被覆盖、归档被 RMAN 删掉之后，LogMiner 要么报 ORA-01291 要么干脆什么都不返回，
+     * 外层看到的只是"任务在跑但没数据"。等重启才发现就已经晚了，只能重做全量。
+     */
+    private void checkRetentionQuietly() {
+        if (!retentionCheckEnabled || currentScn == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastRetentionCheckMs < retentionCheckIntervalMs) {
+            return;
+        }
+        lastRetentionCheckMs = now;
+
+        long scn;
+        try {
+            scn = Long.parseLong(currentScn);
+        } catch (NumberFormatException e) {
+            return;
+        }
+        String url = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, database);
+        try (Connection probe = DriverManager.getConnection(url, user, password);
+             Statement stmt = probe.createStatement()) {
+            Long earliest = null;
+            long olderLogs = 0;
+            for (String sql : new String[]{
+                    "SELECT MIN(FIRST_CHANGE#), COUNT(*) FROM V$LOG WHERE STATUS <> 'UNUSED' AND FIRST_CHANGE# < " + scn,
+                    "SELECT MIN(FIRST_CHANGE#), COUNT(*) FROM V$ARCHIVED_LOG "
+                            + "WHERE DELETED = 'NO' AND STATUS = 'A' AND FIRST_CHANGE# < " + scn}) {
+                try (java.sql.ResultSet rs = stmt.executeQuery(sql)) {
+                    if (rs.next()) {
+                        long v = rs.getLong(1);
+                        if (!rs.wasNull() && v > 0 && (earliest == null || v < earliest)) {
+                            earliest = v;
+                        }
+                        olderLogs += rs.getLong(2);
+                    }
+                } catch (Exception ignored) {
+                    // 单个视图不可读（权限/版本差异）时用另一个的结果
+                }
+            }
+            if (earliest != null && scn < earliest) {
+                com.migration.common.position.RetentionStatus.write(outputDir,
+                        com.migration.common.position.RetentionStatus.State.LOST, 0,
+                        "当前 SCN " + scn + " 早于最早可用 SCN " + earliest);
+                logger.error("位点保留期告警：当前 SCN {} 早于源端最早可用 SCN {}，redo/归档已被清理", scn, earliest);
+                return;
+            }
+            boolean atEdge = olderLogs == 0;
+            com.migration.common.position.RetentionStatus.write(outputDir,
+                    atEdge ? com.migration.common.position.RetentionStatus.State.WARN
+                           : com.migration.common.position.RetentionStatus.State.OK,
+                    olderLogs, "当前 SCN " + scn + " 之前尚存 " + olderLogs + " 个 redo/归档日志");
+            if (atEdge) {
+                logger.warn("位点保留期告警：当前 SCN {} 之前已无保留的 redo/归档日志，"
+                        + "一旦落后即无法回挖，建议延长归档保留策略", scn);
+            }
+        } catch (Exception e) {
+            com.migration.common.position.RetentionStatus.write(outputDir,
+                    com.migration.common.position.RetentionStatus.State.UNKNOWN, -1,
+                    "巡检查询失败: " + e.getMessage());
+            logger.debug("redo 保留状态巡检跳过: {}", e.getMessage());
+        }
+    }
+
     /** 落盘 redo 位点，原子写（tmp+fsync+rename），崩溃重启后据此续传而非从任务起始 SCN 重挖。 */
     private void savePosition() {
         if (currentScn == null) return;
@@ -1281,7 +1357,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date()));
 
         com.migration.common.position.CapturePositionStore.save(
-                outputDir, posProps, "Oracle Redo Capture position for task: " + taskId);
+                outputDir, posProps, "Oracle Redo Capture position for task: " + taskId, taskId);
     }
 
     public String getCurrentScn() {

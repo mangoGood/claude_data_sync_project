@@ -49,6 +49,10 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     /** 位点落盘的时间兜底间隔：低流量任务下不足 1000 事件也要能看到当前位点。 */
     private static final long POSITION_SAVE_INTERVAL_MS = 5000;
     private volatile long lastPositionSaveTime = 0;
+    /** 位点保留期在线巡检：运行中日志被清理不会报错，只会等到重启才炸，所以要主动看。 */
+    private boolean retentionCheckEnabled = true;
+    private long retentionCheckIntervalMs = 60000;
+    private volatile long lastRetentionCheckMs = 0;
     private String outputDir;
     private String taskId;
     private long serverId;
@@ -129,6 +133,10 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             gtidSet = "";
         }
         taskId = props.getProperty("task.id", "unknown");
+        retentionCheckEnabled = Boolean.parseBoolean(
+                props.getProperty("capture.position.health.enabled", "true"));
+        retentionCheckIntervalMs = Long.parseLong(
+                props.getProperty("capture.position.health.interval.ms", "60000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         serverId = Long.parseLong(props.getProperty("capture.server.id", "65535"));
         bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
@@ -759,6 +767,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                     lastPositionSaveTime = now;
                 }
             }
+            checkRetentionQuietly();
         } catch (Exception e) {
             logger.error("处理binlog事件异常: {}", e.getMessage(), e);
         }
@@ -999,6 +1008,60 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
     }
 
+    /**
+     * 位点保留期在线巡检：当前读到的 binlog 文件之前，源端还留着几个文件。
+     *
+     * <p>启动预检只能回答"现在能不能续上"；运行中源库 {@code PURGE BINARY LOGS} / 到期自动清理
+     * 会把位点推到边缘，而这件事要等下一次重启才会暴露——那时已经晚了，只能重做全量。
+     * 这里每 60s 看一眼余量，贴边就告警，让人还有时间去延长 {@code binlog_expire_logs_seconds}。
+     *
+     * <p>只预警不阻断：正在跑的任务被打成 FAILED 比告警晚一点更糟。真丢了由启动预检的 E3006 拦。
+     */
+    private void checkRetentionQuietly() {
+        if (!retentionCheckEnabled || currentBinlogFile == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastRetentionCheckMs < retentionCheckIntervalMs) {
+            return;
+        }
+        lastRetentionCheckMs = now;
+
+        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        try (Connection conn = DriverManager.getConnection(url, user, password);
+             Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery("SHOW BINARY LOGS")) {
+            java.util.List<String> logs = new java.util.ArrayList<>();
+            while (rs.next()) {
+                logs.add(rs.getString(1));
+            }
+            int idx = logs.indexOf(currentBinlogFile);
+            if (idx < 0) {
+                com.migration.common.position.RetentionStatus.write(outputDir,
+                        com.migration.common.position.RetentionStatus.State.LOST, 0,
+                        "当前 binlog 文件 " + currentBinlogFile + " 已不在源端保留列表中");
+                logger.error("位点保留期告警：当前 binlog 文件 {} 已不在源端（共 {} 个文件），位点即将/已经失效",
+                        currentBinlogFile, logs.size());
+                return;
+            }
+            // 只有一个文件时 idx 必然为 0，但那是"还没轮转过"，不是贴边，别刷假告警
+            boolean atEdge = idx == 0 && logs.size() > 1;
+            com.migration.common.position.RetentionStatus.write(outputDir,
+                    atEdge ? com.migration.common.position.RetentionStatus.State.WARN
+                           : com.migration.common.position.RetentionStatus.State.OK,
+                    idx, "位点文件 " + currentBinlogFile + "，其前尚存 " + idx + " 个文件（共 " + logs.size() + "）");
+            if (atEdge) {
+                logger.warn("位点保留期告警：正读取最老的 binlog 文件 {}，下一次清理即可能使位点失效，"
+                        + "建议延长源库 binlog 保留期", currentBinlogFile);
+            }
+        } catch (Exception e) {
+            com.migration.common.position.RetentionStatus.write(outputDir,
+                    com.migration.common.position.RetentionStatus.State.UNKNOWN, -1,
+                    "巡检查询失败: " + e.getMessage());
+            logger.debug("位点保留期巡检跳过: {}", e.getMessage());
+        }
+    }
+
     private void savePosition() {
         if (currentBinlogFile == null) return;
 
@@ -1014,7 +1077,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
 
         com.migration.common.position.CapturePositionStore.save(
-                outputDir, posProps, "Capture position for task: " + taskId);
+                outputDir, posProps, "Capture position for task: " + taskId, taskId);
     }
 
     public String getCurrentBinlogFile() {

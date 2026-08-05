@@ -1216,19 +1216,54 @@ public class ContinuousSubscribeMain {
         File target = new File(progressFile);
         File tmp = new File(progressFile + ".tmp");
         try {
+            StringBuilder text = new StringBuilder();
             try (BufferedWriter writer = new BufferedWriter(new FileWriter(tmp))) {
                 for (Map.Entry<String, Long> entry : fileSeqno.entrySet()) {
-                    writer.write(entry.getKey() + "=" + entry.getValue()
-                            + "|" + (completedFiles.contains(entry.getKey()) ? "1" : "0"));
+                    String line = entry.getKey() + "=" + entry.getValue()
+                            + "|" + (completedFiles.contains(entry.getKey()) ? "1" : "0");
+                    writer.write(line);
                     writer.newLine();
+                    text.append(line).append('\n');
                 }
             }
             if (!tmp.renameTo(target)) {
                 java.nio.file.Files.move(tmp.toPath(), target.toPath(),
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
+            saveUnifiedCheckpoint(text.toString());
         } catch (IOException e) {
             logger.warn("保存订阅进度失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 并行写一份统一位点（供 agent 上卷到元数据库、接管方回灌）。
+     *
+     * <p>订阅位点不是一个标量，而是"每个 THL 文件读到哪"的整张表，所以 payload 存进度文件<b>原文</b>，
+     * 回灌时原样写回。可比标量取其中最大的 seqno——seqno 只增不减，用它守住回退就够了。
+     */
+    private void saveUnifiedCheckpoint(String progressText) {
+        try {
+            long maxSeqno = -1L;
+            for (Long v : fileSeqno.values()) {
+                if (v != null && v > maxSeqno) {
+                    maxSeqno = v;
+                }
+            }
+            java.util.Properties payload = new java.util.Properties();
+            payload.setProperty("subscribe.progress.text", progressText);
+            com.migration.common.position.LocalCheckpointStore.saveThrottled(
+                    new com.migration.common.position.CheckpointRecord(
+                            taskId,
+                            com.migration.common.position.CheckpointRecord.Stage.SUBSCRIBE,
+                            "kafka",
+                            com.migration.common.position.CheckpointRecord.Kind.SEQNO,
+                            payload,
+                            com.migration.common.position.MonotonicKey.ofNumeric(maxSeqno),
+                            0L),
+                    1000L, false);
+        } catch (Exception e) {
+            logger.debug("统一位点（subscribe）落盘失败: {}", e.getMessage());
         }
     }
 

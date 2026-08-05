@@ -159,6 +159,26 @@ public class AgentMain {
                 agentConfig.getH2MetadataUser(), agentConfig.getH2MetadataPassword(),
                 metricsFlushMs, metricsBatchSize);
 
+        // 位点中心持久化：位点不能只活在这台机器的磁盘上——V8 的故障转移假设"接管方从各自
+        // checkpoint 续传"，而那个 checkpoint 在 files/<taskId>/ 里，换台机器就是空的，
+        // 接管方于是去取"源库此刻的位点"，把崩溃到接管之间的变更整段跳过（不报错、不告警）。
+        if (Boolean.parseBoolean(agentConfig.getRawProperty("checkpoint.central.enabled", "true"))) {
+            com.migration.agent.checkpoint.CentralCheckpointStore checkpointStore =
+                    com.migration.agent.checkpoint.CentralCheckpointStore.initialize(
+                            agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(),
+                            agentConfig.getMysqlDbPassword());
+            com.migration.agent.checkpoint.CheckpointHydrator.initialize(checkpointStore,
+                    agentRegistry.getAgentId(),
+                    Boolean.parseBoolean(agentConfig.getRawProperty("checkpoint.hydrate.fail.stop", "true")));
+            com.migration.agent.checkpoint.CheckpointUploader.initialize(checkpointStore,
+                    agentRegistry.getAgentId(),
+                    Long.parseLong(agentConfig.getRawProperty("checkpoint.central.upload.interval.ms", "3000")),
+                    Long.parseLong(agentConfig.getRawProperty("checkpoint.history.sample.interval.s", "300")) * 1000L,
+                    () -> new java.util.HashSet<>(migrationAgentThreads.keySet()));
+        } else {
+            logger.info("位点中心持久化已关闭（checkpoint.central.enabled=false），回到本地位点行为");
+        }
+
         kafkaConsumer = new KafkaConsumerService(KAFKA_BOOTSTRAP_SERVERS, CONSUMER_GROUP_ID,
             this::handleTaskMessage);
         
@@ -286,6 +306,15 @@ public class AgentMain {
         
         if (kafkaConsumer != null) {
             kafkaConsumer.stop();
+        }
+
+        // 停机前把位点再上卷一次：优雅停机后任务马上会被改派，接管方拿到的位点越新，重放越少。
+        // 必须排在 agentRegistry.stop() 之前——释放租约后后端可能立刻改派，那时再上卷
+        // 就会撞上新主更高的 epoch 被 fencing 拒掉。
+        com.migration.agent.checkpoint.CheckpointUploader uploader =
+                com.migration.agent.checkpoint.CheckpointUploader.getInstance();
+        if (uploader != null) {
+            uploader.stop();
         }
 
         // 优雅停机时主动下线并释放租约，后端立刻能改派，不用干等 90s 心跳超时
@@ -658,7 +687,22 @@ public class AgentMain {
                 logger.info("Deleted single-process engine checkpoint: {}, success: {}", f.getAbsolutePath(), f.delete());
             }
         }
+
+        // 统一位点与中心位点也必须一并作废。中心位点尤其不能留：本地清干净了，
+        // 接管方一回灌就把刚清掉的旧源位点原样请回来——旧源的 GTID 拿到新源上，
+        // 服务端会从新源 binlog 最开头整段重放，直接冲垮备库。
+        clearCentralCheckpoints(taskId, "FAILOVER");
         logger.info("All checkpoint DB files deleted before config update for failover task: {}", taskId);
+    }
+
+    /**
+     * 作废该任务的统一位点与中心位点。
+     *
+     * <p><b>倒换/重做全量时不能只清本地</b>：中心位点留着，接管方回灌就会把旧源的位点请回来。
+     * 上卷缓存也要一并清掉，否则新位点会被"内容没变"的判断挡住而永远写不进中心库。
+     */
+    private void clearCentralCheckpoints(String taskId, String reason) {
+        com.migration.agent.checkpoint.CheckpointCleaner.clear(taskId, reason);
     }
 
     private void deleteDirContents(java.io.File dir, String label, String taskId) {

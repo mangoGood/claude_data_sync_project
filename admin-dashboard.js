@@ -412,7 +412,7 @@
             'E2005': { desc: 'Checkpoint初始化失败', solution: '请检查源数据库连接是否正常，确认用户有REPLICATION权限' },
             'E2006': { desc: 'PostgreSQL WAL LSN获取失败', solution: '请检查PostgreSQL连接是否正常，确认用户有replication权限' },
             'E2007': { desc: 'Oracle SCN获取失败', solution: '请检查Oracle连接是否正常，确认用户有SELECT ANY DICTIONARY权限且数据库处于ARCHIVELOG模式' },
-            'E2008': { desc: 'Oracle LogMiner会话启动失败', solution: '请确认数据库处于ARCHIVELOG模式，用户具有EXECUTE CATALOG ROLE权限，且redo日志可访问' },
+            'E2008': { desc: 'Oracle LogMiner会话启动失败', solution: '请确认数据库处于ARCHIVELOG模式，用户具有EXECUTE_CATALOG_ROLE权限，且redo日志可访问' },
             'E3001': { desc: 'Capture进程启动失败', solution: '请检查Agent日志，确认capture模块JAR包存在且配置正确' },
             'E3002': { desc: 'Capture进程异常退出', solution: '请检查Agent日志，确认源数据库连接正常且binlog/WAL可访问' },
             'E3003': { desc: 'Extract进程启动失败', solution: '请检查Agent日志，确认extract模块JAR包存在且配置正确' },
@@ -424,6 +424,10 @@
             'E3009': { desc: '增量事件转换失败', solution: '该事件无法转换成目标端SQL（未知类型/结构不匹配）。可在死信页面裁决跳过，或将 increment.convert.error.policy 设为 DEAD_LETTER 自动记死信并跳过' },
             'E3010': { desc: 'THL文件读取中断', solution: 'THL文件损坏或读取异常，已在断点处停止且未跳过剩余事件。请检查磁盘与 thl_output 目录，必要时重新初始化增量' },
             'E3011': { desc: '双向同步写写冲突', solution: '两端同时改了同一行且策略为 ERROR（不自动丢写）。请人工确认保留哪一端，或改用 LWW_SOURCE_TS/NODE_PRIORITY 自动裁决' },
+            'E3013': { desc: '汇聚/拆分事件缺少类型化值', solution: '命中路由规则的表其事件没有类型化值（rows_typed），无法生成带来源标识列的 DML，已停止应用以免改坏同一汇聚表里其它来源的行。请检查该表的路由规则是否配错、源端 binlog_row_image 是否为 FULL，以及该源→目标引擎对是否支持类型化管道（increment.typed.pipeline.enabled 是否被关掉）' },
+            'E3014': { desc: '位点回灌失败', solution: '本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管；按首次启动去取源库当前位点会静默跳过崩溃到接管之间的全部变更，因此任务停在这里。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务' },
+            'E3101': { desc: 'Elastic同步进程启动失败', solution: '请检查Agent日志，确认elastic模块JAR包存在且配置正确' },
+            'E3102': { desc: 'Elastic同步失败', solution: '请检查Agent日志，确认Elasticsearch连接正常、索引可写且源库binlog可访问' },
             'E4001': { desc: '全量同步失败', solution: '请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常' },
             'E4002': { desc: '全量同步超时', solution: '请检查数据量是否过大，考虑分批同步或优化网络带宽' },
             'E4003': { desc: '目标数据库写入失败', solution: '请检查目标数据库磁盘空间、表结构是否与源库一致、是否有写入权限' },
@@ -2283,7 +2287,31 @@
             const pendingEvents = gaps.pending_events != null ? gaps.pending_events : '-';
             const binlogGap = gaps.binlog_gap != null ? gaps.binlog_gap : '-';
 
-            el.innerHTML = `
+            // agent 不可达时后端会降级读中心位点表。必须显式标出来：这是"几秒前的快照"，
+            // 不是实时值，而 agent 挂掉恰恰是最需要看清"还能不能续、续到哪"的时刻。
+            const degradedBanner = d.degraded ? `
+                <div style="margin-bottom:10px;padding:8px 12px;border-radius:4px;
+                            background:#fffbe6;border:1px solid #ffe58f;color:#874d00;font-size:12px;">
+                    ⚠ agent 不可达，以下位点来自中心库快照（${d.binlog && d.binlog.updatedAt
+                        ? new Date(d.binlog.updatedAt).toLocaleString() : '时间未知'}），
+                    THL/积压等实时项不可用。原因：${d.degradedReason || '-'}
+                </div>` : '';
+
+            // 位点保留期预警：源端日志被清掉之后位点就永久失效、只能重做全量，
+            // 而这件事平时一点征兆都没有——贴边时必须显眼地说出来，此时延长保留期还来得及。
+            const ret = d.retention || {};
+            const retentionBanner = (ret.available && (ret.state === 'WARN' || ret.state === 'LOST')) ? `
+                <div style="margin-bottom:10px;padding:8px 12px;border-radius:4px;
+                            background:${ret.state === 'LOST' ? '#fff1f0' : '#fffbe6'};
+                            border:1px solid ${ret.state === 'LOST' ? '#ffa39e' : '#ffe58f'};
+                            color:${ret.state === 'LOST' ? '#a8071a' : '#874d00'};font-size:12px;">
+                    ${ret.state === 'LOST' ? '✕ 位点已失效' : '⚠ 位点即将失效'}：${ret.detail || ''}
+                    ${ret.state === 'LOST'
+                        ? '<br>源端日志已被清理，需重新初始化全量同步。'
+                        : '<br>建议尽快延长源端日志保留期（binlog_expire_logs_seconds / max_slot_wal_keep_size / 归档保留策略）。'}
+                </div>` : '';
+
+            el.innerHTML = degradedBanner + retentionBanner + `
                 <div class="adv-metric-grid">
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">Binlog 位点</div>
@@ -2333,7 +2361,68 @@
                     <span class="adv-link-arrow">→</span>
                     <div class="adv-link-node ${cp.available ? 'ok' : ''}">checkpoint</div>
                 </div>
+                <div id="ckptHistoryBox" style="margin-top:14px;"></div>
             `;
+            loadCheckpointHistory(d.taskId);
+        }
+
+        // ---- 位点历史 / 重置（PITR）----
+        // 重置是全平台唯一允许位点倒退的入口：任务必须先停下来，且每次重置都会留审计。
+        async function loadCheckpointHistory(taskId) {
+            const box = document.getElementById('ckptHistoryBox');
+            if (!box || !taskId) return;
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/checkpoint/history?limit=20`);
+                if (!resp) return;
+                const rows = await resp.json();
+                if (!Array.isArray(rows) || !rows.length) {
+                    box.innerHTML = '<div style="font-size:12px;color:#999;">位点历史：暂无采样（任务跑满一个采样周期后出现）</div>';
+                    return;
+                }
+                box.innerHTML = `
+                    <div style="font-weight:600;margin-bottom:6px;font-size:13px;">位点历史（可回溯到任一采样点）</div>
+                    <table class="data-table" style="font-size:12px;">
+                        <thead><tr><th>时间</th><th>段</th><th>类型</th><th>位点</th><th>原因</th><th>操作</th></tr></thead>
+                        <tbody>${rows.map(r => `
+                            <tr>
+                                <td>${new Date(r.recordedAt).toLocaleString()}</td>
+                                <td>${r.stage}</td>
+                                <td>${r.reason === 'RESET' ? 'RESET' : r.kind}</td>
+                                <td style="font-family:monospace;">${(r.payload || '').replace(/\n/g, ' ').slice(0, 60)}</td>
+                                <td>${r.reason}${r.operator ? '（' + r.operator + '）' : ''}</td>
+                                <td>${r.reason === 'SAMPLE'
+                                    ? `<button class="btn-test" onclick="resetCheckpointTo('${taskId}','${r.stage}',${r.id})">重置到此</button>`
+                                    : '-'}</td>
+                            </tr>`).join('')}</tbody>
+                    </table>`;
+            } catch (e) {
+                box.innerHTML = `<div style="font-size:12px;color:#999;">位点历史加载失败: ${e.message}</div>`;
+            }
+        }
+
+        async function resetCheckpointTo(taskId, stage, historyId) {
+            if (!confirm('确认把 ' + stage + ' 段的位点重置到该历史点？\n\n'
+                    + '任务必须处于已暂停/已失败状态；重置后下次启动会从该位点重放，'
+                    + '期间的变更会被再次投递（下游按幂等吸收）。此操作会记入审计。')) {
+                return;
+            }
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/checkpoint/reset`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ stage: stage, target: { type: 'HISTORY_ID', value: historyId } })
+                });
+                if (!resp) return;
+                const data = await resp.json();
+                if (data.success === false) {
+                    alert('重置失败: ' + (data.message || '未知错误'));
+                    return;
+                }
+                alert('位点已重置，任务下次启动时按该位点续传');
+                loadCheckpoint(taskId);
+            } catch (e) {
+                alert('重置失败: ' + e.message);
+            }
         }
 
         // ---- 同步延迟热力图 ----

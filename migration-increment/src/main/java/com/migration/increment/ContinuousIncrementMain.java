@@ -652,6 +652,7 @@ public class ContinuousIncrementMain {
                             binlogPosition != null ? binlogPosition : 0,
                             event.getEventId() != null ? event.getEventId() : ""
                     );
+                    saveUnifiedApplyCheckpoint(event);
 
                     if (event.getSourceTstamp() != null) {
                         long rtoMs = System.currentTimeMillis() - event.getSourceTstamp().getTime();
@@ -681,6 +682,7 @@ public class ContinuousIncrementMain {
                             skipBinlogPosition != null ? skipBinlogPosition : 0,
                             event.getEventId() != null ? event.getEventId() : ""
                     );
+                    saveUnifiedApplyCheckpoint(event);
                     continue;
                 }
 
@@ -2403,6 +2405,42 @@ public class ContinuousIncrementMain {
                 binlogPosition != null ? binlogPosition : 0,
                 event.getEventId() != null ? event.getEventId() : ""
         );
+        saveUnifiedApplyCheckpoint(event);
+    }
+
+    /**
+     * 并行写一份统一位点（APPLY 段），供 agent 上卷到元数据库、以及接管方回灌。
+     *
+     * <p><b>必须跟在 {@code checkpointManager.saveCheckpoint} 之后</b>：H2 那份才是本进程续传的权威，
+     * 这份只是它的影子。按 1s 节流是因为本方法在<b>每个事件</b>上都会被调到，
+     * 而 apply 的热路径经不起每事件一次 fsync；节流的后果只是这份位点更旧，
+     * 而更旧只会带来重放、不会丢数据。
+     */
+    private void saveUnifiedApplyCheckpoint(THLEvent event) {
+        try {
+            java.util.Properties payload = new java.util.Properties();
+            payload.setProperty("seqno", String.valueOf(event.getSeqno()));
+            String binlogFile = (String) event.getMetadata("binlog_file");
+            Long binlogPosition = (Long) event.getMetadata("binlog_position");
+            payload.setProperty("binlog.file", binlogFile != null ? binlogFile : "");
+            payload.setProperty("binlog.position",
+                    String.valueOf(binlogPosition != null ? binlogPosition : 0L));
+            payload.setProperty("event.id", event.getEventId() != null ? event.getEventId() : "");
+            long sourceTs = event.getSourceTstamp() != null ? event.getSourceTstamp().getTime() : 0L;
+            com.migration.common.position.CheckpointRecord record =
+                    new com.migration.common.position.CheckpointRecord(
+                            taskId,
+                            com.migration.common.position.CheckpointRecord.Stage.APPLY,
+                            props.getProperty("source.db.type", "mysql"),
+                            com.migration.common.position.CheckpointRecord.Kind.SEQNO,
+                            payload,
+                            com.migration.common.position.MonotonicKey.ofNumeric(event.getSeqno()),
+                            sourceTs);
+            com.migration.common.position.LocalCheckpointStore.saveThrottled(record, 1000L, false);
+        } catch (Exception e) {
+            // 影子载体写失败绝不能影响应用：权威位点已经落在 H2 里了
+            logger.debug("统一位点（APPLY）落盘失败: {}", e.getMessage());
+        }
     }
 
     private void acquireRateLimit(long rows) {

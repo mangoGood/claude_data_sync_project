@@ -133,6 +133,9 @@ public class WorkflowService {
     @Autowired
     private AgentClusterService agentClusterService;
 
+    @Autowired
+    private CheckpointCentralService checkpointCentralService;
+
     @Transactional
     public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId, String taskType) {
         return createWorkflow(name, sourceType, targetType, userId, taskType, null, null);
@@ -1196,7 +1199,39 @@ public class WorkflowService {
     /** 同步位点可视化：代理 agent 的 /api/checkpoint/{taskId}（先做属主校验）。 */
     public Map<String, Object> getCheckpointVisualization(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）", id);
+        try {
+            Map<String, Object> live = callAgentJson(
+                    "/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）", id);
+            live.put("source", "live");
+            live.put("degraded", false);
+            return live;
+        } catch (RuntimeException e) {
+            // agent 挂了恰恰是最需要知道"还能不能续、续到哪"的时刻，位点视图不该跟着一起瞎。
+            // 中心库里的位点最多旧几秒（上卷间隔），远好过一个 500。
+            try {
+                Map<String, Object> degraded =
+                        checkpointCentralService.degradedVisualization(id, e.getMessage());
+                logger.warn("[{}] agent 位点查询失败，降级读中心位点表: {}", id, e.getMessage());
+                return degraded;
+            } catch (Exception fallbackError) {
+                logger.warn("[{}] 中心位点降级读取也失败: {}", id, fallbackError.getMessage());
+                throw e;
+            }
+        }
+    }
+
+    /** 位点历史（回溯/审计），直接读中心库，不经 agent。 */
+    public java.util.List<Map<String, Object>> getCheckpointHistory(String id, Long userId,
+                                                                    String stage, int limit) {
+        getWorkflowById(id, userId);
+        return checkpointCentralService.history(id, stage, limit);
+    }
+
+    /** 位点重置（PITR）：唯一允许位点倒退的入口，必须留审计。 */
+    public Map<String, Object> resetCheckpoint(String id, Long userId, String stage, String streamKey,
+                                               Map<String, Object> target, String operator) {
+        Workflow workflow = getWorkflowById(id, userId);
+        return checkpointCentralService.reset(workflow, stage, streamKey, target, operator);
     }
 
     // ==================== 实时监控指标：代理 agent 的只读监控接口 ====================

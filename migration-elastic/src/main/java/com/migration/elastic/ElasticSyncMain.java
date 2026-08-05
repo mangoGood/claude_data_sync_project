@@ -897,8 +897,33 @@ public final class ElasticSyncMain {
             Path tmp = positionPath.resolveSibling(positionPath.getFileName() + ".tmp");
             Files.write(tmp, gson.toJson(m).getBytes(StandardCharsets.UTF_8));
             Files.move(tmp, positionPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            saveUnifiedCheckpoint(pos);
         } catch (Exception e) {
             logger.warn("持久化 binlog 位点失败: {}", e.getMessage());
+        }
+    }
+
+    /** 并行写一份统一位点（供 agent 上卷到元数据库、接管方回灌）；失败不影响主流程。 */
+    private void saveUnifiedCheckpoint(BinlogPosition pos) {
+        try {
+            java.util.Properties payload = new java.util.Properties();
+            payload.setProperty("binlog.file", pos.file);
+            payload.setProperty("binlog.position", String.valueOf(pos.position));
+            // 标出老载体是哪一个：ES 链路的位点形态与 mysql capture 完全一样（binlog file+pos），
+            // 回灌时靠这个标记才知道该写 elastic_binlog_position.json 而不是 capture_position.properties
+            payload.setProperty("carrier", "elastic");
+            com.migration.common.position.LocalCheckpointStore.saveThrottled(
+                    new com.migration.common.position.CheckpointRecord(
+                            taskId,
+                            com.migration.common.position.CheckpointRecord.Stage.CAPTURE,
+                            "mysql",
+                            com.migration.common.position.CheckpointRecord.Kind.BINLOG_FILE_POS,
+                            payload,
+                            com.migration.common.position.MonotonicKey.ofBinlog(pos.file, pos.position),
+                            0L),
+                    1000L, false);
+        } catch (Exception e) {
+            logger.debug("统一位点（elastic）落盘失败: {}", e.getMessage());
         }
     }
 

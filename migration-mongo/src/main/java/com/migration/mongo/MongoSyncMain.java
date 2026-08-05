@@ -1039,10 +1039,41 @@ public final class MongoSyncMain {
             }
             Files.createDirectories(tokenPath.getParent());
             Path tmp = tokenPath.resolveSibling(tokenPath.getFileName() + ".tmp");
-            Files.write(tmp, doc.toJson().getBytes(StandardCharsets.UTF_8));
+            String json = doc.toJson();
+            Files.write(tmp, json.getBytes(StandardCharsets.UTF_8));
             Files.move(tmp, tokenPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            saveUnifiedCheckpoint(json);
         } catch (Exception e) {
             logger.warn("持久化 resume token 失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 并行写一份统一位点，供 agent 上卷到元数据库、以及接管方回灌。
+     *
+     * <p>payload 直接存 resume token 文件的<b>原文</b>：token 是服务端的不透明结构，
+     * 拆开重组毫无意义且容易失真，回灌时原样写回文件即可。
+     * 同理它也<b>折不出可比标量</b>（{@code _data} 是编码过的十六进制串），
+     * 因此 monotonicKey 记 UNKNOWN，单调守卫对这一行自动降级为不校验——
+     * mongo 这条链路的防回退靠的是 resume token 本身在服务端的语义。
+     */
+    private void saveUnifiedCheckpoint(String checkpointJson) {
+        try {
+            java.util.Properties payload = new java.util.Properties();
+            payload.setProperty("mongo.checkpoint.json", checkpointJson);
+            payload.setProperty("carrier", "mongo");
+            com.migration.common.position.LocalCheckpointStore.saveThrottled(
+                    new com.migration.common.position.CheckpointRecord(
+                            taskId,
+                            com.migration.common.position.CheckpointRecord.Stage.CAPTURE,
+                            "mongodb",
+                            com.migration.common.position.CheckpointRecord.Kind.RESUME_TOKEN,
+                            payload,
+                            com.migration.common.position.MonotonicKey.UNKNOWN,
+                            0L),
+                    1000L, false);
+        } catch (Exception e) {
+            logger.debug("统一位点（mongo）落盘失败: {}", e.getMessage());
         }
     }
 
