@@ -103,14 +103,31 @@ public class TypedDmlConverter {
         final String targetDb;
         final String targetTable;
         final java.util.LinkedHashMap<String, String> tagValues;
+        /**
+         * 汇聚下需要逐行注值的附加列（列处理的 CUSTOM 附加列）→ 值。
+         *
+         * <p>与 {@code tagValues} 分开放：这些列只进 INSERT 的列表与参数，
+         * <b>不能</b>进 UPDATE/DELETE 的 WHERE、也不进冲突键——它们不是主键的一部分，
+         * 混进去会让 WHERE 命中不到行。
+         */
+        final java.util.LinkedHashMap<String, String> extraValues;
         final boolean compositePk;
 
         MergeCtx(String targetDb, String targetTable,
-                 java.util.LinkedHashMap<String, String> tagValues, boolean compositePk) {
+                 java.util.LinkedHashMap<String, String> tagValues,
+                 java.util.LinkedHashMap<String, String> extraValues, boolean compositePk) {
             this.targetDb = targetDb;
             this.targetTable = targetTable;
             this.tagValues = tagValues;
+            this.extraValues = extraValues;
             this.compositePk = compositePk;
+        }
+
+        /** INSERT 时补在源列之后的列（顺序：附加列 → 来源标识列，与全量侧严格一致）。 */
+        java.util.LinkedHashMap<String, String> insertOnlyColumns() {
+            java.util.LinkedHashMap<String, String> all = new java.util.LinkedHashMap<>(extraValues);
+            all.putAll(tagValues);
+            return all;
         }
     }
 
@@ -245,11 +262,17 @@ public class TypedDmlConverter {
                 tags.put(col, value);
             }
         }
-        MergeCtx ctx = new MergeCtx(target.getDatabase(), target.getTable(), tags,
+        // 汇聚下 CUSTOM 附加列由 DML 逐行注值（建表不带 DEFAULT）——合并表只由第一个来源建出来，
+        // DEFAULT 里烤的是那一个来源的库表名。全量侧同理，两边的列序也必须一致
+        java.util.LinkedHashMap<String, String> extras = columnProcessingActive
+                ? columnProcessing.perRowExtraValues(srcDb, srcTable)
+                : new java.util.LinkedHashMap<>();
+        MergeCtx ctx = new MergeCtx(target.getDatabase(), target.getTable(), tags, extras,
                 rule.getPkStrategy() == com.migration.common.route.MergeRule.PkStrategy.COMPOSITE_SOURCE);
         mergeCtxCache.put(key, ctx);
-        logger.info("汇聚路由（增量）: {}.{} -> {}.{}，来源标识 {}",
-                srcDb, srcTable, ctx.targetDb, ctx.targetTable, tags);
+        logger.info("汇聚路由（增量）: {}.{} -> {}.{}，来源标识 {}{}",
+                srcDb, srcTable, ctx.targetDb, ctx.targetTable, tags,
+                extras.isEmpty() ? "" : "，逐行附加列 " + extras.keySet());
         return ctx;
     }
 
@@ -507,7 +530,7 @@ public class TypedDmlConverter {
             List<Object> params = row;
             if (ctx != null) {
                 params = new ArrayList<>(row);
-                params.addAll(ctx.tagValues.values());
+                params.addAll(ctx.insertOnlyColumns().values());
                 // 汇聚的"命中分布"记的是每个来源贡献了多少行（key 用来源，不是目标——
                 // 目标只有一张表，记目标看不出哪个分库偏斜）
                 routeHits.computeIfAbsent(srcDb + "." + srcTable,
@@ -688,11 +711,12 @@ public class TypedDmlConverter {
         MergeCtx ctx = mergeCtxOf(srcDb, srcTable);
         String[] sqlCols = mapColumns(srcDb, srcTable, cols);
         if (ctx != null) {
-            // 汇聚：来源标识列补在列尾，顺序与 convertInsert 的补值顺序一致
-            String[] withTags = java.util.Arrays.copyOf(sqlCols, sqlCols.length + ctx.tagValues.size());
+            // 汇聚：逐行附加列与来源标识列补在列尾，顺序与 convertInsert 的补值顺序一致
+            java.util.LinkedHashMap<String, String> appended = ctx.insertOnlyColumns();
+            String[] withTags = java.util.Arrays.copyOf(sqlCols, sqlCols.length + appended.size());
             int i = sqlCols.length;
-            for (String tag : ctx.tagValues.keySet()) {
-                withTags[i++] = tag;
+            for (String col : appended.keySet()) {
+                withTags[i++] = col;
             }
             sqlCols = withTags;
         }
@@ -795,7 +819,7 @@ public class TypedDmlConverter {
                     List<Object> insParams = after;
                     if (ctx != null) {
                         insParams = new ArrayList<>(after);
-                        insParams.addAll(ctx.tagValues.values());
+                        insParams.addAll(ctx.insertOnlyColumns().values());
                     }
                     out.add(new ParameterizedDml(insertSql, insParams, table,
                             mergeRowKey(rowKeyOf(setCols, after, pks), ctx), "INSERT"));

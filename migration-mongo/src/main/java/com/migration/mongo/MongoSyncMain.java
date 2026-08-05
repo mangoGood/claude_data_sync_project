@@ -71,6 +71,8 @@ public final class MongoSyncMain {
     private final Map<String, List<String>> syncObjects;
     /** 列处理（列过滤/列名映射/附加列）；无配置时各集合短路走原始文档 */
     private final MongoDocumentProcessor processor;
+    /** 聚合路由（汇聚多集合到一个 / 按字段拆分到多个集合）；未配置时 isActive()=false，走原 1:1 路径 */
+    private final com.migration.common.route.DocumentRouter router;
     private final Path progressPath;
     private final Path tokenPath;
     /** 全量 bulkWrite 装载配置（与 SQL/ES/Redis 各链路共用同一组 migration.full.bulk.* 键）。 */
@@ -107,6 +109,7 @@ public final class MongoSyncMain {
         this.props = props;
         this.syncObjects = parseSyncObjects(props.getProperty("migration.sync.objects", ""));
         this.processor = MongoDocumentProcessor.fromProperties(props);
+        this.router = com.migration.common.route.DocumentRouter.fromProperties(props);
         this.progressPath = Paths.get("files", taskId, "mongo_progress.json");
         this.tokenPath = Paths.get("files", taskId, "checkpoint", "mongo_resume_token.json");
         this.bulkOptions = com.migration.common.bulk.BulkLoadOptions.from(props);
@@ -281,6 +284,15 @@ public final class MongoSyncMain {
                 for (String collName : e.getValue()) {
                     currentCollection = dbName + "." + collName;
                     writeProgress();
+                    if (router.matches(dbName, collName)) {
+                        copyRoutedCollection(target, dbName, collName,
+                                srcDb.getCollection(collName), snapshotSession);
+                        completedCollections++;
+                        writeProgress();
+                        logger.info("集合 {} 全量完成（路由）({}/{})",
+                                currentCollection, completedCollections, totalCollections);
+                        continue;
+                    }
                     copyCollection(dbName, collName, srcDb.getCollection(collName),
                             tgtDb.getCollection(collName), snapshotSession);
                     completedCollections++;
@@ -443,6 +455,93 @@ public final class MongoSyncMain {
         }
     }
 
+    // ==================== 全量：聚合路由 ====================
+
+    /**
+     * 路由下的全量搬运：逐文档算落点后写目标集合。
+     *
+     * <p>与 1:1 路径分开写而不是在里面塞判断，是因为两件事根本不同：那条路径一个源集合对一个
+     * 目标集合、可以走 insertMany 快路径；这里一条文档一个落点，只能逐条 upsert。
+     *
+     * <p>汇聚必须换 {@code _id}（{@code 来源标识|原_id}）：不换的话两个来源里 _id 相同的文档
+     * 会互相覆盖，数据只会少、不会报错——与关系库"必须用复合主键"是同一件事。
+     */
+    private void copyRoutedCollection(MongoClient target, String db, String coll,
+                                      MongoCollection<Document> src,
+                                      com.mongodb.client.ClientSession snapshotSession) {
+        boolean active = processor.isActive(db, coll);
+        String shardKey = router.shardKeyField(db, coll);
+        com.mongodb.client.model.ReplaceOptions upsert =
+                new com.mongodb.client.model.ReplaceOptions().upsert(true);
+        com.mongodb.client.FindIterable<Document> find = snapshotSession != null
+                ? src.find(snapshotSession) : src.find();
+        long copied = 0;
+        try (MongoCursor<Document> cursor = find.batchSize(FULL_BATCH_SIZE).iterator()) {
+            while (cursor.hasNext()) {
+                Document doc = cursor.next();
+                if (active && processor.excluded(db, coll, doc)) {
+                    continue;
+                }
+                Document out = active ? processor.transform(db, coll, doc) : new Document(doc);
+                for (Document written : routeDocument(target, db, coll, out, shardKey, upsert)) {
+                    copied += written == null ? 0 : 1;
+                }
+            }
+        }
+        copiedDocs += copied;
+        writeProgress();
+        logger.info("集合 {}.{} 路由装载完成: {} 文档", db, coll, copied);
+    }
+
+    /**
+     * 把一条文档写到它的路由落点，返回实际写入的份数（广播时可能多份）。
+     *
+     * <p>拆分下分片键为空时按未路由策略处置：默认广播到每一片（宁可重复也不静默丢），
+     * DEADLETTER 则整条不写。
+     */
+    private java.util.List<Document> routeDocument(MongoClient target, String db, String coll,
+                                                   Document doc, String shardKey,
+                                                   com.mongodb.client.model.ReplaceOptions upsert) {
+        java.util.List<Document> written = new java.util.ArrayList<>();
+        if (router.isMerge()) {
+            com.migration.common.route.DocumentRouter.Target t = router.mergeTarget(db, coll, db);
+            Document out = new Document(doc);
+            out.put("_id", router.mergedId(db, coll, doc.get("_id")));
+            router.mergeTags(db, coll).forEach(out::put);
+            target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                    .replaceOne(new Document("_id", out.get("_id")), out, upsert);
+            written.add(out);
+            return written;
+        }
+        for (com.migration.common.route.DocumentRouter.Target t : shardTargetsOf(db, coll, doc, shardKey)) {
+            target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                    .replaceOne(new Document("_id", doc.get("_id")), doc, upsert);
+            written.add(doc);
+        }
+        return written;
+    }
+
+    /** 拆分：一条文档该进哪些分片（正常一片；分片键算不出时按未路由策略广播或丢弃）。 */
+    private java.util.List<com.migration.common.route.DocumentRouter.Target> shardTargetsOf(
+            String db, String coll, Document doc, String shardKey) {
+        Object value = shardKey == null ? null : doc.get(shardKey);
+        com.migration.common.route.DocumentRouter.Target t = router.shardOf(db, coll, value, db);
+        if (t != null) {
+            return java.util.List.of(t);
+        }
+        switch (router.unroutedPolicy(db, coll)) {
+            case DEADLETTER:
+                logger.warn("文档 {}.{} _id={} 的分片键为空/算不出分片，按 DEADLETTER 丢弃",
+                        db, coll, doc.get("_id"));
+                return java.util.List.of();
+            case ERROR:
+                throw new IllegalStateException("文档 " + db + "." + coll + " _id=" + doc.get("_id")
+                        + " 的分片键算不出分片，按 ERROR 策略终止");
+            default:
+                return router.allShards(db, coll, db);
+        }
+    }
+
     // ==================== 增量（Change Streams） ====================
 
     /** 打开一次 deployment 级 change stream，取当前位点 token（无事件也能拿 postBatchResumeToken）。 */
@@ -560,7 +659,9 @@ public final class MongoSyncMain {
                 logger.info("集合 {}.{} 已随源库 drop", db, coll);
                 return;
             }
-            if (bidiEnabled) {
+            if (router.matches(db, coll)) {
+                applyRoutedDml(target, db, coll, event, upsert);
+            } else if (bidiEnabled) {
                 applyInMarkedTransaction(target, db, coll, event, upsert);
             } else {
                 applyDml(target.getDatabase(db).getCollection(coll), db, coll, event, upsert, null);
@@ -569,6 +670,91 @@ public final class MongoSyncMain {
             // 单事件失败记日志继续（upsert/delete 幂等，绝大多数为暂时性错误，
             // 下轮 resume 重放可自愈；不因单事件卡死整个流）
             logger.error("应用增量事件失败: {} {}.{}: {}", op, db, coll, e.getMessage());
+        }
+    }
+
+    /**
+     * 路由下的增量应用。
+     *
+     * <p>两处必须与 1:1 路径不同，都是 change stream 拿不到前镜像逼出来的：
+     * <ul>
+     *   <li><b>DELETE 只带 _id</b>，没有文档内容 → 算不出分片键 → 只能<b>广播删</b>到每一片。
+     *       删一个不存在的 _id 是 no-op，代价可接受；按某一片猜着删则会漏删，留下幽灵文档。</li>
+     *   <li><b>UPDATE 改了分片键时</b>，新落点由新文档算得出，旧落点却算不出（没有前镜像）。
+     *       做法是：先把这个 _id 从<b>其余各片</b>删掉，再写进新落点——等价于一次搬迁，
+     *       且对"没改分片键"的普通更新也是安全的（其余片本来就没有这条）。</li>
+     * </ul>
+     *
+     * <p>汇聚下 _id 已按来源重构，天然不会跨来源撞车，删改都按重构后的 _id 定位。
+     */
+    private void applyRoutedDml(MongoClient target, String db, String coll,
+                                ChangeStreamDocument<Document> event,
+                                ReplaceOptions upsert) {
+        OperationType op = event.getOperationType();
+        boolean active = processor.isActive(db, coll);
+        if (op == OperationType.DELETE) {
+            Document key = event.getDocumentKey() == null
+                    ? null : Document.parse(event.getDocumentKey().toJson());
+            Object id = key == null ? null : key.get("_id");
+            if (id == null) {
+                return;
+            }
+            if (router.isMerge()) {
+                com.migration.common.route.DocumentRouter.Target t = router.mergeTarget(db, coll, db);
+                target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                        .deleteOne(new Document("_id", router.mergedId(db, coll, id)));
+                return;
+            }
+            for (com.migration.common.route.DocumentRouter.Target t : router.allShards(db, coll, db)) {
+                target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                        .deleteOne(new Document("_id", id));
+            }
+            return;
+        }
+
+        Document full = event.getFullDocument();
+        if (full == null) {
+            // UPDATE 的 lookup 落空 = 文档已被删，后续 DELETE 事件会处理
+            return;
+        }
+        if (active && processor.excluded(db, coll, full)) {
+            // 列过滤把这条排除了：目标端不该再有它，按删处理（与关系库侧的语义一致）
+            Object id = router.isMerge() ? router.mergedId(db, coll, full.get("_id")) : full.get("_id");
+            if (router.isMerge()) {
+                com.migration.common.route.DocumentRouter.Target t = router.mergeTarget(db, coll, db);
+                target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                        .deleteOne(new Document("_id", id));
+            } else {
+                for (com.migration.common.route.DocumentRouter.Target t : router.allShards(db, coll, db)) {
+                    target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                            .deleteOne(new Document("_id", id));
+                }
+            }
+            return;
+        }
+
+        Document doc = active ? processor.transform(db, coll, full) : new Document(full);
+        if (router.isMerge()) {
+            routeDocument(target, db, coll, doc, null, upsert);
+            return;
+        }
+        String shardKey = router.shardKeyField(db, coll);
+        java.util.List<com.migration.common.route.DocumentRouter.Target> targets =
+                shardTargetsOf(db, coll, doc, shardKey);
+        java.util.Set<String> keep = new java.util.HashSet<>();
+        for (com.migration.common.route.DocumentRouter.Target t : targets) {
+            keep.add(t.toString());
+        }
+        // 先清其余片上的同 _id（分片键被改过时那份就是陈行），再写新落点
+        for (com.migration.common.route.DocumentRouter.Target t : router.allShards(db, coll, db)) {
+            if (!keep.contains(t.toString())) {
+                target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                        .deleteOne(new Document("_id", doc.get("_id")));
+            }
+        }
+        for (com.migration.common.route.DocumentRouter.Target t : targets) {
+            target.getDatabase(t.getDatabase()).getCollection(t.getName())
+                    .replaceOne(new Document("_id", doc.get("_id")), doc, upsert);
         }
     }
 

@@ -73,6 +73,8 @@ public final class ElasticSyncMain {
 
     private final String taskId;
     private final Properties props;
+    /** 聚合路由（汇聚多表到一个索引 / 按字段拆到多个索引）；未配置时 matches() 恒 false，走原 1:1 路径 */
+    private final com.migration.common.route.DocumentRouter router;
     /** 同步对象：db -> 表清单；空清单 = 整库（dbLevel） */
     private final Map<String, List<String>> syncObjects;
     private final Path progressPath;
@@ -99,6 +101,7 @@ public final class ElasticSyncMain {
     private ElasticSyncMain(String taskId, Properties props) {
         this.taskId = taskId;
         this.props = props;
+        this.router = com.migration.common.route.DocumentRouter.fromProperties(props);
         this.syncObjects = parseSyncObjects(props.getProperty("migration.sync.objects", ""));
         this.progressPath = Paths.get("files", taskId, "elastic_progress.json");
         this.positionPath = Paths.get("files", taskId, "checkpoint", "elastic_binlog_position.json");
@@ -252,13 +255,22 @@ public final class ElasticSyncMain {
     private void copyTable(Connection conn, Connection readConn, String db, String table) throws Exception {
         TableMeta meta = tableMeta(conn, db, table);
         String index = indexName(db, table);
-        es.createIndexIfAbsent(index);
+        // 路由下要预建的是<b>落点</b>索引：汇聚是那一个合并索引，拆分是全部分片索引
+        List<String> ensureIndexes = router.matches(db, table)
+                ? (router.isMerge()
+                    ? List.of(indexName(router.mergeTarget(db, table, db).getDatabase(),
+                                        router.mergeTarget(db, table, db).getName()))
+                    : allShardIndexes(db, table))
+                : List.of(index);
+        for (String idx : ensureIndexes) {
+            es.createIndexIfAbsent(idx);
+        }
         if (meta.pkIndexes.length == 0) {
             logger.warn("表 {}.{} 无主键：全量按自动 _id 写入，增量 UPDATE/DELETE 将被跳过", db, table);
         }
 
         // 装载窗口：关刷新与副本装完再恢复。finally 兜底，异常退出也不会把索引留在该状态。
-        String[] originalSettings = es.beginLoadWindow(index);
+        String[] originalSettings = es.beginLoadWindow(ensureIndexes.get(0));
         try (EsBulkChannel channel = new EsBulkChannel(es, bulkOptions)) {
             // 流式读取：MySQL 驱动需 fetchSize=Integer.MIN_VALUE 才逐行拉取，避免大表 OOM
             try (Statement stmt = readConn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
@@ -271,7 +283,9 @@ public final class ElasticSyncMain {
                         for (int i = 1; i <= cols; i++) {
                             doc.put(rsMeta.getColumnName(i), convertJdbcValue(rs.getObject(i)));
                         }
-                        channel.add(EsClient.indexOp(index, docId(meta, doc), doc));
+                        for (String[] op : indexOps(db, table, docId(meta, doc), doc)) {
+                            channel.add(op);
+                        }
                         if (channel.isFull()) {
                             flushBulk(channel);
                         }
@@ -281,7 +295,7 @@ public final class ElasticSyncMain {
             flushBulk(channel);
             logger.info("表 {}.{} 装载完成: {}", db, table, channel.stats().summary());
         } finally {
-            es.endLoadWindow(index, originalSettings);
+            es.endLoadWindow(ensureIndexes.get(0), originalSettings);
         }
     }
 
@@ -385,7 +399,7 @@ public final class ElasticSyncMain {
             List<String[]> ops = new ArrayList<>();
             for (Serializable[] row : w.getRows()) {
                 Map<String, Object> doc = rowToDoc(meta, w.getIncludedColumns(), row);
-                ops.add(EsClient.indexOp(indexName(tm.getDatabase(), tm.getTable()), docId(meta, doc), doc));
+                ops.addAll(indexOps(tm.getDatabase(), tm.getTable(), docId(meta, doc), doc));
             }
             applyOps(ops);
         } else if (data instanceof UpdateRowsEventData) {
@@ -399,17 +413,30 @@ public final class ElasticSyncMain {
                 logger.warn("表 {}.{} 无主键，跳过 UPDATE 事件", tm.getDatabase(), tm.getTable());
                 return;
             }
-            String index = indexName(tm.getDatabase(), tm.getTable());
+            String db = tm.getDatabase();
+            String table = tm.getTable();
             List<String[]> ops = new ArrayList<>();
             for (Map.Entry<Serializable[], Serializable[]> pair : u.getRows()) {
                 Map<String, Object> before = rowToDoc(meta, u.getIncludedColumnsBeforeUpdate(), pair.getKey());
                 Map<String, Object> after = rowToDoc(meta, u.getIncludedColumns(), pair.getValue());
                 String oldId = docId(meta, before);
                 String newId = docId(meta, after);
+                List<String> oldIndexes = targetIndexes(db, table, before);
+                List<String> newIndexes = targetIndexes(db, table, after);
+                // 主键变更删旧建新；分片键变更则是<b>跨分片搬迁</b>——binlog 带前镜像，
+                // 旧落点算得准，不必像 Mongo 那样广播删
                 if (oldId != null && !oldId.equals(newId)) {
-                    ops.add(EsClient.deleteOp(index, oldId)); // 主键变更：删旧建新
+                    for (String idx : oldIndexes) {
+                        ops.add(EsClient.deleteOp(idx, targetDocId(db, table, oldId)));
+                    }
+                } else {
+                    for (String idx : oldIndexes) {
+                        if (!newIndexes.contains(idx)) {
+                            ops.add(EsClient.deleteOp(idx, targetDocId(db, table, oldId)));
+                        }
+                    }
                 }
-                ops.add(EsClient.indexOp(index, newId, after));
+                ops.addAll(indexOps(db, table, newId, after));
             }
             applyOps(ops);
         } else if (data instanceof DeleteRowsEventData) {
@@ -423,13 +450,15 @@ public final class ElasticSyncMain {
                 logger.warn("表 {}.{} 无主键，跳过 DELETE 事件", tm.getDatabase(), tm.getTable());
                 return;
             }
-            String index = indexName(tm.getDatabase(), tm.getTable());
             List<String[]> ops = new ArrayList<>();
             for (Serializable[] row : d.getRows()) {
                 Map<String, Object> doc = rowToDoc(meta, d.getIncludedColumns(), row);
                 String id = docId(meta, doc);
                 if (id != null) {
-                    ops.add(EsClient.deleteOp(index, id));
+                    // DELETE 事件带整行前镜像，分片键在里面，落点算得出来
+                    for (String idx : targetIndexes(tm.getDatabase(), tm.getTable(), doc)) {
+                        ops.add(EsClient.deleteOp(idx, targetDocId(tm.getDatabase(), tm.getTable(), id)));
+                    }
                 }
             }
             applyOps(ops);
@@ -723,6 +752,84 @@ public final class ElasticSyncMain {
     /** ES 索引名：{db}_{table} 小写（ES 索引名不允许大写）。 */
     static String indexName(String db, String table) {
         return (db + "_" + table).toLowerCase();
+    }
+
+    // ==================== 聚合路由（汇聚 N 表 → 1 索引 / 拆分 1 表 → N 索引） ====================
+
+    /**
+     * 一条文档的落点索引。
+     *
+     * <p>汇聚是"多张表并进一个索引"，拆分是"一张表按字段散到多个索引"——ES 侧的落点就只是
+     * 索引名，因此整套路由在这里收敛成一个函数。分片键算不出时按未路由策略处置：
+     * 默认广播到每一片（宁可重复也不静默丢），DEADLETTER 则整条不写。
+     */
+    private List<String> targetIndexes(String db, String table, Map<String, Object> doc) {
+        if (!router.matches(db, table)) {
+            return List.of(indexName(db, table));
+        }
+        if (router.isMerge()) {
+            com.migration.common.route.DocumentRouter.Target t = router.mergeTarget(db, table, db);
+            return List.of(indexName(t.getDatabase(), t.getName()));
+        }
+        String shardKey = router.shardKeyField(db, table);
+        Object value = shardKey == null || doc == null ? null : doc.get(shardKey);
+        com.migration.common.route.DocumentRouter.Target t = router.shardOf(db, table, value, db);
+        if (t != null) {
+            return List.of(indexName(t.getDatabase(), t.getName()));
+        }
+        switch (router.unroutedPolicy(db, table)) {
+            case DEADLETTER:
+                logger.warn("表 {}.{} 有文档的分片键为空/算不出分片，按 DEADLETTER 丢弃", db, table);
+                return List.of();
+            case ERROR:
+                throw new IllegalStateException("表 " + db + "." + table
+                        + " 的分片键算不出分片，按 ERROR 策略终止");
+            default:
+                return allShardIndexes(db, table);
+        }
+    }
+
+    /** 拆分的全部分片索引（广播写、按 _id 广播删都要用）。 */
+    private List<String> allShardIndexes(String db, String table) {
+        List<String> indexes = new ArrayList<>();
+        for (com.migration.common.route.DocumentRouter.Target t : router.allShards(db, table, db)) {
+            indexes.add(indexName(t.getDatabase(), t.getName()));
+        }
+        return indexes;
+    }
+
+    /**
+     * 汇聚下的文档 id：加来源前缀。
+     *
+     * <p>不加的话，两张源表里主键相同的行会写成同一个 {@code _id} 互相覆盖——
+     * ES 的 index 操作就是 upsert，覆盖不报错，只会少数据。
+     */
+    private String targetDocId(String db, String table, String rawId) {
+        if (rawId == null || !router.isMerge() || !router.matches(db, table)) {
+            return rawId;
+        }
+        return router.mergedId(db, table, rawId);
+    }
+
+    /** 汇聚下把来源标识写进文档（便于按来源筛选与对数）。 */
+    private Map<String, Object> withMergeTags(String db, String table, Map<String, Object> doc) {
+        if (doc == null || !router.isMerge() || !router.matches(db, table)) {
+            return doc;
+        }
+        Map<String, Object> out = new LinkedHashMap<>(doc);
+        out.putAll(router.mergeTags(db, table));
+        return out;
+    }
+
+    /** 一条文档的写入操作（可能落到多个索引：广播时）。 */
+    private List<String[]> indexOps(String db, String table, String rawId, Map<String, Object> doc) {
+        List<String[]> ops = new ArrayList<>();
+        Map<String, Object> out = withMergeTags(db, table, doc);
+        String id = targetDocId(db, table, rawId);
+        for (String index : targetIndexes(db, table, doc)) {
+            ops.add(EsClient.indexOp(index, id, out));
+        }
+        return ops;
     }
 
     // ==================== 连接 / checkpoint / 进度 ====================

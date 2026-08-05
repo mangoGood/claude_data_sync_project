@@ -25,6 +25,11 @@ public final class RouteConfigValidator {
     private static final List<String> DDL_POLICIES = List.of("FIRST_WINS", "SKIP", "MANUAL");
     private static final List<String> ALGORITHMS = List.of("HASH_MOD", "RANGE", "LIST", "DATE_FORMAT");
     private static final List<String> UNROUTED = List.of("BROADCAST", "DEADLETTER", "ERROR");
+    /** 关系库侧支持聚合路由的引擎（含异构 mysql↔pg），与引擎侧 RoutingConfig 的白名单一致 */
+    private static final List<String> ROUTABLE_ENGINES = List.of("mysql", "postgresql");
+    /** 文档型引擎：路由由各自引擎实现（mongo 走集合、ES 走索引），不读 JDBC 侧的 route.* */
+    private static final List<String> DOCUMENT_ENGINES = List.of("mongodb", "elasticsearch");
+    private static final String[] COLUMN_PROCESSING_KEYS = {"columnFilter", "columnMapping", "extraColumns"};
 
     private RouteConfigValidator() {
     }
@@ -85,6 +90,84 @@ public final class RouteConfigValidator {
             throw new IllegalArgumentException(String.join("；", errors));
         }
         return GSON.toJson(root);
+    }
+
+    /**
+     * 任务级适用性校验：这条任务的<b>库类型与任务类型</b>允不允许用聚合路由。
+     *
+     * <p>与 {@link #validate} 分开：那个只看路由 JSON 本身写得对不对，这个看它和任务其余配置
+     * 兼不兼容——两边的入口不同（改路由、改同步对象、启动任务都要判），合在一起会漏。
+     *
+     * <p>口径必须与引擎侧 {@code RoutingConfig#validateEngineSupport} 一致；这里挡在保存/启动时，
+     * 引擎那道挡的是绕过接口直接改 config.properties 的情况，两道都要有。
+     *
+     * @param syncObjects 任务的 syncObjects JSON（保留参数：调用方三处入口一致，后续判定要用）
+     * @throws IllegalArgumentException 不允许时抛出，消息直接给用户看
+     */
+    public static void assertApplicable(String routeConfig, String sourceType, String targetType,
+                                        String taskType, String syncObjects) {
+        if (routeConfig == null || routeConfig.trim().isEmpty()) {
+            return;
+        }
+        String source = lower(sourceType);
+        String target = lower(targetType);
+        String pair = source + "→" + target;
+        if ("redis".equals(source) || "redis".equals(target)) {
+            throw new IllegalArgumentException("Redis 不支持聚合路由：Redis 没有表的概念，"
+                    + "所谓汇聚/拆分只能是 key 前缀命名空间的合并或分裂，与分库分表不是一回事");
+        }
+        if ("tidb".equals(source)) {
+            throw new IllegalArgumentException("TiDB 源暂不支持聚合路由：增量走 TiCDC canal-json，"
+                    + "路由改写未在该链路验证");
+        }
+        // Mongo / ES 的路由由各自引擎实现，与 JDBC 链路的规则同形（见 MongoSyncMain / ElasticSyncMain）
+        boolean documentEngine = DOCUMENT_ENGINES.contains(source) || DOCUMENT_ENGINES.contains(target);
+        if (!documentEngine && !source.isEmpty() && !target.isEmpty()
+                && (!ROUTABLE_ENGINES.contains(source) || !ROUTABLE_ENGINES.contains(target))) {
+            throw new IllegalArgumentException("库对 " + pair + " 暂不支持聚合路由："
+                    + "幂等 upsert 装载只实现了 MySQL 与 PostgreSQL 方言");
+        }
+        // MERGE_LEG 是跨实例汇聚派生出的隐藏子任务，天然带父任务的路由配置，必须放行
+        if (taskType != null && !"SYNC".equals(taskType) && !"MERGE_LEG".equals(taskType)) {
+            throw new IllegalArgumentException("聚合路由目前只支持实时同步任务，"
+                    + "灾备/订阅任务暂不支持（当前任务类型: " + taskType + "）");
+        }
+    }
+
+    /**
+     * 任务是否配置了列处理（syncObjects 任一库 entry 携带非空的
+     * columnFilter / columnMapping / extraColumns）。
+     */
+    @SuppressWarnings("unchecked")
+    public static boolean hasColumnProcessing(String syncObjectsJson) {
+        if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
+            return false;
+        }
+        try {
+            Map<String, Object> raw = GSON.fromJson(syncObjectsJson, Map.class);
+            if (raw == null) {
+                return false;
+            }
+            for (Object value : raw.values()) {
+                if (!(value instanceof Map)) {
+                    continue;
+                }
+                Map<?, ?> entry = (Map<?, ?>) value;
+                for (String key : COLUMN_PROCESSING_KEYS) {
+                    Object cp = entry.get(key);
+                    if (cp instanceof Map && !((Map<?, ?>) cp).isEmpty()) {
+                        return true;
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            return false;
+        }
+        return false;
+    }
+
+    private static String lower(String raw) {
+        return raw == null ? "" : raw.trim().toLowerCase();
     }
 
     private static void validateMergeRule(Map<String, Object> rule, int index, List<String> errors) {

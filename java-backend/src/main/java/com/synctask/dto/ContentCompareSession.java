@@ -15,6 +15,10 @@ public class ContentCompareSession {
     private List<TableCompareTask> tables;
     private String status;
     private long createdAt;
+    /** 聚合路由配置 JSON（汇聚/拆分任务的落点由它解析出来）；1:1 任务为 null */
+    private String routeConfig;
+    /** 来源实例标识：汇聚下用于按来源标识列切出属于本任务的那部分行 */
+    private String routeNodeId;
 
     public ContentCompareSession() {
         this.sessionId = UUID.randomUUID().toString();
@@ -38,6 +42,12 @@ public class ContentCompareSession {
         private int totalDiffsFound;
         private boolean scanCompleted;
         private String status;
+        /**
+         * 路由解析用的"任务默认目标库"（库名映射之后、路由之前的那个库名）。
+         * 单独存一份是因为 {@code targetDb} 在路由任务里会被改写成合并表/首个分片所在的库，
+         * 拿它当默认库去解析规则，模板缺省的场景会解析到错误的库上。
+         */
+        private String routeDefaultTargetDb;
 
         public TableCompareTask() {
             this.diffs = new ArrayList<>();
@@ -74,6 +84,8 @@ public class ContentCompareSession {
         public void setScanCompleted(boolean scanCompleted) { this.scanCompleted = scanCompleted; }
         public String getStatus() { return status; }
         public void setStatus(String status) { this.status = status; }
+        public String getRouteDefaultTargetDb() { return routeDefaultTargetDb; }
+        public void setRouteDefaultTargetDb(String routeDefaultTargetDb) { this.routeDefaultTargetDb = routeDefaultTargetDb; }
     }
 
     public static class ColumnMeta {
@@ -118,16 +130,29 @@ public class ContentCompareSession {
         public void setTotalRows(long totalRows) { this.totalRows = totalRows; }
     }
 
+    /**
+     * 一条差异。{@code diffType} ∈ SOURCE_ONLY / TARGET_ONLY / CONTENT_DIFF /
+     * <b>WRONG_SHARD</b>（拆分专有：行在目标端，但不在它按分片键<b>应该</b>在的那一片上）。
+     */
     public static class DataDiff {
         private Object primaryKeyValue;
         private String diffType;
         private List<String> diffFields;
         private String sourceData;
         private String targetData;
+        /** 该行实际所在的分片表（"库.表"）；拆分任务才有值，修复时据此定位到具体分片 */
+        private String targetShard;
+        /** WRONG_SHARD 专用：按分片键算出的正确分片表（"库.表"） */
+        private String expectedShard;
 
         public DataDiff() {
             this.diffFields = new ArrayList<>();
         }
+
+        public String getTargetShard() { return targetShard; }
+        public void setTargetShard(String targetShard) { this.targetShard = targetShard; }
+        public String getExpectedShard() { return expectedShard; }
+        public void setExpectedShard(String expectedShard) { this.expectedShard = expectedShard; }
 
         public Object getPrimaryKeyValue() { return primaryKeyValue; }
         public void setPrimaryKeyValue(Object primaryKeyValue) { this.primaryKeyValue = primaryKeyValue; }
@@ -140,6 +165,11 @@ public class ContentCompareSession {
         public String getTargetData() { return targetData; }
         public void setTargetData(String targetData) { this.targetData = targetData; }
     }
+
+    public String getRouteConfig() { return routeConfig; }
+    public void setRouteConfig(String routeConfig) { this.routeConfig = routeConfig; }
+    public String getRouteNodeId() { return routeNodeId; }
+    public void setRouteNodeId(String routeNodeId) { this.routeNodeId = routeNodeId; }
 
     public String getSessionId() { return sessionId; }
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }

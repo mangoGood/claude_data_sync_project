@@ -252,13 +252,18 @@ public class DataMigration {
      */
     private Object[] readRowValues(ResultSet rs, ResultSetMetaData metaData, int columnCount, TableInfo table)
             throws SQLException {
+        // 顺序必须与 getColumnNames 严格一致：源列 → 逐行注值的附加列 → 来源标识列
+        java.util.Collection<String> extraValues = perRowExtras(table).values();
         java.util.Collection<String> tagValues = table.getMergeTagValues().values();
-        Object[] values = new Object[columnCount + tagValues.size()];
+        Object[] values = new Object[columnCount + extraValues.size() + tagValues.size()];
         for (int i = 1; i <= columnCount; i++) {
             Object value = readColumnValue(rs, i, metaData, table);
             values[i - 1] = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
         }
         int idx = columnCount;
+        for (String extra : extraValues) {
+            values[idx++] = extra;
+        }
         for (String tag : tagValues) {
             values[idx++] = tag;
         }
@@ -281,9 +286,15 @@ public class DataMigration {
             return plainInsert;
         }
         List<String> pkColumns = new ArrayList<>();
+        boolean applyColumnMapping = columnProcessingApplicable();
+        String srcDb = applyColumnMapping ? columnProcessingDbOf(table) : null;
         for (ColumnInfo column : table.getColumns()) {
             if (column.isPrimaryKey()) {
-                pkColumns.add(column.getColumnName());
+                // 冲突目标是<b>目标表</b>的主键列名：配了列名映射时目标端叫的是映射后的名字，
+                // 拿源列名去写 ON CONFLICT 会直接报列不存在
+                pkColumns.add(applyColumnMapping
+                        ? columnProcessing.mapColumn(srcDb, table.getTableName(), column.getColumnName())
+                        : column.getColumnName());
             }
         }
         if (table.isMergeCompositePk()) {
@@ -331,15 +342,38 @@ public class DataMigration {
     }
 
     /**
+     * 列处理规则的源库 key：<b>按表取</b>，不能用连接上的库名。
+     *
+     * <p>汇聚一条通道要搬多个源库（shard_1/shard_2/...），连接上的 database 只有一个，
+     * 拿它当 key 的话除那一个库外，其余源库的过滤/映射规则一条都命中不了，而且不报错——
+     * 增量侧的源库名取自 binlog 事件是对的，于是同一张表全量放行、增量过滤，越跑越不一致。
+     */
+    private String columnProcessingDbOf(TableInfo table) {
+        String srcDb = table.getSourceDatabase();
+        return srcDb != null && !srcDb.isEmpty() ? srcDb : sourceConnection.getConfig().getDatabase();
+    }
+
+    /**
      * 列过滤的 "保留行" WHERE 片段（源端 SELECT/COUNT 共用）；无过滤配置返回 null。
      * 命中过滤条件（如 col1 &lt; 1）的行不同步；过滤列为 NULL 的行保留。
      */
-    private String filterKeepClause(String tableName) {
+    private String filterKeepClause(TableInfo table) {
         if (!columnProcessingApplicable()) {
             return null;
         }
-        String srcDb = sourceConnection.getConfig().getDatabase();
-        return columnProcessing.buildKeepClause(srcDb, tableName, this::sourceQuoteIdentifier);
+        return columnProcessing.buildKeepClause(columnProcessingDbOf(table), table.getTableName(),
+                this::sourceQuoteIdentifier);
+    }
+
+    /**
+     * 汇聚下需要逐行注值的附加列（CUSTOM 类型）。1:1 与拆分下返回空——
+     * 那两种情形目标表由该源表独占，建表 DEFAULT 里的来源标识就是对的。
+     */
+    private java.util.LinkedHashMap<String, String> perRowExtras(TableInfo table) {
+        if (!columnProcessingApplicable() || !table.isUpsertLoad()) {
+            return new java.util.LinkedHashMap<>();
+        }
+        return columnProcessing.perRowExtraValues(columnProcessingDbOf(table), table.getTableName());
     }
 
     public void migrateAllData(List<TableInfo> tables) throws SQLException {
@@ -368,12 +402,20 @@ public class DataMigration {
         
         closeNodeConnections();
         logger.info("数据迁移完成，总成功: {}, 总失败: {}", totalSuccessCount, totalFailCount);
+        // 逐行写入失败此前只记了个数：进程照样退出 0，任务报"完成"，而目标端可能一行都没写进去
+        // （实测汇聚下某个来源列名对不上，那一整个来源的行全部失败，任务仍然成功退出）。
+        // continueOnError=false 的语义就是"有失败就别装作成功"，这里必须抛。
+        if (totalFailCount > 0 && !continueOnError) {
+            throw new SQLException("全量迁移有 " + totalFailCount + " 行写入失败（成功 "
+                    + totalSuccessCount + " 行）。已按 migration.continue.on.error=false 终止，"
+                    + "具体失败原因见上方日志");
+        }
     }
 
     public int[] migrateTableData(TableInfo table) throws SQLException {
         String tableName = table.getTableName();
         
-        long totalRows = getTableRowCount(tableName);
+        long totalRows = getTableRowCount(table);
         logger.info("开始迁移表 {} 的数据，总行数: {}", tableName, totalRows);
         
         if (totalRows == 0) {
@@ -638,7 +680,7 @@ public class DataMigration {
                 // 每页用独立连接：避免 Oracle 源端 PGA 累积（ORA-04036），做法与串行分页路径一致；
                 // 一致性快照下改为向快照借用固定的快照会话（见 acquirePageConnection）
                 Connection pageConn = acquirePageConnection(shardSrc);
-                String shardKeepClause = filterKeepClause(tableName);
+                String shardKeepClause = filterKeepClause(table);
                 String pageSql = "SELECT " + sourceQuoteColumnList + " FROM " + snapshotTable(sourceQuoteIdentifier(tableName)) +
                         " WHERE " + sourceQuoteIdentifier(primaryKeyColumn) + " > ? AND " +
                         sourceQuoteIdentifier(primaryKeyColumn) + " <= ? " +
@@ -766,7 +808,7 @@ public class DataMigration {
                     // 关闭并重建连接强制释放源端会话 PGA；一致性快照下改为借用快照会话
                     Connection pageConn = acquirePageConnection(sourceConnection);
                     // 分页子句按源库方言生成：MySQL → LIMIT，Oracle/PostgreSQL → FETCH FIRST ... ROWS ONLY
-                    String pageKeepClause = filterKeepClause(tableName);
+                    String pageKeepClause = filterKeepClause(table);
                     String lowerBoundClause = withLowerBound
                             ? sourceQuoteIdentifier(primaryKeyColumn) + " > ? "
                             : null;
@@ -859,7 +901,7 @@ public class DataMigration {
             } else {
                 // ===== 无主键 fallback：单次全表查询 =====
                 String selectSql = "SELECT " + sourceQuoteColumnList + " FROM " + snapshotTable(sourceQuoteIdentifier(tableName));
-                String fullKeepClause = filterKeepClause(tableName);
+                String fullKeepClause = filterKeepClause(table);
                 if (fullKeepClause != null) {
                     selectSql += " WHERE " + fullKeepClause;
                 }
@@ -1026,10 +1068,11 @@ public class DataMigration {
         return String.join(", ", columns);
     }
 
-    private long getTableRowCount(String tableName) throws SQLException {
+    private long getTableRowCount(TableInfo table) throws SQLException {
+        String tableName = table.getTableName();
         String sql = "SELECT COUNT(*) FROM " + sourceQuoteIdentifier(tableName);
         // 列过滤：总行数按过滤后口径统计，进度/日志与实际搬运行数一致
-        String keepClause = filterKeepClause(tableName);
+        String keepClause = filterKeepClause(table);
         if (keepClause != null) {
             sql += " WHERE " + keepClause;
         }
@@ -1048,7 +1091,7 @@ public class DataMigration {
     private List<String> getColumnNames(TableInfo table) {
         List<String> columns = new ArrayList<>();
         boolean applyColumnMapping = columnProcessingApplicable();
-        String srcDb = applyColumnMapping ? sourceConnection.getConfig().getDatabase() : null;
+        String srcDb = applyColumnMapping ? columnProcessingDbOf(table) : null;
         for (var column : table.getColumns()) {
             // Oracle→PG 场景：源端列名通常为大写，目标 PG 表已建为小写，这里转小写以匹配
             String colName = (sourceIsOracle() && targetIsPostgresql) ? column.getColumnName().toLowerCase() : column.getColumnName();
@@ -1057,6 +1100,10 @@ public class DataMigration {
                 colName = columnProcessing.mapColumn(srcDb, table.getTableName(), colName);
             }
             columns.add(quoteIdentifier(colName));
+        }
+        // 汇聚下 CUSTOM 附加列改为逐行注值（建表不带 DEFAULT），排在源列之后、来源标识列之前
+        for (String extraColumn : perRowExtras(table).keySet()) {
+            columns.add(quoteIdentifier(extraColumn));
         }
         // 汇聚来源标识列排在末尾：与 readRowValues 的补值顺序严格对应
         for (String tagColumn : table.getMergeTagValues().keySet()) {

@@ -166,14 +166,6 @@ public class ValidationTaskService {
                     "源端与目标端数据不再一一对应，无法进行内容对比和行数对比");
         }
 
-        // 聚合路由任务：行数对比按路由后的落点统计（已支持），但内容对比要逐行比字段，
-        // 汇聚表多了来源标识列、拆分后一张源表散在 N 张表里，逐行比对没有可靠口径，先拒绝。
-        if ("CONTENT".equals(compareType)
-                && !"NONE".equals(RouteCompareSupport.modeOf(workflow.getRouteConfig()))) {
-            throw new RuntimeException("该任务配置了分库分表路由（汇聚/拆分），"
-                    + "源端与目标端不是一一对应的表，暂不支持内容对比，请使用行数对比");
-        }
-
         if ("CONTENT".equals(compareType)) {
             if (workflow.getTargetConnection().startsWith("elastic")) {
                 throw new RuntimeException("Elasticsearch 任务暂不支持内容对比，请使用行数对比（按索引文档数）");
@@ -317,12 +309,15 @@ public class ValidationTaskService {
                 }
             }
 
-            // 表名/库名映射（表级同步）：syncObjectsMap 已压平丢失映射，显式补传给对比服务
+            // 表名/库名映射（表级同步）：syncObjectsMap 已压平丢失映射，显式补传给对比服务。
+            // 聚合路由配置同理：目标端读法（汇聚切片 / 拆分并集）全靠它解析
+            String routeConfig = routeConfigOf(task);
             ContentCompareSession session = contentCompareService.startCompare(
                 sourceConnStr, targetConnStr,
                 sourceType, targetType, syncObjectsMap,
                 parseTableMappings(task.getSyncObjects()),
-                parseDbMappings(task.getSyncObjects()));
+                parseDbMappings(task.getSyncObjects()),
+                routeConfig, routeNodeIdOf(routeConfig, parseConnection(task.getSourceConnection())));
 
             addLog(taskId, ValidationTaskLog.LogLevel.INFO, "内容对比会话已创建: " + session.getSessionId());
 
@@ -347,6 +342,9 @@ public class ValidationTaskService {
                 tr.put("sourceDb", t.getSourceDb());
                 tr.put("targetDb", t.getTargetDb());
                 tr.put("primaryKeyColumn", t.getPrimaryKeyColumn());
+                // 修复时要重新解析路由落点，而 targetDb 在路由任务里已被改写成合并表/首片所在的库，
+                // 当不了解析规则用的"默认目标库"
+                tr.put("routeDefaultTargetDb", t.getRouteDefaultTargetDb());
                 List<Map<String, String>> colMeta = new ArrayList<>();
                 if (t.getColumns() != null) {
                     for (com.synctask.dto.ContentCompareSession.ColumnMeta cm : t.getColumns()) {
@@ -363,12 +361,20 @@ public class ValidationTaskService {
                     tr.put("status", "MATCH");
                     addLog(taskId, ValidationTaskLog.LogLevel.INFO,
                         "表 " + t.getSourceTable() + " 内容一致");
+                } else if ("UNSUPPORTED".equals(t.getStatus())) {
+                    failedTables++;
+                    tr.put("status", "UNSUPPORTED");
+                    addLog(taskId, ValidationTaskLog.LogLevel.WARNING,
+                        "表 " + t.getSourceTable() + " 的分片分布在多个目标实例上，内容对比只能连一个目标实例，已跳过");
                 } else if (t.getPrimaryKeyColumn() == null || t.getPrimaryKeyColumn().isEmpty()) {
                     failedTables++;
                     tr.put("status", "NO_PK");
                     addLog(taskId, ValidationTaskLog.LogLevel.WARNING,
                         "表 " + t.getSourceTable() + " 无主键，无法详细对比");
                 } else {
+                    // 阶段1的结论要在 findDiffs 改写 status 之前留一份：拆分是"摘要一致也得逐行核"，
+                    // 与"摘要不一致"是两种情况，日志不能混为一谈
+                    String phase1Status = t.getStatus();
                     ContentCompareSession.TableCompareTask diffResult =
                         contentCompareService.findDiffs(session.getSessionId(), i, 100);
                     int diffCount = diffResult.getDiffs().size();
@@ -385,7 +391,9 @@ public class ValidationTaskService {
                         tr.put("diffCount", 0);
                         tr.put("diffs", Collections.emptyList());
                         addLog(taskId, ValidationTaskLog.LogLevel.INFO,
-                            "表 " + t.getSourceTable() + " 校验和不一致但逐行对比数据一致（CHECKSUM TABLE 对浮点/BIT/BLOB等类型可能产生误报）");
+                            "NEEDS_ROW_SCAN".equals(phase1Status)
+                                ? "表 " + t.getSourceTable() + " 摘要一致，逐行核对落点也没有错片行"
+                                : "表 " + t.getSourceTable() + " 校验和不一致但逐行对比数据一致（CHECKSUM TABLE 对浮点/BIT/BLOB等类型可能产生误报）");
                     } else {
                         totalDiffs += diffCount;
                         failedTables++;
@@ -463,6 +471,12 @@ public class ValidationTaskService {
         ParsedConnection sourceConn = parseConnection(task.getSourceConnection());
         ParsedConnection targetConn = parseConnection(task.getTargetConnection());
         boolean isPg = "postgresql".equalsIgnoreCase(sourceConn.type);
+        // 路由任务的修复要写到<b>路由后的落点</b>：汇聚要带上来源标识列，拆分要按分片键选片。
+        // 照 tr 里的 targetTable 直接写，汇聚会漏掉标识列（写出一行谁也认领不了的数据），
+        // 拆分会写到"第一片"上（下次对比又成了错片行）
+        String routeConfig = routeConfigOf(task);
+        String routeMode = RouteCompareSupport.modeOf(routeConfig);
+        String routeNodeId = routeNodeIdOf(routeConfig, sourceConn);
 
         List<Map<String, Object>> tableSummaries = new ArrayList<>();
         int totalActions = 0;
@@ -508,8 +522,20 @@ public class ValidationTaskService {
                 }
             }
 
-            String targetQualified = isPg ? quoteId(targetTable, true)
-                : quoteId(targetDb, false) + "." + quoteId(targetTable, false);
+            String routeDefaultDb = tr.get("routeDefaultTargetDb") instanceof String
+                    ? (String) tr.get("routeDefaultTargetDb") : targetDb;
+            RouteCompareSupport.MergeTarget mergeTarget = "MERGE".equals(routeMode)
+                    ? RouteCompareSupport.mergeTargetOf(routeConfig, sourceDb, sourceTable, routeDefaultDb, routeNodeId)
+                    : null;
+            RouteCompareSupport.SplitTargets splitTargets = "SPLIT".equals(routeMode)
+                    ? RouteCompareSupport.splitTargetsOf(routeConfig, sourceDb, sourceTable, routeDefaultDb)
+                    : null;
+
+            String targetQualified = mergeTarget != null
+                ? qualifyFor(mergeTarget.database, mergeTarget.table, isPg)
+                : (isPg ? quoteId(targetTable, true)
+                        : quoteId(targetDb, false) + "." + quoteId(targetTable, false));
+            Map<String, String> mergeTags = mergeTarget != null ? mergeTarget.tagFilters : Collections.emptyMap();
 
             int inserted = 0, updated = 0, deleted = 0, errors = 0;
 
@@ -525,13 +551,56 @@ public class ValidationTaskService {
                             String sourceDataJson = (String) diff.get("sourceData");
                             if (sourceDataJson == null) { errors++; continue; }
                             Map<String, Object> row = gson.fromJson(sourceDataJson, Map.class);
-                            executeUpsert(targetConnDb, targetQualified, columnNames, pkCol, row, binaryColumns, isPg);
+                            String writeTo = targetQualified;
+                            if (splitTargets != null) {
+                                // 分片键取自<b>源行</b>：这行本该去哪一片，由源端当前的值说了算
+                                Integer shard = splitTargets.shardOf(shardKeyValue(row, splitTargets.shardKeyColumn));
+                                if (shard == null) {
+                                    errors++;
+                                    logger.warn("修复表 {} 主键 {} 跳过：分片键算不出落点",
+                                        sourceTable, diff.get("primaryKeyValue"));
+                                    continue;
+                                }
+                                String[] read = splitTargets.shards.get(shard);
+                                writeTo = qualifyFor(read[0], read[1], isPg);
+                            }
+                            executeUpsert(targetConnDb, writeTo, columnNames, pkCol, row, binaryColumns, isPg,
+                                    mergeTags);
                             if ("SOURCE_ONLY".equals(diffType)) inserted++; else updated++;
-                        } else if ("TARGET_ONLY".equals(diffType)) {
+                        } else if ("TARGET_ONLY".equals(diffType) || "WRONG_SHARD".equals(diffType)) {
+                            // 错片行的修复是一次<b>搬迁</b>：先把它补到对的片上（差异带了源行才需要，
+                            // 对的片上已有正确一份时不带），再删掉错片那份。顺序不能反——
+                            // 先删后插中途失败还有源端可依据，先插后删失败会留下两份
                             Object pkValue = diff.get("primaryKeyValue");
-                            String sql = "DELETE FROM " + targetQualified + " WHERE " + quoteId(pkCol, isPg) + " = ?";
-                            try (PreparedStatement ps = targetConnDb.prepareStatement(sql)) {
+                            if ("WRONG_SHARD".equals(diffType) && diff.get("sourceData") != null
+                                    && splitTargets != null) {
+                                Map<String, Object> row = gson.fromJson((String) diff.get("sourceData"), Map.class);
+                                Integer shard = splitTargets.shardOf(
+                                        shardKeyValue(row, splitTargets.shardKeyColumn));
+                                if (shard != null) {
+                                    String[] read = splitTargets.shards.get(shard);
+                                    executeUpsert(targetConnDb, qualifyFor(read[0], read[1], isPg),
+                                            columnNames, pkCol, row, binaryColumns, isPg, mergeTags);
+                                    inserted++;
+                                }
+                            }
+                            String deleteFrom = targetQualified;
+                            if (diff.get("targetShard") instanceof String) {
+                                String[] parts = ((String) diff.get("targetShard")).split("\\.", 2);
+                                deleteFrom = parts.length == 2 ? qualifyFor(parts[0], parts[1], isPg)
+                                        : qualifyFor(targetDb, parts[0], isPg);
+                            }
+                            StringBuilder sql = new StringBuilder("DELETE FROM ").append(deleteFrom)
+                                    .append(" WHERE ").append(quoteId(pkCol, isPg)).append(" = ?");
+                            for (String tag : mergeTags.keySet()) {
+                                sql.append(" AND ").append(quoteId(tag, isPg)).append(" = ?");
+                            }
+                            try (PreparedStatement ps = targetConnDb.prepareStatement(sql.toString())) {
                                 ps.setObject(1, pkValue);
+                                int idx = 2;
+                                for (String tagValue : mergeTags.values()) {
+                                    ps.setString(idx++, tagValue);
+                                }
                                 ps.executeUpdate();
                             }
                             deleted++;
@@ -563,7 +632,20 @@ public class ValidationTaskService {
                         targetConn.database != null ? targetConn.database : targetDb),
                     targetConn.username, targetConn.password)) {
                 newSourceCount = getRowCountSafe(srcVerify, sourceDb, sourceTable, isPg);
-                newTargetCount = getRowCountSafe(tgtVerify, targetDb, targetTable, isPg);
+                // 复核也要按路由后的落点数，否则汇聚会拿"整张合并表"、拆分会拿"第一片"跟源表比，
+                // 修得再对也永远显示没收敛
+                if (mergeTarget != null) {
+                    newTargetCount = getMergedRowCount(tgtVerify, mergeTarget, isPg);
+                } else if (splitTargets != null) {
+                    newTargetCount = 0;
+                    for (String[] read : splitTargets.shards) {
+                        long n = getRowCountSafe(tgtVerify, read[0], read[1], isPg);
+                        if (n < 0) { newTargetCount = -1; break; }
+                        newTargetCount += n;
+                    }
+                } else {
+                    newTargetCount = getRowCountSafe(tgtVerify, targetDb, targetTable, isPg);
+                }
                 verified = newSourceCount >= 0 && newSourceCount == newTargetCount;
             } catch (Exception e) {
                 logger.warn("修复后复核表 {} 失败: {}", sourceTable, e.getMessage());
@@ -601,6 +683,16 @@ public class ValidationTaskService {
     /** 按源库快照 upsert 一行到目标（mysql: ON DUPLICATE KEY UPDATE；pg: ON CONFLICT DO UPDATE），二进制列先做 Base64 解码 */
     private void executeUpsert(Connection conn, String qualifiedTable, List<String> columnNames, String pkCol,
                                 Map<String, Object> row, Set<String> binaryColumns, boolean isPg) throws SQLException {
+        executeUpsert(conn, qualifiedTable, columnNames, pkCol, row, binaryColumns, isPg, Collections.emptyMap());
+    }
+
+    /**
+     * @param extraColumns 固定值列（汇聚的来源标识列）：这些列不在源表里，但目标表的主键含它们，
+     *                     不带上去就是插一行谁也认领不了的数据，而且下次对比照样是差异
+     */
+    private void executeUpsert(Connection conn, String qualifiedTable, List<String> columnNames, String pkCol,
+                                Map<String, Object> row, Set<String> binaryColumns, boolean isPg,
+                                Map<String, String> extraColumns) throws SQLException {
         List<String> nonPkColumns = columnNames.stream()
             .filter(c -> !c.equalsIgnoreCase(pkCol)).collect(Collectors.toList());
 
@@ -611,10 +703,19 @@ public class ValidationTaskService {
             sql.append(quoteId(columnNames.get(i), isPg));
             placeholders.append("?");
         }
+        for (String extra : extraColumns.keySet()) {
+            sql.append(", ").append(quoteId(extra, isPg));
+            placeholders.append(", ?");
+        }
         sql.append(") VALUES (").append(placeholders).append(")");
 
         if (isPg) {
-            sql.append(" ON CONFLICT (").append(quoteId(pkCol, true)).append(") ");
+            // 汇聚目标表的主键是 源主键 + 来源标识列，冲突目标要写全，否则 ON CONFLICT 找不到约束
+            StringBuilder conflictCols = new StringBuilder(quoteId(pkCol, true));
+            for (String extra : extraColumns.keySet()) {
+                conflictCols.append(", ").append(quoteId(extra, true));
+            }
+            sql.append(" ON CONFLICT (").append(conflictCols).append(") ");
             if (nonPkColumns.isEmpty()) {
                 sql.append("DO NOTHING");
             } else {
@@ -645,6 +746,10 @@ public class ValidationTaskService {
                 }
                 ps.setObject(i + 1, val);
             }
+            int idx = columnNames.size() + 1;
+            for (String value : extraColumns.values()) {
+                ps.setString(idx++, value);
+            }
             ps.executeUpdate();
         }
     }
@@ -653,32 +758,37 @@ public class ValidationTaskService {
         return isPg ? "\"" + id + "\"" : "`" + id + "`";
     }
 
+    /** "库.表" 的方言限定名；PG 只用表名（与 getRowCount / 对比服务的口径保持一致）。 */
+    private String qualifyFor(String db, String table, boolean isPg) {
+        return isPg ? quoteId(table, true) : quoteId(db, false) + "." + quoteId(table, false);
+    }
+
+    /**
+     * 从修复用的源行 JSON 里取分片键的值。列名大小写按目标端可能不同（MySQL 大小写不敏感），
+     * 精确取不到就退回不区分大小写找一遍。
+     */
+    private Object shardKeyValue(Map<String, Object> row, String shardKeyColumn) {
+        if (shardKeyColumn == null || shardKeyColumn.isEmpty()) {
+            return null;
+        }
+        if (row.containsKey(shardKeyColumn)) {
+            return row.get(shardKeyColumn);
+        }
+        for (Map.Entry<String, Object> e : row.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(shardKeyColumn)) {
+                return e.getValue();
+            }
+        }
+        return null;
+    }
+
     /**
      * 任务是否配置了列处理（syncObjects 任一库 entry 携带非空的
      * columnFilter/columnMapping/extraColumns）。列处理任务不支持行数/内容对比。
      */
-    @SuppressWarnings("unchecked")
     public boolean hasColumnProcessing(String syncObjectsJson) {
-        if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
-            return false;
-        }
-        try {
-            Map<String, Object> raw = gson.fromJson(syncObjectsJson, Map.class);
-            if (raw == null) return false;
-            for (Object value : raw.values()) {
-                if (!(value instanceof Map)) continue;
-                Map<?, ?> entry = (Map<?, ?>) value;
-                for (String key : new String[]{"columnFilter", "columnMapping", "extraColumns"}) {
-                    Object cp = entry.get(key);
-                    if (cp instanceof Map && !((Map<?, ?>) cp).isEmpty()) {
-                        return true;
-                    }
-                }
-            }
-        } catch (Exception e) {
-            logger.warn("解析列处理配置失败: {}", e.getMessage());
-        }
-        return false;
+        // 实现落在 RouteConfigValidator：聚合路由的适用性校验也要判同一件事，两份判断迟早会漂
+        return RouteConfigValidator.hasColumnProcessing(syncObjectsJson);
     }
 
     @SuppressWarnings("unchecked")

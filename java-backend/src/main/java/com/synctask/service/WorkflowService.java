@@ -401,6 +401,11 @@ public class WorkflowService {
                     workflow.getSnapshotMode()));
         }
 
+        // 路由与其余配置的兼容性要在<b>改完之后</b>再判一次：用户完全可能先存好路由配置，
+        // 再回到第 3 步加列处理、或把目标库类型改成 mongodb——只在保存路由时判就绕过去了。
+        RouteConfigValidator.assertApplicable(workflow.getRouteConfig(), workflow.getSourceType(),
+                workflow.getTargetType(), workflow.getTaskType(), workflow.getSyncObjects());
+
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务配置已更新");
         return workflowRepository.save(workflow);
     }
@@ -418,6 +423,8 @@ public class WorkflowService {
             throw new RuntimeException("只能修改配置中的任务的路由配置，当前状态: " + workflow.getStatus().name());
         }
         String normalized = RouteConfigValidator.validate(routeConfig);
+        RouteConfigValidator.assertApplicable(normalized, workflow.getSourceType(), workflow.getTargetType(),
+                workflow.getTaskType(), workflow.getSyncObjects());
         workflow.setRouteConfig(normalized);
         addLog(workflowId, WorkflowLog.LogLevel.INFO,
                 normalized == null ? "聚合路由已清除（回到 1:1 同步）" : "聚合路由配置已更新");
@@ -614,6 +621,10 @@ public class WorkflowService {
             }
             workflow.setMigrationMode("subscribe");
         }
+
+        // 聚合路由的最后一道门：配置可以分多次改，只有启动这一刻的组合才是真正要跑的那个
+        RouteConfigValidator.assertApplicable(workflow.getRouteConfig(), workflow.getSourceType(),
+                workflow.getTargetType(), workflow.getTaskType(), workflow.getSyncObjects());
 
         // 双向灾备：创建隐藏的反向影子任务（B→A，仅增量）。此刻只建行不启动——
         // 若立即启动，反向全量会把尚未初始化的 B 反灌回 A；等正向进入增量同步

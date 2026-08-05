@@ -3038,6 +3038,7 @@
             cfgRenderFilterList();
             cfgRenderMappingRows();
             cfgRenderExtraList();
+            cfgRefreshRouteExclusion();
         }
 
         // ==================== 分库分表路由（步骤3 的第四个页签） ====================
@@ -3050,6 +3051,80 @@
                 cfgRouteConfig.mode === 'MERGE' ? 'block' : 'none';
             document.getElementById('cfgRouteSplitBody').style.display =
                 cfgRouteConfig.mode === 'SPLIT' ? 'block' : 'none';
+            cfgRefreshRouteExclusion();
+        };
+
+        // 聚合路由已实现的库对：关系库 mysql/pg 任意组合（含异构）、mongodb→mongodb（集合级）、
+        // mysql→elasticsearch（索引级）。Redis 不在其列——它没有表的概念。
+        // 与后端 RouteConfigValidator / 引擎 RoutingConfig 的白名单保持一致。
+        function cfgRouteSupported() {
+            const s = (cfgSourceType || 'mysql').toLowerCase();
+            const t = (cfgTargetType || 'mysql').toLowerCase();
+            const relational = ['mysql', 'postgresql'];
+            return (relational.includes(s) && relational.includes(t))
+                || (s === 'mongodb' && t === 'mongodb')
+                || (s === 'mysql' && t === 'elasticsearch');
+        }
+
+        function cfgHasColumnProcessing() {
+            const nonEmpty = obj => Object.keys(obj || {}).some(k => {
+                const v = obj[k];
+                return Array.isArray(v) ? v.length > 0 : (v && Object.keys(v).length > 0);
+            });
+            return nonEmpty(cfgColumnFilters) || nonEmpty(cfgColumnMappings) || nonEmpty(cfgExtraColumns);
+        }
+
+        /** 在页签顶部插/删一条互斥提示（没有就建，文本为空就移除）。 */
+        function cfgPaneNotice(paneId, text) {
+            const pane = document.getElementById(paneId);
+            if (!pane) return;
+            let el = pane.querySelector('.route-exclusive-notice');
+            if (!text) {
+                if (el) el.remove();
+                return;
+            }
+            if (!el) {
+                el = document.createElement('div');
+                el.className = 'route-exclusive-notice';
+                el.style.cssText = 'padding:8px 10px;margin-bottom:10px;border:1px solid #ffe58f;'
+                    + 'background:#fffbe6;color:#fa8c16;border-radius:4px;font-size:12px;';
+                pane.insertBefore(el, pane.firstChild);
+            }
+            el.textContent = text;
+        }
+
+        /**
+         * 路由页签的可用性联动。
+         *
+         * <p>列处理与路由现已<b>可以叠加</b>（汇聚下 CUSTOM 附加列改为逐行注值、
+         * 列处理规则按表取源库名），只在两者一起用时给一条说明；引擎对不支持路由的仍隐藏页签。
+         */
+        window.cfgRefreshRouteExclusion = function() {
+            const routeBtn = document.getElementById('cfgColTabRouteBtn');
+            const supported = cfgRouteSupported();
+            if (routeBtn) routeBtn.style.display = supported ? '' : 'none';
+            // 只支持路由、不支持列处理的库对（mysql→pg / mysql→es）：把列处理三个页签藏掉，
+            // 第 3 步就只剩路由，不给用户看一堆填了也不生效的输入框
+            const colProcOn = cfgColProcSupported();
+            ['Filter', 'Mapping', 'Extra'].forEach(p => {
+                const btn = document.getElementById('cfgColTab' + p + 'Btn');
+                if (btn) btn.style.display = colProcOn ? '' : 'none';
+            });
+            if (!colProcOn && supported) {
+                cfgSwitchColTabInternal('route');
+            }
+            if (!supported && cfgRouteConfig.mode !== 'NONE') {
+                // 引擎对不支持路由（如 mongodb→mongodb）：清掉残留配置，否则保存/启动会被后端拒
+                cfgRouteConfig = { mode: 'NONE', merge: [], split: [], legs: [] };
+                const sel = document.getElementById('cfgRouteMode');
+                if (sel) sel.value = 'NONE';
+            }
+            const bothOn = supported && cfgRouteConfig.mode !== 'NONE' && cfgHasColumnProcessing();
+            const note = bothOn
+                ? '已同时启用列处理与分库分表路由：汇聚下"自定义附加列"的值按各自来源逐行写入'
+                  + '（不再由建表默认值承载），列名映射对汇入同一张目标表的各源表必须一致。'
+                : '';
+            ['Filter', 'Mapping', 'Extra', 'Route'].forEach(p => cfgPaneNotice('cfgColPane' + p, note));
         };
 
         window.cfgAddMergeRule = function() {
@@ -3163,6 +3238,7 @@
                     : cfgRouteConfig.legs.map((l, i) => row(
                         `${l.nodeId} — ${l.host}:${l.port}`, 'legs', i)).join('');
             }
+            cfgRefreshRouteExclusion();
         }
 
         /** 保存路由配置到后端（校验不过时后端会把原因原样返回）。 */
@@ -3224,13 +3300,20 @@
         window.cfgLoadRouteConfig = cfgLoadRouteConfig;
         // ==================== 分库分表路由结束 ====================
 
-        window.cfgSwitchColTab = function(tab) {
+        /** 只切页签，不回头重算可用性（供 cfgRefreshRouteExclusion 内部调用，避免相互递归）。 */
+        function cfgSwitchColTabInternal(tab) {
             ['filter', 'mapping', 'extra', 'route'].forEach(t => {
                 const btn = document.getElementById('cfgColTab' + t.charAt(0).toUpperCase() + t.slice(1) + 'Btn');
                 const pane = document.getElementById('cfgColPane' + t.charAt(0).toUpperCase() + t.slice(1));
-                btn.className = 'colproc-tab' + (t === tab ? ' active' : '');
-                pane.className = 'colproc-pane' + (t === tab ? ' active' : '');
+                if (btn) btn.className = 'colproc-tab' + (t === tab ? ' active' : '');
+                if (pane) pane.className = 'colproc-pane' + (t === tab ? ' active' : '');
             });
+        }
+
+        window.cfgSwitchColTab = function(tab) {
+            cfgSwitchColTabInternal(tab);
+            // 页签可用性可能在别的页签里被改过（加了过滤条件、改了路由模式），切过来时重算
+            cfgRefreshRouteExclusion();
         }
 
         // 加载表的列信息（带缓存）
@@ -3934,13 +4017,14 @@
             });
         }
 
-        // 向导步骤序列：1连接 2对象 [3列处理] [4账号同步] 5校验。
-        //   mysql→mysql：1→2→3→4→5（含列处理+账号同步）
-        //   pg→pg / mongo→mongo：1→2→3→5（含列处理，无账号同步）
+        // 向导步骤序列：1连接 2对象 [3列处理/路由] [4账号同步] 5校验。
+        //   mysql→mysql：1→2→3→4→5（含列处理+路由+账号同步）
+        //   pg→pg / mongo→mongo：1→2→3→5（含列处理+路由，无账号同步）
+        //   mysql→pg / mysql→es：1→2→3→5（只有路由页签，列处理三页签不适用）
         //   其余库对：1→2→5
         function cfgStepSequence() {
             const seq = [1, 2];
-            if (cfgColProcSupported()) seq.push(3);
+            if (cfgColProcSupported() || cfgRouteSupported()) seq.push(3);
             if (cfgAccountSyncSupported()) seq.push(4);
             seq.push(5);
             return seq;
@@ -5374,10 +5458,20 @@
             
             html += `<div style="background: #fff2f0; padding: 4px 8px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #ffe7e7;">`;
             html += `<span style="color: #999;">#${globalIdx + 1}</span>`;
-            const typeLabel = diffType === 'CONTENT_DIFF' ? '内容差异' : (diffType === 'SOURCE_ONLY' ? '仅源库存在' : (diffType === 'TARGET_ONLY' ? '仅目标库存在' : diffType));
+            const DIFF_TYPE_LABELS = {
+                CONTENT_DIFF: '内容差异', SOURCE_ONLY: '仅源库存在',
+                TARGET_ONLY: '仅目标库存在', WRONG_SHARD: '落在错误的分片'
+            };
+            const typeLabel = DIFF_TYPE_LABELS[diffType] || diffType;
             html += `<span style="background: #f5222d22; color: #f5222d; padding: 0 4px; border-radius: 2px; font-size: 11px;">${typeLabel}</span>`;
             if (pkValue) {
                 html += `<span style="color: #333;">主键: ${pkValue}</span>`;
+            }
+            // 拆分任务：这行实际在哪一片、按分片键本该在哪一片——只给主键的话没法定位
+            if (diff.targetShard) {
+                html += `<span style="color: #999;">所在分片: ${escapeHtml(diff.targetShard)}`
+                     + (diff.expectedShard ? ` → 应在: <b>${escapeHtml(diff.expectedShard)}</b>` : '')
+                     + `</span>`;
             }
             if (diffFields.length > 0) {
                 html += `<span style="color: #fa8c16;">差异字段: ${diffFields.join(', ')}</span>`;

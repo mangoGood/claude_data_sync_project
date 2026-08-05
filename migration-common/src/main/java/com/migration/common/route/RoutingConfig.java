@@ -60,6 +60,8 @@ public final class RoutingConfig {
     public static final String PREFIX_NODE = "route.node.";
 
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*");
+    /** 已验证支持聚合路由的关系库引擎（含异构 mysql↔pg） */
+    private static final java.util.Set<String> ROUTABLE_ENGINES = java.util.Set.of("mysql", "postgresql");
     /** 校验模板渲染结果用的样例时刻（DATE_FORMAT 规则没有数值分片号可渲染） */
     private static final LocalDateTime SAMPLE_TIME = LocalDateTime.of(2026, 8, 3, 0, 0);
 
@@ -100,6 +102,7 @@ public final class RoutingConfig {
 
         List<String> errors = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
+        validateEngineSupport(props, errors);
         Map<String, List<RouteNode>> nodeGroups = parseNodeGroups(props, errors);
 
         List<MergeRule> mergeRules = new ArrayList<>();
@@ -142,6 +145,58 @@ public final class RoutingConfig {
         logger.info("路由配置加载完成: mode={}, merge规则={}, split规则={}, 实例组={}, 错误={}",
                 mode, mergeRules.size(), splitRules.size(), nodeGroups.size(), errors.size());
         return config;
+    }
+
+    /**
+     * 引擎对白名单校验：哪些库对的聚合路由已经实现并验证过。
+     *
+     * <p>拦在这里而不是"跑到哪算哪"，是因为不支持的链路各有各的错法，而且都不是好错法：
+     * <ul>
+     *   <li>Redis：没有表的概念，"汇聚/拆分"只能是 key 前缀命名空间的合并或分裂，不是分库分表。</li>
+     *   <li>Oracle：幂等 upsert 只实现了 MySQL/PostgreSQL 两种方言（{@link UpsertSqlBuilder}），
+     *       Oracle 要 MERGE INTO。</li>
+     *   <li>TiDB 源：增量走 TiCDC canal-json，路由改写在该链路上没有验证过。</li>
+     * </ul>
+     *
+     * <p>已支持的范围：关系库 mysql/pg 任意组合（含异构，来源标识列会追加到翻译器产出的目标方言
+     * DDL 上、分片表也由翻译器生成）、mongodb→mongodb（集合级）、mysql→elasticsearch（索引级），
+     * 后两者由 {@link DocumentRouter} 消费同一份规则。</p>
+     *
+     * <p><b>库类型缺失时不判</b>：单测与部分直驱场景不下发 {@code source.db.type}，
+     * 把"没声明"当成"不支持"会误伤；生产链路由 agent 的 ConfigService 保证两个键一定有值。
+     */
+    private static void validateEngineSupport(Properties props, List<String> errors) {
+        String source = lower(props.getProperty("source.db.type"));
+        String target = lower(props.getProperty("target.db.type"));
+        if (source.isEmpty() || target.isEmpty()) {
+            return;
+        }
+        String pair = source + "→" + target;
+        // TiDB 源在引擎侧被归一成 mysql（见 agent ConfigService），只能靠 flavor 认出来
+        if ("tidb".equals(lower(props.getProperty("source.db.flavor")))) {
+            errors.add("TiDB 源暂不支持聚合路由：增量走 TiCDC canal-json，路由改写未在该链路验证");
+            return;
+        }
+        if ("redis".equals(source) || "redis".equals(target)) {
+            errors.add("Redis 不支持聚合路由：Redis 没有表的概念，所谓汇聚/拆分只能是"
+                    + " key 前缀命名空间的合并或分裂，与分库分表不是一回事");
+            return;
+        }
+        // 关系库对：源与目标都在白名单里即可，异构（mysql↔pg）也放行——汇聚的来源标识列已能追加到
+        // 翻译器产出的 DDL 上、拆分改走翻译器建分片表，两条链路的幂等 upsert 方言也都齐了。
+        // Oracle 仍不行：upsert 要 MERGE INTO，没实现。
+        boolean relational = ROUTABLE_ENGINES.contains(source) && ROUTABLE_ENGINES.contains(target);
+        // 文档型：mongo↔mongo 走集合、mysql→ES 走索引，由各自引擎的 DocumentRouter 消费同一份规则
+        boolean documentPair = ("mongodb".equals(source) && "mongodb".equals(target))
+                || ("mysql".equals(source) && "elasticsearch".equals(target));
+        if (!relational && !documentPair) {
+            errors.add("库对 " + pair + " 暂不支持聚合路由：关系库只实现了 MySQL 与 PostgreSQL 方言的"
+                    + "幂等 upsert，文档型只支持 mongodb→mongodb 与 mysql→elasticsearch");
+        }
+    }
+
+    private static String lower(String raw) {
+        return raw == null ? "" : raw.trim().toLowerCase();
     }
 
     private static Mode parseMode(String raw) {

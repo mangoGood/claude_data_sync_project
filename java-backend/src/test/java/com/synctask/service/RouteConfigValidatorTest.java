@@ -4,6 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -118,5 +119,80 @@ class RouteConfigValidatorTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> RouteConfigValidator.validate("{\"mode\":\"MERGE\",\"merge\":[{}]}"));
         assertEquals(2, e.getMessage().split("；").length, e.getMessage());
+    }
+
+    // ==================== 适用范围拦截（assertApplicable） ====================
+
+    private static final String MERGE_JSON =
+            "{\"mode\":\"MERGE\",\"merge\":[{\"match\":\"db_*.t_*\",\"target\":\"dw.t\"}]}";
+
+    private static String rejectReason(String sourceType, String targetType,
+                                       String taskType, String syncObjects) {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> RouteConfigValidator.assertApplicable(MERGE_JSON, sourceType, targetType,
+                        taskType, syncObjects));
+        return e.getMessage();
+    }
+
+    @Test
+    @DisplayName("没有路由配置：任何库类型/任务类型都放行（1:1 任务零影响）")
+    void noRouteConfigAlwaysApplicable() {
+        RouteConfigValidator.assertApplicable(null, "mongodb", "mongodb", "DR", "{}");
+        RouteConfigValidator.assertApplicable("", "mysql", "postgresql", "SUBSCRIBE", null);
+    }
+
+    @Test
+    @DisplayName("mysql→mysql / pg→pg 的实时同步任务：放行")
+    void supportedPairsApplicable() {
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "mysql", "mysql", "SYNC", "{}");
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "postgresql", "postgresql", "SYNC", null);
+    }
+
+    @Test
+    @DisplayName("跨实例汇聚派生的 MERGE_LEG 子任务必须放行（它天生带父任务的路由配置）")
+    void mergeLegApplicable() {
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "mysql", "mysql", "MERGE_LEG", "{}");
+    }
+
+    @Test
+    @DisplayName("Redis 拒绝；mongo↔mongo 与 mysql→es 放行（路由由各自引擎实现）")
+    void engineScope() {
+        assertTrue(rejectReason("redis", "redis", "SYNC", null).contains("Redis"));
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "mongodb", "mongodb", "SYNC", null);
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "mysql", "elasticsearch", "SYNC", null);
+    }
+
+    @Test
+    @DisplayName("异构关系库对放行；Oracle 与 TiDB 源仍拒绝")
+    void relationalScope() {
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "mysql", "postgresql", "SYNC", null);
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "postgresql", "mysql", "SYNC", null);
+        assertTrue(rejectReason("tidb", "mysql", "SYNC", null).contains("TiDB"));
+        assertTrue(rejectReason("oracle", "oracle", "SYNC", null).contains("upsert"));
+    }
+
+    @Test
+    @DisplayName("灾备/订阅任务：拒绝——路由改写没在这两条链路上验证过")
+    void nonSyncTaskTypesRejected() {
+        assertTrue(rejectReason("mysql", "mysql", "DR", null).contains("灾备"));
+        assertTrue(rejectReason("mysql", "mysql", "SUBSCRIBE", null).contains("订阅"));
+    }
+
+    @Test
+    @DisplayName("叠加列处理：放行（汇聚下附加列改为逐行注值后两者可以同时用）")
+    void columnProcessingCanCoexist() {
+        String filter = "{\"db1\":{\"tables\":[\"t\"],\"columnFilter\":{\"t\":\"a|<|1\"}}}";
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "mysql", "mysql", "SYNC", filter);
+        RouteConfigValidator.assertApplicable(MERGE_JSON, "mysql", "mysql", "SYNC",
+                "{\"db1\":{\"extraColumns\":{\"t\":[\"c\"]}}}");
+        assertTrue(RouteConfigValidator.hasColumnProcessing(filter), "列处理探测本身要照常工作");
+    }
+
+    @Test
+    @DisplayName("空的列处理容器不算配了列处理（前端会把空对象一起提交）")
+    void emptyColumnProcessingContainersIgnored() {
+        assertFalse(RouteConfigValidator.hasColumnProcessing("{\"db1\":{\"columnFilter\":{}}}"));
+        assertFalse(RouteConfigValidator.hasColumnProcessing("不是 JSON"));
+        assertFalse(RouteConfigValidator.hasColumnProcessing(null));
     }
 }

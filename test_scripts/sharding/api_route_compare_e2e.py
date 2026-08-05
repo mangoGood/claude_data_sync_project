@@ -7,7 +7,7 @@
 没有路由感知的话，两种任务的对比都会去目标端找同名表（汇聚/拆分下根本不存在），
 结果是"目标端 0 行"，看着像数据全丢了。
 
-同时验证：路由任务不允许创建内容对比（逐行比对没有可靠口径）。
+内容对比同样已路由感知（见 api_route_content_compare_e2e.py），这里只确认它不再被拒。
 
 前置：./start.sh 已起好后端(38080)与 agent；synctask-mysql 在跑。
 用法：python3 test_scripts/sharding/api_route_compare_e2e.py
@@ -142,15 +142,16 @@ def stop_previous_runs():
     （实测表现为目标表被清空、或"database exists"）。
     """
     listed = api("/workflows?page=1&pageSize=100")
-    items = ((listed.get("data") or {}).get("list") or [])
-    stopped = 0
-    for it in items:
-        if str(it.get("name", "")).startswith("rc-"):
-            api(f"/workflows/{it.get('id')}/stop", "POST", {})
-            stopped += 1
-    if stopped:
-        print(f"  已停止 {stopped} 个上一轮遗留任务，等待管线退出...")
-        time.sleep(12)
+    mine = [it for it in ((listed.get("data") or {}).get("list") or [])
+            if str(it.get("name", "")).startswith("rc-")]
+    for it in mine:
+        api(f"/workflows/{it.get('id')}/stop", "POST", {})
+    if mine:
+        print(f"  已停止 {len(mine)} 个上一轮遗留任务，等待管线退出...")
+        time.sleep(15)
+        # 顺带删掉：任务是配额资源（每用户 50 个），只停不删跑几轮就建不出新任务了
+        for it in mine:
+            api(f"/workflows/{it.get('id')}", "DELETE")
 
 
 def main():
@@ -187,8 +188,10 @@ def main():
         record("汇聚：对比结论为一致（无差异表）", result.get("failedTables") == 0,
                f"status={result.get('status')}, failed={result.get('failedTables')}")
 
+    # 内容对比现已路由感知（逐行核对 + 错片探针），细致用例在 api_route_content_compare_e2e.py，
+    # 这里只确认它对路由任务不再被拒
     content, err = run_compare(merge_id, "CONTENT")
-    record("汇聚任务不允许内容对比", content is None and err and "内容对比" in str(err), str(err)[:60])
+    record("汇聚任务也能做内容对比（不再被拒）", content is not None, str(err)[:60])
 
     print("== 拆分任务：1 张源表 → 4 张分片表 ==")
     setup_split()

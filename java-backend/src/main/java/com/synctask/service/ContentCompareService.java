@@ -22,6 +22,8 @@ public class ContentCompareService {
     );
     private static final int BUCKET_COUNT = 100;
     private static final int CHUNK_SIZE = 1000;
+    /** 目标行上临时打的分片号（不是真列名，比对完就丢）。带 '$' 避开真实列名。 */
+    private static final String SHARD_MARKER = "$shard$";
 
     private final ConcurrentHashMap<String, ContentCompareSession> sessions = new ConcurrentHashMap<>();
 
@@ -52,6 +54,21 @@ public class ContentCompareService {
                                                Map<String, List<String>> syncObjects,
                                                Map<String, Map<String, String>> explicitTableMappings,
                                                Map<String, String> explicitDbMappings) {
+        return startCompare(sourceConnection, targetConnection, sourceType, targetType,
+                syncObjects, explicitTableMappings, explicitDbMappings, null, null);
+    }
+
+    /**
+     * @param routeConfigJson 聚合路由配置；非空时目标端按<b>路由后的落点</b>取数：
+     *                        汇聚按来源标识列切片、拆分把 N 张分片表并成一条按主键有序的流。
+     * @param routeNodeId     来源实例标识（汇聚切片条件的一部分），兜底规则与引擎一致
+     */
+    public ContentCompareSession startCompare(String sourceConnection, String targetConnection,
+                                               String sourceType, String targetType,
+                                               Map<String, List<String>> syncObjects,
+                                               Map<String, Map<String, String>> explicitTableMappings,
+                                               Map<String, String> explicitDbMappings,
+                                               String routeConfigJson, String routeNodeId) {
         if (!sourceType.equalsIgnoreCase(targetType)) {
             throw new IllegalArgumentException("内容对比仅支持源库和目标库为相同类型的数据库");
         }
@@ -61,6 +78,11 @@ public class ContentCompareService {
         session.setTargetConnection(targetConnection);
         session.setSourceType(sourceType);
         session.setTargetType(targetType);
+        boolean routed = !"NONE".equals(RouteCompareSupport.modeOf(routeConfigJson));
+        if (routed) {
+            session.setRouteConfig(routeConfigJson);
+            session.setRouteNodeId(routeNodeId);
+        }
 
         boolean isPg = "postgresql".equalsIgnoreCase(sourceType);
         ParsedConn sourceConn = parseConnection(sourceConnection);
@@ -148,9 +170,26 @@ public class ContentCompareService {
                     task.setPrimaryKeyColumn(detectPrimaryKey(sourceDb, qualifiedSource, isPg, sourceConn.database));
                     task.setColumns(getColumnMeta(sourceDb, qualifiedSource, isPg, sourceConn.database));
                     task.setSourceRowCount(getRowCount(sourceDb, qualifiedSource, isPg));
-                    task.setTargetRowCount(getRowCount(targetDb, qualifiedTarget, isPg));
                     task.setCursor(calculateCursorRange(sourceDb, qualifiedSource, task.getPrimaryKeyColumn(), isPg));
                     task.setStatus("PENDING");
+                    task.setRouteDefaultTargetDb(isPg ? targetConn.database : mappedTargetDb);
+
+                    // 路由任务：目标端不是同名表。汇聚是"合并表里属于本源表的那一片"，
+                    // 拆分是"N 张分片表的并集"——照 1:1 去找同名表只会得到"目标端 0 行"。
+                    RoutedTarget routed2 = routedTargetOf(session, dbName, tableName,
+                            task.getRouteDefaultTargetDb());
+                    if (routed2 == null) {
+                        task.setTargetRowCount(getRowCount(targetDb, qualifiedTarget, isPg));
+                    } else if (routed2.unsupportedReason != null) {
+                        task.setTargetRowCount(-1L);
+                        task.setStatus("UNSUPPORTED");
+                        task.setChecksumMatch(false);
+                        logger.warn("表 {}.{} 暂不支持内容对比: {}", dbName, tableName, routed2.unsupportedReason);
+                    } else {
+                        task.setTargetDb(routed2.displayDb);
+                        task.setTargetTable(routed2.displayTable);
+                        task.setTargetRowCount(routedRowCount(targetDb, routed2, isPg));
+                    }
 
                     session.getTables().add(task);
                 }
@@ -192,13 +231,33 @@ public class ContentCompareService {
                 String targetQualified = isPg ? task.getTargetTable() : task.getTargetDb() + "." + task.getTargetTable();
 
                 try {
-                    String sourceChecksum = computeTableChecksum(sourceDb, sourceQualified, isPg);
-                    String targetChecksum = computeTableChecksum(targetDb, targetQualified, isPg);
+                    RoutedTarget rt = routedTargetOf(session, task.getSourceDb(), task.getSourceTable(),
+                            task.getRouteDefaultTargetDb());
+                    String sourceChecksum;
+                    String targetChecksum;
+                    if (rt != null) {
+                        // 路由下整表校验和不可用（目标端混着别的来源 / 根本是 N 张表），改用可合成的行级摘要
+                        sourceChecksum = computeDigest(sourceDb, sourceQualified, task.getColumns(), "", isPg);
+                        targetChecksum = computeRoutedDigest(targetDb, rt, task.getColumns(), isPg);
+                    } else {
+                        sourceChecksum = computeTableChecksum(sourceDb, sourceQualified, isPg);
+                        targetChecksum = computeTableChecksum(targetDb, targetQualified, isPg);
+                    }
 
-                    task.setChecksumMatch(sourceChecksum != null && sourceChecksum.equals(targetChecksum));
-                    task.setStatus(Boolean.TRUE.equals(task.getChecksumMatch()) ? "MATCH" : "MISMATCH");
-                    logger.info("表 {} 校验和对比: source={}, target={}, match={}",
-                        task.getSourceTable(), sourceChecksum, targetChecksum, task.getChecksumMatch());
+                    boolean digestMatch = sourceChecksum != null && sourceChecksum.equals(targetChecksum);
+                    if (digestMatch && rt != null && rt.isSplit()) {
+                        // 拆分下摘要一致<b>不等于</b>没问题：摘要对顺序不敏感（这正是它能跨分片相加的原因），
+                        // 一行从这片挪到那片，count 和 sum 分毫不差。落点对不对只能逐行核，
+                        // 所以这里不给"一致"的结论，强制走阶段 2。
+                        task.setChecksumMatch(false);
+                        task.setStatus("NEEDS_ROW_SCAN");
+                    } else {
+                        task.setChecksumMatch(digestMatch);
+                        task.setStatus(digestMatch ? "MATCH" : "MISMATCH");
+                    }
+                    logger.info("表 {} 校验和对比: source={}, target={}, match={}{}",
+                        task.getSourceTable(), sourceChecksum, targetChecksum, digestMatch,
+                        "NEEDS_ROW_SCAN".equals(task.getStatus()) ? "（拆分仍需逐行核对落点）" : "");
                 } catch (Exception e) {
                     logger.warn("表 {} 校验和计算失败: {}", task.getSourceTable(), e.getMessage());
                     task.setChecksumMatch(false);
@@ -229,6 +288,10 @@ public class ContentCompareService {
         if (Boolean.TRUE.equals(task.getChecksumMatch())) {
             return task;
         }
+        if ("UNSUPPORTED".equals(task.getStatus())) {
+            task.setScanCompleted(true);
+            return task;
+        }
         if (task.isScanCompleted() && task.getDiffs().size() <= task.getTotalDiffsFound()) {
             return task;
         }
@@ -254,8 +317,12 @@ public class ContentCompareService {
                 return task;
             }
 
-            List<DataDiff> newDiffs = mergeJoinCompare(sourceDb, targetDb, sourceQualified, targetQualified,
-                pkCol, task.getColumns(), task.getCursor(), newDiffsNeeded, isPg);
+            RoutedTarget rt = routedTargetOf(session, task.getSourceDb(), task.getSourceTable(),
+                    task.getRouteDefaultTargetDb());
+            List<DataDiff> newDiffs = rt != null
+                ? routedMergeJoin(sourceDb, targetDb, task, rt, isPg, newDiffsNeeded)
+                : mergeJoinCompare(sourceDb, targetDb, sourceQualified, targetQualified,
+                    pkCol, task.getColumns(), task.getCursor(), newDiffsNeeded, isPg);
 
             task.getDiffs().addAll(newDiffs);
             task.setTotalDiffsFound(task.getTotalDiffsFound() + newDiffs.size());
@@ -354,6 +421,386 @@ public class ContentCompareService {
         }
 
         return diffs;
+    }
+
+    // ==================== 路由感知的内容对比 ====================
+
+    /**
+     * 一张源表在<b>路由之后</b>的目标端读法。
+     *
+     * <p>汇聚是"合并表里带本来源标识的那一片"（一个读点 + 过滤条件），
+     * 拆分是"N 张分片表"（N 个读点 + 每行要判落点对不对）——两者统一成"若干读点"，
+     * 后面的比对逻辑就只有一套。
+     */
+    private static final class RoutedTarget {
+        /** 读点：[库, 表]，下标对拆分而言就是分片号 */
+        final List<String[]> reads = new ArrayList<>();
+        /** 汇聚的来源标识过滤条件（列 → 值）；拆分为空 */
+        Map<String, String> tagFilters = Collections.emptyMap();
+        /** 拆分规则（用于按分片键重算正确落点）；汇聚为 null */
+        RouteCompareSupport.SplitTargets split;
+        String unsupportedReason;
+        String displayDb;
+        String displayTable;
+
+        boolean isSplit() {
+            return split != null;
+        }
+    }
+
+    /** 解析路由落点；未配路由或该表未命中规则时返回 null（按 1:1 对比）。 */
+    private RoutedTarget routedTargetOf(ContentCompareSession session, String sourceDb, String sourceTable,
+                                        String defaultTargetDb) {
+        String routeConfig = session.getRouteConfig();
+        if (routeConfig == null || routeConfig.isEmpty()) {
+            return null;
+        }
+        String mode = RouteCompareSupport.modeOf(routeConfig);
+        if ("MERGE".equals(mode)) {
+            RouteCompareSupport.MergeTarget merge = RouteCompareSupport.mergeTargetOf(
+                    routeConfig, sourceDb, sourceTable, defaultTargetDb, session.getRouteNodeId());
+            if (merge == null) {
+                return null;
+            }
+            RoutedTarget rt = new RoutedTarget();
+            rt.reads.add(new String[]{merge.database, merge.table});
+            rt.tagFilters = merge.tagFilters;
+            rt.displayDb = merge.database;
+            rt.displayTable = merge.table;
+            return rt;
+        }
+        if ("SPLIT".equals(mode)) {
+            RouteCompareSupport.SplitTargets split = RouteCompareSupport.splitTargetsOf(
+                    routeConfig, sourceDb, sourceTable, defaultTargetDb);
+            if (split == null || split.shards.isEmpty()) {
+                return null;
+            }
+            RoutedTarget rt = new RoutedTarget();
+            rt.reads.addAll(split.shards);
+            rt.split = split;
+            rt.displayDb = split.shards.get(0)[0];
+            rt.displayTable = split.shards.size() == 1 ? split.shards.get(0)[1]
+                    : split.shards.get(0)[1] + " 等 " + split.shards.size() + " 片";
+            if (split.crossInstance) {
+                // 分片散在多个实例上，而对比只有一条目标连接——够不着的片会被当成"目标端没有"，
+                // 报一堆假差异比不报更糟
+                rt.unsupportedReason = "分片分布在多个目标实例上，内容对比只能连一个目标实例";
+            }
+            return rt;
+        }
+        return null;
+    }
+
+    /** 路由后的目标行数：汇聚按来源切片、拆分把各片相加。 */
+    private long routedRowCount(Connection targetDb, RoutedTarget rt, boolean isPg) {
+        long total = 0;
+        for (String[] read : rt.reads) {
+            String qualified = qualify(read[0], read[1], isPg);
+            String where = tagWhere(rt, isPg);
+            try (Statement stmt = targetDb.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + qualified + where)) {
+                if (rs.next()) {
+                    total += rs.getLong(1);
+                }
+            } catch (SQLException e) {
+                logger.warn("路由目标行数统计失败 {}: {}", qualified, e.getMessage());
+                return -1;
+            }
+        }
+        return total;
+    }
+
+    /**
+     * 可合成的行级摘要：{@code COUNT(*)} + {@code SUM(每行哈希)}。
+     *
+     * <p>整表校验和（{@code CHECKSUM TABLE} / {@code md5(string_agg(...))}）在路由下没法用——
+     * 汇聚的目标表混着别的来源的行还多了标识列，拆分的"目标表"根本是 N 张。换成对<b>顺序不敏感、
+     * 可跨表相加</b>的聚合，汇聚就能"源表 vs 目标切片"、拆分就能"源表 vs Σ 各分片"。
+     *
+     * <p><b>不能用 {@code BIT_XOR}</b>：重复行会成对抵消，正好盖住"同一行在两个分片里各留一份"
+     * 这类 bug——而那恰恰是拆分最该被查出来的问题。{@code SUM} 配 {@code COUNT} 才挡得住。
+     */
+    private String computeDigest(Connection conn, String qualifiedTable, List<ColumnMeta> columns,
+                                 String whereClause, boolean isPg) throws SQLException {
+        String sql = "SELECT COUNT(*), COALESCE(SUM(" + rowHashExpr(columns, isPg) + "), 0) FROM "
+                + qualifiedTable + whereClause;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            if (rs.next()) {
+                return "n=" + rs.getLong(1) + ",s=" + rs.getString(2);
+            }
+        }
+        return null;
+    }
+
+    /** 逐行哈希表达式。列值一律转成文本再拼，NULL 换成哨兵——CONCAT_WS 会跳过 NULL，
+     *  不换的话 (a, NULL, b) 与 (a, b, NULL) 拼出来一模一样。 */
+    private String rowHashExpr(List<ColumnMeta> columns, boolean isPg) {
+        StringBuilder concat = new StringBuilder(isPg ? "concat_ws(chr(1)" : "CONCAT_WS(0x01");
+        for (ColumnMeta col : columns) {
+            concat.append(", ");
+            if (isPg) {
+                concat.append("COALESCE(").append(quote(col.getName(), true)).append("::text, '\\N')");
+            } else {
+                concat.append("IFNULL(CAST(").append(quote(col.getName(), false)).append(" AS CHAR), '\\\\N')");
+            }
+        }
+        concat.append(")");
+        return isPg
+                ? "('x' || substr(md5(" + concat + "), 1, 8))::bit(32)::bigint"
+                : "CAST(CRC32(" + concat + ") AS SIGNED)";
+    }
+
+    /** 路由后的目标端摘要：汇聚一个读点带过滤，拆分把各片的 count 与 sum 分别相加。 */
+    private String computeRoutedDigest(Connection targetDb, RoutedTarget rt, List<ColumnMeta> columns,
+                                       boolean isPg) throws SQLException {
+        long count = 0;
+        java.math.BigDecimal sum = java.math.BigDecimal.ZERO;
+        for (String[] read : rt.reads) {
+            String digest = computeDigest(targetDb, qualify(read[0], read[1], isPg), columns,
+                    tagWhere(rt, isPg), isPg);
+            if (digest == null) {
+                return null;
+            }
+            count += Long.parseLong(digest.substring(2, digest.indexOf(",s=")));
+            sum = sum.add(new java.math.BigDecimal(digest.substring(digest.indexOf(",s=") + 3)));
+        }
+        return "n=" + count + ",s=" + sum.toPlainString();
+    }
+
+    /**
+     * 路由感知的逐行比对。
+     *
+     * <p>与 1:1 路径的关键差别是<b>目标窗口由源端 chunk 的主键上界卡住</b>：
+     * 拆分下 N 张分片表各取 1000 行，并起来会覆盖比源端 chunk 宽得多的主键区间，
+     * 直接归并会把"下一个 chunk 才轮到的源行"对应的目标行全判成目标端多余。
+     */
+    private List<DataDiff> routedMergeJoin(Connection sourceDb, Connection targetDb, TableCompareTask task,
+                                           RoutedTarget rt, boolean isPg, int maxDiffs) throws SQLException {
+        List<DataDiff> diffs = new ArrayList<>();
+        String pkCol = task.getPrimaryKeyColumn();
+        List<ColumnMeta> columns = task.getColumns();
+        String columnList = buildColumnList(columns, pkCol);
+        String sourceQualified = qualify(task.getSourceDb(), task.getSourceTable(), isPg);
+        CompareCursor cursor = task.getCursor();
+        Object lastPk = cursor.getLastProcessedPk();
+
+        while (diffs.size() < maxDiffs) {
+            List<Map<String, Object>> sourceRows = executeQuery(sourceDb,
+                    buildChunkQuery(sourceQualified, pkCol, columnList, lastPk, isPg));
+
+            if (sourceRows.isEmpty()) {
+                // 源端扫完了，目标端还可能有主键更大的残留行
+                for (Map<String, Object> row : fetchTargetWindow(targetDb, rt, pkCol, columnList,
+                        lastPk, null, isPg)) {
+                    diffs.add(targetOnlyDiff(row, columns, pkCol, rt));
+                    if (diffs.size() >= maxDiffs) break;
+                }
+                cursor.setLastProcessedPk(null);
+                break;
+            }
+
+            Object chunkMaxPk = sourceRows.get(sourceRows.size() - 1).get(pkCol);
+            List<Map<String, Object>> targetRows = fetchTargetWindow(targetDb, rt, pkCol, columnList,
+                    lastPk, chunkMaxPk, isPg);
+            diffs.addAll(joinWindow(sourceRows, targetRows, task, rt, maxDiffs - diffs.size()));
+
+            cursor.setScannedRows(cursor.getScannedRows() + sourceRows.size());
+            if (sourceRows.size() < CHUNK_SIZE) {
+                for (Map<String, Object> row : fetchTargetWindow(targetDb, rt, pkCol, columnList,
+                        chunkMaxPk, null, isPg)) {
+                    if (diffs.size() >= maxDiffs) break;
+                    diffs.add(targetOnlyDiff(row, columns, pkCol, rt));
+                }
+                cursor.setLastProcessedPk(null);
+                break;
+            }
+            lastPk = chunkMaxPk;
+            cursor.setLastProcessedPk(lastPk);
+        }
+        return diffs;
+    }
+
+    /**
+     * 把一个主键窗口里的源行与目标行对起来。
+     *
+     * <p>目标行<b>按主键建索引</b>而不是做 k 路归并：拆分下同一个主键可能在多张分片表里各有一份
+     * （分片键被改过但旧片没删就是这个形态），归并流做不出"有几份、分别在哪片"的判断。
+     *
+     * <p>正确分片按<b>源行</b>的分片键算。按目标行自己的值算是抓不到陈行的——
+     * 旧行带的是旧分片键，它待的正是"按它自己的旧值该待的那一片"，看上去完全合规。
+     */
+    private List<DataDiff> joinWindow(List<Map<String, Object>> sourceRows, List<Map<String, Object>> targetRows,
+                                      TableCompareTask task, RoutedTarget rt, int maxDiffs) {
+        List<DataDiff> diffs = new ArrayList<>();
+        String pkCol = task.getPrimaryKeyColumn();
+        List<ColumnMeta> columns = task.getColumns();
+
+        Map<Object, List<Map<String, Object>>> byPk = new LinkedHashMap<>();
+        for (Map<String, Object> row : targetRows) {
+            byPk.computeIfAbsent(normalizeValue(row.get(pkCol)), k -> new ArrayList<>()).add(row);
+        }
+
+        for (Map<String, Object> sourceRow : sourceRows) {
+            if (diffs.size() >= maxDiffs) return diffs;
+            Object pk = normalizeValue(sourceRow.get(pkCol));
+            List<Map<String, Object>> matches = byPk.remove(pk);
+            if (matches == null || matches.isEmpty()) {
+                diffs.add(buildDiff(sourceRow, null, "SOURCE_ONLY", columns, pkCol));
+                continue;
+            }
+
+            Integer expected = expectedShard(rt, sourceRow);
+            Map<String, Object> primary = null;
+            List<Map<String, Object>> misplaced = new ArrayList<>();
+            for (Map<String, Object> candidate : matches) {
+                if (expected == null || expected == shardIndexOf(candidate)) {
+                    // 分片键为 NULL 的行按 BROADCAST 会进每一片，此时不判落点，取第一份比内容
+                    if (primary == null) {
+                        primary = candidate;
+                    }
+                    continue;
+                }
+                misplaced.add(candidate);
+            }
+            for (int i = 0; i < misplaced.size(); i++) {
+                // 一行只报一条差异：对的片上没有这行时，这条差异同时带上源行——
+                // 修复就是一次搬迁（错片删 + 对片补），拆成 WRONG_SHARD + SOURCE_ONLY 两条
+                // 会让"一个问题"看起来像"两个问题"，差异条数也虚高一倍
+                Map<String, Object> moveSource = (primary == null && i == 0) ? sourceRow : null;
+                diffs.add(wrongShardDiff(misplaced.get(i), columns, pkCol, rt, expected, moveSource));
+                if (diffs.size() >= maxDiffs) return diffs;
+            }
+            if (primary == null) {
+                if (misplaced.isEmpty()) {
+                    diffs.add(buildDiff(sourceRow, null, "SOURCE_ONLY", columns, pkCol));
+                }
+                continue;
+            }
+            DataDiff contentDiff = compareRowContent(sourceRow, primary, columns, pkCol);
+            if (contentDiff != null) {
+                contentDiff.setTargetShard(shardLabel(rt, shardIndexOf(primary)));
+                diffs.add(contentDiff);
+            }
+        }
+
+        for (List<Map<String, Object>> orphans : byPk.values()) {
+            for (Map<String, Object> row : orphans) {
+                if (diffs.size() >= maxDiffs) return diffs;
+                diffs.add(targetOnlyDiff(row, columns, pkCol, rt));
+            }
+        }
+        return diffs;
+    }
+
+    /** 源行按分片键应落在哪一片；汇聚模式与不可判定（分片键为 NULL）时返回 null。 */
+    private Integer expectedShard(RoutedTarget rt, Map<String, Object> sourceRow) {
+        if (!rt.isSplit() || rt.split.shardKeyColumn.isEmpty()) {
+            return null;
+        }
+        Object value = sourceRow.get(rt.split.shardKeyColumn);
+        if (value == null) {
+            for (Map.Entry<String, Object> e : sourceRow.entrySet()) {
+                if (e.getKey().equalsIgnoreCase(rt.split.shardKeyColumn)) {
+                    value = e.getValue();
+                    break;
+                }
+            }
+        }
+        return rt.split.shardOf(value);
+    }
+
+    private DataDiff targetOnlyDiff(Map<String, Object> row, List<ColumnMeta> columns, String pkCol,
+                                    RoutedTarget rt) {
+        DataDiff diff = buildDiff(null, row, "TARGET_ONLY", columns, pkCol);
+        diff.setTargetShard(shardLabel(rt, shardIndexOf(row)));
+        return diff;
+    }
+
+    /**
+     * @param moveSource 对的片上没有这行时传源行：修复据此把它补到正确分片（连同删掉错片那份
+     *                   构成一次搬迁）。对的片上已有正确的一份时传 null，修复只需删掉多余的那份。
+     */
+    private DataDiff wrongShardDiff(Map<String, Object> row, List<ColumnMeta> columns, String pkCol,
+                                    RoutedTarget rt, Integer expected, Map<String, Object> moveSource) {
+        DataDiff diff = new DataDiff();
+        diff.setDiffType("WRONG_SHARD");
+        diff.setPrimaryKeyValue(row.get(pkCol));
+        diff.setTargetData(toJsonString(row, columns));
+        diff.setSourceData(moveSource == null ? null : toJsonString(moveSource, columns));
+        diff.setTargetShard(shardLabel(rt, shardIndexOf(row)));
+        diff.setExpectedShard(expected == null ? null : shardLabel(rt, expected));
+        diff.setDiffFields(List.of(rt.split.shardKeyColumn));
+        return diff;
+    }
+
+    private String shardLabel(RoutedTarget rt, int index) {
+        if (index < 0 || index >= rt.reads.size()) {
+            return null;
+        }
+        String[] read = rt.reads.get(index);
+        return read[0] + "." + read[1];
+    }
+
+    private int shardIndexOf(Map<String, Object> row) {
+        Object idx = row.get(SHARD_MARKER);
+        return idx instanceof Number ? ((Number) idx).intValue() : 0;
+    }
+
+    /**
+     * 取目标端 {@code (low, high]} 区间内的行；{@code high} 为 null 表示取到末尾（带 LIMIT 兜底）。
+     * 拆分下逐片查，行上打分片号——后面判落点、定位修复都要靠它。
+     */
+    private List<Map<String, Object>> fetchTargetWindow(Connection targetDb, RoutedTarget rt, String pkCol,
+                                                        String columnList, Object low, Object high,
+                                                        boolean isPg) throws SQLException {
+        List<Map<String, Object>> all = new ArrayList<>();
+        String escapedPk = quote(pkCol, isPg);
+        for (int i = 0; i < rt.reads.size(); i++) {
+            String[] read = rt.reads.get(i);
+            StringBuilder sql = new StringBuilder("SELECT ").append(columnList).append(" FROM ")
+                    .append(qualify(read[0], read[1], isPg)).append(tagWhere(rt, isPg));
+            String glue = rt.tagFilters.isEmpty() ? " WHERE " : " AND ";
+            if (low != null) {
+                sql.append(glue).append(escapedPk).append(" > ").append(formatValue(low));
+                glue = " AND ";
+            }
+            if (high != null) {
+                sql.append(glue).append(escapedPk).append(" <= ").append(formatValue(high));
+            }
+            sql.append(" ORDER BY ").append(escapedPk).append(" ASC LIMIT ").append(CHUNK_SIZE);
+            for (Map<String, Object> row : executeQuery(targetDb, sql.toString())) {
+                row.put(SHARD_MARKER, i);
+                all.add(row);
+            }
+        }
+        all.sort((a, b) -> toComparable(a.get(pkCol)).compareTo(toComparable(b.get(pkCol))));
+        return all;
+    }
+
+    /** 汇聚的来源标识过滤条件；拆分与 1:1 返回空串。 */
+    private String tagWhere(RoutedTarget rt, boolean isPg) {
+        if (rt.tagFilters.isEmpty()) {
+            return "";
+        }
+        StringBuilder where = new StringBuilder(" WHERE ");
+        boolean first = true;
+        for (Map.Entry<String, String> e : rt.tagFilters.entrySet()) {
+            if (!first) {
+                where.append(" AND ");
+            }
+            where.append(quote(e.getKey(), isPg)).append(" = ").append(formatValue(e.getValue()));
+            first = false;
+        }
+        return where.toString();
+    }
+
+    private String qualify(String db, String table, boolean isPg) {
+        return isPg ? quote(table, true) : quote(db, false) + "." + quote(table, false);
+    }
+
+    private String quote(String identifier, boolean isPg) {
+        return isPg ? "\"" + identifier + "\"" : "`" + identifier + "`";
     }
 
     private DataDiff compareRowContent(Map<String, Object> sourceRow, Map<String, Object> targetRow,

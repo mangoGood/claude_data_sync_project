@@ -373,10 +373,6 @@ public class ConfigService {
             }
         }
 
-        // 聚合路由（分库分表汇聚/拆分）：JSON 展开成 route.*，并用引擎的解析器当场校验。
-        // 配置非法直接抛——路由错了就是数据写错地方，不能让任务带着坏规则起来。
-        RouteConfigExpander.expand(props, taskMessage.getRouteConfig(), taskMessage.getRouteNodeId());
-
         String rawSourceType = taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql";
         String targetType = taskMessage.getTargetType() != null ? taskMessage.getTargetType() : "mysql";
         // TiDB 讲 MySQL 协议：驱动、方言、类型映射、全量迁移、增量应用全部与 mysql→mysql 同构，
@@ -390,6 +386,12 @@ public class ConfigService {
         props.setProperty("target.db.type", targetType);
         logger.info("Source database type: {} (flavor={}), Target database type: {}",
                 sourceType, props.getProperty("source.db.flavor"), targetType);
+
+        // 聚合路由（分库分表汇聚/拆分）：JSON 展开成 route.*，并用引擎的解析器当场校验。
+        // 配置非法直接抛——路由错了就是数据写错地方，不能让任务带着坏规则起来。
+        // 必须排在库类型与列处理之后：引擎的 RoutingConfig 要靠 source.db.type/target.db.type
+        // 判引擎对是否支持路由、靠 column.* 判是否与列处理冲突，排在前面这两道校验会全部落空。
+        RouteConfigExpander.expand(props, taskMessage.getRouteConfig(), taskMessage.getRouteNodeId());
 
         // 账号同步（仅 mysql→mysql）：sync.account.enabled 打开后，全量阶段同步存量账号、
         // 增量阶段同步账号管理语句；sync.account.super 决定是否连同超级/管理权限。
