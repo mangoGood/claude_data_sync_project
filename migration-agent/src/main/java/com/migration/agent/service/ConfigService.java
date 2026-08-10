@@ -521,6 +521,11 @@ public class ConfigService {
         if (taskMessage.getSubscribeFormat() != null && !taskMessage.getSubscribeFormat().isEmpty()) {
             props.setProperty("subscribe.format", taskMessage.getSubscribeFormat());
         }
+        // Avro（Confluent wire format）需要 Schema Registry 才能拿到 schema id。
+        // 地址是部署环境级的，不随任务走——同一个环境接的就是那一个 registry。
+        writeStringPropFromEnv(props, "subscribe.schema.registry.url", "SUBSCRIBE_SCHEMA_REGISTRY_URL");
+        writeStringPropFromEnv(props, "subscribe.schema.registry.user", "SUBSCRIBE_SCHEMA_REGISTRY_USER");
+        writeStringPropFromEnv(props, "subscribe.schema.registry.password", "SUBSCRIBE_SCHEMA_REGISTRY_PASSWORD");
 
         props.setProperty("subscribe.thl.dir", "files/" + taskId + "/thl_output");
 
@@ -872,6 +877,20 @@ public class ConfigService {
         String id = (host.isEmpty() ? "node" : host) + (port.isEmpty() ? "" : ":" + port)
                 + (db.isEmpty() ? "" : "/" + db);
         return id;
+    }
+
+    /**
+     * 从环境变量/系统属性读取字符串写入 props（未设则不写）。
+     *
+     * <p>值可能是口令（Schema Registry 的 basic auth），所以<b>只记键名不记值</b>——
+     * config.properties 里的口令由 CredentialCipher 负责加密，日志里不该再泄一遍。
+     */
+    private void writeStringPropFromEnv(java.util.Properties props, String key, String envName) {
+        String v = System.getenv(envName);
+        if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);
+        if (v == null || v.trim().isEmpty()) return;
+        props.setProperty(key, v.trim());
+        logger.info("引擎参数已写入配置: {}（值不记录）", key);
     }
 
     /** 从环境变量/系统属性读取整数写入 props（未设或非法则不写，保持子进程默认）。 */

@@ -1958,10 +1958,122 @@ schema 变更丢了比数据丢了更难排查（下游要到很久以后才发�
 > （实测对照组偶发"没丢数据"，把一条本该复现丢数据的尺子判成失效）。
 > 改成连子进程一起杀——"整机失联"的语义本来就是这台机器上的一切同时消失。
 
-### 14.7　仍未做（明确记下来，别让它变成"以为做了"）
+### 14.7　第 7 批收尾时仍未做的三项 —— **已在 §15 补完**
 
-- **Oracle / MongoDB 源的对象级预检**（PG 已补，TiDB 走 MySQL 那套）
-- **传输加密只覆盖数据面**，控制面连接仍是明文
-- **订阅消息仍是 JSON**，没有 Avro / Schema Registry
-- §12.7 那六项"压根没做"的能力（表级重同步、湖仓目标、分片在线扩缩容、
-  容量规划与 SLA 基线、Oracle 作为路由目标）一项没动
+- ~~Oracle / MongoDB 源的对象级预检~~ → §15.1
+- ~~传输加密只覆盖数据面~~ → §15.2
+- ~~订阅消息仍是 JSON~~ → §15.3
+
+§12.7 那六项"压根没做"的能力（表级重同步、湖仓目标、分片在线扩缩容、
+容量规划与 SLA 基线、Oracle 作为路由目标）仍然一项没动。
+
+---
+
+## 15. 收尾三项（Oracle/Mongo 预检 · 控制面加密 · Avro 订阅）
+
+日期：2026-08-10。`./test.sh all` **703 通过 / 0 失败**（第 7 批为 695，新增 8 例）。
+
+### 15.1　Oracle / MongoDB 源的对象级预检
+
+对象级预检此前只覆盖 MySQL/TiDB 与 PostgreSQL，Oracle 与 MongoDB 仍是一句
+"暂不支持该源类型，已跳过"——这两条链路的对象级预检覆盖率是 **0**。
+
+**Oracle**（`ALL_TABLES` / `ALL_CONSTRAINTS` / `ALL_TAB_COLUMNS`）：与 MySQL 同一批判据
+（对象存在性、增量主键、列处理引用列），外加两条 Oracle 特有的：
+
+| 检查项 | 为什么值得单独有一条 |
+|---|---|
+| **补充日志** | 没有最小补充日志时 LogMiner 的 UPDATE/DELETE 记录**不带行标识**，增量表现为"任务健康、位点一直推进、目标端一行不动"。这是 Oracle 源最难查的一类故障，而且只有跑起来才暴露 |
+| **标识符大小写** | Oracle 对象名默认大写存储。用户在向导里填小写表名会查不到，但那不是"表不存在"——不单独提示的话，用户会去建一张本来就有的表 |
+
+**MongoDB**（`hello` / `listCollections` / `local.oplog.rs`）：关系库那套"主键 / 列存在性"
+在这里没有对应物（`_id` 必然存在、文档无固定列），所以判据换成 Mongo 自己会炸的那几条：
+
+| 检查项 | 为什么 |
+|---|---|
+| **副本集/分片集群** | Change Streams 只在副本集/分片集群可用。单机 mongod 上增量任务**起得来但一条变更都收不到** |
+| **集合类型** | 视图不产生 change stream，不能作为同步源 |
+| **oplog 窗口** | 窗口比全量耗时还短时，全量还没搬完 resume token 就滚出去了，增量接不上只能重做全量。这条只有事后才发现，所以要在启动前量一次 |
+
+仍未覆盖：Elasticsearch 与 Redis 源（ES 只能作目标；Redis 没有"对象"这个概念，
+它的预检在连接级已经做了）。
+
+### 15.2　传输加密覆盖控制面
+
+第 7 批的 TLS 只覆盖了数据面（capture / full / increment 的源目标连接）。
+但**后端自己也直连用户数据库**——元数据探查、连接校验、数据校验、
+以及**内容对比（逐行把两端业务数据读回来比）**。数据面加密而控制面明文，
+等于同一批数据换条路又明文走了一遍，比不加密更容易让人误判。
+
+| 链路 | 开关 | 落点 |
+|---|---|---|
+| 后端直连用户库（探查/校验/**内容对比**） | `CONTROL_PLANE_DB_SSL_MODE` + `CONTROL_PLANE_DB_SSL_ROOT_CERT` | [JdbcSslOptions](java-backend/src/main/java/com/synctask/util/JdbcSslOptions.java)，9 处硬编码 `useSSL=false` 收敛到这里 |
+| 后端 / agent 到元数据库 | `META_DB_SSL_MODE` | `application.yml` 与 `AgentConfig` 的默认 URL（显式给 `DB_URL` / `MIGRATION_AGENT_MYSQL_DB_URL` 时以它为准） |
+| Kafka（后端生产/消费、agent 消费、**订阅生产**） | `KAFKA_SECURITY_PROTOCOL` / `KAFKA_SSL_*` / `KAFKA_SASL_*` | [KafkaSecurity](migration-common/src/main/java/com/migration/common/security/KafkaSecurity.java) |
+
+三个刻意的选择：
+
+- **档位与数据面完全一致**（`DISABLED | PREFERRED | REQUIRED | VERIFY_CA | VERIFY_IDENTITY`），
+  不给控制面另造一套说法。
+- **取值来自环境变量而不是任务配置**：控制面的连接是后端进程发起的，一个部署环境要么整体走 TLS、
+  要么整体不走；按任务配会出现"同一个库有的连接加密有的不加密"这种没人能推理的状态。
+- **关闭主机名校验是独立开关**（`KAFKA_SSL_VERIFY_HOSTNAME=false`），
+  免得有人为了跑通把 `security.protocol` 一路降回 PLAINTEXT。
+
+预检的"传输加密"项相应改成**四条一起判**（数据面源/目标 + 控制面到用户库/到元数据库/Kafka），
+全开才 PASS，明细里逐条列出当前档位。
+
+`KafkaSecurity` 在引擎侧与后端侧是**同一份逻辑的两个副本**——两个工程互不依赖（见 `build.sh`），
+为十几行参数拉一条工程依赖不划算，但两边键名必须逐字一致，类注释里写明了要一起改。
+
+### 15.3　订阅支持 Avro + Schema Registry
+
+`subscribe.format=AVRO`：产出 **Confluent wire format**（`0x00` + 4 字节大端 schema id +
+Avro binary），下游可以直接用 Confluent 官方的 Avro 反序列化器读。
+
+**不引 Confluent 的序列化器**：那要额外挂一个 Confluent 私有 maven 仓库，把整条构建链绑到
+第三方仓库的可用性上；而真正需要的只有"向 registry 注册 schema 换一个整型 id"
+和"按 wire format 拼字节"两件事，加起来不到两百行
+（[SchemaRegistryClient](migration-subscribe/src/main/java/com/migration/subscribe/avro/SchemaRegistryClient.java)
++ [AvroCdcSerializer](migration-subscribe/src/main/java/com/migration/subscribe/avro/AvroCdcSerializer.java)）。
+
+三个设计点：
+
+1. **schema 按"事件里实际出现的列集"生成**并按 (topic, 列集) 缓存。订阅侧拿到的是 THL 事件、
+   没有目标端 DDL，只能这么来。列集变了（源端 ADD/DROP COLUMN）就是新版本，
+   注册到同一个 subject——兼容性该由 Schema Registry 管，不该由我们猜。
+2. **每个列字段都是可空且带 `default: null`**，所以加列对老消费者是**向后兼容**的
+   （registry 的 BACKWARD 检查能过）。
+3. **列值是 union `["null","boolean","long","double","string"]` 而不是全 string**。
+   全 string 最省事，但这个项目在订阅链路上专门修过"整数变浮点""NULL 被丢"这类值保真缺陷，
+   压平回字符串等于把修过的东西又丢一遍。分支由 JSON 里值的**字面形态**决定
+   （有小数点/指数才是 double），与 JSON 输出的判定口径一致；
+   超出 long 的整数（`DECIMAL(38,0)` 之类）按字符串原样带过去，**不转 double 丢精度**。
+
+**生产者的值类型从 `String` 改成 `byte[]`**（Avro 是二进制）。JSON 路径改成 UTF-8 编码后发送——
+`StringSerializer` 本来就是 UTF-8，所以线上字节逐字节相同；
+`subscribe_txn_metadata.py` 5/0 回归确认了这一点。
+
+**Avro 序列化失败计入 `sendErrors`**：schema 注册不上就意味着下游拿到的字节没人能读，
+与其投一堆读不出来的消息，不如让位点停在这里（`saveProgress` 前会检查 `sendErrors` 增量）。
+同理 `subscribe.format=AVRO` 而没配 registry 地址时**直接抛**而不是悄悄退回 JSON——
+"我以为在发 Avro，其实发的是 JSON"是最难查的一类问题。
+
+新增 `docker-compose-synctask-kafka-sub.yml` 里的 `synctask-schema-registry`（宿主 38081），
+只有 Avro 用例需要它。**镜像刻意用的是 Apicurio 而不是 Confluent 自家的**：
+Apicurio 提供一套 Confluent 兼容 API（`/apis/ccompat/v7`），拿它来验能同时回答两个问题——
+我们产出的 wire format 对不对、以及"Confluent 兼容"是不是只对 Confluent 自己成立。
+**换一家实现照样跑通，才说明这个格式是通用的**，而不是自说自话。
+
+### 15.4　判据脚本
+
+| 脚本 | 覆盖 |
+|---|---|
+| [precheck_coverage.py](test_scripts/fault_injection/precheck_coverage.py) | Oracle/Mongo 源产出实质检查项（而不是"已跳过"）、Oracle 补充日志、Mongo 副本集、不存在的对象被判 FAIL、传输加密项覆盖控制面 —— **6 / 0** |
+| [subscribe_avro.py](test_scripts/fault_injection/subscribe_avro.py) | wire format、subject 注册、用 registry 返回的 schema 解码、值保真、UPDATE 前后镜像、加列产生新版本 —— **7 / 0**（实测 `qty=7` 是 int 不是 float、`note=None` 保住了 NULL、加列后 subject 版本 `[1] → [1,2]`） |
+
+单测新增 [AvroCdcSerializerTest](migration-subscribe/src/test/java/com/migration/subscribe/avro/AvroCdcSerializerTest.java)（8 例）。
+
+> 实施时踩的一个坑：Avro 的具名类型只能定义一次，`before` 与 `after` 都展开写行记录会直接
+> `SchemaParseException`；`after` 必须按**名字**引用，而且引用要是带引号的字符串
+> （`["null","OrdersRow"]`，不是 `["null",OrdersRow]`）。

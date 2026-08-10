@@ -30,7 +30,12 @@ public class AgentConfig {
         props.setProperty("kafka.topic.task-created", "sync-task-created");
         props.setProperty("kafka.topic.task-status", "sync-task-status");
 
-        props.setProperty("mysql.db.url", "jdbc:mysql://localhost:33306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
+        // 元数据库连接（位点中心库、agent 注册、配额）。META_DB_SSL_MODE 缺省 DISABLED
+        // （= 历史行为的明文），设成 REQUIRED/VERIFY_CA/VERIFY_IDENTITY 即让这一跳走 TLS。
+        // 显式给 MIGRATION_AGENT_MYSQL_DB_URL 时以它为准。
+        props.setProperty("mysql.db.url", "jdbc:mysql://localhost:33306/sync_task_db?sslMode="
+                + System.getenv().getOrDefault("META_DB_SSL_MODE", "DISABLED")
+                + "&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
         props.setProperty("mysql.db.user", "root");
         props.setProperty("mysql.db.password", "rootpassword");
 

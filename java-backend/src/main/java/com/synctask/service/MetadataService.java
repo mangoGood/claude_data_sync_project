@@ -208,7 +208,7 @@ public class MetadataService {
             String service = (conn.database != null && !conn.database.isEmpty()) ? conn.database : "ORCL";
             jdbcUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
         } else {
-            jdbcUrl = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&connectTimeout=15000&socketTimeout=15000&allowPublicKeyRetrieval=true",
+            jdbcUrl = String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&connectTimeout=15000&socketTimeout=15000&allowPublicKeyRetrieval=true",
                 conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "");
         }
 
@@ -573,9 +573,9 @@ public class MetadataService {
             return String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
         }
         if (database != null && !database.isEmpty()) {
-            return String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port, database);
+            return String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port, database);
         }
-        return String.format("jdbc:mysql://%s:%d/?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port);
+        return String.format("jdbc:mysql://%s:%d/?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port);
     }
     
     private String buildJdbcUrl(ParsedConnection conn) {

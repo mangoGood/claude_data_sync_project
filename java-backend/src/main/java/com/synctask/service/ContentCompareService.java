@@ -1128,7 +1128,7 @@ public class ContentCompareService {
             url = String.format("jdbc:postgresql://%s:%d/%s?currentSchema=public&stringtype=unspecified",
                 conn.host, conn.port, conn.database != null ? conn.database : "postgres");
         } else {
-            url = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true",
+            url = String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true",
                 conn.host, conn.port, conn.database != null ? conn.database : "");
         }
 

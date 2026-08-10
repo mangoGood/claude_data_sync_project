@@ -300,9 +300,11 @@ public class DiagnosticService {
         // TiDB 讲 MySQL 协议，连接串同为 mysql://，走同一套 information_schema 查询
         boolean mysqlSource = srcConn != null && srcConn.startsWith("mysql://");
         boolean pgSource = srcConn != null && srcConn.startsWith("postgresql://");
-        if (!mysqlSource && !pgSource) {
+        boolean oracleSource = srcConn != null && srcConn.startsWith("oracle://");
+        boolean mongoSource = srcConn != null && srcConn.startsWith("mongodb://");
+        if (!mysqlSource && !pgSource && !oracleSource && !mongoSource) {
             checks.add(check("schema 预检", "WARNING",
-                    "对象级预检暂不支持该源类型（当前支持 MySQL/TiDB/PostgreSQL），已跳过（不影响启动）", null));
+                    "对象级预检暂不支持该源类型（当前支持 MySQL/TiDB/PostgreSQL/Oracle/MongoDB），已跳过（不影响启动）", null));
             return summarize(result, checks, workflow);
         }
 
@@ -320,6 +322,12 @@ public class DiagnosticService {
 
         if (pgSource) {
             return summarize(result, pgSchemaPrecheck(workflow, srcConn, entries, checks), workflow);
+        }
+        if (oracleSource) {
+            return summarize(result, oracleSchemaPrecheck(workflow, srcConn, entries, checks), workflow);
+        }
+        if (mongoSource) {
+            return summarize(result, mongoSchemaPrecheck(workflow, srcConn, entries, checks), workflow);
         }
 
         String mode = workflow.getMigrationMode();
@@ -372,16 +380,35 @@ public class DiagnosticService {
     private Map<String, Object> checkTransportEncryption(Workflow workflow) {
         String src = System.getenv("SOURCE_DB_SSL_MODE");
         String tgt = System.getenv("TARGET_DB_SSL_MODE");
-        boolean srcOn = src != null && !src.isEmpty() && !"DISABLED".equalsIgnoreCase(src);
-        boolean tgtOn = tgt != null && !tgt.isEmpty() && !"DISABLED".equalsIgnoreCase(tgt);
-        if (srcOn && tgtOn) {
-            return check("传输加密", "PASS", "源/目标连接均已启用 TLS（源=" + src + "，目标=" + tgt + "）", null);
+        boolean srcOn = on(src);
+        boolean tgtOn = on(tgt);
+        // 控制面：后端自己也直连用户库（元数据探查、连接校验、数据校验、**内容对比逐行读业务数据**），
+        // 以及后端/agent 到元数据库与 Kafka 的那几跳。数据面加密而控制面明文，
+        // 等于同一批数据换条路又明文走了一遍——所以四项一起判，只报"全开"才算 PASS。
+        String control = com.synctask.util.JdbcSslOptions.mode();
+        String meta = System.getenv("META_DB_SSL_MODE");
+        String kafka = com.synctask.util.KafkaSecurity.protocol();
+        boolean controlOn = on(control);
+        boolean metaOn = on(meta);
+        boolean kafkaOn = com.synctask.util.KafkaSecurity.enabled();
+
+        String detail = String.format(
+                "数据面 源=%s 目标=%s；控制面 到用户库=%s 到元数据库=%s Kafka=%s",
+                srcOn ? src : "DISABLED", tgtOn ? tgt : "DISABLED",
+                controlOn ? control : "DISABLED", metaOn ? meta : "DISABLED", kafka);
+
+        if (srcOn && tgtOn && controlOn && metaOn && kafkaOn) {
+            return check("传输加密", "PASS", "数据面与控制面均已启用 TLS", detail);
         }
         return check("传输加密", "WARNING",
-                "源/目标数据库连接未启用 TLS，业务数据在网络上是明文传输"
-                        + "（源=" + (srcOn ? src : "DISABLED") + "，目标=" + (tgtOn ? tgt : "DISABLED") + "）",
-                "如需启用，设置 agent 环境变量 SOURCE_DB_SSL_MODE / TARGET_DB_SSL_MODE "
-                        + "为 PREFERRED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY");
+                "以下链路未启用 TLS，数据在网络上是明文传输", detail
+                        + "。开关：SOURCE_DB_SSL_MODE / TARGET_DB_SSL_MODE（数据面）、"
+                        + "CONTROL_PLANE_DB_SSL_MODE（后端直连用户库）、META_DB_SSL_MODE（元数据库）、"
+                        + "KAFKA_SECURITY_PROTOCOL=SSL|SASL_SSL（Kafka）");
+    }
+
+    private static boolean on(String v) {
+        return v != null && !v.isEmpty() && !"DISABLED".equalsIgnoreCase(v);
     }
 
     /**
@@ -467,6 +494,271 @@ public class DiagnosticService {
             checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
         }
         return checks;
+    }
+
+    /**
+     * Oracle 源的对象级预检。
+     *
+     * <p>与 MySQL/PG 同一批判据（对象存在性、增量主键、列处理引用列），换成 {@code ALL_*} 数据字典。
+     * 两条 Oracle 特有的：
+     *
+     * <ul>
+     *   <li><b>补充日志</b>：LogMiner 默认只记录被改的列，没有最小补充日志时
+     *       UPDATE/DELETE 拿不到行标识，增量根本定位不到目标行。这是 Oracle 源最常见的
+     *       "任务起得来但增量一条都不同步"的原因，且只有跑起来才会暴露。</li>
+     *   <li><b>标识符大小写</b>：Oracle 的对象名默认大写存储，用户在向导里填小写表名
+     *       会查不到——但这不是"表不存在"，只是大小写问题，所以单独提示，
+     *       否则用户看到"源库不存在以下对象"会去建一张本来就有的表。</li>
+     * </ul>
+     */
+    private List<Map<String, Object>> oracleSchemaPrecheck(Workflow workflow, String srcConn,
+                                                           List<DbEntry> entries,
+                                                           List<Map<String, Object>> checks) {
+        String mode = workflow.getMigrationMode();
+        boolean needsIncrement = mode != null
+                && (mode.toLowerCase().contains("incre") || mode.equalsIgnoreCase("subscribe"));
+        try (Connection src = openOracleConn(srcConn)) {
+            List<String> missing = new ArrayList<>();
+            List<String> caseHint = new ArrayList<>();
+            List<String> noPk = new ArrayList<>();
+            List<String> missingCols = new ArrayList<>();
+
+            for (DbEntry de : entries) {
+                if (de.dbLevel) continue;
+                String owner = de.sourceDb == null ? "" : de.sourceDb.toUpperCase();
+                for (String t : de.tables) {
+                    String table = t.toUpperCase();
+                    if (!oracleTableExists(src, owner, table)) {
+                        missing.add(de.sourceDb + "." + t);
+                        continue;
+                    }
+                    if (!table.equals(t)) {
+                        caseHint.add(de.sourceDb + "." + t + " → " + table);
+                    }
+                    if (needsIncrement && !oracleHasPrimaryKey(src, owner, table)) {
+                        noPk.add(owner + "." + table);
+                    }
+                }
+                for (Map.Entry<String, java.util.Set<String>> te : de.referencedColumns.entrySet()) {
+                    String table = te.getKey().toUpperCase();
+                    if (!oracleTableExists(src, owner, table)) continue;
+                    java.util.Set<String> cols = oracleTableColumns(src, owner, table);
+                    for (String ref : te.getValue()) {
+                        if (!cols.contains(ref.toUpperCase())) {
+                            missingCols.add(owner + "." + table + "." + ref);
+                        }
+                    }
+                }
+            }
+
+            checks.add(missing.isEmpty()
+                    ? check("源库对象存在性", "PASS", "所有同步对象均存在于源库", null)
+                    : check("源库对象存在性", "FAIL",
+                            "源库不存在以下对象（" + missing.size() + " 个）", String.join(", ", missing)));
+
+            if (!caseHint.isEmpty()) {
+                checks.add(check("标识符大小写", "WARNING",
+                        "Oracle 对象名默认以大写存储，以下对象按大写匹配成功（" + caseHint.size() + " 个）；"
+                                + "若源端确实建的是带引号的小写名，请在同步对象里填写实际大小写",
+                        String.join(", ", caseHint)));
+            }
+
+            if (needsIncrement) {
+                checks.add(noPk.isEmpty()
+                        ? check("增量主键", "PASS", "增量同步的表均有主键", null)
+                        : check("增量主键", "FAIL",
+                                "以下表无主键，增量 UPDATE/DELETE 只能按整行匹配定位（存在完全重复行时无法区分是哪一条，"
+                                        + "引擎默认限量成只影响一行）。建议加主键或唯一索引（" + noPk.size() + " 个）",
+                                String.join(", ", noPk)));
+                checks.add(checkOracleSupplementalLog(src));
+            }
+
+            checks.add(missingCols.isEmpty()
+                    ? check("列处理引用列", "PASS", "列过滤/映射引用的源列均存在", null)
+                    : check("列处理引用列", "FAIL",
+                            "列处理引用了不存在的源列（" + missingCols.size() + " 个）", String.join(", ", missingCols)));
+        } catch (Exception e) {
+            checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
+        }
+        return checks;
+    }
+
+    /**
+     * 最小补充日志。没有它，LogMiner 的 UPDATE/DELETE 记录里没有行标识，
+     * 增量表现为"任务健康、位点在推进、目标端一行不动"——是 Oracle 源最难查的一类故障。
+     */
+    private Map<String, Object> checkOracleSupplementalLog(Connection conn) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT supplemental_log_data_min FROM v$database");
+             ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+                String v = rs.getString(1);
+                if (v != null && !"NO".equalsIgnoreCase(v)) {
+                    return check("补充日志", "PASS", "supplemental_log_data_min=" + v, null);
+                }
+                return check("补充日志", "FAIL",
+                        "源库未开启最小补充日志（supplemental_log_data_min=NO）：LogMiner 的 UPDATE/DELETE "
+                                + "记录里不带行标识，增量会表现为「位点一直推进、目标端一行不动」",
+                        "执行 ALTER DATABASE ADD SUPPLEMENTAL LOG DATA; 后重试");
+            }
+        } catch (Exception e) {
+            return check("补充日志", "WARNING", "无法查询补充日志状态（需要 v$database 读权限）: " + e.getMessage(), null);
+        }
+        return check("补充日志", "WARNING", "无法确定补充日志状态", null);
+    }
+
+    private Connection openOracleConn(String connStr) throws Exception {
+        // oracle://user:pass@host:port/service
+        String rest = connStr.substring("oracle://".length());
+        int at = rest.indexOf('@');
+        String[] up = rest.substring(0, at).split(":", 2);
+        String hostPortService = rest.substring(at + 1);
+        String service = hostPortService.contains("/")
+                ? hostPortService.substring(hostPortService.indexOf('/') + 1) : "ORCL";
+        String hostPort = hostPortService.contains("/")
+                ? hostPortService.substring(0, hostPortService.indexOf('/')) : hostPortService;
+        return DriverManager.getConnection("jdbc:oracle:thin:@" + hostPort + "/" + service,
+                up[0], up.length > 1 ? up[1] : "");
+    }
+
+    private boolean oracleTableExists(Connection c, String owner, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM all_tables WHERE owner = ? AND table_name = ?")) {
+            ps.setString(1, owner);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private boolean oracleHasPrimaryKey(Connection c, String owner, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM all_constraints WHERE owner = ? AND table_name = ? "
+                        + "AND constraint_type = 'P' AND status = 'ENABLED'")) {
+            ps.setString(1, owner);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private java.util.Set<String> oracleTableColumns(Connection c, String owner, String table) throws Exception {
+        java.util.Set<String> cols = new java.util.HashSet<>();
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT column_name FROM all_tab_columns WHERE owner = ? AND table_name = ?")) {
+            ps.setString(1, owner);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) cols.add(rs.getString(1).toUpperCase());
+            }
+        }
+        return cols;
+    }
+
+    /**
+     * MongoDB 源的对象级预检。
+     *
+     * <p>关系库那套"主键 / 列存在性"在这里没有对应物（{@code _id} 必然存在、文档无固定列），
+     * 所以判据换成 Mongo 自己会炸的那几条：
+     *
+     * <ul>
+     *   <li><b>副本集</b>：Change Streams 只在副本集/分片集群可用。单机 mongod 上增量任务
+     *       起得来但一条变更都收不到。</li>
+     *   <li><b>集合存在性</b>与<b>集合类型</b>：视图（view）与 capped 集合都不能作为同步源，
+     *       但表现各不相同——视图直接读不出 change stream，capped 集合会在写满回卷时丢事件。</li>
+     *   <li><b>oplog 窗口</b>：窗口太短时，全量搬运还没跑完 resume token 就已经滚出窗口，
+     *       增量接不上只能重做全量。这条只有事后才发现，所以要在启动前量一次。</li>
+     * </ul>
+     */
+    private List<Map<String, Object>> mongoSchemaPrecheck(Workflow workflow, String srcConn,
+                                                          List<DbEntry> entries,
+                                                          List<Map<String, Object>> checks) {
+        String mode = workflow.getMigrationMode();
+        boolean needsIncrement = mode != null
+                && (mode.toLowerCase().contains("incre") || mode.equalsIgnoreCase("subscribe"));
+        com.mongodb.client.MongoClient client = null;
+        try {
+            client = com.mongodb.client.MongoClients.create(srcConn);
+            org.bson.Document hello = client.getDatabase("admin")
+                    .runCommand(new org.bson.Document("hello", 1));
+
+            if (needsIncrement) {
+                boolean replicaSet = hello.get("setName") != null || hello.getBoolean("isreplicaset", false)
+                        || "isdbgrid".equals(hello.getString("msg"));
+                checks.add(replicaSet
+                        ? check("副本集/分片集群", "PASS",
+                                "源端是副本集或分片集群（setName=" + hello.getString("setName") + "），Change Streams 可用", null)
+                        : check("副本集/分片集群", "FAIL",
+                                "源端不是副本集/分片集群：Change Streams 不可用，增量任务会起得来但一条变更都收不到",
+                                "把源端 mongod 配成副本集（哪怕单节点 rs.initiate()）后重试"));
+            }
+
+            List<String> missing = new ArrayList<>();
+            List<String> notCollections = new ArrayList<>();
+            for (DbEntry de : entries) {
+                com.mongodb.client.MongoDatabase db = client.getDatabase(de.sourceDb);
+                Map<String, String> types = new java.util.HashMap<>();
+                for (org.bson.Document d : db.listCollections()) {
+                    types.put(d.getString("name"), d.getString("type"));
+                }
+                if (types.isEmpty() && !de.dbLevel && !de.tables.isEmpty()) {
+                    missing.add("库 " + de.sourceDb);
+                    continue;
+                }
+                if (de.dbLevel) continue;
+                for (String t : de.tables) {
+                    if (!types.containsKey(t)) {
+                        missing.add(de.sourceDb + "." + t);
+                    } else if (types.get(t) != null && !"collection".equals(types.get(t))) {
+                        notCollections.add(de.sourceDb + "." + t + "(" + types.get(t) + ")");
+                    }
+                }
+            }
+            checks.add(missing.isEmpty()
+                    ? check("源库对象存在性", "PASS", "所有同步集合均存在于源库", null)
+                    : check("源库对象存在性", "FAIL",
+                            "源库不存在以下集合（" + missing.size() + " 个）", String.join(", ", missing)));
+            checks.add(notCollections.isEmpty()
+                    ? check("集合类型", "PASS", "同步对象均为普通集合", null)
+                    : check("集合类型", "FAIL",
+                            "以下对象不是普通集合（视图不产生 change stream，无法作为同步源）（"
+                                    + notCollections.size() + " 个）", String.join(", ", notCollections)));
+
+            if (needsIncrement) {
+                checks.add(checkMongoOplogWindow(client));
+            }
+        } catch (Exception e) {
+            checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
+        } finally {
+            if (client != null) {
+                try { client.close(); } catch (Exception ignored) { }
+            }
+        }
+        return checks;
+    }
+
+    /** oplog 窗口：小于 1 小时时全量还没搬完 resume token 就可能已经滚出去了。 */
+    private Map<String, Object> checkMongoOplogWindow(com.mongodb.client.MongoClient client) {
+        try {
+            com.mongodb.client.MongoCollection<org.bson.Document> oplog =
+                    client.getDatabase("local").getCollection("oplog.rs");
+            org.bson.Document first = oplog.find().sort(new org.bson.Document("$natural", 1)).first();
+            org.bson.Document last = oplog.find().sort(new org.bson.Document("$natural", -1)).first();
+            if (first == null || last == null) {
+                return check("oplog 窗口", "WARNING", "无法读取 oplog（需要 local.oplog.rs 读权限）", null);
+            }
+            org.bson.BsonTimestamp t0 = first.get("ts", org.bson.BsonTimestamp.class);
+            org.bson.BsonTimestamp t1 = last.get("ts", org.bson.BsonTimestamp.class);
+            long windowSec = (long) t1.getTime() - t0.getTime();
+            String human = (windowSec / 3600) + "h" + ((windowSec % 3600) / 60) + "m";
+            if (windowSec >= 3600) {
+                return check("oplog 窗口", "PASS", "oplog 覆盖约 " + human, null);
+            }
+            return check("oplog 窗口", "WARNING",
+                    "oplog 窗口只有约 " + human + "：全量搬运耗时超过这个窗口时，"
+                            + "resume token 会滚出 oplog，增量接不上只能重做全量",
+                    "调大 replSetResizeOplog 的 size，或先在业务低峰期跑全量");
+        } catch (Exception e) {
+            return check("oplog 窗口", "WARNING", "无法评估 oplog 窗口: " + e.getMessage(), null);
+        }
     }
 
     private Connection openPgConn(String connStr) throws Exception {
@@ -927,7 +1219,7 @@ public class DiagnosticService {
         String username = up[0];
         String password = up.length > 1 ? up[1] : "";
 
-        String jdbcUrl = "jdbc:mysql://" + hostDb + "?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
+        String jdbcUrl = "jdbc:mysql://" + hostDb + "?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
 
         return new String[]{jdbcUrl, username, password};
     }

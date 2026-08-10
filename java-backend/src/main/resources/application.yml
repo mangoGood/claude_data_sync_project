@@ -19,7 +19,10 @@ spring:
   # 主数据库（业务库，存储任务/用户/审计等元数据）
   # ============================================================
   datasource:
-    url: ${DB_URL:jdbc:mysql://localhost:33306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true}
+    # 元数据库连接。META_DB_SSL_MODE 缺省 DISABLED（= useSSL=false，历史行为）；
+    # 设成 REQUIRED/VERIFY_CA/VERIFY_IDENTITY 即让后端到元数据库这一跳也走 TLS。
+    # 直接给 DB_URL 时以 DB_URL 为准（运维可以自己写全参数）。
+    url: ${DB_URL:jdbc:mysql://localhost:33306/sync_task_db?sslMode=${META_DB_SSL_MODE:DISABLED}&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true}
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD:rootpassword}
     driver-class-name: com.mysql.cj.jdbc.Driver

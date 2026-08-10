@@ -41,7 +41,13 @@ public class ContinuousSubscribeMain {
     private String sourceType;
     private long scanInterval;
 
-    private KafkaProducer<String, String> kafkaProducer;
+    /**
+     * 值类型是 byte[] 而不是 String：AVRO 格式产出的是二进制。
+     * JSON 路径改用 UTF-8 编码后发送，线上字节与 StringSerializer 逐字节相同。
+     */
+    private KafkaProducer<String, byte[]> kafkaProducer;
+    /** subscribe.format=AVRO 时的序列化器（含 Schema Registry 注册）；其它格式为 null。 */
+    private com.migration.subscribe.avro.AvroCdcSerializer avroSerializer;
     /**
      * serializeNulls：值为 NULL 的列必须以 {@code "col": null} 出现在消息里。
      *
@@ -176,6 +182,7 @@ public class ContinuousSubscribeMain {
         }
 
         initKafkaProducer();
+        initAvro(props);
 
         // 订阅续传只认 .subscribe_progress（每个 THL 文件读到哪个 seqno）。
         // 曾经还有一个 checkpoint/subscribe_checkpoint 文件被读进 lastSentSeqno，但从未参与过跳过判断，
@@ -191,7 +198,8 @@ public class ContinuousSubscribeMain {
         Properties producerProps = new Properties();
         producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers);
         producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+                org.apache.kafka.common.serialization.ByteArraySerializer.class.getName());
         // acks=all + 幂等生产者：订阅位点一旦推进就再也不会重读这段 THL，因此"写进 Kafka"必须是
         // 真的落到全部 ISR。acks=1 时 leader 刚确认就崩溃会静默丢消息，而位点已经推进 —— 永久丢数据。
         producerProps.put(ProducerConfig.ACKS_CONFIG, "all");
@@ -203,6 +211,8 @@ public class ContinuousSubscribeMain {
         producerProps.put(ProducerConfig.LINGER_MS_CONFIG, 5);
         producerProps.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 33554432);
         producerProps.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "snappy");
+        // 订阅这条走的是**业务数据本身**，加密与否比控制面更要紧
+        com.migration.common.security.KafkaSecurity.apply(producerProps);
 
         this.kafkaProducer = new KafkaProducer<>(producerProps);
         logger.info("Kafka生产者初始化完成, bootstrapServers: {} (acks=all, 幂等)", kafkaBootstrapServers);
@@ -722,16 +732,28 @@ public class ContinuousSubscribeMain {
     private void sendToKafka(CdcEvent cdcEvent) {
         String topic = resolveTopic(cdcEvent);
         String messageKey = cdcEvent.key;
-        String messageValue;
+        byte[] messageValue;
 
-        if ("SIMPLE_JSON".equals(subscribeFormat)) {
-            messageValue = buildSimpleJson(cdcEvent);
+        if (avroSerializer != null) {
+            try {
+                messageValue = buildAvro(topic, cdcEvent);
+            } catch (Exception e) {
+                // schema 注册不上 / 序列化失败 = 下游拿到的字节没人能读。
+                // 与其投一堆读不出来的消息，不如计入 sendErrors 让位点停在这里
+                // （saveProgress 前会检查 sendErrors 增量，不推进位点）。
+                sendErrors.incrementAndGet();
+                logger.error("Avro 序列化失败 (seqno={}, topic={}): {}",
+                        cdcEvent.seqno, topic, e.getMessage());
+                return;
+            }
+        } else if ("SIMPLE_JSON".equals(subscribeFormat)) {
+            messageValue = utf8(buildSimpleJson(cdcEvent));
         } else {
-            messageValue = buildDebeziumJson(cdcEvent);
+            messageValue = utf8(buildDebeziumJson(cdcEvent));
         }
 
         try {
-            ProducerRecord<String, String> record = new ProducerRecord<>(topic, messageKey, messageValue);
+            ProducerRecord<String, byte[]> record = new ProducerRecord<>(topic, messageKey, messageValue);
             Future<RecordMetadata> future = kafkaProducer.send(record, (metadata, exception) -> {
                 if (exception != null) {
                     sendErrors.incrementAndGet();
@@ -742,7 +764,7 @@ public class ContinuousSubscribeMain {
             });
 
             totalEventsSent.incrementAndGet();
-            totalBytesSent.addAndGet(messageValue.length());
+            totalBytesSent.addAndGet(messageValue.length);
 
             if (totalEventsSent.get() % 1000 == 0) {
                 logger.info("Kafka发送统计: 总事件数={}, 字节数={}, 错误数={}",
@@ -818,7 +840,7 @@ public class ContinuousSubscribeMain {
         String topic = kafkaTopicPrefix + "." + taskId + ".schema-changes";
         try {
             // key 用库名：同一个库的 DDL 落同一分区，下游按分区顺序重放就是源端的 DDL 顺序
-            kafkaProducer.send(new ProducerRecord<>(topic, String.valueOf(msg.get("database")), gson.toJson(msg)),
+            kafkaProducer.send(new ProducerRecord<>(topic, String.valueOf(msg.get("database")), utf8(gson.toJson(msg))),
                     (md, ex) -> {
                         if (ex != null) {
                             sendErrors.incrementAndGet();
@@ -851,7 +873,7 @@ public class ContinuousSubscribeMain {
         marker.put("ts_ms", System.currentTimeMillis());
         String topic = kafkaTopicPrefix + "." + taskId + ".transaction";
         try {
-            kafkaProducer.send(new ProducerRecord<>(topic, txId, gson.toJson(marker)), (md, ex) -> {
+            kafkaProducer.send(new ProducerRecord<>(topic, txId, utf8(gson.toJson(marker))), (md, ex) -> {
                 if (ex != null) {
                     sendErrors.incrementAndGet();
                     logger.error("发送事务标记到 {} 失败: {}", topic, ex.getMessage());
@@ -861,6 +883,52 @@ public class ContinuousSubscribeMain {
             sendErrors.incrementAndGet();
             logger.error("发送事务标记异常: {}", e.getMessage());
         }
+    }
+
+    private static byte[] utf8(String s) {
+        return s == null ? new byte[0] : s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Avro 初始化。{@code subscribe.format=AVRO} 时必须配 {@code subscribe.schema.registry.url}——
+     * 没有 registry 就没有 schema id，产出的字节下游读不了，所以这里直接抛而不是悄悄退回 JSON：
+     * "我以为在发 Avro，其实发的是 JSON" 是最难查的一类问题。
+     */
+    private void initAvro(Properties props) {
+        if (!"AVRO".equalsIgnoreCase(subscribeFormat)) {
+            return;
+        }
+        String url = props.getProperty("subscribe.schema.registry.url", "").trim();
+        if (url.isEmpty()) {
+            throw new IllegalStateException(
+                    "subscribe.format=AVRO 需要配置 subscribe.schema.registry.url（Schema Registry 地址）");
+        }
+        int timeout = Integer.parseInt(props.getProperty("subscribe.schema.registry.timeout.ms", "10000"));
+        com.migration.subscribe.avro.SchemaRegistryClient client =
+                new com.migration.subscribe.avro.SchemaRegistryClient(url,
+                        props.getProperty("subscribe.schema.registry.user", ""),
+                        props.getProperty("subscribe.schema.registry.password", ""),
+                        timeout);
+        this.avroSerializer = new com.migration.subscribe.avro.AvroCdcSerializer(client);
+        logger.info("订阅消息格式 = AVRO（Confluent wire format），Schema Registry: {}", url);
+    }
+
+    /** 组装 Avro 消息：前后镜像 + 信封元数据，脱敏与 JSON 路径共用同一套规则。 */
+    private byte[] buildAvro(String topic, CdcEvent cdcEvent) throws Exception {
+        Map<String, Object> before = parseDataToMap(cdcEvent.beforeData);
+        Map<String, Object> after = parseDataToMap(cdcEvent.afterData);
+        if (dataMaskingService != null && dataMaskingService.isEnabled()) {
+            before = dataMaskingService.mask(before);
+            after = dataMaskingService.mask(after);
+        }
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("op", cdcEvent.operation);
+        meta.put("ts_ms", cdcEvent.sourceTstamp);
+        meta.put("seqno", cdcEvent.seqno);
+        meta.put("db", cdcEvent.database);
+        meta.put("table", cdcEvent.table);
+        meta.put("txId", cdcEvent.txSourceId != null ? cdcEvent.txSourceId : cdcEvent.txId);
+        return avroSerializer.serialize(topic, before, after, meta);
     }
 
     private String resolveTopic(CdcEvent cdcEvent) {

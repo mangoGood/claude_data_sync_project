@@ -116,9 +116,9 @@ public class ValidationTaskService {
             return String.format("jdbc:postgresql://%s:%d/?stringtype=unspecified", host, port);
         }
         if (!db.isEmpty()) {
-            return String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", host, port, db);
+            return String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", host, port, db);
         }
-        return String.format("jdbc:mysql://%s:%d/?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", host, port);
+        return String.format("jdbc:mysql://%s:%d/?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", host, port);
     }
 
     public List<Workflow> getIncrementalWorkflows(Long userId) {

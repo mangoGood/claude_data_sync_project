@@ -29,6 +29,8 @@ public class KafkaProducerService {
         props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
         props.put("acks", "1");
         props.put("retries", 3);
+        // 控制面到 Kafka 的传输加密/认证（默认全空 = PLAINTEXT，与之前逐字节相同）
+        com.migration.common.security.KafkaSecurity.apply(props);
         
         producer = new org.apache.kafka.clients.producer.KafkaProducer<>(props);
         logger.info("Kafka producer initialized");
