@@ -26,6 +26,13 @@ public class MigrationConfig {
     private int bulkBatchRows;
     /** 批量装载的完整配置（档位/行阈值/字节阈值），与 Mongo/ES/Redis 各链路共用同一组键。 */
     private com.migration.common.bulk.BulkLoadOptions bulkLoadOptions;
+    /**
+     * 全量装载限速（行/秒），0/负数 = 不限速。
+     *
+     * <p>第 5 批把全量提到 38K 行/秒之后，"链路上一个阀门都没有"本身成了风险——
+     * 一个没人看着的全量任务可以把源库 IO 打满。增量早有限速，全量一直没有。
+     */
+    private long fullRateLimitRowsPerSec;
     /** 全量一致性快照模式（migration.full.snapshot.mode）：NONE / GTID_ONLY / CONSISTENT。 */
     private String snapshotMode;
     private Set<String> includedDatabases;
@@ -84,6 +91,9 @@ public class MigrationConfig {
         // flavor：TiDB 归一成 dbType=mysql，快照手法却完全不同（MVCC 无锁 vs FTWRL），
         // 故单独带一个 flavor 传给一致性快照
         sourceConfig.setFlavor(props.getProperty("source.db.flavor"));
+        // 传输层加密：默认 DISABLED，与历史行为完全一致；配了才走 TLS
+        sourceConfig.setSslMode(props.getProperty("source.db.ssl.mode"));
+        sourceConfig.setSslRootCert(props.getProperty("source.db.ssl.root.cert"));
 
         String sourceSchema = props.getProperty("source.db.schema");
         if (sourceSchema != null && !sourceSchema.isEmpty()) {
@@ -100,6 +110,8 @@ public class MigrationConfig {
         );
 
         targetConfig.setFlavor(props.getProperty("target.db.flavor"));
+        targetConfig.setSslMode(props.getProperty("target.db.ssl.mode"));
+        targetConfig.setSslRootCert(props.getProperty("target.db.ssl.root.cert"));
 
         String targetSchema = props.getProperty("target.db.schema");
         if (targetSchema != null && !targetSchema.isEmpty()) {
@@ -134,6 +146,8 @@ public class MigrationConfig {
         // COPY（PG 二进制）/ DIRECT_PATH（Oracle 直接路径）由 migration.full.bulk.mode 显式选中。
         // 只加驱动参数、不改协议（仍是 PreparedStatement 类型绑定），故默认开启。
         bulkLoadOptions = com.migration.common.bulk.BulkLoadOptions.from(props);
+        fullRateLimitRowsPerSec = Long.parseLong(
+                props.getProperty("migration.full.rate.limit.rows.per.sec", "0"));
         bulkLoadEnabled = bulkLoadOptions.isEnabled();
         // 未显式配置行阈值时按 batchSize 放大：重写后的多值 INSERT 每批越大往返越少，
         // 但单条语句过大会撞 max_allowed_packet，取 5 倍是实测的稳妥档位（另有字节阈值兜底）
@@ -263,6 +277,10 @@ public class MigrationConfig {
     }
 
     /** 批量装载的完整配置（档位/行阈值/字节阈值）。 */
+    public long getFullRateLimitRowsPerSec() {
+        return fullRateLimitRowsPerSec;
+    }
+
     public com.migration.common.bulk.BulkLoadOptions getBulkLoadOptions() {
         return bulkLoadOptions != null
                 ? bulkLoadOptions

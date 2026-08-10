@@ -118,11 +118,70 @@ public class DatabaseConfig {
         return sb.toString();
     }
 
+    /**
+     * 传输层加密档位：{@code DISABLED（默认）| PREFERRED | REQUIRED | VERIFY_CA | VERIFY_IDENTITY}。
+     *
+     * <p>此前全仓 34 处硬编码 {@code useSSL=false}，且没有任何 SSL 配置项——
+     * 平台把凭证 AES-GCM 落库加密、THL 文件也能加密，唯独<b>真正流动的业务数据在网络上是明文的</b>。
+     * 金融政企的入网评审基本过不了这一关。默认仍是 DISABLED，行为与之前完全一致。
+     */
+    private String sslMode = "DISABLED";
+    /** CA 证书/信任库路径（VERIFY_CA / VERIFY_IDENTITY 时用） */
+    private String sslRootCert;
+
+    public void setSslMode(String sslMode) {
+        if (sslMode != null && !sslMode.trim().isEmpty()) {
+            this.sslMode = sslMode.trim().toUpperCase();
+        }
+    }
+
+    public String getSslMode() {
+        return sslMode;
+    }
+
+    public void setSslRootCert(String sslRootCert) {
+        this.sslRootCert = sslRootCert;
+    }
+
+    public boolean isSslEnabled() {
+        return !"DISABLED".equalsIgnoreCase(sslMode);
+    }
+
+    /** MySQL 的 SSL 参数段（Connector/J 8 的 sslMode 取代了老的 useSSL/requireSSL 组合）。 */
+    private String mysqlSslParams() {
+        if (!isSslEnabled()) {
+            return "useSSL=false";
+        }
+        StringBuilder sb = new StringBuilder("sslMode=").append(sslMode);
+        if (sslRootCert != null && !sslRootCert.isEmpty()) {
+            sb.append("&trustCertificateKeyStoreUrl=file:").append(sslRootCert);
+        }
+        return sb.toString();
+    }
+
+    /** PG 的 sslmode 取值与我们的档位一一对应。 */
+    private String pgSslParams() {
+        String mode;
+        switch (sslMode) {
+            case "PREFERRED":       mode = "prefer"; break;
+            case "REQUIRED":        mode = "require"; break;
+            case "VERIFY_CA":       mode = "verify-ca"; break;
+            case "VERIFY_IDENTITY": mode = "verify-full"; break;
+            default:                mode = "disable";
+        }
+        StringBuilder sb = new StringBuilder("sslmode=").append(mode);
+        if (isSslEnabled() && sslRootCert != null && !sslRootCert.isEmpty()) {
+            sb.append("&sslrootcert=").append(sslRootCert);
+        }
+        return sb.toString();
+    }
+
     public String getJdbcUrl() {
         if ("postgresql".equals(dbType)) {
             String currentSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
-            return withExtraOptions(String.format("jdbc:postgresql://%s:%d/%s?currentSchema=%s&stringtype=unspecified",
-                               host, port, database, currentSchema));
+            return withExtraOptions(String.format(
+                    "jdbc:postgresql://%s:%d/%s?currentSchema=%s&stringtype=unspecified&%s",
+                    host, port, database, currentSchema, pgSslParams()));
         }
         if ("oracle".equals(dbType)) {
             // Oracle 使用 service name 方式连接: jdbc:oracle:thin:@host:port/service
@@ -130,8 +189,9 @@ public class DatabaseConfig {
             String service = (database != null && !database.isEmpty()) ? database : "ORCL";
             return String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, service);
         }
-        return withExtraOptions(String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&autoReconnect=true&connectTimeout=30000&socketTimeout=0",
-                           host, port, database));
+        return withExtraOptions(String.format(
+                "jdbc:mysql://%s:%d/%s?%s&serverTimezone=UTC&characterEncoding=utf8&autoReconnect=true&connectTimeout=30000&socketTimeout=0",
+                host, port, database, mysqlSslParams()));
     }
 
     public String getJdbcDriverClass() {

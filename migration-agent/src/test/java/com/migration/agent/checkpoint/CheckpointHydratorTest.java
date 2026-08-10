@@ -73,6 +73,14 @@ class CheckpointHydratorTest {
         }
 
         @Override
+        public boolean hasAny(String taskId) throws SQLException {
+            if (unreachable) {
+                throw new SQLException("模拟元数据库不可达");
+            }
+            return !records.isEmpty();
+        }
+
+        @Override
         public int leaseEpoch(String taskId) {
             return 1;
         }
@@ -238,5 +246,67 @@ class CheckpointHydratorTest {
         assertEquals("mysql-bin.000009", central.get(0).payloadValue("binlog.file"));
         assertEquals("mysql-bin.000009", LocalCheckpointStore.load(taskId, CheckpointRecord.Stage.CAPTURE)
                 .payloadValue("binlog.file"));
+    }
+
+    // ==================== 以下四例锁的是实测抓到的那条跨机接管丢数据 ====================
+
+    @Test
+    @DisplayName("空的 H2 checkpoint 文件不算「本地有位点」——文件存在 ≠ 位点存在")
+    void emptyH2FileIsNotAPosition() {
+        // 复现现场：接管机上 files/<taskId>/ 是新建的，H2 一 connect 就把 .mv.db 建了出来，
+        // 里面一行都没有。旧判据只看 File.isFile()，于是把一台全新的机器判成"同机重启"，
+        // 回灌被整个跳过，紧接着 initMysqlCheckpoint 去取源库当前位点——崩溃到接管之间的变更全丢。
+        CheckpointManager cm = new CheckpointManager("./files/" + taskId + "/checkpoint/checkpoint");
+        cm.close();
+        assertTrue(new File("files/" + taskId + "/checkpoint/checkpoint.mv.db").isFile(),
+                "前提：H2 确实把文件建出来了，否则这一例没在测想测的东西");
+
+        CheckpointHydrator hydrator = hydratorFor(
+                new FakeCentralStore(new ArrayList<>(Collections.singletonList(captureRecord())), false), true);
+
+        assertEquals(CheckpointHydrator.Result.HYDRATED, hydrator.hydrate(taskId),
+                "空 H2 库必须被判成「本地无位点」，走跨机接管回灌");
+    }
+
+    @Test
+    @DisplayName("H2 里真有一行才算「本地有位点」")
+    void nonEmptyH2CountsAsLocalPosition() {
+        CheckpointManager cm = new CheckpointManager("./files/" + taskId + "/checkpoint/checkpoint");
+        cm.saveCheckpoint(new CheckpointManager.BinlogPositionInfo(
+                "mysql-bin.000001", 4L, null, System.currentTimeMillis()));
+        cm.close();
+
+        CheckpointHydrator hydrator = hydratorFor(
+                new FakeCentralStore(new ArrayList<>(Collections.singletonList(captureRecord())), false), true);
+
+        assertEquals(CheckpointHydrator.Result.NOT_NEEDED, hydrator.hydrate(taskId));
+    }
+
+    @Test
+    @DisplayName("只有注释没有位点键的 capture 位点文件不算「本地有位点」")
+    void capturePositionWithoutPositionKeysIsNotAPosition() {
+        Properties junk = new Properties();
+        junk.setProperty("some.unrelated.key", "x");
+        CapturePositionStore.save("files/" + taskId + "/binlog_output", junk, "no real position here");
+
+        CheckpointHydrator hydrator = hydratorFor(
+                new FakeCentralStore(new ArrayList<>(Collections.singletonList(captureRecord())), false), true);
+
+        assertEquals(CheckpointHydrator.Result.HYDRATED, hydrator.hydrate(taskId));
+    }
+
+    @Test
+    @DisplayName("中心库已有行时，首启位点一律不许写——否则超前位点会盖掉正确的旧位点")
+    void initialPositionMustNotOverwriteExistingCentralRow() {
+        // 单调守卫只比大小，而"取自源库此刻"的位点恰好总是更大，一定会被放行。
+        // 实测就是这样把中心库里那份正确的、偏旧的位点覆盖掉，连再接管一次的机会都没了。
+        List<CheckpointRecord> central = new ArrayList<>(Collections.singletonList(captureRecord()));
+        CheckpointHydrator hydrator = hydratorFor(new FakeCentralStore(central, false), true);
+
+        hydrator.publishInitialPosition(taskId, "mysql", "mysql-bin.000099", 999999L, null);
+
+        assertEquals(1, central.size(), "中心库已有位点行时不得再写首启位点");
+        assertEquals("mysql-bin.000042", central.get(0).payloadValue("binlog.file"),
+                "原有位点必须原封不动");
     }
 }

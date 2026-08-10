@@ -62,6 +62,8 @@ public class DataMigration {
     // 批量装载档位（BATCH / PG 二进制 COPY / Oracle direct-path）；未注入 = AUTO（即 BATCH）
     private com.migration.common.bulk.BulkLoadOptions bulkLoadOptions =
             com.migration.common.bulk.BulkLoadOptions.of(true, com.migration.common.bulk.BulkLoadOptions.Mode.AUTO, 0, 0);
+    /** 全量装载限速器；未注入 = 不限速（历史行为） */
+    private com.migration.common.ratelimit.RowRateLimiter rowRateLimiter;
 
     public DataMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection,
                         int batchSize, boolean continueOnError, ProgressManager progressManager) {
@@ -103,6 +105,35 @@ public class DataMigration {
     }
 
     /** 注入批量装载档位（未注入 = AUTO，即驱动语句重写，与既有行为一致）。 */
+    /**
+     * 全量装载限速。
+     *
+     * <p>第 5 批把全量从 291 行/秒提到 38,365 行/秒之后，这个缺口的性质就变了：
+     * **提速本身成了新的风险**——一个没人看着的全量任务可以把源库 IO 打满。
+     * 而在此之前全量链路上一个限速阀门都没有（{@code RowRateLimiter} 在 migration-full 里引用数为 0），
+     * 只有增量有。
+     *
+     * <p>限在 flush 之后按"这一批实际写了多少行"计费：限在读侧会让页缓冲攒着不写、
+     * 内存和事务都拖长；限在 add 上则每行一次判定，热路径开销白花。
+     */
+    public void setRowRateLimiter(com.migration.common.ratelimit.RowRateLimiter limiter) {
+        if (limiter != null) {
+            this.rowRateLimiter = limiter;
+        }
+    }
+
+    /** 按本批实际写入行数限速。中断只还原中断位，绝不把它变成一次搬运失败。 */
+    private void throttle(long rows) {
+        if (rowRateLimiter == null || rowRateLimiter.isUnlimited() || rows <= 0) {
+            return;
+        }
+        try {
+            rowRateLimiter.acquire(rows);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     public void setBulkLoadOptions(com.migration.common.bulk.BulkLoadOptions bulkLoadOptions) {
         if (bulkLoadOptions != null) {
             this.bulkLoadOptions = bulkLoadOptions;
@@ -717,6 +748,7 @@ public class DataMigration {
                             long[] r = writer.flush();
                             successCount += r[0];
                             failCount += r[1];
+                            throttle(r[0] + r[1]);
                         }
                         pageRows++;
                     } catch (SQLException e) {
@@ -735,6 +767,7 @@ public class DataMigration {
                     long[] r = writer.flush();
                     successCount += r[0];
                     failCount += r[1];
+                    throttle(r[0] + r[1]);
                 }
                 rs.close();
                 selectStmt.close();
@@ -857,6 +890,7 @@ public class DataMigration {
                                 long[] r = writer.flush();
                                 successCount += r[0];
                                 failCount += r[1];
+                                throttle(r[0] + r[1]);
                                 if (progressManager != null && progressManager.isEnabled()) {
                                     progressManager.updateProgress(progressKey, processedRows, currentLastId);
                                 }
@@ -882,6 +916,7 @@ public class DataMigration {
                         long[] r = writer.flush();
                         successCount += r[0];
                         failCount += r[1];
+                        throttle(r[0] + r[1]);
                     }
                     if (progressManager != null && progressManager.isEnabled()) {
                         try { progressManager.updateProgress(progressKey, processedRows, currentLastId); } catch (SQLException ex) { logger.error("更新进度失败", ex); }
@@ -921,6 +956,7 @@ public class DataMigration {
                             long[] r = writer.flush();
                             successCount += r[0];
                             failCount += r[1];
+                            throttle(r[0] + r[1]);
                             if (progressManager != null && progressManager.isEnabled()) {
                                 progressManager.updateProgress(progressKey, processedRows, currentLastId);
                             }
@@ -942,6 +978,7 @@ public class DataMigration {
                     long[] r = writer.flush();
                     successCount += r[0];
                     failCount += r[1];
+                    throttle(r[0] + r[1]);
                 }
                 rs.close();
                 selectStmt.close();

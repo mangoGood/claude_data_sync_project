@@ -127,6 +127,25 @@ public final class DdlIdentifierRewriter {
                         repl.add(renderIdent(tgtDb, next));
                     }
                 }
+            } else if (schemaMapper != null
+                    && (t.getType() == MySqlClassifierLexer.DATABASE || t.getType() == MySqlClassifierLexer.SCHEMA)) {
+                // 规则4：CREATE/DROP/ALTER DATABASE|SCHEMA [IF [NOT] EXISTS] db —— 关键字后的**裸库名**。
+                // 规则1 只认限定名 db.table 里的 db，库级 DDL 里的库名它一个都碰不到，
+                // 于是 `DROP DATABASE src` 会带着**源库名**原样打到目标实例上（实测把目标库整个删掉）。
+                int j = skipIfExists(toks, i + 1);
+                if (j < toks.size() && isIdent(toks.get(j))) {
+                    Token dbTok = toks.get(j);
+                    Token after = (j + 1 < toks.size()) ? toks.get(j + 1) : null;
+                    // 后跟 DOT 说明这是限定名的链首（如 ALTER DATABASE 不会有，但防御一下），交给规则1
+                    if (after == null || after.getType() != MySqlClassifierLexer.DOT) {
+                        String srcDb = identName(dbTok);
+                        String tgtDb = schemaMapper.apply(srcDb);
+                        if (tgtDb != null && !tgtDb.equals(srcDb)) {
+                            ranges.add(new int[]{dbTok.getStartIndex(), dbTok.getStopIndex() + 1});
+                            repl.add(renderIdent(tgtDb, dbTok));
+                        }
+                    }
+                }
             } else if (isIdent(t) && tablePositions.contains(i)
                     && (next == null || next.getType() != MySqlClassifierLexer.DOT)) {
                 // 规则3：非限定表名（关键字上下文定位），库名上下文 = defaultSchema
@@ -230,6 +249,17 @@ public final class DdlIdentifierRewriter {
             k += 2;
         }
         return k;
+    }
+
+    /** 跳过可选的 {@code IF [NOT] EXISTS}，返回其后第一个 token 的下标。 */
+    private static int skipIfExists(List<Token> toks, int i) {
+        int n = toks.size();
+        if (i < n && toks.get(i).getType() == MySqlClassifierLexer.IF) {
+            i++;
+            if (i < n && toks.get(i).getType() == MySqlClassifierLexer.NOT) i++;
+            if (i < n && toks.get(i).getType() == MySqlClassifierLexer.EXISTS) i++;
+        }
+        return i;
     }
 
     private static boolean isIdent(Token t) {

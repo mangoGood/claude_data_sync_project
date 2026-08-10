@@ -175,6 +175,15 @@ public class AgentMain {
                     Long.parseLong(agentConfig.getRawProperty("checkpoint.central.upload.interval.ms", "3000")),
                     Long.parseLong(agentConfig.getRawProperty("checkpoint.history.sample.interval.s", "300")) * 1000L,
                     () -> new java.util.HashSet<>(migrationAgentThreads.keySet()));
+            // 全量表级断点也要能跨机：位点中心化只覆盖了增量，全量的断点还在本机 H2 里，
+            // 接管方于是把已经搬完的表从头再搬一遍——正确但慢，10 亿行的表就是 7 小时
+            com.migration.agent.checkpoint.FullProgressStore fullProgressStore =
+                    new com.migration.agent.checkpoint.FullProgressStore(
+                            agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(),
+                            agentConfig.getMysqlDbPassword());
+            com.migration.agent.checkpoint.FullProgressStoreHolder.set(fullProgressStore);
+            com.migration.agent.checkpoint.CheckpointUploader.getInstance()
+                    .setFullProgressStore(fullProgressStore);
         } else {
             logger.info("位点中心持久化已关闭（checkpoint.central.enabled=false），回到本地位点行为");
         }

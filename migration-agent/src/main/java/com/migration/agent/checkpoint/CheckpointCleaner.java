@@ -39,6 +39,12 @@ public final class CheckpointCleaner {
         if (store != null) {
             store.deleteTask(taskId, reason);
         }
-        logger.info("[{}] 位点已作废（{}）：统一载体 + 中心库 + 上卷缓存", taskId, reason);
+
+        // 全量表级断点同理：倒换/重做全量之后留着它，下次接管会跳过其实需要重搬的表
+        FullProgressStore fullProgress = FullProgressStoreHolder.get();
+        if (fullProgress != null) {
+            fullProgress.clear(taskId);
+        }
+        logger.info("[{}] 位点已作废（{}）：统一载体 + 中心库 + 上卷缓存 + 全量表级断点", taskId, reason);
     }
 }

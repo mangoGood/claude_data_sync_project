@@ -89,6 +89,7 @@ public class ParallelDataMigration {
                     dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
                     dataMigration.setSnapshot(snapshot);
                     dataMigration.setBulkLoadOptions(config.getBulkLoadOptions());
+                    dataMigration.setRowRateLimiter(FullRateLimiter.get(config));
                     dataMigration.setTableRouter(config.getTableRouter());
                     dataMigration.setRoutingConfig(config.getRoutingConfig());
 

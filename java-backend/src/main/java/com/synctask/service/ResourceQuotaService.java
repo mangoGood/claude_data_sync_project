@@ -51,13 +51,14 @@ public class ResourceQuotaService {
     @Transactional
     public ResourceQuota updateQuota(Long userId, Integer maxTasks, Integer maxConcurrentTasks,
                                      Long maxStorageMb, Integer apiRateLimitPerMin) {
-        return updateQuota(userId, maxTasks, maxConcurrentTasks, maxStorageMb, apiRateLimitPerMin, null, null);
+        return updateQuota(userId, maxTasks, maxConcurrentTasks, maxStorageMb, apiRateLimitPerMin, null, null, null);
     }
 
     @Transactional
     public ResourceQuota updateQuota(Long userId, Integer maxTasks, Integer maxConcurrentTasks,
                                      Long maxStorageMb, Integer apiRateLimitPerMin,
-                                     Integer maxIncrementRowsPerSec, Integer maxFullSyncConcurrentTables) {
+                                     Integer maxIncrementRowsPerSec, Integer maxFullSyncConcurrentTables,
+                                     Integer maxFullSyncRowsPerSec) {
         ResourceQuota quota = getOrCreateQuota(userId);
         if (maxTasks != null) quota.setMaxTasks(maxTasks);
         if (maxConcurrentTasks != null) quota.setMaxConcurrentTasks(maxConcurrentTasks);
@@ -65,6 +66,7 @@ public class ResourceQuotaService {
         if (apiRateLimitPerMin != null) quota.setApiRateLimitPerMin(apiRateLimitPerMin);
         if (maxIncrementRowsPerSec != null) quota.setMaxIncrementRowsPerSec(maxIncrementRowsPerSec);
         if (maxFullSyncConcurrentTables != null) quota.setMaxFullSyncConcurrentTables(maxFullSyncConcurrentTables);
+        if (maxFullSyncRowsPerSec != null) quota.setMaxFullSyncRowsPerSec(maxFullSyncRowsPerSec);
         return quotaRepository.save(quota);
     }
 

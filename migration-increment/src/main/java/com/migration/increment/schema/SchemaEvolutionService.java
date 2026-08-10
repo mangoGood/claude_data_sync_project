@@ -68,6 +68,17 @@ public class SchemaEvolutionService {
     private final java.util.Set<String> includedDatabases = new java.util.HashSet<>();
     /** 列处理配置：仅用于对列处理表的 DDL 告警（DDL 不做列级改写，需人工核对） */
     private final com.migration.config.ColumnProcessingConfig columnProcessing;
+    /**
+     * 库级破坏性 DDL（{@code DROP DATABASE} / {@code ALTER DATABASE}）的处置。
+     *
+     * <p>{@code BLOCK}（默认）= 不应用、告警并写进人工 DDL 日志；{@code ALLOW} = 照旧应用。
+     * 默认改成 BLOCK 是因为实测：源端一条 {@code DROP DATABASE <同步中的源库>} 会被原样
+     * （连库名都不改写）打到目标连接上，把<b>整个目标库</b>连同不在同步范围的表一起删掉，
+     * 日志还写"DDL 应用成功"。灾备两端库名一致，这等于主库一句话清空整个备库。
+     */
+    private final boolean blockDestructiveDbDdl;
+    /** 灾备任务：库级破坏性 DDL 强制 BLOCK，配置改不动——备库被清空是灾备的反义词。 */
+    private final boolean drTask;
     /** 聚合路由：汇聚下 DDL 要改写到合并后的目标表，且 N 个来源的同一条 DDL 只应用一次 */
     private final com.migration.common.route.TableRouter router;
     private final boolean mergeActive;
@@ -107,6 +118,9 @@ public class SchemaEvolutionService {
             }
         }
         this.columnProcessing = com.migration.config.ColumnProcessingConfig.loadFromProperties(props);
+        this.drTask = "DR".equalsIgnoreCase(props.getProperty("task.type", ""));
+        this.blockDestructiveDbDdl = drTask
+                || !"ALLOW".equalsIgnoreCase(props.getProperty("schema.ddl.destructive.policy", "BLOCK"));
 
         DdlTranslator.Direction direction;
         if (sourceIsPostgresql && !targetIsPostgresql) {
@@ -214,6 +228,17 @@ public class SchemaEvolutionService {
                 logger.info("表级同步：表 {} 不在同步对象清单，DDL 跳过: subtype={} | sql={}",
                         fullTable, ddlSubType, truncate(sql));
                 return ApplyResult.skipped("表 " + fullTable + " 不在表级同步对象清单，DDL 不应用");
+            }
+        }
+
+        // —— 库级 DDL 的爆炸半径闸门 ——
+        // 放在作用域判断之后：范围外的库已经被上面拦掉了，这里管的是<b>范围之内</b>的库级 DDL。
+        // 那正是此前唯一没人拦的一类——`isTableScopedDdl()` 不认它，两个作用域分支也放它过去，
+        // 于是原样打到目标连接上（库名都不改写）。
+        if (isDatabaseScopedDdl(subtypeUpper)) {
+            ApplyResult guarded = guardDatabaseScopedDdl(sql, ddlSubType, subtypeUpper, sourceDb);
+            if (guarded != null) {
+                return guarded;
             }
         }
 
@@ -546,6 +571,51 @@ public class SchemaEvolutionService {
                 || lower.contains("duplicate key name")
                 || lower.contains("cannot drop index")
                 || lower.contains("unknown column");
+    }
+
+    /** 是否为作用于整个数据库的 DDL 子类型。 */
+    static boolean isDatabaseScopedDdl(String subtypeUpper) {
+        return "CREATE_DATABASE".equals(subtypeUpper) || "DROP_DATABASE".equals(subtypeUpper)
+                || "ALTER_DATABASE".equals(subtypeUpper) || "CREATE_SCHEMA".equals(subtypeUpper)
+                || "DROP_SCHEMA".equals(subtypeUpper) || "ALTER_SCHEMA".equals(subtypeUpper);
+    }
+
+    /**
+     * 库级 DDL 该不该放行。返回非 null 表示已经处置完（不再继续走下面的改写与执行）。
+     *
+     * <p>两条规则，分别对应两种同步粒度：
+     *
+     * <ul>
+     *   <li><b>表级同步</b>：库级 DDL 一律不应用。表级同步的语义就是"只同步这几张表"，
+     *       建库删库越界到没边——目标库很可能还装着别的任务的数据。</li>
+     *   <li><b>库级同步</b>：{@code CREATE DATABASE} 放行（新库属于范围内，且下面会做库名改写）；
+     *       {@code DROP/ALTER DATABASE} 按 {@code schema.ddl.destructive.policy} 处置，
+     *       默认 BLOCK，灾备任务强制 BLOCK。</li>
+     * </ul>
+     *
+     * <p>被拦下的语句写进人工 DDL 日志：拦住不等于当没发生过，
+     * 运维需要知道"源端删了库、目标端我没跟着删"，否则两端结构差异会在很久以后才被发现。
+     */
+    private ApplyResult guardDatabaseScopedDdl(String sql, String ddlSubType, String subtypeUpper, String sourceDb) {
+        boolean destructive = !subtypeUpper.startsWith("CREATE_");
+        if (!dbLevelSync) {
+            totalDdlSkipped++;
+            logManualDdl(sql, ddlSubType, sourceDb, "表级同步不应用库级 DDL");
+            logger.warn("表级同步：库级 DDL 不应用（表级同步只同步选中的表，建库/删库越界）: subtype={} | sql={}",
+                    ddlSubType, truncate(sql));
+            return ApplyResult.skipped("表级同步不应用库级 DDL：" + ddlSubType);
+        }
+        if (destructive && blockDestructiveDbDdl) {
+            totalDdlSkipped++;
+            logManualDdl(sql, ddlSubType, sourceDb,
+                    drTask ? "灾备任务强制拦截库级破坏性 DDL" : "schema.ddl.destructive.policy=BLOCK");
+            logger.warn("库级破坏性 DDL 已拦截（{}）: subtype={} | sql={}",
+                    drTask ? "灾备任务强制 BLOCK" : "schema.ddl.destructive.policy=BLOCK",
+                    ddlSubType, truncate(sql));
+            return ApplyResult.skipped("库级破坏性 DDL 已拦截（" + ddlSubType + "），如确需同步请设置 "
+                    + "schema.ddl.destructive.policy=ALLOW（灾备任务不可放开）");
+        }
+        return null;   // 放行，继续走库名改写与执行
     }
 
     /** 是否为作用于单表的 DDL 子类型（表级同步按同步清单过滤的范围）。 */

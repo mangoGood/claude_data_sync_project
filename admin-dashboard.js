@@ -425,6 +425,7 @@
             'E3010': { desc: 'THL文件读取中断', solution: 'THL文件损坏或读取异常，已在断点处停止且未跳过剩余事件。请检查磁盘与 thl_output 目录，必要时重新初始化增量' },
             'E3011': { desc: '双向同步写写冲突', solution: '两端同时改了同一行且策略为 ERROR（不自动丢写）。请人工确认保留哪一端，或改用 LWW_SOURCE_TS/NODE_PRIORITY 自动裁决' },
             'E3013': { desc: '汇聚/拆分事件缺少类型化值', solution: '命中路由规则的表其事件没有类型化值（rows_typed），无法生成带来源标识列的 DML，已停止应用以免改坏同一汇聚表里其它来源的行。请检查该表的路由规则是否配错、源端 binlog_row_image 是否为 FULL，以及该源→目标引擎对是否支持类型化管道（increment.typed.pipeline.enabled 是否被关掉）' },
+            'E3017': { desc: '唯一键冲突（非主键）', solution: '目标端存在源端没有的唯一索引/约束挡住了这一行。主键冲突是幂等重放可以忽略，唯一键冲突忽略掉则是永久丢一行，因此默认停下等人处置。请核对两端唯一索引差异；确认可丢弃时把 increment.unique.conflict.policy 设为 IGNORE' },
             'E3014': { desc: '位点回灌失败', solution: '本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管；按首次启动去取源库当前位点会静默跳过崩溃到接管之间的全部变更，因此任务停在这里。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务' },
             'E3101': { desc: 'Elastic同步进程启动失败', solution: '请检查Agent日志，确认elastic模块JAR包存在且配置正确' },
             'E3102': { desc: 'Elastic同步失败', solution: '请检查Agent日志，确认Elasticsearch连接正常、索引可写且源库binlog可访问' },
@@ -4425,8 +4426,14 @@
         }
 
 
-        // 启动前 schema 预检门禁：返回 true=可继续启动，false=中止。
-        // PASS 直接放行；WARNING 提示后由用户确认；FAIL 需明确二次确认强制启动。
+        // 启动前 schema 预检门禁。
+        //
+        // 注意这里只是"提前告诉用户"，**真正的门禁在后端** launchWorkflow 里：
+        // 早先只有这个弹窗，于是调度/依赖/批量启动/集群改派四条自动化路径的拦截率是 0。
+        // 现在 FAIL 必须由调用方显式带 force=true 才放行，所以这里除了"要不要继续"
+        // 还得把"用户是不是明确选择了强制"传回去。
+        //
+        // 返回 {proceed, force}
         async function schemaPrecheckGate(workflowId) {
             let data;
             try {
@@ -4435,16 +4442,16 @@
                 });
                 const j = await resp.json();
                 if (!j.success) {
-                    // 预检自身出错不应硬卡启动，提示后交由用户决定
-                    return confirm('schema 预检未能完成：' + (j.message || '未知错误') + '\n\n仍要启动吗？');
+                    // 预检自身出错不应硬卡启动（后端同样不因此阻断），提示后交由用户决定
+                    return { proceed: confirm('schema 预检未能完成：' + (j.message || '未知错误') + '\n\n仍要启动吗？'), force: false };
                 }
                 data = j.data;
             } catch (e) {
-                return confirm('schema 预检请求异常，仍要启动吗？');
+                return { proceed: confirm('schema 预检请求异常，仍要启动吗？'), force: false };
             }
 
             const overall = data.overall;
-            if (overall === 'PASS') return true;
+            if (overall === 'PASS') return { proceed: true, force: false };
 
             const lines = (data.checks || [])
                 .filter(c => c.status === 'FAIL' || c.status === 'WARNING')
@@ -4452,10 +4459,12 @@
                 .join('\n');
 
             if (overall === 'FAIL') {
-                return confirm(`schema 预检发现严重问题（可能导致同步失败）：\n\n${lines}\n\n确定要忽略并强制启动吗？`);
+                const ok = confirm(`schema 预检发现严重问题（可能导致同步失败）：\n\n${lines}\n\n`
+                    + `确定要忽略并强制启动吗？\n（强制启动会记入审计与预检留档）`);
+                return { proceed: ok, force: ok };
             }
-            // WARNING
-            return confirm(`schema 预检有警告：\n\n${lines}\n\n确定继续启动吗？`);
+            // WARNING：后端不拦，这里只是知情确认
+            return { proceed: confirm(`schema 预检有警告：\n\n${lines}\n\n确定继续启动吗？`), force: false };
         }
 
         async function launchTask() {
@@ -4471,9 +4480,11 @@
 
                 // 启动前 schema 预检：把结构问题（源表缺失、无主键、列处理引用不存在的列、
                 // 目标同名表冲突）挡在启动前。FAIL 需二次确认强制启动，WARNING 提示后可继续。
-                if (!await schemaPrecheckGate(cfgWorkflowId)) return;
+                const gate = await schemaPrecheckGate(cfgWorkflowId);
+                if (!gate.proceed) return;
 
-                const response = await fetchWithAuth(`${API_BASE_URL}/workflows/${cfgWorkflowId}/launch`, {
+                const response = await fetchWithAuth(
+                    `${API_BASE_URL}/workflows/${cfgWorkflowId}/launch${gate.force ? '?force=true' : ''}`, {
                     method: 'POST',
                     headers: getAuthHeaders()
                 });

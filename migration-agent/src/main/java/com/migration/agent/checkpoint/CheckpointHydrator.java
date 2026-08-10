@@ -195,27 +195,82 @@ public class CheckpointHydrator {
     }
 
     /**
-     * 本地是否已有任何位点痕迹。任何一种载体在，就说明这台机器跑过这个任务，属于同机重启。
+     * 本地是否已有任何<b>可用于续传的位点</b>。
+     *
+     * <p><b>判的是内容，不是文件在不在</b>——这是修掉的一处致命缺陷：原先三类载体里有两类只判
+     * {@code File.isFile()}，而 H2 一 connect 就会把 {@code .mv.db} 建出来、ConfigService 在拉起
+     * 执行器前也会先把 {@code checkpoint/}、{@code binlog_output/} 这些目录建好。
+     * 于是一台<b>全新的接管机</b>被判成"同机重启"，回灌被整个跳过，
+     * {@code initXxxCheckpoint} 接着去取"源库此刻的位点"——崩溃到接管之间的变更全部静默消失
+     * （实测连跑三次每次稳定丢同一批行）。
+     *
+     * <p>三类载体现在一律判内容：统一载体要解析得出记录、capture 位点文件要真的含位点键、
+     * H2 要 {@code SELECT} 得出一行（走 {@link CheckpointManager#hasStoredCheckpoint}，
+     * 与 {@code initXxxCheckpoint} 同一个读取口）、mongo/es 的 json 要非空。
      */
     private boolean hasLocalPosition(String taskId) {
         if (!LocalCheckpointStore.loadAll(taskId).isEmpty()) {
             return true;
         }
-        Properties capturePos = CapturePositionStore.load("files/" + taskId + "/binlog_output");
-        if (!capturePos.isEmpty()) {
+        if (hasCapturePositionKeys(CapturePositionStore.load("files/" + taskId + "/binlog_output"))) {
             return true;
         }
-        String[] legacy = {
-                "files/" + taskId + "/checkpoint/checkpoint.mv.db",
+        if (CheckpointManager.hasStoredCheckpoint("./files/" + taskId + "/checkpoint/checkpoint")) {
+            return true;
+        }
+        String[] jsonCarriers = {
                 "files/" + taskId + "/checkpoint/mongo_resume_token.json",
                 "files/" + taskId + "/checkpoint/elastic_binlog_position.json"
         };
-        for (String p : legacy) {
-            if (new File(p).isFile()) {
+        for (String p : jsonCarriers) {
+            if (hasJsonContent(new File(p))) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * capture 位点文件里有没有真位点。空 Properties 与"只有注释/无关键"都算没有——
+     * 位点文件是原子写的，写到一半的残缺文件宁可当没有（多重放，安全方向）。
+     */
+    private static boolean hasCapturePositionKeys(Properties p) {
+        if (p == null || p.isEmpty()) {
+            return false;
+        }
+        String[] keys = {"binlog.file", "gtid.set", "wal.lsn", "redo.scn",
+                "ticdc.commit.ts", "redis.repl.offset"};
+        for (String k : keys) {
+            String v = p.getProperty(k);
+            if (v != null && !v.trim().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** json 载体：文件在且内容不是空串/空对象才算有位点。 */
+    private static boolean hasJsonContent(File f) {
+        if (!f.isFile() || f.length() == 0) {
+            return false;
+        }
+        try {
+            String s = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8).trim();
+            return !s.isEmpty() && !"{}".equals(s) && !"null".equals(s);
+        } catch (Exception e) {
+            logger.warn("读取位点文件失败，按无位点处理: {} - {}", f, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 中心库里已经有这个任务的位点行吗。
+     *
+     * <p>给"取源库当前位点"这条路径当门禁用：中心库里有行就说明这条任务此前已经跑过、
+     * 现在是接管而不是首启，此时再取源库当前位点就是丢数据。
+     */
+    public boolean hasCentralPosition(String taskId) throws Exception {
+        return store.hasAny(taskId);
     }
 
     /**
@@ -366,6 +421,20 @@ public class CheckpointHydrator {
         }
         CheckpointRecord record = new CheckpointRecord(taskId, CheckpointRecord.Stage.CAPTURE,
                 sourceType == null ? "mysql" : sourceType, kind, payload, monotonic, 0L);
+        // 首启位点绝不能覆盖已有行。"首启"按定义就是"中心库里没有这条任务"；
+        // 中心库已经有行还写进去，等于把一个"取自源库此刻"的<b>超前</b>位点盖到正确的旧位点上
+        // （单调守卫只比大小，而超前的那个恰好更大，一定会被放行），
+        // 之后连"再接管一次"的补救机会都没有了。实测就是这么把中心位点毁掉的。
+        try {
+            if (store.hasAny(taskId)) {
+                logger.error("[{}] 拒绝写入首启位点：中心库已存在该任务的位点行，"
+                        + "这说明当前是接管而不是首启（本地位点判据出错）", taskId);
+                return;
+            }
+        } catch (Exception e) {
+            logger.warn("[{}] 首启位点写入前无法确认中心库是否已有行，保守起见不写: {}", taskId, e.getMessage());
+            return;
+        }
         LocalCheckpointStore.save(record);
         CentralCheckpointStore.WriteResult result = store.upsert(record, agentId, store.leaseEpoch(taskId));
         logger.info("[{}] 首启位点已写入中心库: {} ({})", taskId, filename + ":" + position, result);

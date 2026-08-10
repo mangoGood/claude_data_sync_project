@@ -649,6 +649,25 @@ public class ConfigService {
         writeEnumPropFromEnv(props, "subscribe.transaction.topic.enabled",
                 "SUBSCRIBE_TRANSACTION_TOPIC_ENABLED", "true", "false");
 
+        // 传输层加密（agent 级开关，随任务 config 下发）。默认不写 = DISABLED（历史行为，明文）。
+        // 全仓此前 34 处硬编码 useSSL=false 且没有任何 SSL 配置项——凭证与 THL 都能加密，
+        // 唯独真正流动的业务数据在网络上是明文的。
+        writeEnumPropFromEnv(props, "source.db.ssl.mode", "SOURCE_DB_SSL_MODE",
+                "DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY");
+        writeEnumPropFromEnv(props, "target.db.ssl.mode", "TARGET_DB_SSL_MODE",
+                "DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY");
+        // 非主键唯一键冲突的处置（默认 FAIL_STOP：忽略它就是永久丢一行）
+        writeEnumPropFromEnv(props, "increment.unique.conflict.policy",
+                "INCREMENT_UNIQUE_CONFLICT_POLICY", "FAIL_STOP", "IGNORE");
+        // 无主键表的行定位（默认 LIMIT_ONE：整行 WHERE 会命中所有重复行）
+        writeEnumPropFromEnv(props, "increment.nopk.row.match",
+                "INCREMENT_NOPK_ROW_MATCH", "LIMIT_ONE", "ALL_MATCHING");
+
+        // 库级破坏性 DDL（DROP/ALTER DATABASE）的处置。默认 BLOCK——实测源端一条
+        // DROP DATABASE 会被原样打到目标实例、把整个目标库连同无关表删光。灾备任务强制 BLOCK。
+        writeEnumPropFromEnv(props, "schema.ddl.destructive.policy",
+                "SCHEMA_DDL_DESTRUCTIVE_POLICY", "BLOCK", "ALLOW");
+
         // 转换失败（毒事件）处置策略：默认 FAIL_STOP（停下等人裁决），
         // DEAD_LETTER 让此类事件写死信后自动跳过（愿意用少量丢弃换不中断）。
         writeEnumPropFromEnv(props, "increment.convert.error.policy",
@@ -1003,6 +1022,7 @@ public class ConfigService {
      * 该表由 backend 的 JPA ddl-auto 建/改表结构，agent 侧只读），把配额转换为具体的执行层限制：
      * <ul>
      *   <li>{@code increment.rate.limit.rows.per.sec} = max_increment_rows_per_sec（增量应用限速）；</li>
+     *   <li>{@code migration.full.rate.limit.rows.per.sec} = max_full_sync_rows_per_sec（全量装载限速）；</li>
      *   <li>{@code migration.full.parallelism} = min(工程默认值, max_full_sync_concurrent_tables)
      *       ——配额只降不升，不会绕过/超过工程默认的全量并行度。</li>
      * </ul>
@@ -1016,8 +1036,8 @@ public class ConfigService {
 
         try (Connection conn = DriverManager.getConnection(url, agentConfig.getMysqlDbUser(), agentConfig.getMysqlDbPassword());
              PreparedStatement ps = conn.prepareStatement(
-                     "SELECT max_increment_rows_per_sec, max_full_sync_concurrent_tables " +
-                     "FROM resource_quotas WHERE user_id = ?")) {
+                     "SELECT max_increment_rows_per_sec, max_full_sync_concurrent_tables, " +
+                     "max_full_sync_rows_per_sec FROM resource_quotas WHERE user_id = ?")) {
             ps.setLong(1, userId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) {
@@ -1028,6 +1048,13 @@ public class ConfigService {
                 if (!rs.wasNull() && rowsPerSec > 0) {
                     props.setProperty("increment.rate.limit.rows.per.sec", String.valueOf(rowsPerSec));
                     logger.info("配额限速已下发: userId={}, 增量限速 {} 行/秒", userId, rowsPerSec);
+                }
+                // 全量装载限速。第 5 批把全量提到 38K 行/秒之后，"没有阀门"本身成了风险：
+                // 一个没人看着的全量任务可以把源库 IO 打满。
+                int fullRowsPerSec = rs.getInt("max_full_sync_rows_per_sec");
+                if (!rs.wasNull() && fullRowsPerSec > 0) {
+                    props.setProperty("migration.full.rate.limit.rows.per.sec", String.valueOf(fullRowsPerSec));
+                    logger.info("配额限速已下发: userId={}, 全量限速 {} 行/秒", userId, fullRowsPerSec);
                 }
                 int maxTables = rs.getInt("max_full_sync_concurrent_tables");
                 if (!rs.wasNull() && maxTables > 0) {

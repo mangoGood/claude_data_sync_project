@@ -192,4 +192,35 @@ class DdlIdentifierRewriterTest {
         assertEquals("/* ApplicationName=DBeaver 25.2.4 - SQLEditor <Script-4.sql> */ "
                 + "alter table test2.t1_new add column name2 varchar(20)", out);
     }
+
+    @Test
+    @DisplayName("CREATE DATABASE 裸库名改写 test1 -> test2")
+    void createDatabaseBareName() {
+        assertEquals("CREATE DATABASE test2",
+                DdlIdentifierRewriter.rewriteSchema("CREATE DATABASE test1", map));
+    }
+
+    @Test
+    @DisplayName("DROP DATABASE IF EXISTS 裸库名改写——不改写就会拿源库名去目标实例删库")
+    void dropDatabaseIfExistsBareName() {
+        // 这条正是实测把目标实例上的同名库整个删掉的形态：限定名规则只认 db.table，
+        // 库级 DDL 里的裸库名一个都碰不到，语句原样落到目标连接上。
+        assertEquals("DROP DATABASE IF EXISTS test2",
+                DdlIdentifierRewriter.rewriteSchema("DROP DATABASE IF EXISTS test1", map));
+    }
+
+    @Test
+    @DisplayName("CREATE SCHEMA IF NOT EXISTS 与反引号库名同样改写")
+    void createSchemaBackticked() {
+        assertEquals("CREATE SCHEMA IF NOT EXISTS `test2` DEFAULT CHARACTER SET utf8mb4",
+                DdlIdentifierRewriter.rewriteSchema(
+                        "CREATE SCHEMA IF NOT EXISTS `test1` DEFAULT CHARACTER SET utf8mb4", map));
+    }
+
+    @Test
+    @DisplayName("不在映射表里的库名原样保留（别把无关库改成别的名字）")
+    void unmappedDatabaseUntouched() {
+        assertEquals("DROP DATABASE other_db",
+                DdlIdentifierRewriter.rewriteSchema("DROP DATABASE other_db", map));
+    }
 }

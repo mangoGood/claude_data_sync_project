@@ -111,18 +111,27 @@ public class WorkflowController {
         }
     }
 
+    /**
+     * @param force 预检 FAIL 时仍要启动。默认 false —— 门禁的意义就在于默认拦得住，
+     *              绕过必须是调用方**显式**表达的一个动作，并且会留审计
+     */
     @PostMapping("/{id}/launch")
     public ResponseEntity<?> launchWorkflow(
             @PathVariable String id,
+            @RequestParam(required = false, defaultValue = "false") boolean force,
             Authentication authentication) {
         UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
         try {
             // 并发任务配额检查
             quotaService.checkConcurrentTaskQuota(userPrincipal.getId());
 
-            Workflow workflow = workflowService.launchWorkflow(id, userPrincipal.getId());
-            auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.LAUNCH_TASK,
-                    id, AuditLogService.buildDetails(workflow.getName(), null, null, null, null));
+            Workflow workflow = workflowService.launchWorkflow(id, userPrincipal.getId(), force);
+            Map<String, Object> details =
+                    AuditLogService.buildDetails(workflow.getName(), null, null, null, null);
+            if (force) {
+                details.put("precheckOverride", true);   // 强启必须在审计里认得出来
+            }
+            auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.LAUNCH_TASK, id, details);
             return ResponseEntity.ok(new ApiResponse(true, "任务启动成功", convertToMap(workflow)));
         } catch (Exception e) {
             auditLogService.logFailure(userPrincipal.getId(), AuditLog.Action.LAUNCH_TASK,
@@ -567,6 +576,43 @@ public class WorkflowController {
             auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.FAILOVER_TASK, id,
                     AuditLogService.buildDetails(workflow.getName(), null, null, null, null));
             return ResponseEntity.ok(new ApiResponse(true, "主备倒换已启动", convertToMap(workflow)));
+        } catch (Exception e) {
+            auditLogService.logFailure(userPrincipal.getId(), AuditLog.Action.FAILOVER_TASK, id, null, e.getMessage());
+            return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));
+        }
+    }
+
+    /**
+     * 计划内主备切换：停旧主写入 → 等链路追平 → 才切。追不平就什么都不改。
+     *
+     * <p>与 {@code /failover}（计划外接管，有损）刻意分成两个端点：一个按钮同时承担两种语义，
+     * 用户没法表达"我要的是不丢数据的那种"。
+     */
+    @PostMapping("/{id}/switchover")
+    public ResponseEntity<?> switchoverWorkflow(
+            @PathVariable String id,
+            @RequestBody(required = false) Map<String, Object> body,
+            Authentication authentication) {
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        long timeoutMs = 300000L;
+        boolean fence = true;
+        if (body != null) {
+            if (body.get("drainTimeoutMs") instanceof Number) {
+                timeoutMs = ((Number) body.get("drainTimeoutMs")).longValue();
+            }
+            // fence=false：调用方声明"业务写入我已自行停掉"。这不是默认值——
+            // 默认必须由平台亲自把旧主停写，否则"追平"这个结论随时会被新写入推翻。
+            fence = !Boolean.FALSE.equals(body.get("fence"));
+        }
+        try {
+            // 两步走：drain 是长耗时且不带事务的，切换本身才进事务（见 switchoverDrain 的注释）
+            workflowService.switchoverDrain(id, userPrincipal.getId(), timeoutMs, fence);
+            Workflow workflow = workflowService.failoverWorkflow(id, userPrincipal.getId());
+            Map<String, Object> details =
+                    AuditLogService.buildDetails(workflow.getName(), null, null, null, workflow.getTaskType());
+            details.put("switchover", "PLANNED_DRAINED");   // 与计划外接管在审计里分得开
+            auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.FAILOVER_TASK, id, details);
+            return ResponseEntity.ok(new ApiResponse(true, "计划内切换已启动（链路已追平）", convertToMap(workflow)));
         } catch (Exception e) {
             auditLogService.logFailure(userPrincipal.getId(), AuditLog.Action.FAILOVER_TASK, id, null, e.getMessage());
             return ResponseEntity.badRequest().body(new ApiResponse(false, e.getMessage()));

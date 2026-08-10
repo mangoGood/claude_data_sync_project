@@ -297,10 +297,12 @@ public class DiagnosticService {
         List<Map<String, Object>> checks = new ArrayList<>();
 
         String srcConn = workflow.getSourceConnection();
+        // TiDB 讲 MySQL 协议，连接串同为 mysql://，走同一套 information_schema 查询
         boolean mysqlSource = srcConn != null && srcConn.startsWith("mysql://");
-        if (!mysqlSource) {
+        boolean pgSource = srcConn != null && srcConn.startsWith("postgresql://");
+        if (!mysqlSource && !pgSource) {
             checks.add(check("schema 预检", "WARNING",
-                    "schema 预检当前仅支持 MySQL 源库，已跳过（不影响启动）", null));
+                    "对象级预检暂不支持该源类型（当前支持 MySQL/TiDB/PostgreSQL），已跳过（不影响启动）", null));
             return summarize(result, checks, workflow);
         }
 
@@ -314,6 +316,10 @@ public class DiagnosticService {
         if (entries.isEmpty()) {
             checks.add(check("同步对象", "FAIL", "未选择任何同步对象", null));
             return summarize(result, checks, workflow);
+        }
+
+        if (pgSource) {
+            return summarize(result, pgSchemaPrecheck(workflow, srcConn, entries, checks), workflow);
         }
 
         String mode = workflow.getMigrationMode();
@@ -338,16 +344,192 @@ public class DiagnosticService {
             checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
         }
 
+        checks.add(checkTransportEncryption(workflow));
+
         // 目标同名表预存在（仅关系型目标；异构/kafka 跳过）——目标库名按 per-db 映射解析
         if (relationalTarget && tgtConn.startsWith("mysql://")) {
-            try (Connection tgt = openConn(tgtConn)) {
+            try (Connection tgt = openConn(tgtConn); Connection src2 = openConn(srcConn)) {
                 checks.add(checkTargetConflicts(tgt, entries, workflow));
+                checks.add(checkTargetUniqueIndexes(src2, tgt, entries));
             } catch (Exception e) {
                 checks.add(check("目标库 schema 检查", "WARNING", "连接目标库失败，跳过目标冲突检查: " + e.getMessage(), null));
             }
         }
 
         return summarize(result, checks, workflow);
+    }
+
+    /**
+     * 传输层加密。
+     *
+     * <p>平台把凭证 AES-GCM 落库加密、THL 文件也能加密，唯独<b>真正流动的业务数据</b>
+     * 长期是明文的（全仓 34 处硬编码 {@code useSSL=false}，且没有任何 SSL 配置项）。
+     * 金融政企的入网评审基本过不了这一关。
+     *
+     * <p>只报 WARNING 不阻断：内网环境不开 TLS 是常见且合理的选择，
+     * 但"当初知不知道自己没开"必须留下痕迹（预检结果现在会落 {@code task_precheck_results}）。
+     */
+    private Map<String, Object> checkTransportEncryption(Workflow workflow) {
+        String src = System.getenv("SOURCE_DB_SSL_MODE");
+        String tgt = System.getenv("TARGET_DB_SSL_MODE");
+        boolean srcOn = src != null && !src.isEmpty() && !"DISABLED".equalsIgnoreCase(src);
+        boolean tgtOn = tgt != null && !tgt.isEmpty() && !"DISABLED".equalsIgnoreCase(tgt);
+        if (srcOn && tgtOn) {
+            return check("传输加密", "PASS", "源/目标连接均已启用 TLS（源=" + src + "，目标=" + tgt + "）", null);
+        }
+        return check("传输加密", "WARNING",
+                "源/目标数据库连接未启用 TLS，业务数据在网络上是明文传输"
+                        + "（源=" + (srcOn ? src : "DISABLED") + "，目标=" + (tgtOn ? tgt : "DISABLED") + "）",
+                "如需启用，设置 agent 环境变量 SOURCE_DB_SSL_MODE / TARGET_DB_SSL_MODE "
+                        + "为 PREFERRED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY");
+    }
+
+    /**
+     * PostgreSQL 源的对象级预检。
+     *
+     * <p>与 MySQL 版是<b>同一批判据、不同的目录表</b>：PG 里 syncObjects 的 key 是 schema，
+     * 所以查的是 {@code pg_catalog}/{@code information_schema} 而不是 {@code information_schema.schemata} 那套。
+     * 之前这条链路整个被一句"仅支持 MySQL 源库，已跳过"打发掉——对象级预检覆盖率为 0，
+     * 而"跑起来才炸"的问题恰恰大多在对象级。
+     *
+     * <p>多一条 MySQL 没有的检查：<b>REPLICA IDENTITY</b>。PG 的逻辑复制默认只在 WAL 里带主键列，
+     * 无主键表若不设 {@code REPLICA IDENTITY FULL}，UPDATE/DELETE 根本没有前镜像可用，
+     * 增量会直接哑掉——这是 PG 特有、且必炸的一条。
+     */
+    private List<Map<String, Object>> pgSchemaPrecheck(Workflow workflow, String srcConn,
+                                                       List<DbEntry> entries,
+                                                       List<Map<String, Object>> checks) {
+        String mode = workflow.getMigrationMode();
+        boolean needsIncrement = mode != null
+                && (mode.toLowerCase().contains("incre") || mode.equalsIgnoreCase("subscribe"));
+        try (Connection src = openPgConn(srcConn)) {
+            List<String> missing = new ArrayList<>();
+            List<String> noPk = new ArrayList<>();
+            List<String> weakIdentity = new ArrayList<>();
+            List<String> missingCols = new ArrayList<>();
+
+            for (DbEntry de : entries) {
+                if (!pgSchemaExists(src, de.sourceDb)) {
+                    missing.add("schema " + de.sourceDb);
+                    continue;
+                }
+                if (de.dbLevel) continue;
+                for (String t : de.tables) {
+                    if (!pgTableExists(src, de.sourceDb, t)) {
+                        missing.add(de.sourceDb + "." + t);
+                        continue;
+                    }
+                    if (needsIncrement) {
+                        if (!pgHasPrimaryKey(src, de.sourceDb, t)) {
+                            noPk.add(de.sourceDb + "." + t);
+                            if (!"f".equalsIgnoreCase(pgReplicaIdentity(src, de.sourceDb, t))) {
+                                weakIdentity.add(de.sourceDb + "." + t);
+                            }
+                        }
+                    }
+                }
+                for (Map.Entry<String, java.util.Set<String>> te : de.referencedColumns.entrySet()) {
+                    if (!pgTableExists(src, de.sourceDb, te.getKey())) continue;
+                    java.util.Set<String> cols = pgTableColumns(src, de.sourceDb, te.getKey());
+                    for (String ref : te.getValue()) {
+                        if (!cols.contains(ref.toLowerCase())) {
+                            missingCols.add(de.sourceDb + "." + te.getKey() + "." + ref);
+                        }
+                    }
+                }
+            }
+
+            checks.add(missing.isEmpty()
+                    ? check("源库对象存在性", "PASS", "所有同步对象均存在于源库", null)
+                    : check("源库对象存在性", "FAIL",
+                            "源库不存在以下对象（" + missing.size() + " 个）", String.join(", ", missing)));
+
+            if (needsIncrement) {
+                checks.add(noPk.isEmpty()
+                        ? check("增量主键", "PASS", "增量同步的表均有主键", null)
+                        : check("增量主键", "FAIL",
+                                "以下表无主键，增量 UPDATE/DELETE 只能按整行匹配定位（存在完全重复行时无法区分是哪一条，"
+                                        + "引擎默认限量成只影响一行）。建议加主键或唯一索引（" + noPk.size() + " 个）",
+                                String.join(", ", noPk)));
+                checks.add(weakIdentity.isEmpty()
+                        ? check("REPLICA IDENTITY", "PASS", "无主键表均已设置 REPLICA IDENTITY FULL", null)
+                        : check("REPLICA IDENTITY", "FAIL",
+                                "以下无主键表未设置 REPLICA IDENTITY FULL，逻辑复制不会记录前镜像，"
+                                        + "UPDATE/DELETE 无法同步（" + weakIdentity.size() + " 个）",
+                                String.join(", ", weakIdentity)));
+            }
+
+            checks.add(missingCols.isEmpty()
+                    ? check("列处理引用列", "PASS", "列过滤/映射引用的源列均存在", null)
+                    : check("列处理引用列", "FAIL",
+                            "列处理引用了不存在的源列（" + missingCols.size() + " 个）", String.join(", ", missingCols)));
+        } catch (Exception e) {
+            checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
+        }
+        return checks;
+    }
+
+    private Connection openPgConn(String connStr) throws Exception {
+        String url = connStr.replace("postgresql://", "");
+        int at = url.indexOf('@');
+        String[] up = url.substring(0, at).split(":", 2);
+        String hostDb = url.substring(at + 1);
+        if (!hostDb.contains("/")) {
+            hostDb = hostDb + "/postgres";
+        }
+        return DriverManager.getConnection("jdbc:postgresql://" + hostDb, up[0], up.length > 1 ? up[1] : "");
+    }
+
+    private boolean pgSchemaExists(Connection c, String schema) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name = ?")) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private boolean pgTableExists(Connection c, String schema, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private boolean pgHasPrimaryKey(Connection c, String schema, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid "
+                        + "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                        + "WHERE n.nspname = ? AND t.relname = ? AND i.indisprimary LIMIT 1")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    /** relreplident: d=default(主键) / f=full / i=index / n=nothing */
+    private String pgReplicaIdentity(Connection c, String schema, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT t.relreplident FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace "
+                        + "WHERE n.nspname = ? AND t.relname = ?")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next() ? rs.getString(1) : "d"; }
+        }
+    }
+
+    private java.util.Set<String> pgTableColumns(Connection c, String schema, String table) throws Exception {
+        java.util.Set<String> cols = new java.util.HashSet<>();
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ?")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) cols.add(rs.getString(1).toLowerCase());
+            }
+        }
+        return cols;
     }
 
     /** 单库同步 entry（预检用）。tables 为空 + dbLevel=true 表示整库同步。 */
@@ -438,8 +620,15 @@ public class DiagnosticService {
         if (noPk.isEmpty()) {
             return check("增量主键", "PASS", "增量同步的表均有主键", null);
         }
-        return check("增量主键", "WARNING",
-                "以下表无主键，增量 UPDATE/DELETE 无法按主键定位行，可能同步异常（" + noPk.size() + " 个）",
+        // 从 WARNING 升级为 FAIL：无主键表的增量 UPDATE/DELETE 只能按整行前镜像定位，
+        // 而无主键表允许完全重复的行——源端删 1 条，目标端会把所有重复行一起删掉（实测源剩 2/目标剩 0）。
+        // 引擎侧已默认限量成"只影响一行"（increment.nopk.row.match=LIMIT_ONE），
+        // 但"删哪一条"仍然是不确定的，行序也无法保证，所以这依旧是需要人明确知情并确认的事，
+        // 不该是一条划过去就没了的黄字。
+        return check("增量主键", "FAIL",
+                "以下表无主键，增量 UPDATE/DELETE 只能按整行匹配定位（存在完全重复行时无法区分是哪一条，"
+                        + "引擎默认限量成只影响一行）。建议加主键或唯一索引；确需继续请强制启动并知悉风险（"
+                        + noPk.size() + " 个）",
                 String.join(", ", noPk));
     }
 
@@ -585,6 +774,71 @@ public class DiagnosticService {
         return check("目标表冲突", "WARNING",
                 "目标库已存在同名表，全量同步可能产生重复或冲突数据，请确认（" + existing.size() + " 个）",
                 String.join(", ", existing));
+    }
+
+    /**
+     * 目标端存在源端没有的唯一索引。
+     *
+     * <p>这条比它看起来严重得多，而且<b>只能在这里拦</b>。MySQL 目标的增量 INSERT 是
+     * {@code INSERT ... ON DUPLICATE KEY UPDATE 全部列}，撞上一个源端没有的唯一索引时它
+     * <b>不报错</b>——而是把那条冲突的旧行整行改掉，<b>连主键一起改成新行的主键</b>。
+     *
+     * <p>实测：目标表加 {@code UNIQUE(email)} 后，源端插入一条 email 重复的新行（id=99991），
+     * 目标端原来的 id=0 那一行直接变成了 id=99991——<b>一条语句毁掉一行、又把两行并成一行</b>，
+     * 全程没有任何错误或告警。PG 目标则是 {@code ON CONFLICT (pk) DO NOTHING} 兜不住唯一约束，
+     * 抛异常后被"重复键忽略"吞掉（那条已由 E3017 修）。
+     *
+     * <p>运行期分辨不了"主键冲突（幂等重放，该忽略）"与"唯一键冲突（该停）"——
+     * MySQL 的 upsert 两种情况都返回成功。所以必须在启动前把结构差异摆出来。
+     */
+    private Map<String, Object> checkTargetUniqueIndexes(Connection src, Connection tgt,
+                                                         List<DbEntry> entries) throws Exception {
+        List<String> extra = new ArrayList<>();
+        for (DbEntry de : entries) {
+            if (de.dbLevel || !schemaExists(tgt, de.targetDb)) continue;
+            for (String t : de.tables) {
+                String tgtTable = de.tableMapping.getOrDefault(t, t);
+                if (!tableExists(tgt, de.targetDb, tgtTable) || !tableExists(src, de.sourceDb, t)) continue;
+                java.util.Set<String> srcKeys = uniqueIndexSignatures(src, de.sourceDb, t);
+                for (Map.Entry<String, String> e : uniqueIndexColumns(tgt, de.targetDb, tgtTable).entrySet()) {
+                    if (!srcKeys.contains(e.getValue())) {
+                        extra.add(de.targetDb + "." + tgtTable + "." + e.getKey() + "(" + e.getValue() + ")");
+                    }
+                }
+            }
+        }
+        if (extra.isEmpty()) {
+            return check("目标唯一索引", "PASS", "目标端没有源端不存在的唯一索引", null);
+        }
+        return check("目标唯一索引", "FAIL",
+                "目标端存在源端没有的唯一索引：增量 upsert 撞上它时不会报错，"
+                        + "而是把冲突的旧行整行改掉（连主键一起改），等于毁掉一行又把两行并成一行（"
+                        + extra.size() + " 个）",
+                String.join(", ", extra));
+    }
+
+    /** 表上所有唯一索引（不含主键）的列签名集合，用于两端对比。 */
+    private java.util.Set<String> uniqueIndexSignatures(Connection conn, String schema, String table) throws Exception {
+        return new java.util.HashSet<>(uniqueIndexColumns(conn, schema, table).values());
+    }
+
+    /** 索引名 → 列签名（按 seq_in_index 排序后小写逗号拼接）。 */
+    private Map<String, String> uniqueIndexColumns(Connection conn, String schema, String table) throws Exception {
+        Map<String, String> out = new java.util.LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT index_name, GROUP_CONCAT(LOWER(column_name) ORDER BY seq_in_index) cols "
+                        + "FROM information_schema.statistics "
+                        + "WHERE table_schema = ? AND table_name = ? AND non_unique = 0 "
+                        + "AND index_name <> 'PRIMARY' GROUP BY index_name")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.put(rs.getString("index_name"), rs.getString("cols"));
+                }
+            }
+        }
+        return out;
     }
 
     // ---- information_schema 查询辅助（标识符经参数化，避免注入与 LIKE 通配符误匹配）----

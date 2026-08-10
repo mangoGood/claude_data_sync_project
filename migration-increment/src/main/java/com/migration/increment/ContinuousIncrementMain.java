@@ -34,6 +34,28 @@ public class ContinuousIncrementMain {
     private long scanInterval;
     /** 增量应用限速（行/秒配额落到执行层）：避免应用过快反压到 capture/binlog 读取而打挂源库。 */
     private RowRateLimiter rowRateLimiter;
+    /** {@code increment.unique.conflict.policy} = FAIL_STOP（默认）| IGNORE */
+    private String uniqueConflictPolicy = "FAIL_STOP";
+
+    /**
+     * 这条重复键错误是不是<b>主键</b>冲突。
+     *
+     * <p>MySQL 报 {@code Duplicate entry 'x' for key 'PRIMARY'}（或 {@code t.PRIMARY}），
+     * PG 报 {@code violates unique constraint "t_pkey"}。认不出来时按<b>主键</b>处理——
+     * 保持既有的幂等重放行为，不因为一条没见过的错误文案把正常任务打停。
+     */
+    private static boolean isPrimaryKeyConflict(String msg) {
+        if (msg == null) {
+            return true;
+        }
+        String lower = msg.toLowerCase();
+        if (lower.contains("for key 'primary'") || lower.contains("for key \"primary\"")
+                || lower.contains(".primary'") || lower.contains("_pkey")) {
+            return true;
+        }
+        // 能明确指出是别的键名，才判成非主键冲突
+        return !(lower.contains("for key ") || lower.contains("unique constraint"));
+    }
     /** 双向同步/环路防护：启用后每个应用事务先写 origin 标记，供对端 capture 识别并跳过，防止回环。 */
     private boolean bidirectionalEnabled;
     /** 双向写写冲突消解（P1-4）：只在双向模式下初始化，单向同步完全不受影响。 */
@@ -249,6 +271,10 @@ public class ContinuousIncrementMain {
         scanInterval = Long.parseLong(props.getProperty("increment.scan.interval", "3000"));
         long maxRowsPerSec = Long.parseLong(props.getProperty("increment.rate.limit.rows.per.sec", "0"));
         rowRateLimiter = new RowRateLimiter(maxRowsPerSec);
+        // 非主键唯一键冲突的处置：默认 FAIL_STOP（停下等人看），IGNORE 回到旧的"warn 一句继续"。
+        // 旧行为把主键冲突（幂等重放，忽略正确）和唯一键冲突（目标端多了一条源端没有的约束，
+        // 忽略即永久丢一行）混成了一类。
+        uniqueConflictPolicy = props.getProperty("increment.unique.conflict.policy", "FAIL_STOP");
         if (!rowRateLimiter.isUnlimited()) {
             logger.info("增量限速已启用: {} 行/秒（配额落到执行层，避免应用过快打挂源库）", maxRowsPerSec);
         }
@@ -364,6 +390,32 @@ public class ContinuousIncrementMain {
                 thlDirectory, targetHost, targetPort, targetDatabase, lastExecutedSeqno);
     }
 
+    /**
+     * 目标库连接的 TLS 参数（{@code target.db.ssl.mode}，默认 DISABLED = 历史行为）。
+     *
+     * <p>这条 URL 是增量自己拼的，不走 {@code DatabaseConfig}，所以加密档位得在这里也认一次——
+     * 否则"配了 TLS"只对全量生效、增量还是明文，比不支持更糟（以为加密了其实没有）。
+     */
+    private String targetSslParams() {
+        String mode = props.getProperty("target.db.ssl.mode", "DISABLED").trim().toUpperCase();
+        String cert = props.getProperty("target.db.ssl.root.cert", "");
+        if (isPostgresql) {
+            String pg;
+            switch (mode) {
+                case "PREFERRED":       pg = "prefer"; break;
+                case "REQUIRED":        pg = "require"; break;
+                case "VERIFY_CA":       pg = "verify-ca"; break;
+                case "VERIFY_IDENTITY": pg = "verify-full"; break;
+                default:                pg = "disable";
+            }
+            return "sslmode=" + pg + (cert.isEmpty() || "disable".equals(pg) ? "" : "&sslrootcert=" + cert);
+        }
+        if ("DISABLED".equals(mode)) {
+            return "useSSL=false";
+        }
+        return "sslMode=" + mode + (cert.isEmpty() ? "" : "&trustCertificateKeyStoreUrl=file:" + cert);
+    }
+
     /** 目标库 JDBC URL（串行主连接与并行 worker 连接共用，避免 URL 口径漂移）。 */
     private String buildTargetJdbcUrl() {
         if (isPostgresql) {
@@ -373,10 +425,10 @@ public class ContinuousIncrementMain {
             }
             // stringtype=unspecified：字符串参数由 PG 按列类型推断（interval/jsonb/时间等绑定依赖）
             return "jdbc:postgresql://" + targetHost + ":" + targetPort + "/" + targetDatabase
-                    + "?stringtype=unspecified";
+                    + "?stringtype=unspecified&" + targetSslParams();
         }
         return "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
-                "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+                "?" + targetSslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
     }
 
     private void connectToTargetDatabase() throws SQLException {
@@ -782,7 +834,22 @@ public class ContinuousIncrementMain {
                             } catch (SQLException e) {
                                 String errorMsg = e.getMessage();
                                 if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contains("duplicate key"))) {
-                                    logger.warn("重复键忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                                    // 主键冲突 = 幂等重放，忽略是对的；但**非主键唯一键**冲突不是——
+                                    // 那说明目标端有一条源端没有的约束把这一行挡住了，忽略掉就是永久丢一行
+                                    // （PG 尤其明显：ON CONFLICT (pk) DO NOTHING 只覆盖主键，
+                                    // 唯一索引冲突会抛异常然后被这条 warn 吞掉）。
+                                    if (isPrimaryKeyConflict(errorMsg)) {
+                                        logger.warn("主键重复忽略（幂等重放）(seqno={}): {}", event.getSeqno(), errorMsg);
+                                    } else if ("IGNORE".equalsIgnoreCase(uniqueConflictPolicy)) {
+                                        logger.warn("唯一键冲突按策略忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                                    } else {
+                                        txFailed = true;
+                                        logger.error("唯一键冲突（非主键）(seqno={}): {}。"
+                                                + "目标端存在源端没有的唯一约束，忽略它会永久丢掉这一行",
+                                                event.getSeqno(), errorMsg);
+                                        writeErrorStatus("E3017", "唯一键冲突（非主键）: " + errorMsg, event);
+                                        break;
+                                    }
                                 } else if (errorMsg != null && (errorMsg.contains("Connection") || errorMsg.contains("timed out"))) {
                                     logger.error("目标库连接异常 (seqno={}): {}, 尝试重连", event.getSeqno(), errorMsg);
                                     reconnectTargetDatabase();

@@ -46,6 +46,14 @@ public class CheckpointUploader {
     private final ConcurrentHashMap<String, Long> lastHistoryAt = new ConcurrentHashMap<>();
 
     private final AtomicLong rejectedTotal = new AtomicLong();
+    /** 全量表级断点的上卷（跨机接管时不必把已搬完的表再搬一遍） */
+    private FullProgressStore fullProgressStore;
+    private volatile long lastFullProgressAt;
+    private static final long FULL_PROGRESS_INTERVAL_MS = 30000L;
+
+    public void setFullProgressStore(FullProgressStore store) {
+        this.fullProgressStore = store;
+    }
 
     private ScheduledExecutorService executor;
 
@@ -95,6 +103,15 @@ public class CheckpointUploader {
             Set<String> tasks = runningTasks != null ? runningTasks.get() : Collections.emptySet();
             for (String taskId : tasks) {
                 uploadTask(taskId);
+            }
+            // 全量表级断点：变化远比位点慢（一张表一条），单独按低频上卷，
+            // 不跟着位点每 3s 走一遍 H2
+            long now = System.currentTimeMillis();
+            if (fullProgressStore != null && now - lastFullProgressAt >= FULL_PROGRESS_INTERVAL_MS) {
+                lastFullProgressAt = now;
+                for (String taskId : tasks) {
+                    fullProgressStore.upload(taskId, agentId);
+                }
             }
         } catch (Exception e) {
             // 巡检类代码必须吞掉所有异常：Files.walk 惰性遍历撞上边写边删会抛 UncheckedIOException

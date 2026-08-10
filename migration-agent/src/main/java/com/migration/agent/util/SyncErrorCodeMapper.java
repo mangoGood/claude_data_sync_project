@@ -49,6 +49,7 @@ public class SyncErrorCodeMapper {
         // 必须排在下面那条泛化的 checkpoint 规则之前：回灌失败是"跨机接管拿不到位点"这个特定故障，
         // 落到 E2005（checkpoint 初始化失败）会让人往源库连接上查，方向就错了
         if (msg.contains("位点回灌失败")) return "E3014";
+        if (msg.contains("唯一键冲突")) return "E3017";
         if (msg.contains("checkpoint") && msg.contains("失败")) return "E2005";
         if (msg.contains("wal") && msg.contains("lsn")) return "E2006";
         if (msg.contains("binlog") && msg.contains("未开启")) return "E2001";

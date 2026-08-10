@@ -366,7 +366,8 @@ public class AdvancedFeaturesController {
                     req.get("maxStorageMb") != null ? ((Number) req.get("maxStorageMb")).longValue() : null,
                     (Integer) req.get("apiRateLimitPerMin"),
                     req.get("maxIncrementRowsPerSec") != null ? ((Number) req.get("maxIncrementRowsPerSec")).intValue() : null,
-                    req.get("maxFullSyncConcurrentTables") != null ? ((Number) req.get("maxFullSyncConcurrentTables")).intValue() : null);
+                    req.get("maxFullSyncConcurrentTables") != null ? ((Number) req.get("maxFullSyncConcurrentTables")).intValue() : null,
+                    req.get("maxFullSyncRowsPerSec") != null ? ((Number) req.get("maxFullSyncRowsPerSec")).intValue() : null);
             return ResponseEntity.ok(Map.of("success", true, "data", quota));
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));

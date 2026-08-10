@@ -34,9 +34,15 @@ public class CheckpointCentralService {
 
     private static final Logger logger = LoggerFactory.getLogger(CheckpointCentralService.class);
 
-    /** 只有停下来的任务才允许重置位点：跑着的任务本地位点还在推进，改中心库纯属自欺欺人。 */
+    /**
+     * 只有停下来的任务才允许重置位点：跑着的任务本地位点还在推进，改中心库纯属自欺欺人。
+     *
+     * <p>{@code COMPLETED} 也算停下来的——而且"任务跑完了才发现某段数据不对、想回退位点重跑"
+     * 恰恰是 PITR 最常见的用法，早先把它漏在名单外，等于把这个能力的主场景关掉了。
+     */
     private static final Set<WorkflowStatus> RESETTABLE = EnumSet.of(
-            WorkflowStatus.PAUSED, WorkflowStatus.FAILED, WorkflowStatus.CONFIGURING);
+            WorkflowStatus.PAUSED, WorkflowStatus.FAILED, WorkflowStatus.CONFIGURING,
+            WorkflowStatus.COMPLETED);
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -180,7 +186,7 @@ public class CheckpointCentralService {
     public Map<String, Object> reset(Workflow workflow, String stage, String streamKey,
                                      Map<String, Object> target, String operator) {
         if (!RESETTABLE.contains(workflow.getStatus())) {
-            throw new IllegalStateException("只有已暂停/已失败/配置中的任务才能重置位点，当前状态: "
+            throw new IllegalStateException("只有已暂停/已失败/已完成/配置中的任务才能重置位点，当前状态: "
                     + workflow.getStatus());
         }
         String taskId = workflow.getId();

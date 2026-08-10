@@ -42,7 +42,13 @@ def api(method, path, token, **kw):
 
 
 def create_task(token, name, source_type, target_type, src_conn, tgt_conn,
-                mode, sync_objects, target_db, source_db=None):
+                mode, sync_objects, target_db, source_db=None, force=False):
+    """建任务 + 下发配置 + 启动。
+
+    force=True 用于**故意**构造预检不通过的场景（比如无主键表的行定位用例）：
+    后端 launchWorkflow 现在会拦 FAIL 的预检，不显式强制就根本起不来。
+    正常用例不要传——那样等于把刚加的门禁在测试里绕过去了。
+    """
     r = api("POST", "/api/workflows", token,
             json={"name": name, "sourceType": source_type, "targetType": target_type, "taskType": "SYNC"})
     if not r.get("success"):
@@ -61,7 +67,7 @@ def create_task(token, name, source_type, target_type, src_conn, tgt_conn,
     if source_db:
         cfg["sourceDbName"] = source_db
     api("PUT", f"/api/workflows/{task_id}/config", token, json=cfg)
-    api("POST", f"/api/workflows/{task_id}/launch", token)
+    api("POST", f"/api/workflows/{task_id}/launch" + ("?force=true" if force else ""), token)
     return task_id
 
 

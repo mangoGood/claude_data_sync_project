@@ -114,6 +114,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 stopped.set(true);
                 return;
             }
+            hydrateFullProgress(threadName);
 
             doRun();
 
@@ -491,6 +492,29 @@ public abstract class AbstractTaskExecutor implements Runnable {
     }
 
     /**
+     * 全量表级断点的回灌。
+     *
+     * <p>与位点回灌的区别：位点灌不上必须 fail-stop（会静默丢数据），
+     * 全量断点灌不上只是<b>慢</b>——退回"整个全量重做"，数据仍然正确。
+     * 所以这里绝不阻断启动，失败只留一行日志。
+     */
+    private void hydrateFullProgress(String threadName) {
+        com.migration.agent.checkpoint.FullProgressStore store =
+                com.migration.agent.checkpoint.FullProgressStoreHolder.get();
+        if (store == null) {
+            return;
+        }
+        try {
+            int n = store.hydrate(taskId);
+            if (n > 0) {
+                logger.info("[{}] 已回灌全量表级断点 {} 条", threadName, n);
+            }
+        } catch (Exception e) {
+            logger.warn("[{}] 全量断点回灌异常（退回整段重做，数据仍正确）: {}", threadName, e.getMessage());
+        }
+    }
+
+    /**
      * 首启位点<b>立刻</b>进中心库，不等上卷那一拍。
      *
      * <p>否则留下一个几秒的窗口：任务刚起来还没上卷就崩了、又被别的 agent 接管，
@@ -510,6 +534,48 @@ public abstract class AbstractTaskExecutor implements Runnable {
         }
     }
 
+    /**
+     * "取源库当前位点"这条路的最后一道门禁。
+     *
+     * <p>本地没有 checkpoint 有两种可能：<b>真首启</b>（该取源库当前位点）和
+     * <b>跨机接管但回灌没生效</b>（取了就等于跳过崩溃到接管之间的全部变更）。
+     * 两者在本地看起来一模一样，唯一能分辨的证据在中心库：那里有行 = 这条任务此前跑过。
+     *
+     * <p>所以这里不信任上游任何判断，直接问中心库。回灌逻辑再出 bug，
+     * 也不会从这条路上悄悄丢一段数据——最坏是任务停在 E3014 等人来看。
+     *
+     * @return false 表示必须 fail-stop
+     */
+    private boolean assertFirstStartAllowed(String threadName) {
+        CheckpointHydrator hydrator = CheckpointHydrator.getInstance();
+        if (hydrator == null) {
+            return true;   // 中心位点未启用：没有别的证据可用，回到老行为
+        }
+        boolean centralHasRows;
+        try {
+            centralHasRows = hydrator.hasCentralPosition(taskId);
+        } catch (Exception e) {
+            if (!hydrator.isFailStop()) {
+                logger.warn("[{}] 无法确认中心库是否已有位点，按首启继续（fail-stop 已关）: {}",
+                        threadName, e.getMessage());
+                return true;
+            }
+            String detail = "位点回灌失败：本地无 checkpoint，又读不到中心库，判不出这是首次启动还是跨机接管，"
+                    + "拒绝按首次启动取源库当前位点";
+            logger.error("[{}] {}", threadName, detail);
+            sendStatus("FAILED", detail, 0);
+            return false;
+        }
+        if (!centralHasRows) {
+            return true;   // 中心库确认没有这条任务：真首启
+        }
+        String detail = "位点回灌失败：中心库已存在该任务的位点，但本地没有 checkpoint 且回灌未生效；"
+                + "此时取源库当前位点会跳过崩溃到接管之间的全部变更，因此停止启动";
+        logger.error("[{}] {}", threadName, detail);
+        sendStatus("FAILED", detail, 0);
+        return false;
+    }
+
     protected boolean initMysqlCheckpoint(String threadName) {
         String checkpointDbPath = "./files/" + taskId + "/checkpoint/checkpoint";
         CheckpointManager checkpointManager = null;
@@ -523,6 +589,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 logger.info("[{}] 发现已存在的 checkpoint: {}", threadName, existingCheckpoint);
             } else {
                 logger.info("[{}] 未找到 checkpoint，从源数据库获取当前位点", threadName);
+                if (!assertFirstStartAllowed(threadName)) {
+                    return false;
+                }
                 String[] sourceCreds = getSourceCredentials(threadName);
                 String sourceHost = sourceCreds[0];
                 int sourcePort = Integer.parseInt(sourceCreds[1]);
@@ -569,6 +638,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 logger.info("[{}] 发现已存在的 PostgreSQL checkpoint: {}", threadName, existingCheckpoint);
             } else {
                 logger.info("[{}] 未找到 checkpoint，从 PostgreSQL 源数据库获取当前 WAL LSN", threadName);
+                if (!assertFirstStartAllowed(threadName)) {
+                    return false;
+                }
                 String[] sourceCreds = getSourceCredentials(threadName);
                 String sourceHost = sourceCreds[0];
                 int sourcePort = Integer.parseInt(sourceCreds[1]);
@@ -615,6 +687,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 logger.info("[{}] 发现已存在的 Oracle checkpoint: {}", threadName, existingCheckpoint);
             } else {
                 logger.info("[{}] 未找到 checkpoint，从 Oracle 源数据库获取当前 SCN", threadName);
+                if (!assertFirstStartAllowed(threadName)) {
+                    return false;
+                }
                 String[] sourceCreds = getSourceCredentials(threadName);
                 String sourceHost = sourceCreds[0];
                 int sourcePort = Integer.parseInt(sourceCreds[1]);

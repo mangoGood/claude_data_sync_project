@@ -32,6 +32,7 @@ public class AgentHttpServer {
     private final String apiToken;
     private final String allowedOrigin;
     private final CheckpointVisualizationService checkpointVisualizationService;
+    private final SwitchoverService switchoverService;
     private final TableLatencyService tableLatencyService;
     private final DiagnosticsBundleService diagnosticsBundleService;
     private final Map<String, FanoutDispatcherService> fanoutServices = new java.util.concurrent.ConcurrentHashMap<>();
@@ -43,6 +44,7 @@ public class AgentHttpServer {
         // CORS 允许来源：环境变量优先，否则取 agent.properties/默认（已更新为 backend 的 38080）
         this.allowedOrigin = System.getenv().getOrDefault("AGENT_CORS_ORIGIN", config.getAgentCorsAllowedOrigin());
         this.checkpointVisualizationService = new CheckpointVisualizationService();
+        this.switchoverService = new SwitchoverService();
         this.tableLatencyService = new TableLatencyService();
         this.diagnosticsBundleService = new DiagnosticsBundleService();
         this.gson = new GsonBuilder()
@@ -73,6 +75,7 @@ public class AgentHttpServer {
             server.setExecutor(Executors.newFixedThreadPool(4));
 
             server.createContext("/api/agent/failover", this::handleFailover);
+            server.createContext("/api/agent/switchover-drain", this::handleSwitchoverDrain);
             server.createContext("/api/agent/start-increment", this::handleStartIncrement);
             server.createContext("/api/agent/status", this::handleStatus);
             server.createContext("/api/agent/health", this::handleHealth);
@@ -151,6 +154,44 @@ public class AgentHttpServer {
         } catch (Exception e) {
             logger.error("Error handling failover request", e);
             sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    /**
+     * 计划内切换的第一步：停旧主的写 + 等链路追平。POST /api/agent/switchover-drain
+     *
+     * <p>后端拿到 {@code success=true} 之后才去交换连接串、走原来那套倒换动作；
+     * 拿到 false 就<b>什么都不改</b>——这正是"计划内切换零丢失"与"计划外接管有损"的分界线。
+     * 同步返回（不像 failover 那样起线程），因为调用方必须等到结论才能决定下一步。
+     */
+    private void handleSwitchoverDrain(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuth(exchange)) return;
+        if (!"POST".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> req = gson.fromJson(readRequestBody(exchange), Map.class);
+            String taskId = req == null ? null : String.valueOf(req.get("taskId"));
+            if (taskId == null || taskId.isEmpty() || "null".equals(taskId)) {
+                sendResponse(exchange, 400, Map.of("success", false, "message", "taskId is required"));
+                return;
+            }
+            long timeoutMs = req.get("timeoutMs") instanceof Number
+                    ? ((Number) req.get("timeoutMs")).longValue() : 300000L;
+            boolean fence = !Boolean.FALSE.equals(req.get("fence"));
+
+            SwitchoverService.DrainResult r = switchoverService.drainAndFence(taskId, timeoutMs, fence);
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("success", r.ok);
+            body.put("message", r.reason);
+            body.put("data", r.details);
+            sendResponse(exchange, r.ok ? 200 : 409, body);
+        } catch (Exception e) {
+            logger.error("Error handling switchover-drain request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", String.valueOf(e.getMessage())));
         }
     }
 

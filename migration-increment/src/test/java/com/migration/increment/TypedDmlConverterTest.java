@@ -96,12 +96,16 @@ class TypedDmlConverterTest {
         assertEquals("DELETE FROM \"bt\" WHERE \"id\"=?", dmls.get(0).getSql());
         assertEquals(1, dmls.get(0).getParams().size());
 
-        // 无主键 → 整行前镜像定位，NULL 列用 IS NULL
+        // 无主键 → 整行前镜像定位，NULL 列用 IS NULL；
+        // 并且必须限定成只影响一行——无主键表允许完全重复的行，源端删 1 条、
+        // 整行 WHERE 会把目标端所有重复行一起删掉（实测源剩 2 / 目标剩 0）。
+        // PG 的 DELETE 不支持 LIMIT，所以走 ctid 子查询（详见 TypedDmlConverterNoPkTest）。
         THLEvent e2 = event("DELETE");
         e2.getMetadata().remove("primary_keys");
         e2.addMetadata("rows_typed", rows(typedRow("2", "bob", null, null)));
         ParameterizedDml d2 = converter.convert(e2).get(0);
-        assertEquals("DELETE FROM \"bt\" WHERE \"id\"=? AND \"name\"=? AND \"c_bool\" IS NULL AND \"c_bit\" IS NULL",
+        assertEquals("DELETE FROM \"bt\" WHERE ctid IN (SELECT ctid FROM \"bt\" WHERE \"id\"=? AND \"name\"=?"
+                        + " AND \"c_bool\" IS NULL AND \"c_bit\" IS NULL LIMIT 1)",
                 d2.getSql());
         assertEquals(2, d2.getParams().size());
     }

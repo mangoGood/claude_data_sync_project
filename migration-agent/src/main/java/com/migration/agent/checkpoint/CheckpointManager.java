@@ -19,7 +19,41 @@ public class CheckpointManager {
         this.dbPath = dbPath;
         initDatabase();
     }
-    
+
+    /**
+     * 这个 H2 库里到底<b>有没有一条位点</b>——注意不是"文件在不在"。
+     *
+     * <p>H2 一 connect 就会把 {@code .mv.db} 建出来，所以"空库"和"有位点"在
+     * {@code File.isFile()} 眼里完全一样。跨机接管时正是这个区别决定了走回灌还是走
+     * "取源库当前位点"，判错就是静默丢掉崩溃到接管之间的全部变更。
+     *
+     * <p>因此这里是"本地有没有位点"这个问题的<b>唯一</b>答案来源：
+     * {@link CheckpointHydrator} 与 {@code AbstractTaskExecutor.initXxxCheckpoint}
+     * 都走它，不允许各自再判一遍——两个函数对同一个问题给出相反答案，正是那条缺陷的形状。
+     *
+     * <p>文件不存在时直接返回 false 且<b>不建库</b>：探测本身不该产生副作用，
+     * 否则探完一次之后"文件存在"就永远成立了。
+     */
+    public static boolean hasStoredCheckpoint(String dbPath) {
+        if (!new java.io.File(dbPath + ".mv.db").isFile()) {
+            return false;
+        }
+        CheckpointManager cm = null;
+        try {
+            cm = new CheckpointManager(dbPath);
+            return cm.loadCheckpoint() != null;
+        } catch (Exception e) {
+            // 打不开就当作没有位点：宁可多判成"接管"（回灌或 fail-stop），
+            // 也不能因为一个坏文件的存在而误判成"同机重启"从而跳过回灌。
+            logger.warn("探测 checkpoint 失败，按无位点处理: {} - {}", dbPath, e.getMessage());
+            return false;
+        } finally {
+            if (cm != null) {
+                cm.close();
+            }
+        }
+    }
+
     private void initDatabase() {
         try {
             String url = DB_URL_PREFIX + dbPath + ";AUTO_SERVER=TRUE";

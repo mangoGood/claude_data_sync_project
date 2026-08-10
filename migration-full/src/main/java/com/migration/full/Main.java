@@ -496,6 +496,7 @@ public class Main {
                     dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
                     dataMigration.setSnapshot(snapshot);
                     dataMigration.setBulkLoadOptions(config.getBulkLoadOptions());
+                    dataMigration.setRowRateLimiter(com.migration.full.migration.FullRateLimiter.get(config));
                     dataMigration.setTableRouter(config.getTableRouter());
                     dataMigration.setRoutingConfig(config.getRoutingConfig());
                     dataMigration.migrateAllData(tables);

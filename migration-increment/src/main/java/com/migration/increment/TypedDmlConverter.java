@@ -42,6 +42,14 @@ public class TypedDmlConverter {
     private final boolean targetIsMysql;
     private final boolean guardWithBeforeImage;
     private final boolean sourceIsMysql;
+    /**
+     * 无主键表的 UPDATE/DELETE 是否限定成只影响一行（{@code increment.nopk.row.match}，默认 LIMIT_ONE）。
+     *
+     * <p>无主键表只能按<b>整行前镜像</b>定位，而无主键表天然允许完全重复的行——
+     * 源端删掉 3 条重复行中的 1 条，目标端那条 WHERE 会把 3 条全删掉（实测：源剩 2 / 目标剩 0）。
+     * 不报错、不进死信，只有对数时才发现。置 {@code ALL_MATCHING} 回到旧行为（不推荐）。
+     */
+    private final boolean limitNoPkToSingleRow;
     private final String targetDatabaseName;
     /** 表名映射（仅表级同步下发）："源库.源表" → 目标表名，来自 schema.mapping.table.* */
     private final Map<String, String> tableNameMapping = new java.util.HashMap<>();
@@ -148,6 +156,8 @@ public class TypedDmlConverter {
         this.guardWithBeforeImage = Boolean.parseBoolean(
                 props.getProperty("sync.bidi.conflict.before.image.guard", "false"));
         this.sourceIsMysql = "mysql".equals(source);
+        this.limitNoPkToSingleRow = !"ALL_MATCHING".equalsIgnoreCase(
+                props.getProperty("increment.nopk.row.match", "LIMIT_ONE"));
         this.targetDatabaseName = props.getProperty("target.db.database", "");
 
         // 表名映射：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>，DML 只需要表名部分
@@ -828,7 +838,8 @@ public class TypedDmlConverter {
                 }
             }
 
-            StringBuilder sql = new StringBuilder("UPDATE ").append(tableRef(metadata, table, ctx)).append(" SET ");
+            String updRef = tableRef(metadata, table, ctx);
+            StringBuilder sql = new StringBuilder("UPDATE ").append(updRef).append(" SET ");
             List<Object> params = new ArrayList<>(after.size() + before.size());
             for (int i = 0; i < sqlSetCols.length; i++) {
                 if (i > 0) sql.append(", ");
@@ -838,16 +849,21 @@ public class TypedDmlConverter {
             // 主键定位版（冲突裁决判"来的一方赢"时用它强制覆盖）
             StringBuilder pkOnly = new StringBuilder(sql);
             List<Object> pkOnlyParams = new ArrayList<>(params);
+            int pkOnlyWhereStart = pkOnly.length();
             if (!appendWhere(pkOnly, pkOnlyParams, whereCols, sqlWhereCols, before, pks)) {
                 return null;
             }
             // 汇聚：源主键在合并表里不唯一，两种 WHERE 都必须补来源标识列
             appendMergeTagWhere(pkOnly, pkOnlyParams, ctx);
+            // 无主键表：WHERE 是整行前镜像，重复行会被一起改掉。必须在 WHERE 全部拼完之后再限量。
+            limitToSingleRow(pkOnly, updRef, pkOnlyWhereStart, pks);
             if (guardWithBeforeImage) {
+                int guardWhereStart = sql.length();
                 if (!appendBeforeImageWhere(sql, params, whereCols, sqlWhereCols, before, pks)) {
                     return null;
                 }
                 appendMergeTagWhere(sql, params, ctx);
+                limitToSingleRow(sql, updRef, guardWhereStart, pks);
             } else {
                 sql = pkOnly;
                 params = pkOnlyParams;
@@ -885,13 +901,17 @@ public class TypedDmlConverter {
                 logger.debug("列过滤跳过 DELETE 行: {}.{}", srcDb, srcTable);
                 continue;
             }
-            StringBuilder sql = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table, ctx));
+            String delRef = tableRef(metadata, table, ctx);
+            StringBuilder sql = new StringBuilder("DELETE FROM ").append(delRef);
             List<Object> params = new ArrayList<>();
+            int delWhereStart = sql.length();
             if (!appendWhere(sql, params, cols, sqlCols, row, pks)) {
                 return null;
             }
             // 汇聚：不带来源标识的 DELETE 会连同其它来源的同主键行一起删掉
             appendMergeTagWhere(sql, params, ctx);
+            // 无主键表：整行 WHERE 会命中所有重复行，源端删一行目标端会删光
+            limitToSingleRow(sql, delRef, delWhereStart, pks);
             out.add(new ParameterizedDml(sql.toString(), params, table,
                     mergeRowKey(rowKeyOf(cols, row, pks), ctx), "DELETE"));
         }
@@ -968,6 +988,34 @@ public class TypedDmlConverter {
      * @param cols    源列名（用于主键匹配——metadata 的 primary_keys 是源列名）
      * @param sqlCols SQL 输出用列名（列名映射后的目标列名；无映射时与 cols 相同）
      */
+    /**
+     * 无主键表：把"只影响一行"钉进 SQL 里。
+     *
+     * <p>有主键时 WHERE 天然只命中一行，什么都不做。无主键时 WHERE 是整行前镜像，
+     * 而完全重复的行在无主键表里是合法的——源端删一行，目标端会把所有重复行一起删掉。
+     *
+     * <p>两种方言的写法不一样，所以不能简单地"在末尾追加一句"：
+     * MySQL 的 UPDATE/DELETE 支持 {@code LIMIT 1}；PostgreSQL 不支持，得改写成
+     * {@code WHERE ctid IN (SELECT ctid FROM t WHERE ... LIMIT 1)}——子查询里的条件与参数
+     * 跟原 WHERE 完全一致，所以参数列表的顺序不用动。
+     *
+     * @param whereStart 调用 {@link #appendWhere} <b>之前</b> {@code sql.length()} 的值
+     */
+    private void limitToSingleRow(StringBuilder sql, String tableRef, int whereStart,
+                                  java.util.Set<String> pks) {
+        if (!limitNoPkToSingleRow || !pks.isEmpty()) {
+            return;
+        }
+        if (targetIsMysql) {
+            sql.append(" LIMIT 1");
+            return;
+        }
+        String where = sql.substring(whereStart);   // " WHERE a=? AND b IS NULL"
+        sql.setLength(whereStart);
+        sql.append(" WHERE ctid IN (SELECT ctid FROM ").append(tableRef)
+                .append(where).append(" LIMIT 1)");
+    }
+
     private boolean appendWhere(StringBuilder sql, List<Object> params,
                                 String[] cols, String[] sqlCols, List<Object> values, java.util.Set<String> pks) {
         sql.append(" WHERE ");

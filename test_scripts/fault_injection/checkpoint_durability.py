@@ -147,7 +147,9 @@ def start_agent_b():
         "AGENT_API_TOKEN": secret(".synctask_agent_token"),
         "MIGRATION_AGENT_ID": AGENT_B_ID,
     })
-    log = open(os.path.join(AGENT_B_DIR, "agent-b.out"), "w")
+    # 追加而不是覆盖：一次运行里 agent-B 会被重启多次（每个用例一次），
+    # 用 "w" 会把上一个用例的日志冲掉，事后完全没法排查（本轮就栽在这里）。
+    log = open(os.path.join(AGENT_B_DIR, "agent-b.out"), "a")
     proc = subprocess.Popen(
         [java, "-Dh2.bindAddress=127.0.0.1", "-jar",
          os.path.join(PROJECT_DIR, "migration-agent/target/migration-agent-1.0.0.jar")],
@@ -183,22 +185,70 @@ def wait_agent_b_registered(timeout=90):
     return False
 
 
-def kill_agent_a():
-    """SIGKILL 掉 A（含它拉起的子进程），模拟整机失联。"""
+def kill_agent_a(agent_b_proc=None, task_id=None):
+    """SIGKILL 掉 A **以及它拉起的子进程**，模拟整机失联。
+
+    子进程必须显式杀：它们靠 ParentWatchdog 每 5s 探活自杀，那 5s 里 capture/extract/increment
+    还在正常干活——崩溃窗口里写入的行会被它们捡走一部分，主用例与对照组的判定就都变成了
+    "看运气"（实测对照组因此偶发"没丢数据"，把一条本该复现丢数据的尺子判成失效）。
+    整机失联的语义本来就是"这台机器上的一切同时消失"。
+
+    **不能靠命令行区分 A 和 B**：B 是用同一个绝对路径的 jar 起的，只有 cwd 不同，
+    而 cwd 不出现在 `ps -o command=` 里。早先按命令行里找 AGENT_B_DIR 来"避让 B"，
+    结果这个条件永远不成立——每次都把 B 一起杀了，接管自然永远等不到，
+    整个脚本因此从来没跑通过。改为按**进程组**排除 B（B 用 setsid 独立成组）。
+    """
+    b_pgid = None
+    if agent_b_proc is not None:
+        try:
+            b_pgid = os.getpgid(agent_b_proc.pid)
+        except Exception:
+            b_pgid = None
     out = subprocess.run(["pgrep", "-f", "migration-agent/target/migration-agent-1.0.0.jar"],
                          capture_output=True, text=True).stdout.split()
     killed = []
+    if task_id:
+        for pid in F.all_child_pids(task_id):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except ProcessLookupError:
+                pass
     for pid in out:
-        cmd = subprocess.run(["ps", "-o", "command=", "-p", pid],
-                             capture_output=True, text=True).stdout
-        if AGENT_B_DIR in cmd:
-            continue  # 别误杀 B
+        pid = int(pid)
+        if b_pgid is not None:
+            try:
+                if os.getpgid(pid) == b_pgid:
+                    continue  # 别误杀 B 及它拉起的子进程
+            except ProcessLookupError:
+                continue
         try:
-            os.kill(int(pid), signal.SIGKILL)
-            killed.append(int(pid))
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
         except ProcessLookupError:
             pass
     return killed
+
+
+def ensure_agent_a():
+    """确保 agent-A 在跑。
+
+    跨机接管用例会 SIGKILL 掉 A，而**后面每个用例都还需要一个常驻 agent**
+    （对照组、位点重置、保留期巡检都要先把任务跑进增量）。原先没有这一步，
+    第一个用例之后 A 就没了、B 又在 finally 里被收掉，剩下三个用例全部卡在 PENDING——
+    表现为"一堆判据失败"，实际什么也没测到。
+    """
+    # 调用点都在 agent-B 已收掉之后，所以"还有 agent 进程"就等于 A 还活着
+    out = subprocess.run(["pgrep", "-f", "migration-agent/target/migration-agent-1.0.0.jar"],
+                         capture_output=True, text=True).stdout.split()
+    if out:
+        return
+    print("    agent-A 不在，重新拉起 ...")
+    r = subprocess.run([os.path.join(PROJECT_DIR, "restart_agent.sh")], cwd=PROJECT_DIR,
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"拉起 agent-A 失败: {r.stdout}\n{r.stderr}")
+    time.sleep(5)
 
 
 def task_owner(task_id):
@@ -270,6 +320,7 @@ def run_takeover(token, passed, failed, central_enabled):
     agent_b = None
     task_id = None
     try:
+        ensure_agent_a()
         seed(600)
         task_id = F.create_task(token, f"ckpt-durability-{int(time.time())}", "mysql", "mysql",
                                 CONN, CONN, "fullAndIncre",
@@ -300,7 +351,7 @@ def run_takeover(token, passed, failed, central_enabled):
             failed.append(f"{label}: agent-B 未能注册到元数据库")
             return
 
-        killed = kill_agent_a()
+        killed = kill_agent_a(agent_b, task_id)
         print(f"    已 SIGKILL agent-A 及其子进程: {killed}")
         # 崩溃窗口内持续写入：这批数据正是"丢没丢"的判据
         gap_rows = write_rows(400, "gap")
@@ -349,6 +400,7 @@ def agent_b_hydrated_from_central():
 
 def run_reset(token, passed, failed):
     """位点重置（PITR）：唯一允许位点倒退的入口。不需要第二个 agent。"""
+    ensure_agent_a()
     print("\n=== 位点重置（PITR） ===")
     task_id = None
     try:
@@ -405,6 +457,7 @@ def run_reset(token, passed, failed):
 
 def run_retention(token, passed, failed):
     """保留期在线巡检：运行中就该产出 retention_metric。"""
+    ensure_agent_a()
     print("\n=== 保留期在线巡检 ===")
     task_id = None
     try:

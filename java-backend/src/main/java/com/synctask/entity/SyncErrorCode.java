@@ -31,6 +31,8 @@ public enum SyncErrorCode {
     BIDI_WRITE_CONFLICT("E3011", "双向同步写写冲突", "两端同时修改了同一行，且冲突策略配置为 ERROR（不自动丢写）。请人工确认应保留哪一端的值，或改用 LWW_SOURCE_TS/NODE_PRIORITY 策略自动裁决"),
     // E3012 未分配（历史空位，新增错误码请顺延，不要复用）
     ROUTE_TYPED_PIPELINE_UNAVAILABLE("E3013", "汇聚/拆分事件缺少类型化值", "命中路由规则的表其事件没有类型化值（rows_typed），无法生成带来源标识列的 DML——文本路径的 UPDATE/DELETE 只按源主键定位，会改到同一张汇聚表里其它来源的同主键行，因此已停止应用。请检查该表的路由规则是否配错（不该汇聚的表被规则命中）、源端 binlog_row_image 是否为 FULL，以及该源→目标引擎对是否支持类型化管道（increment.typed.pipeline.enabled 是否被关掉）"),
+    UNIQUE_KEY_CONFLICT("E3017", "唯一键冲突（非主键）", "目标端存在源端没有的唯一索引/约束，把这一行挡住了。主键冲突属于幂等重放可以忽略，但唯一键冲突忽略掉就是永久丢一行，因此默认停下等人处置。请核对两端的唯一索引差异；确认可以丢弃这类行时，将 increment.unique.conflict.policy 设为 IGNORE"),
+
     CHECKPOINT_HYDRATE_FAILED("E3014", "位点回灌失败", "本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管。此时若按首次启动去取源库当前位点，会静默跳过崩溃到接管之间的全部变更，因此任务停在这里等人处置。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务；确认这确实是一个全新任务时，可临时将 checkpoint.hydrate.fail.stop 设为 false"),
 
     ELASTIC_PROCESS_START_FAILED("E3101", "Elastic同步进程启动失败", "请检查Agent日志，确认elastic模块JAR包存在且配置正确"),

@@ -446,6 +446,13 @@ public class ContinuousSubscribeMain {
             case "DELETE":
                 cdcEvent.operation = "d";
                 break;
+            case "QUERY":
+                // DDL：此前 default 分支一句 return null 把它整个丢掉了。
+                // 下游按订阅流建镜像表的消费者因此完全不知道源端结构变了——
+                // ADD COLUMN 之后消息里突然多一个字段、DROP COLUMN 之后字段悄悄消失。
+                // Debezium 有专门的 schema change topic，这里对齐它。
+                sendSchemaChange(thlEvent, metadata);
+                return null;
             default:
                 return null;
         }
@@ -780,6 +787,53 @@ public class ContinuousSubscribeMain {
         sendTransactionMarker("END", currentTxId, currentTxCount);
         currentTxId = null;
         currentTxCount = 0;
+    }
+
+    /**
+     * schema 变更 topic（{@code <prefix>.<taskId>.schema-changes}）。
+     *
+     * <p>DDL 事件此前在 {@code convertToCdcEvent} 的 {@code default} 分支被整个丢掉：
+     * 下游按订阅流建镜像表的消费者，在源端 {@code ADD COLUMN} 之后收到的消息突然多一个字段，
+     * 而它完全不知道发生了什么；{@code DROP COLUMN} 则是字段悄悄消失。
+     * 第 2 批已经把<b>事务</b>元数据补齐到 Debezium 口径了，schema 这一半一直缺着。
+     *
+     * <p>投递失败与数据消息一样计入 {@code sendErrors}——位点推进的前提是"这一批全部落到 Kafka"，
+     * schema 变更丢了比数据丢了更难排查（下游要到很久以后才发现自己按错的结构在解析）。
+     */
+    private void sendSchemaChange(THLEvent thlEvent, Map<String, Object> metadata) {
+        Object sql = metadata.get("sql");
+        if (sql == null || sql.toString().trim().isEmpty()) {
+            return;
+        }
+        Map<String, Object> msg = new LinkedHashMap<>();
+        msg.put("taskId", taskId);
+        msg.put("seqno", thlEvent.getSeqno());
+        msg.put("database", metadata.getOrDefault("database_name", ""));
+        msg.put("table", metadata.getOrDefault("table_name", ""));
+        msg.put("ddl", sql.toString());
+        msg.put("ddlSubType", String.valueOf(metadata.getOrDefault("ddl_subtype", "")));
+        msg.put("txId", com.migration.common.txn.TxnMetadata.txIdOf(metadata));
+        msg.put("ts_ms", thlEvent.getSourceTstamp() != null
+                ? thlEvent.getSourceTstamp().getTime() : System.currentTimeMillis());
+        String topic = kafkaTopicPrefix + "." + taskId + ".schema-changes";
+        try {
+            // key 用库名：同一个库的 DDL 落同一分区，下游按分区顺序重放就是源端的 DDL 顺序
+            kafkaProducer.send(new ProducerRecord<>(topic, String.valueOf(msg.get("database")), gson.toJson(msg)),
+                    (md, ex) -> {
+                        if (ex != null) {
+                            sendErrors.incrementAndGet();
+                            logger.error("发送 schema 变更到 {} 失败: {}", topic, ex.getMessage());
+                        }
+                    });
+            logger.info("已投递 schema 变更事件 (seqno={}): {}", thlEvent.getSeqno(), truncateSql(sql.toString()));
+        } catch (Exception e) {
+            sendErrors.incrementAndGet();
+            logger.error("发送 schema 变更异常: {}", e.getMessage());
+        }
+    }
+
+    private static String truncateSql(String s) {
+        return s.length() <= 200 ? s : s.substring(0, 200) + "...";
     }
 
     /**
