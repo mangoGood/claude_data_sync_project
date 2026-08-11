@@ -110,7 +110,23 @@ MySQL DDL 语法里最难的部分正是任意表达式，裁掉之后规模从 
 | 2 ALTER 施加 | ✅ | `DdlApplier` / `SchemaChange`；单测 34 项通过（模块合计 180 项全绿） |
 | 3 时序库与位点查询 | ✅ | `SchemaTimeline` / `SchemaHistoryFile` / `SchemaTracker`（extract）+ `SchemaVersionStore`（agent）+ `V18__task_schema_versions.sql`；capture 打基线；单测 39 项 |
 | 4 extract 切换 + 交叉校验 | ✅ | `resolveSchema` 三档切换 + E3024 交叉校验 + 分级降级 + 四项指标 + 启动自检；单测 12 项 |
-| 5 影子灰度 + 判据 | ⏳ | |
+| 5 影子灰度 + 判据 | ✅ | `test_scripts/schema_drift/` 六场景 **13/13 真链路通过**；`DRIFT_MODE=OFF` 对拍 |
+
+## 判据实测到的收益
+
+`test_scripts/schema_drift/` 在 `dr-mysql-a → dr-mysql-b` 真链路上跑出来的对拍
+（`DRIFT_MODE=OFF` 是改造前的行为）：
+
+| 场景 | 改造前 | 改造后 |
+|---|---|---|
+| 积压期 `RENAME COLUMN` | **静默写坏**：值以 `0x…` 十六进制字面量落库，无任何报错 | 正确 |
+| 积压期 `DROP a`+`ADD b`（列数不变） | 正确（FULL 事件列名已能自愈） | 正确 |
+| 积压期 enum 增删取值 | E3004 停机（`Data truncated`） | 正确 |
+
+第一行是这次改造的核心收益，值得记下它的成因：改造前的自愈只救了列**名**——
+`resolveColumns` 用事件自带的列名，`columnMetaByName` 再拿这些名字去**当前**表定义里找类型，
+改过名的列找不到、类型退化成空串，`isTextType("")` 为假，于是 capture 交付的
+`0x…` 原样落库。**列名自愈了、类型没有**，正是时序库补上的那一维。
 
 ## 分阶段
 
