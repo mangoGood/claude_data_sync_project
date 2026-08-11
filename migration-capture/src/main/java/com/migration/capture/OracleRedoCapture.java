@@ -587,7 +587,9 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
 
         int eventCount = 0;
         StringBuilder queryBuilder = new StringBuilder(
-                "SELECT SCN, OPERATION, XID, SEG_OWNER, TABLE_NAME, SQL_REDO, TIMESTAMP, ROW_ID " +
+                // CSF 必须取：SQL_REDO 单行上限 4000 字节，超了 Oracle 把一条语句拆成多行、
+                // 除末行外 CSF=1。不拼接就是按残缺列集写目标端 + 续行被当独立事件，且全程不报错
+                "SELECT SCN, OPERATION, XID, SEG_OWNER, TABLE_NAME, SQL_REDO, CSF, TIMESTAMP, ROW_ID " +
                 "FROM V$LOGMNR_CONTENTS WHERE OPERATION IN ('INSERT', 'UPDATE', 'DELETE', 'UNSUPPORTED')");
 
         // 添加 SCN 过滤（只查大于当前 SCN 的记录）
@@ -623,6 +625,10 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
 
         queryBuilder.append(" ORDER BY SCN ASC");
 
+        // 每批查询用一个新的拼接器：CSF=1 的末行若落在本批边界之外，下一批会从同一 SCN
+        // 重新读到它，残句留着只会与新一批拼串
+        com.migration.capture.oracle.CsfAssembler csf = new com.migration.capture.oracle.CsfAssembler();
+
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         try {
@@ -636,9 +642,14 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                 String xid = rs.getString("XID");
                 String segOwner = rs.getString("SEG_OWNER");
                 String tableName = rs.getString("TABLE_NAME");
-                String sqlRedo = rs.getString("SQL_REDO");
                 Timestamp timestamp = rs.getTimestamp("TIMESTAMP");
                 String rowId = rs.getString("ROW_ID");
+
+                // 续行拼接：CSF=1 说明这条语句还没完，收下继续读下一行
+                String sqlRedo = csf.accept(rs.getString("SQL_REDO"), rs.getInt("CSF"));
+                if (sqlRedo == null) {
+                    continue;
+                }
 
                 if (segOwner == null || tableName == null) {
                     continue;
@@ -702,6 +713,13 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                     savePosition();
                 }
                 checkRetentionQuietly();
+            }
+            if (csf.hasPending()) {
+                // 半条语句挂在批边界上：本批不下发它，位点也没越过（currentScn 只在写出事件后前进），
+                // 下一批会从同一个 SCN 重新读到完整的一串
+                logger.warn("本批结束时仍有未拼完的 SQL_REDO（已累计 {} 个续行），"
+                        + "该语句留待下一批重新读取", csf.pendingRows());
+                csf.reset();
             }
         } finally {
             if (rs != null) try { rs.close(); } catch (SQLException e) { /* ignore */ }

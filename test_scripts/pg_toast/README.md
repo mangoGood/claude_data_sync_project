@@ -26,3 +26,28 @@ python3 test_scripts/pg_toast/pg_value_e2e.py
    `ALTER COLUMN … SET STORAGE EXTERNAL` 关掉压缩，并**断言 TOAST 附属表真的有字节**。
 2. **任务目录要整个删重建**。只清 `.cap`/`.thl` 而留下位点与进度文件，本轮会从上一轮的
    LSN 续传，判据看到的是上一轮的数据。macOS 上目录项用 `os.remove` 删不掉，用 `shutil.rmtree`。
+
+---
+
+## `pg_schema_truncate_e2e.py`
+
+同一套脚手架的第二个判据，覆盖审查报告的第 8、10、11 项与附录：
+
+```bash
+python3 test_scripts/pg_toast/pg_schema_truncate_e2e.py
+```
+
+| 场景 | 改造前 | 改造后 |
+|---|---|---|
+| 链路积压期间 `DROP COLUMN` | 任务停摆（E3004，删列后的行一条都过不去） | 正常同步、不错位 |
+| `TRUNCATE` | 目标端仍有旧行 | 目标端清空 |
+| 运行中删掉复制槽 | 默默建新槽继续跑，中间变更消失 | E3006 停机、不自建槽 |
+| `.cap` 处理完成标记 | 永远置不上，清理从不生效 | 旧文件标 true 并被清理 |
+
+基线 4/10 → 修复后 13/13。
+
+### 又一个坑
+
+判据里的辅助函数**别写死列名**：中途 `DROP COLUMN` 之后按老列名取值会 SQL 报错，
+而 `wait_until` 把异常当成"还没同步到"，一路等到超时 —— 判据永远失败且看不出原因。
+本目录用 `row_json()`（`row_to_json`）与表结构解耦。

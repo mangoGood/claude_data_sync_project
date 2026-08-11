@@ -150,6 +150,8 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
             parseUpdateEvent(thlEvent, eventData);
         } else if ("DELETE".equals(eventType)) {
             parseDeleteEvent(thlEvent, eventData);
+        } else if ("TRUNCATE".equals(eventType)) {
+            parseTruncateEvent(thlEvent, eventData);
         } else if ("WAL_EVENT".equals(eventType)) {
             thlEvent.addMetadata("operation", "WAL_EVENT");
             thlEvent.addMetadata("raw_data", eventData);
@@ -189,6 +191,28 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         if (currentTxId != null) {
             thlEvent.addMetadata(TxnMetadata.TX_ID, currentTxId);
         }
+    }
+
+    /**
+     * TRUNCATE 走既有的 DDL 通道（{@code event_type=QUERY} + {@code sql}），
+     * 库名/表名映射与方言翻译都在那条路上，这里只负责把语句原样交过去。
+     */
+    private void parseTruncateEvent(THLEvent thlEvent, String eventData) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("sql:\\s*(.+)$", java.util.regex.Pattern.DOTALL).matcher(eventData);
+        if (!m.find()) {
+            logger.warn("TRUNCATE 事件里没有 sql 段，跳过: {}", eventData);
+            return;
+        }
+        java.util.regex.Matcher schemaMatcher =
+                java.util.regex.Pattern.compile("schema:\\s*(\\S+)").matcher(eventData);
+        if (schemaMatcher.find()) {
+            thlEvent.addMetadata("database_name", schemaMatcher.group(1));
+        }
+        // 覆盖成 QUERY：下游按 event_type 分派，DDL 的入口就是 QUERY
+        thlEvent.addMetadata("event_type", "QUERY");
+        thlEvent.addMetadata("operation", "QUERY");
+        thlEvent.addMetadata("sql", m.group(1).trim());
     }
 
     private void parseBeginEvent(THLEvent thlEvent, String eventData) {
@@ -542,20 +566,34 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
 
         resolveTableSchema(rowData);
 
+        // 事件自带的列名/类型优先于回查源库当前定义。capture 那边是按 Relation 消息
+        // （与行值同一时刻的权威结构）解析出来的，而这里回查的是**现在**的定义 ——
+        // 源端在链路积压期间 DROP/ADD COLUMN 之后，两者列数就对不上了，
+        // 按下标把值配到当前列名上就是整行错位的静默写坏。
+        List<String> inbandTypes = parseColumnTypes(eventData);
+        if (inbandTypes != null && !inbandTypes.isEmpty()) {
+            rowData.columnTypes = inbandTypes;
+        }
+
         String newTupleContent = extractBracedContent(eventData, "new-tuple:");
         if (newTupleContent != null) {
             rowData.newValues = parseTupleData(newTupleContent, rowData.columnNames);
+            adoptInbandColumnNames(rowData, newTupleContent);
         }
 
         String oldTupleContent = extractBracedContent(eventData, "old-tuple:");
         if (oldTupleContent != null) {
             rowData.oldValues = parseTupleData(oldTupleContent, rowData.columnNames);
+            if (rowData.newValues == null) {
+                adoptInbandColumnNames(rowData, oldTupleContent);
+            }
         }
 
         if (rowData.newValues == null && !eventData.contains("old-tuple")) {
             String tupleContent = extractBracedContent(eventData, "tuple:");
             if (tupleContent != null) {
                 rowData.newValues = parseTupleData(tupleContent, rowData.columnNames);
+                adoptInbandColumnNames(rowData, tupleContent);
             }
         }
 
@@ -564,6 +602,51 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         }
 
         return rowData;
+    }
+
+    /**
+     * 事件自带的列类型（{@code column_types:{integer,character varying,…}}）。
+     * 老的 .cap 没有这一段，返回 null 表示"沿用回查源库的结果"。
+     */
+    private List<String> parseColumnTypes(String eventData) {
+        String content = extractBracedContent(eventData, "column_types:");
+        if (content == null || content.isEmpty()) {
+            return null;
+        }
+        List<String> types = new ArrayList<>();
+        for (String t : content.split(",")) {
+            types.add(t.trim());
+        }
+        return types;
+    }
+
+    /**
+     * 采用 tuple 里自带的列名（形如 {@code id:1,tag:'x'}）。
+     *
+     * <p>这些列名是 capture 按 Relation 消息写下的、与行值同一时刻的权威信息；
+     * {@link #resolveTableSchema} 查到的是**当前**定义。两者列数不同就说明源端在链路
+     * 积压期间改过表结构，此时必须以事件自带的为准，否则值会整体错位一格写进相邻列。
+     */
+    private void adoptInbandColumnNames(WalRowData rowData, String tupleContent) {
+        List<String> names = new ArrayList<>();
+        for (String part : splitTupleParts(tupleContent)) {
+            String s = part.trim();
+            int colonIdx = s.indexOf(':');
+            if (colonIdx <= 0) {
+                return;                     // 形态不符（老 .cap 或异常），保持回查结果
+            }
+            names.add(s.substring(0, colonIdx).trim());
+        }
+        if (names.isEmpty()) {
+            return;
+        }
+        List<String> current = rowData.columnNames;
+        if (current != null && !current.isEmpty() && !current.equals(names)) {
+            logger.info("{}.{} 事件自带的列清单与源库当前定义不一致（源端已做过 DDL），"
+                            + "按事件自带的解析: 事件={} 当前={}",
+                    rowData.schemaName, rowData.tableName, names, current);
+        }
+        rowData.columnNames = names;
     }
 
     /**

@@ -52,7 +52,8 @@ public class TiCDCExtractor extends MySQLBinlogExtractor {
         // limit=7 保证 JSON 载荷即便含分隔符也不会被切碎（capture 已做过滤，这里再兜一层）
         String[] fields = eventStr.split(String.valueOf(FIELD_SEP), 7);
         if (fields.length < 6) {
-            logger.warn("TiCDC 记录字段数不足，跳过: {}", eventStr.substring(0, Math.min(120, eventStr.length())));
+            failUnusableEvent("TiCDC 记录字段数不足（"
+                    + eventStr.substring(0, Math.min(120, eventStr.length())) + "）");
             return null;
         }
 
@@ -96,10 +97,12 @@ public class TiCDCExtractor extends MySQLBinlogExtractor {
         try {
             msg = gson.fromJson(payload, JsonObject.class);
         } catch (Exception e) {
-            logger.warn("TiCDC canal-json 解析失败，跳过 (commitTs={}): {}", commitTs, e.getMessage());
+            // 解析不了就跳过 = 静默丢掉这条变更。与 MySQL 链路一致：默认停机
+            failUnusableEvent("TiCDC canal-json 解析失败 (commitTs=" + commitTs + "): " + e.getMessage());
             return null;
         }
         if (msg == null) {
+            failUnusableEvent("TiCDC canal-json 解析结果为空 (commitTs=" + commitTs + ")");
             return null;
         }
 
@@ -108,7 +111,10 @@ public class TiCDCExtractor extends MySQLBinlogExtractor {
         } else {
             String operation = operationOf(eventType);
             if (operation == null) {
-                logger.debug("忽略未知 TiCDC 事件类型: {}", eventType);
+                // 黑名单式放行：认识的处理、不认识的丢，且只打 DEBUG。
+                // TiCDC 的消息类型随版本增加，漏一个就是一次静默丢数据
+                failUnusableEvent("不支持的 TiCDC 事件类型 " + eventType
+                        + " (commitTs=" + commitTs + ")，继续跑等于把它携带的数据静默丢掉");
                 return null;
             }
             parseRow(thlEvent, msg, operation);
@@ -135,6 +141,22 @@ public class TiCDCExtractor extends MySQLBinlogExtractor {
         }
 
         return thlEvent;
+    }
+
+    /**
+     * 用不了的 TiCDC 记录：默认停机上报（复用 MySQL 链路的 E3020 通道与开关），
+     * {@code extract.unknown.event.policy=SKIP} 时退回只告警。
+     *
+     * <p>改造前这里是"warn/debug 一句然后 return null"，位点照常前进 —— 这条记录承载的
+     * 变更就此永久消失，而任务全绿。
+     */
+    private void failUnusableEvent(String detail) {
+        if ("SKIP".equalsIgnoreCase(props != null
+                ? props.getProperty("extract.unknown.event.policy", "FAIL_STOP") : "FAIL_STOP")) {
+            logger.error("{}（按 extract.unknown.event.policy=SKIP 放过）", detail);
+            return;
+        }
+        throw new UnsupportedBinlogEventException(detail);
     }
 
     private static String operationOf(String eventType) {

@@ -18,6 +18,7 @@ PG 逻辑复制值保真判据的公共脚手架（pg → pg 增量）。
     根本没被保留。判据里的写入一律等 capture 起来之后再发。
   * 判据用完必须 `pg_drop_replication_slot`：槽会一直卡住 WAL 回收，攒几个就把磁盘吃满。
 """
+import json
 import os
 import subprocess
 import threading
@@ -97,6 +98,19 @@ def drop_publication(db, pub):
         psql(f"DROP PUBLICATION IF EXISTS \"{pub}\"", db=db)
     except Exception as e:
         print(f"    (提示) 清理 publication {pub} 失败: {e}")
+
+
+def row_json(db, table, pk):
+    """
+    整行按 列名→值 返回（不存在返回 None）。
+
+    **别把列名写死在辅助函数里**：判据里换一张表就会 SQL 报错，而 wait_until 把异常
+    当成"还没同步到"一路等到超时——判据永远失败且看不出原因。用 row_to_json 与表结构解耦。
+    """
+    out = psql(f"SELECT row_to_json(t) FROM {table} t WHERE id = {pk}", db=db, want=True)
+    if not out:
+        return None
+    return json.loads(out)
 
 
 def row_of(db, table, pk):

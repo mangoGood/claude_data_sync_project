@@ -2,11 +2,19 @@
 
 日期：2026-08-11　范围：全仓（capture / extract / increment / full / mongo / thl / common）
 
-> **进度**：第 1、2、4、5、6 项**已修并有判据**（本轮），其余 7 项仍是待办。
-> 判据：`test_scripts/pg_toast/pg_value_e2e.py` 11/11；单测
-> `CapPartialLineTest` 5/5、`PgUnchangedToastTest` 7/7、`UpdateColumnSubsetTypeAlignmentTest` 2/2；
-> 回归 `xa_e2e` 12/12、`edge_e2e` 15/15、单测全量 241+122+82 全绿。
-> 新增错误码 E3025（extract）/ E3026（increment），三份目录已同步（CI 门禁通过）。
+> **进度：12 项全部已修**，附录那条也一并处理。两轮提交（`baa1f54` + 本轮）。
+>
+> | 判据 | 改造前 | 改造后 |
+> |---|---|---|
+> | `test_scripts/pg_toast/pg_value_e2e.py` | 6/11 | **11/11** |
+> | `test_scripts/pg_toast/pg_schema_truncate_e2e.py` | 4/10 | **13/13** |
+> | `test_scripts/mongo_failstop/mongo_apply_failure_e2e.py` | 4/8 | **8/8** |
+>
+> 「改造前」是把主源码 stash 掉、重新打包跑出来的真实基线，不是推算的。
+> 单测：`CapPartialLineTest` 5/5、`PgUnchangedToastTest` 7/7、`UpdateColumnSubsetTypeAlignmentTest` 2/2、
+> `CsfAssemblerTest` 7/7、`PgRelationMessageTest` 5/5、`TiCDCUnknownEventTest` 6/6。
+> 回归：`xa_e2e` 12/12、`edge_e2e` 15/15、`./test.sh all` 全绿（引擎 241+62+248+162+8+14+5，agent 122，后端 82）。
+> 新增错误码 E3025 / E3026 / E3027，三份目录已同步（`SyncErrorCodeCatalogTest` 通过）。
 
 ## 排查方法
 
@@ -90,7 +98,7 @@ if (strValue.isEmpty()) {
 
 和刚修的 `0623541`（enum/set 取值表丢空串）是同一个错误，换了个链路。
 
-### 3. Oracle LogMiner 的 CSF 续行没处理，长语句被截在 4000 字节
+### 3. ✅已修 Oracle LogMiner 的 CSF 续行没处理，长语句被截在 4000 字节
 
 `OracleRedoCapture.java:590`
 
@@ -107,8 +115,13 @@ FROM V$LOGMNR_CONTENTS WHERE OPERATION IN (...)
 - 续行本身被当成独立事件，正则匹配不到 → `columnValues` 为空 → 走 `sql_redo:` 原样透传分支
   （`OracleRedoCapture.java:752`）→ 下游拿到半截 SQL。
 
-**修法**：`SELECT ... CSF ...`，`CSF=1` 时把后续行的 SQL_REDO 依次拼到当前语句上，
-拼完（`CSF=0`）再解析。这是 LogMiner 链路的硬性要求。
+**已修**：查询补上 `CSF` 列，拼接逻辑抽成 `CsfAssembler`（单测 7/7，含 4000 字节三段拼回原文）。
+批边界上还挂着半条语句时整条不下发、位点也不前进（`currentScn` 只在写出事件后推进），
+下一批从同一 SCN 重新读到完整的一串。
+
+**验证到什么程度（说明白）**：拼接逻辑有单测；改后的查询在真实 Oracle 上验证过能解析
+（`CSF` 列存在，整条 SQL 只报 ORA-01306「需先 START_LOGMNR」而非列名/语法错）。
+**没有**跑通端到端的 Oracle CSF 同步 —— 那需要归档模式 + 补充日志的完整环境。
 
 ### 4. ✅已修 `.cap` 是按行分隔的文本，写入方无原子性、读取方无半行检测
 
@@ -181,7 +194,7 @@ if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contai
 非主键唯一键冲突走 E3017 fail-stop，`increment.unique.conflict.policy=IGNORE` 可放过。
 `isPrimaryKeyConflict` 认不出错误文案时按主键处理，不会因为一条没见过的文案把正常任务打停。
 
-### 7. Mongo：单事件应用失败后 resume token 照常前进
+### 7. ✅已修 Mongo：单事件应用失败后 resume token 照常前进
 
 `MongoSyncMain.java:672`
 
@@ -196,10 +209,14 @@ if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contai
 （`MongoSyncMain.java:613-620`），位点**越过了刚失败的这条**，重放永远不会再碰到它。
 目标端一次唯一索引冲突、一次 WriteConflict、一次网络抖动 = 永久丢一条文档变更，任务全绿。
 
-**修法**：记住"最后一条成功应用的事件"的 token，失败后就不再推进（或直接 fail-stop，
-与 MySQL 链路的 fail-stop 语义对齐）。
+**已修**：位点只推进到"最后一条**处理完**的事件"的 token（不再用 cursor 当前的 token ——
+那个已经跑到失败事件之后了）；应用失败即 fail-stop 退出，与 MySQL/PG 链路语义一致。
 
-### 8. PG 复制槽在重连路径上会被**重建**，中间 WAL 静默丢失
+**实测基线**：目标端建一个源端没有的唯一索引，第二条文档必然写失败。改造前进程继续跑，
+`_id=2` **永久丢失**——去掉冲突约束再重启也拿不回来（4/8）；改造后进程退出，
+去掉约束重启即补齐（8/8）。判据 `test_scripts/mongo_failstop/mongo_apply_failure_e2e.py`。
+
+### 8. ✅已修 PG 复制槽在重连路径上会被**重建**，中间 WAL 静默丢失
 
 `ensureReplicationSlot` 里对"槽还 active"的分支有完整防护 —— 只踢后端、不删槽，
 踢不掉且有续传位点时宁可失败（`PostgresWalCapture.java:493-519`，注释写得很到位）。
@@ -216,18 +233,28 @@ if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contai
 `withStartPosition(currentLsn)` 对新槽无效，服务端**不报错**，从新槽位置开始发 → 中间那段变更消失。
 `verifyResumePositionAvailable()` 这道校验只在 `doInitialize` 跑一次，进程不重启就永远不会再跑。
 
-### 9. PG 保留期巡检只在有数据流动时才会执行
+**已修**：只有在"还没有任何要保护的位点"时才允许建槽；已经读到过位点却发现槽没了，
+一律 E3006 停机（复制线程单独捕获该异常并停止，不再无限重连）。
+**实测基线**：运行中 `pg_drop_replication_slot` 之后再写数据 —— 改造前 capture 默默建了新槽继续跑
+（中间的变更就此消失），改造后 5 秒内写出 E3006 且不再自建槽。
+
+### 9. ✅已修 PG 保留期巡检只在有数据流动时才会执行
 
 `checkRetentionQuietly()` 的唯一调用点在 `processWalMessage` 末尾（`PostgresWalCapture.java:654`）。
 它要防的场景恰恰是"槽没了 → 收不到数据"，那时 `processWalMessage` 一次都不会被调用，
 巡检自然一次都不跑。等于告警在最需要它的时候必然缺席。
+
+**已修**：巡检挪进复制线程的主循环（方法自身按间隔节流），有没有数据都照跑；
+另外补一条数据面告警 E3027 —— 流中断超过 `capture.stream.down.report.ms`（默认 5 分钟）
+仍未恢复就上报，流恢复后**按原文比对**撤销自己写的那条（error_status 是三个进程共用的文件，
+不能顺手抹掉别人写的真错误）。
 
 配套问题：`AbstractCapture` 的 `capture_liveness` 是**进程级**心跳（独立线程，只看 `running`，
 `AbstractCapture.java:59-82`）。PG/Oracle/Mongo 三个 capture 都不写数据面心跳
 （`grep -c heartbeat`：MySQL 45、TiCDC 5、PG/Oracle/Mongo **0**）。
 WAL 线程死了或反复重连失败时，进程还在、活性文件照刷，看门狗判健康。
 
-### 10. PG TRUNCATE 被丢弃
+### 10. ✅已修 PG TRUNCATE 被丢弃
 
 `PostgresWalCapture.java:681`
 
@@ -243,7 +270,13 @@ default:
 在目标端不发生，之后源端重新灌入的数据靠 upsert 合进旧行 —— 两端从此不一致且无告警。
 `default:` 分支同样是黑名单式放行，PG 后续版本新增的消息类型会走同一条静默丢弃路径（判据 E）。
 
-### 11. PG/Oracle 的列元数据缓存永不失效——PG 侧的权威信息就在手里却丢掉了
+**已修**：解析 `'T'` 消息，下发成一条 DDL 语句走既有的 DDL 通道（库名/表名映射、方言翻译都在那条路上）。
+`default:` 分支改成打 WARN 点名，不再当作没这回事。
+一条语句 TRUNCATE 多张表是 PG 语法，MySQL 目标端只支持单表 —— 那种情况下目标端会明确报错，
+而不是像改造前那样悄悄什么都不做。
+**实测基线**：源端 TRUNCATE 后，改造前目标端仍有 1 行、改造后为 0 行。
+
+### 11. ✅已修 PG 的列元数据缓存永不失效——权威信息就在手里却丢掉了
 
 - capture：`relationIdCache` / `tableColumnsCache` / `tableColumnTypesCache` / `tablePrimaryKeysCache`
   全是 `computeIfAbsent`，装进去就再也不更新（`PostgresWalCapture.java:954` `:977` 等）
@@ -259,7 +292,21 @@ wire 上的 tuple 少一列，而缓存里的列名还是老的 → 被删列之
 也没有借此让缓存失效。extract 侧甚至已经定义了 `RelationMessage` 类和 `relationCache` 字段
 （`PostgresWalExtractor.java:33` `:788`），**从未被赋值使用**——像是设计了没做完。
 
-### 12. TiCDC：解析失败与未知类型都是"记一行日志然后丢"
+**已修**：capture 完整解析 Relation 消息（列名、类型 OID、键标志），按 relationId 缓存，
+**每收到一条新的 Relation 消息即整体替换**（这就是失效机制），并顺手作废回查源库那条老路径的缓存；
+类型 OID 译成与 `information_schema.data_type` 一致的写法（内置常见类型免查，其余回查
+`format_type` 一次 —— OID 与类型的对应关系不随表结构变化，这份缓存可以一直留着）。
+列类型随事件下发（`column_types:{…}`），extract 优先用事件自带的列名/类型，与当前定义不一致时
+打日志并以事件自带的为准。顺带修掉一个隐藏错位：`readCString` 之后按 `String.length()`（字符数）
+前进，非 ASCII 的库表名/列名会让其后每个字段都错位 —— 已改成按字节走的游标。
+
+**实测基线要说准**：链路积压期间 `DROP COLUMN` 之后，改造前**不是**静默写坏，而是
+**任务直接停摆**（E3004 `column "doomed" of relation "drift" does not exist`，
+删列后的行一条都过不去）；改造后正常同步。我在第一版报告里把它归到"静默"是推断，
+实测更正如上。真正静默的变体需要"过期列名恰好在目标端都存在"（例如目标端结构未同步改动），
+本轮没有为它单独造判据。
+
+### 12. ✅已修 TiCDC：解析失败与未知类型都是"记一行日志然后丢"
 
 `TiCDCExtractor.java:99`　canal-json 解析失败 → `logger.warn(... 跳过)` → `return null`
 `TiCDCExtractor.java:111`　未知事件类型 → `logger.debug("忽略未知 TiCDC 事件类型")` → `return null`
@@ -267,14 +314,18 @@ wire 上的 tuple 少一列，而缓存里的列名还是老的 → 被删列之
 黑名单式放行 + DEBUG 级日志。MySQL 链路已经改成白名单 + `extract.unknown.event.policy=FAIL_STOP`，
 TiCDC 链路没跟上。
 
+**已修**：三处（字段数不足 / JSON 解析失败 / 未知事件类型）统一走 `failUnusableEvent`，
+复用 MySQL 链路的 E3020 通道与同一个开关。单测 `TiCDCUnknownEventTest` 6/6。
+**注意这是契约变更**：原有的 `TiCDCExtractorTest.malformedRecords` 断言的正是"安全跳过"，
+已改为断言停机 —— 那条断言本身就是在为静默丢数据背书。
+
 ---
 
-## 附：非丢数但会拖垮长跑
+## 附：`.cap` 的 completed 标记（已修）
 
 `.cap` 的"处理完成"标记实际上**永远不会被置位**：`processFileIncremental` 在
-`totalLinesInFile <= progress.linesRead` 时提前返回（`ContinuousExtractMain.java:470`），
-而只要有新行，文件字节数必然也变了 → `fileStoppedGrowing` 恒为 false →
-`stableCheckCount` 永远到不了 3（`:483-497`）。
+`totalLinesInFile <= progress.linesRead` 时提前返回，而只要有新行，文件字节数必然也变了
+→ `fileStoppedGrowing` 恒为 false → `stableCheckCount` 永远到不了 3。
 
 实测佐证：`files/*/thl_output/.extract_progress` 共约 100 个真实任务，
 **每一条记录的 completed 字段都是 false**，包括早就轮转走、几天没动过的文件。后果：
@@ -283,16 +334,26 @@ TiCDC 链路没跟上。
 - 每轮扫描（默认 3s）对**每个**未完成的 `.cap` 调一次 `countLines()` 整文件重读，
   重读量随保留数据线性增长，总开销是平方级。
 
----
+**已修**：判据换成"已读完 + 不是最后被修改的那个 + 且已静默 `extract.cap.settle.ms`（默认 30s）"。
 
-## 剩余待办
+**这里差点自己埋一个雷**：第一版用的是"文件名不是最大的那个"。文件名是
+`binlog_<时间戳>_<序号>.cap`，而 capture 重启后序号从 `0000` 重来 —— 同一秒内轮转 + 重启
+就会产出一个名字比现存文件**更小的活跃文件**，按名字排序会把它当成旧文件，读完即标完成，
+之后 capture 追加的内容再也不会被抽取。改成按**最后修改时间**判定并加一个静默期。
 
-本轮已修 1、2、4、5、6。剩下的按价值排：
+判据（`pg_schema_truncate_e2e.py` 里，把每文件事件数压到 4 逼出轮转）：
+已读完的旧文件标 `true`、最新的那个仍是 `false`，且被清理到只剩保留份数。
 
-1. **3、11** —— 各自要一段实现（Oracle CSF 续行拼接 / PG 用 Relation 消息驱动 schema 更新），
-   建议各配判据脚本（`test_scripts/oracle_csf/`、`test_scripts/pg_toast/` 加 schema 漂移场景）；
-2. **7~10、12** —— 单点修复，逐条对着上面的行号改即可；
-3. 附录那条（`.cap` 的 completed 永远置不上）是长跑资源问题，独立于丢数。
+## 收尾
+
+12 项 + 附录全部修完。仍然留着的口子，明说：
+
+- **Oracle 只验到查询与拼接逻辑**，没有端到端跑通 CSF 同步（需要归档模式 + 补充日志的完整环境）。
+- **`.cap` 仍是裸文本行**，只是读取端不再消费半行。彻底的做法是像 THL 那样分帧，改动更大。
+- **PG schema 漂移的"静默"变体没有判据**：现有判据覆盖的是"漂移导致链路停摆"，
+  真正无声写坏需要"过期列名在目标端恰好都存在"的构造。
+- Oracle/Mongo 仍无数据面心跳（本轮只给 PG 补了 E3027）；Oracle 的 `SCN >` 在批中途崩溃时
+  会跳过同 SCN 的剩余行，这一条在第一版报告里没有单列，留作下一轮。
 
 ### 判据脚手架的坑（本轮实测撞到的，写下一个判据前先看）
 
@@ -302,5 +363,10 @@ TiCDC 链路没跟上。
   并**断言 TOAST 附属表真的有字节**再往下跑。
 - **判据目录要整个删重建**：只删 `.cap`/`.thl` 而留下位点/进度文件，本轮就会从上一轮的
   LSN 续传，看到的是上一轮的数据。另外 macOS 上 `os.remove` 删不掉目录项，用 `shutil.rmtree`。
+- **辅助函数里别写死列名**：`row_of` 按 `vals` 的列写死，换张表就 SQL 报错，而 `wait_until`
+  把异常当成"还没同步到"一路等到超时 —— 判据永远失败且看不出原因（`xalib.rows_of` 栽过同一跤）。
+  改用 `row_to_json` 与表结构解耦。
+- **单测里改 `-pl <module>` 不带 `-am`** 会拿本地仓库里那份旧的 migration-common，
+  新加的类"不存在"。同一条老规矩：改了 common 就要重新构建依赖。
 - 沿用 [[lob-test-suite]] 的老规矩：子进程 stdout 必须持续排空；判据跑 fat jar，
   只 `compile` 不 `package` 等于跑旧代码。

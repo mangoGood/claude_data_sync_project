@@ -42,6 +42,7 @@ public enum SyncErrorCode {
     SCHEMA_TIMELINE_DDL_PARSE_FAILED("E3023", "DDL 解析失败（表结构时序库）", "时序库解析不了这条 DDL，无法把它施加到表结构模型上，该表之后的版本都会失准。这通常意味着遇到了语法覆盖之外的 DDL 形态。错误信息里带有原始语句，请据此补语法；在补齐之前，该表会按 extract.schema.timeline.fallback 的设置降级回查源库当前定义（RESNAPSHOT）或停止抽取（FAIL_STOP）"),
     SCHEMA_TIMELINE_COLUMN_MISMATCH("E3024", "表结构版本与事件列名不一致", "时序库算出的列布局与 binlog 事件自带的列名（binlog_row_metadata=FULL）对不上，说明时序库跟丢了源库的真实结构——多半是某条 DDL 被漏施加或施加错了。事件列名是与行值同一时刻的权威信息，两者矛盾时硬解就是整行错位的静默数据损坏，因此已停止抽取。请把错误信息里的两份列清单与该表的 DDL 历史对照，并把漏掉的 DDL 形态补进语法"),
     WAL_VALUE_NOT_SENT("E3025", "WAL 事件缺少必需的列值", "PostgreSQL 逻辑复制对行外存储（TOAST）里本次未被修改的列不会发送值，只发一个\"未变更\"标记。这类列会被整列从 UPDATE 的 SET 里摘掉（写 NULL 会把目标端已有的大字段抹掉），但当它落在主键上、或该表没有主键而 WHERE 需要整行前镜像时，就定位不出目标行了，只能停止抽取。请给该表建主键，或将 REPLICA IDENTITY 设为 FULL 后重启任务"),
+    CAPTURE_STREAM_DOWN("E3027", "捕获流长时间中断", "捕获进程还活着，但与源库的复制流已经断开很久且没能恢复，这段时间一条变更都没抓到。进程级的活性心跳在这种状态下照常刷新，看门狗看不出异常，所以这里单独上报。常见原因：源库重启/网络中断、复制槽被占用或删除、账号权限被回收。请检查源库与网络后重启任务；调整判定时长用 capture.stream.down.report.ms"),
     APPLY_NO_STATEMENT("E3026", "数据变更事件未生成任何 SQL", "一条 INSERT/UPDATE/DELETE 事件转换后一条 SQL 都没生成，说明事件里缺库表名或行数据——上游解析退化了。照常提交并推进位点等于把这条变更静默丢掉，因此停下等人处置。请看日志里同一 seqno 前后的 extract 告警定位上游原因；确认这类事件可以丢弃时，将 increment.empty.statement.policy 设为 SKIP"),
 
     CHECKPOINT_HYDRATE_FAILED("E3014", "位点回灌失败", "本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管。此时若按首次启动去取源库当前位点，会静默跳过崩溃到接管之间的全部变更，因此任务停在这里等人处置。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务；确认这确实是一个全新任务时，可临时将 checkpoint.hydrate.fail.stop 设为 false"),

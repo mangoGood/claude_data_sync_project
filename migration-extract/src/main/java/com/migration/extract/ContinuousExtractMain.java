@@ -59,6 +59,9 @@ public class ContinuousExtractMain {
     /** 已处理cap文件保留数量（安全余量），超过此数量的已处理文件将被清理 */
     private int capRetentionCount = 2;
 
+    /** .cap 多久没被写过才认为"capture 已经不写它了"（判错就是永久丢那段事件，宁可晚一点）。 */
+    private long capSettleMs = 30000;
+
     /** THL 加密服务 */
     private ThlEncryptionService thlEncryptionService;
 
@@ -139,6 +142,7 @@ public class ContinuousExtractMain {
         this.watchEnabled = Boolean.parseBoolean(props.getProperty("extract.watch.enabled", "true"));
         this.watchFallbackMs = Long.parseLong(props.getProperty("extract.watch.fallback.ms", "1000"));
         this.progressRecordFile = outputDir + "/.extract_progress";
+        this.capSettleMs = Long.parseLong(props.getProperty("extract.cap.settle.ms", "30000"));
         this.captureType = props.getProperty("capture.type", "binlog").toLowerCase();
 
         // 初始化背压控制器：高水位/低水位可配置
@@ -455,15 +459,24 @@ public class ContinuousExtractMain {
 
         Arrays.sort(binlogFiles, Comparator.comparing(File::getName));
 
+        // 判定"capture 不会再写这个文件了"用**最后修改时间**，不用文件名。
+        // 文件名是 binlog_<时间戳>_<序号>.cap，而 capture 重启后序号从 0000 重来：
+        // 同一秒内轮转+重启就会产出一个名字比现存文件更小的**活跃**文件，按名字排序会
+        // 把它当成旧文件，读完即标完成，之后 capture 追加的内容再也不会被抽取 —— 静默丢数据。
+        long newestModified = 0;
+        for (File f : binlogFiles) {
+            newestModified = Math.max(newestModified, f.lastModified());
+        }
+
         int totalEvents = 0;
         for (File binlogFile : binlogFiles) {
             if (!running.get()) break;
-            totalEvents += processFileIncremental(binlogFile);
+            totalEvents += processFileIncremental(binlogFile, binlogFile.lastModified() >= newestModified);
         }
         return totalEvents;
     }
 
-    private int processFileIncremental(File binlogFile) throws Exception {
+    private int processFileIncremental(File binlogFile, boolean isNewest) throws Exception {
         FileProgress progress = fileProgressMap.get(binlogFile.getName());
 
         if (progress == null) {
@@ -475,7 +488,16 @@ public class ContinuousExtractMain {
         if (progress.completed) return 0;
 
         int totalLinesInFile = countLines(binlogFile);
-        if (totalLinesInFile <= progress.linesRead) return 0;
+        if (totalLinesInFile <= progress.linesRead) {
+            // 已经读完，且 capture 不会再往它里面写了 —— 就是处理完了。
+            //
+            // 旧判据（"连续 3 轮字节数没变"）实际上**永远不成立**：没有新行时上面这一句就返回了，
+            // 有新行时字节数必然也变了，fileStoppedGrowing 恒为 false。实测约 100 个真实任务的
+            // .extract_progress 里 completed 全是 false，于是 cleanupCompletedCapFiles() 从未生效
+            //（.cap 无限堆积），而且每轮扫描都要对每个 .cap 整文件 countLines 一遍。
+            markCompletedIfSettled(binlogFile, progress, isNewest);
+            return 0;
+        }
 
         int newLines = totalLinesInFile - progress.linesRead;
         logger.info("Processing binlog file: {} ({} new lines, already read: {}, total: {})",
@@ -484,25 +506,8 @@ public class ContinuousExtractMain {
         // 使用类级别 currentThlWriter 统一写入，按50MB大小轮转文件
         int newEventCount = readAndExtractNewLines(binlogFile, progress, progress.linesRead, totalLinesInFile);
 
-        long currentSize = binlogFile.length();
-        boolean fileStoppedGrowing = (currentSize == progress.lastFileSize && currentSize > 0);
-        progress.lastFileSize = currentSize;
-
-        if (fileStoppedGrowing) {
-            progress.stableCheckCount++;
-        } else {
-            progress.stableCheckCount = 0;
-        }
-
-        // 正在收集 XA 分支时不标 completed、也不清理 .cap：崩溃重启要从分支起点把这些行重读一遍，
-        // 文件被当成"已处理完"或直接删掉，重读就无从谈起
-        boolean xaCollecting = mysqlExtractor != null && mysqlExtractor.isXaBranchActive();
-        if (progress.stableCheckCount >= 3 && !xaCollecting) {
-            progress.completed = true;
-            logger.info("Binlog file {} appears complete, marking as completed", binlogFile.getName());
-            // 文件处理完成，清理旧的已完成cap文件
-            cleanupCompletedCapFiles();
-        }
+        progress.lastFileSize = binlogFile.length();
+        markCompletedIfSettled(binlogFile, progress, isNewest);
 
         logger.info("Processed binlog file: {} -> {} new events", binlogFile.getName(), newEventCount);
         if (newEventCount > 0) {
@@ -598,6 +603,31 @@ public class ContinuousExtractMain {
             count--;
         }
         return count;
+    }
+
+    /**
+     * 已读完、且 capture 不会再写它的 .cap 文件，标记为处理完成。
+     *
+     * @param isNewest 是否是目录里最后被修改的那个 .cap —— capture 只往它里面追加
+     */
+    private void markCompletedIfSettled(File binlogFile, FileProgress progress, boolean isNewest) {
+        if (progress.completed || isNewest) {
+            return;
+        }
+        // 再等一个静默期才收口：标完成之后这个文件既不再读也可能被清理掉，
+        // 判断错一次就是永久丢掉那段事件，宁可晚一点
+        if (System.currentTimeMillis() - binlogFile.lastModified() < capSettleMs) {
+            return;
+        }
+        // 正在收集 XA 分支时不标 completed、也不清理 .cap：崩溃重启要从分支起点把这些行重读一遍，
+        // 文件被当成"已处理完"或直接删掉，重读就无从谈起
+        if (mysqlExtractor != null && mysqlExtractor.isXaBranchActive()) {
+            return;
+        }
+        progress.completed = true;
+        logger.info("Binlog file {} 已读完且不再有写入，标记为处理完成", binlogFile.getName());
+        cleanupCompletedCapFiles();
+        saveProgress();
     }
 
     /** 文件最后一个字节是否是换行符（空文件按"未结束"处理）。 */
@@ -863,14 +893,12 @@ public class ContinuousExtractMain {
         String fileName;
         int linesRead;
         long lastFileSize;
-        int stableCheckCount;
         boolean completed;
 
         FileProgress(String fileName) {
             this.fileName = fileName;
             this.linesRead = 0;
             this.lastFileSize = 0;
-            this.stableCheckCount = 0;
             this.completed = false;
         }
     }

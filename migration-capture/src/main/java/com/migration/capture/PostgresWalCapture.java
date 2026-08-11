@@ -54,6 +54,19 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
     private long retentionCheckIntervalMs = 60000;
     private volatile long lastRetentionCheckMs = 0;
 
+    /**
+     * WAL 流从什么时候开始不可用（0 表示正常）。
+     *
+     * <p>{@code capture_liveness} 是<b>进程级</b>心跳（AbstractCapture 里一个只看 running 的线程），
+     * 复制线程死了或一直重连不上时它照刷不误，看门狗判健康 —— "进程活着、一个事件也没捕到"
+     * 正是这条链路的盲区。所以这里额外盯住流本身，卡住够久就写 error_status。
+     */
+    private volatile long streamBrokenSinceMs = 0;
+    private long streamDownReportMs = 300000;
+    private volatile boolean streamDownReported = false;
+    /** 自己写进 error_status 的那条中断告警原文，恢复时按原文比对再撤销。 */
+    private volatile String streamDownStatusLine;
+
     // 背压控制：extract 通过信号文件通知 capture 暂停/恢复
     private volatile boolean backpressurePaused = false;
     private String backpressureSignalPath;
@@ -84,6 +97,8 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 props.getProperty("capture.position.health.enabled", "true"));
         retentionCheckIntervalMs = Long.parseLong(
                 props.getProperty("capture.position.health.interval.ms", "60000"));
+        streamDownReportMs = Long.parseLong(
+                props.getProperty("capture.stream.down.report.ms", "300000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         slotName = props.getProperty("capture.wal.slot.name", "migration_slot_" + taskId.replaceAll("[^a-z0-9_]", "_"));
         publicationName = props.getProperty("capture.wal.publication.name", "migration_pub_" + taskId.replaceAll("[^a-z0-9_]", "_"));
@@ -145,6 +160,50 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         }
     }
 
+    /** 流卡住超过阈值就上报，别让"进程活着但一个事件也捕不到"一直装作健康。 */
+    private void reportStreamDownIfStuck() {
+        if (streamDownReported || streamBrokenSinceMs == 0) {
+            return;
+        }
+        if (System.currentTimeMillis() - streamBrokenSinceMs < streamDownReportMs) {
+            return;
+        }
+        String detail = "WAL 复制流已中断超过 " + (streamDownReportMs / 1000)
+                + " 秒且未能恢复，期间没有捕获到任何变更";
+        logger.error("{}（进程仍在运行，活性文件不能反映这种状态）", detail);
+        streamDownStatusLine = errorStatusLine("E3027", detail);
+        streamDownReported = true;
+        com.migration.common.io.AtomicFileWriter.writeStringQuietly(
+                errorStatusFile(), streamDownStatusLine);
+    }
+
+    /**
+     * 流恢复了就把自己写的那条中断告警撤掉，否则任务会一直挂着 FAILED。
+     *
+     * <p>只在文件内容<b>逐字等于</b>自己写的那条时才删：error_status 是 capture / extract /
+     * increment 共用的一个文件，别人写了真错误的话不能被这里顺手抹掉。
+     */
+    private void clearStreamDownStatus() {
+        if (!streamDownReported) {
+            return;
+        }
+        streamDownReported = false;
+        String mine = streamDownStatusLine;
+        streamDownStatusLine = null;
+        File file = errorStatusFile();
+        try {
+            if (mine != null && file.isFile()
+                    && mine.equals(new String(java.nio.file.Files.readAllBytes(file.toPath()),
+                    StandardCharsets.UTF_8))) {
+                if (file.delete()) {
+                    logger.info("WAL 复制流已恢复，撤销此前的中断告警");
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("撤销中断告警失败: {}", e.getMessage());
+        }
+    }
+
     private void failPositionUnavailable(String detail) {
         logger.error("{}（本任务需重新初始化全量）", detail);
         writeCaptureErrorStatus("E3006", detail + "；需重新初始化全量同步");
@@ -160,12 +219,19 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
 
     /** 写 {@code binlog_output/error_status}（格式同 increment 端），agent 轮询到即上报 FAILED。 */
     private void writeCaptureErrorStatus(String errorCode, String message) {
+        com.migration.common.io.AtomicFileWriter.writeStringQuietly(
+                errorStatusFile(), errorStatusLine(errorCode, message));
+    }
+
+    private File errorStatusFile() {
         File dir = new File(outputDir);
         if (!dir.exists()) dir.mkdirs();
-        com.migration.common.io.AtomicFileWriter.writeStringQuietly(
-                new File(dir, "error_status"),
-                System.currentTimeMillis() + "|" + errorCode + "|-1|"
-                        + message.replace("|", "/") + "|capture\n");
+        return new File(dir, "error_status");
+    }
+
+    private String errorStatusLine(String errorCode, String message) {
+        return System.currentTimeMillis() + "|" + errorCode + "|-1|"
+                + message.replace("|", "/") + "|capture\n";
     }
 
     @Override
@@ -295,16 +361,33 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                         lastDataTime = now;
                     }
 
+                    // 保留期巡检必须在这里、而不是只在收到消息之后做：它要防的正是
+                    // "槽没了 → 收不到数据"，那时 processWalMessage 一次都不会被调用，
+                    // 巡检也就永远不跑，告警在最需要它的时候必然缺席。方法自身按间隔节流。
+                    checkRetentionQuietly();
+
                     ByteBuffer msgBuffer = replicationStream.readPending();
                     if (msgBuffer != null) {
                         processWalMessage(msgBuffer);
                         consecutiveErrors = 0;
                         lastDataTime = System.currentTimeMillis();
+                        streamBrokenSinceMs = 0;
+                        clearStreamDownStatus();
                     } else {
                         Thread.sleep(10);
                     }
+                } catch (CapturePositionUnavailableException e) {
+                    // 位点已不可用（槽被删/被判 lost）：重试只会拿到一个从新位置开始的槽，
+                    // 中间的变更再也拿不回来。停下来上报，等人重做全量
+                    logger.error("WAL 位点不可用，停止捕获: {}", e.getMessage());
+                    running = false;
+                    break;
                 } catch (Exception e) {
                     consecutiveErrors++;
+                    if (streamBrokenSinceMs == 0) {
+                        streamBrokenSinceMs = System.currentTimeMillis();
+                    }
+                    reportStreamDownIfStuck();
                     if (running) {
                         logger.error("Error in WAL replication stream (consecutive: {}): {}", consecutiveErrors, e.getMessage());
                         if (consecutiveErrors >= 5) {
@@ -520,11 +603,27 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 } else {
                     logger.info("Replication slot '{}' already exists (inactive)", slotName);
                 }
+            } else if (hasResumePosition()) {
+                // 槽是 WAL 保留的唯一凭据。到这一步说明它在运行中被删掉了（或被
+                // max_slot_wal_keep_size 判成 lost 后清理掉）。这里若顺手建一个新槽，
+                // 服务端不会报错，而是从新槽的位置开始发 —— 中间那段变更静默消失。
+                // reconnectReplication() 每次重连都会走到这里，所以这条分支必须堵死。
+                failPositionUnavailable("复制槽 " + slotName + " 已不存在（运行中被删除或被判 lost），"
+                        + "已捕获到的位点 " + currentResumeLsn() + " 之后的 WAL 无法保证还在");
             } else {
                 stmt.execute("SELECT pg_create_logical_replication_slot('" + slotName + "', 'pgoutput')");
                 logger.info("Created replication slot '{}' with pgoutput plugin", slotName);
             }
         }
+    }
+
+    /** 是否已经有"必须被保留住"的位点：续传位点，或本进程已经读到过的位点。 */
+    private boolean hasResumePosition() {
+        return resumedFromPersisted || currentLsn != null;
+    }
+
+    private String currentResumeLsn() {
+        return currentLsn != null ? currentLsn : String.valueOf(startLsn);
     }
 
     /** 轮询等待槽被释放（被踢掉的 walsender 后端退出通常在数百毫秒内），最多 ~10s。 */
@@ -678,14 +777,62 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                     return parseUpdateMessage(data, offset);
                 case 'D':
                     return parseDeleteMessage(data, offset);
-                case 'O':
                 case 'T':
+                    return parseTruncateMessage(data, offset);
+                case 'O':       // Origin：上游复制来源标记，本身不携带数据
+                case 'Y':       // Type：自定义类型的定义，值仍以文本形态随行事件下发
                     return "";
                 default:
+                    // 黑名单式放行是丢数据的老路：不认识的消息类型至少要留下痕迹，
+                    // 而不是当成"没这回事"。PG 每个大版本都在加消息类型
+                    logger.warn("pgoutput 出现未处理的消息类型 '{}'（{}），该消息未被下发",
+                            msgType, (int) msgType);
                     return "";
             }
         } catch (Exception e) {
             logger.debug("Error parsing pgoutput message: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    /**
+     * TRUNCATE('T') 消息。旧实现直接丢弃 —— 源端 {@code TRUNCATE} 在目标端不发生，
+     * 之后源端重新灌入的数据靠 upsert 合进旧行，两端从此不一致且没有任何告警。
+     *
+     * <p>报文格式：关系数(4B)、选项位(1B，1=CASCADE、2=RESTART IDENTITY)、关系 OID 数组。
+     * 下发成一条 DDL 语句交给既有的 DDL 通道（库名/表名映射、方言翻译都在那条路上）。
+     * 一条语句 TRUNCATE 多张表是 PG 的语法，MySQL 目标端只支持单表 —— 那种情况下
+     * 目标端会明确报错，而不是像改造前那样悄悄什么都不做。
+     */
+    private String parseTruncateMessage(byte[] data, int offset) {
+        try {
+            Cursor c = new Cursor(data, offset);
+            int relationCount = c.int32();
+            int options = c.int8();
+            List<String> tables = new ArrayList<>(relationCount);
+            String schema = null;
+            for (int i = 0; i < relationCount; i++) {
+                long relationId = c.int32() & 0xFFFFFFFFL;
+                TableMeta meta = metaOf(relationId);
+                if (schema == null) {
+                    schema = meta.schema;
+                }
+                tables.add("\"" + meta.schema + "\".\"" + meta.table + "\"");
+            }
+            if (tables.isEmpty()) {
+                return "";
+            }
+            StringBuilder sql = new StringBuilder("TRUNCATE TABLE ").append(String.join(", ", tables));
+            if ((options & 2) != 0) {
+                sql.append(" RESTART IDENTITY");
+            }
+            if ((options & 1) != 0) {
+                sql.append(" CASCADE");
+            }
+            logger.info("捕获 TRUNCATE: {}", sql);
+            return "TRUNCATE schema:" + schema + " sql:" + sql;
+        } catch (Exception e) {
+            logger.warn("解析 TRUNCATE 消息失败: {}", e.getMessage());
             return "";
         }
     }
@@ -714,19 +861,189 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         }
     }
 
+    /**
+     * Relation('R') 消息：<b>权威</b>的表结构，与行值同处一个流、同一时刻，
+     * 且 PG 在关系定义变化后会重发。
+     *
+     * <p>这是 PG 侧对付 schema 漂移的正解，地位等同 MySQL 的 {@code binlog_row_metadata=FULL}。
+     * 旧实现只从这里取了库名表名就把列信息扔了，列名/类型改为回查
+     * {@code information_schema} 并永久缓存 —— 源端 {@code DROP COLUMN} 之后，
+     * wire 上的 tuple 少一列而缓存还是老的，被删列之后的每一列整体错位一格，
+     * 写进目标库的是合法值、看不出异常。
+     *
+     * <p>报文格式（proto v1）：OID、namespace、relname、replica identity(1B)、列数(2B)，
+     * 之后每列是 flags(1B，bit0=属于键)、列名、类型 OID(4B)、typmod(4B)。
+     */
     private String parseRelationMessage(byte[] data, int offset) {
         try {
-            long relationId = readInt32BE(data, offset); offset += 4;
-            String schema = readCString(data, offset);
-            offset += schema.length() + 1;
-            String table = readCString(data, offset);
-            offset += table.length() + 1;
+            Cursor c = new Cursor(data, offset);
+            long relationId = c.int32();
+            String schema = c.cstring();
+            if (schema.isEmpty()) {
+                schema = "public";
+            }
+            String table = c.cstring();
+            c.int8();                       // replica identity
+            int columnCount = c.int16();
 
-            logger.debug("Relation message: {}.{} (oid={})", schema, table, relationId);
-            return "RELATION schema:" + schema + " table:" + table + " oid:" + relationId;
+            List<String> columns = new ArrayList<>(columnCount);
+            List<String> types = new ArrayList<>(columnCount);
+            List<String> keys = new ArrayList<>();
+            for (int i = 0; i < columnCount; i++) {
+                int flags = c.int8();
+                String name = c.cstring();
+                long typeOid = c.int32() & 0xFFFFFFFFL;
+                c.int32();                  // 类型修饰符（长度/精度），值转换用不到
+                columns.add(name);
+                types.add(typeNameOf(typeOid));
+                if ((flags & 1) != 0) {
+                    keys.add(name);
+                }
+            }
+
+            RelationSchema fresh = new RelationSchema(schema, table, columns, types, keys);
+            RelationSchema prev = relationSchemas.put(relationId, fresh);
+            if (prev != null && !prev.columns.equals(columns)) {
+                logger.info("表 {}.{} 的列定义已变化（源端 DDL），按 Relation 消息更新: {} -> {}",
+                        schema, table, prev.columns, columns);
+            }
+            // 回查源库那条老路径的缓存也一并作废，避免它在回退分支上继续给出旧结构
+            String key = schema + "." + table;
+            tableColumnsCache.remove(key);
+            tableColumnTypesCache.remove(key);
+            tablePrimaryKeysCache.remove(key);
+            relationIdCache.put(relationId, new String[]{schema, table});
+
+            logger.debug("Relation message: {}.{} (oid={}) columns={}", schema, table, relationId, columns);
+            return "RELATION schema:" + schema + " table:" + table + " oid:" + relationId
+                    + " columns:" + String.join(",", columns);
         } catch (Exception e) {
+            logger.warn("解析 Relation 消息失败，该表将回退到查源库当前定义: {}", e.getMessage());
             return "";
         }
+    }
+
+    /** Relation 消息带来的表结构；每次收到新的 Relation 消息即整体替换（这就是失效机制）。 */
+    private static final class RelationSchema {
+        final String schema;
+        final String table;
+        final List<String> columns;
+        final List<String> types;
+        final List<String> keyColumns;
+
+        RelationSchema(String schema, String table, List<String> columns,
+                       List<String> types, List<String> keyColumns) {
+            this.schema = schema;
+            this.table = table;
+            this.columns = columns;
+            this.types = types;
+            this.keyColumns = keyColumns;
+        }
+    }
+
+    /** 按字节前进的读取游标：{@code String.length()} 是字符数，非 ASCII 的库表名/列名会按它错位。 */
+    private static final class Cursor {
+        private final byte[] data;
+        private int pos;
+
+        Cursor(byte[] data, int pos) {
+            this.data = data;
+            this.pos = pos;
+        }
+
+        int int8() {
+            return data[pos++] & 0xFF;
+        }
+
+        int int16() {
+            int v = ((data[pos] & 0xFF) << 8) | (data[pos + 1] & 0xFF);
+            pos += 2;
+            return v;
+        }
+
+        int int32() {
+            int v = ((data[pos] & 0xFF) << 24) | ((data[pos + 1] & 0xFF) << 16)
+                    | ((data[pos + 2] & 0xFF) << 8) | (data[pos + 3] & 0xFF);
+            pos += 4;
+            return v;
+        }
+
+        String cstring() {
+            int end = pos;
+            while (end < data.length && data[end] != 0) {
+                end++;
+            }
+            String s = new String(data, pos, end - pos, StandardCharsets.UTF_8);
+            pos = end + 1;
+            return s;
+        }
+    }
+
+    /**
+     * 类型 OID → 类型名。
+     *
+     * <p>OID 与类型的对应关系是<b>不随表结构变化</b>的，所以这份缓存可以一直留着 ——
+     * 与"表的列清单"那种必须失效的缓存是两回事。内置常见类型免去一次查询，
+     * 其余（自定义类型/枚举/数组）回查 {@code format_type} 一次。
+     *
+     * <p>名字刻意与 {@code information_schema.columns.data_type} 的写法对齐
+     * （"character varying" / "timestamp without time zone" …），下游按类型名做判断的地方不用改。
+     */
+    private String typeNameOf(long oid) {
+        String builtin = BUILTIN_TYPE_NAMES.get(oid);
+        if (builtin != null) {
+            return builtin;
+        }
+        return resolvedTypeNames.computeIfAbsent(oid, id -> {
+            String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+            try (Connection qConn = DriverManager.getConnection(url, user, password);
+                 Statement stmt = qConn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT format_type(" + id + ", NULL)")) {
+                if (rs.next()) {
+                    String name = rs.getString(1);
+                    if (name != null && !name.isEmpty()) {
+                        return name;
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("类型 OID {} 解析失败，按文本处理: {}", id, e.getMessage());
+            }
+            return "";
+        });
+    }
+
+    private static final Map<Long, String> BUILTIN_TYPE_NAMES = new java.util.HashMap<>();
+
+    static {
+        BUILTIN_TYPE_NAMES.put(16L, "boolean");
+        BUILTIN_TYPE_NAMES.put(17L, "bytea");
+        BUILTIN_TYPE_NAMES.put(19L, "name");
+        BUILTIN_TYPE_NAMES.put(20L, "bigint");
+        BUILTIN_TYPE_NAMES.put(21L, "smallint");
+        BUILTIN_TYPE_NAMES.put(23L, "integer");
+        BUILTIN_TYPE_NAMES.put(25L, "text");
+        BUILTIN_TYPE_NAMES.put(26L, "oid");
+        BUILTIN_TYPE_NAMES.put(114L, "json");
+        BUILTIN_TYPE_NAMES.put(142L, "xml");
+        BUILTIN_TYPE_NAMES.put(650L, "cidr");
+        BUILTIN_TYPE_NAMES.put(700L, "real");
+        BUILTIN_TYPE_NAMES.put(701L, "double precision");
+        BUILTIN_TYPE_NAMES.put(790L, "money");
+        BUILTIN_TYPE_NAMES.put(829L, "macaddr");
+        BUILTIN_TYPE_NAMES.put(869L, "inet");
+        BUILTIN_TYPE_NAMES.put(1042L, "character");
+        BUILTIN_TYPE_NAMES.put(1043L, "character varying");
+        BUILTIN_TYPE_NAMES.put(1082L, "date");
+        BUILTIN_TYPE_NAMES.put(1083L, "time without time zone");
+        BUILTIN_TYPE_NAMES.put(1114L, "timestamp without time zone");
+        BUILTIN_TYPE_NAMES.put(1184L, "timestamp with time zone");
+        BUILTIN_TYPE_NAMES.put(1186L, "interval");
+        BUILTIN_TYPE_NAMES.put(1266L, "time with time zone");
+        BUILTIN_TYPE_NAMES.put(1560L, "bit");
+        BUILTIN_TYPE_NAMES.put(1562L, "bit varying");
+        BUILTIN_TYPE_NAMES.put(1700L, "numeric");
+        BUILTIN_TYPE_NAMES.put(2950L, "uuid");
+        BUILTIN_TYPE_NAMES.put(3802L, "jsonb");
     }
 
     private String parseInsertMessage(byte[] data, int offset) {
@@ -734,13 +1051,13 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             long relationId = readInt32BE(data, offset); offset += 4;
             char tupleType = (char) (data[offset] & 0xFF); offset++;
 
-            String[] schemaTable = resolveRelationId(relationId);
-            String schema = schemaTable[0];
-            String table = schemaTable[1];
+            TableMeta meta = metaOf(relationId);
+            String schema = meta.schema;
+            String table = meta.table;
 
-            List<String> columnNames = fetchTableColumns(schema, table);
-            List<String> columnTypes = fetchTableColumnTypes(schema, table);
-            List<String> pkColumns = fetchTablePrimaryKeys(schema, table);
+            List<String> columnNames = meta.columns;
+            List<String> columnTypes = meta.types;
+            List<String> pkColumns = meta.keys;
 
             List<String> values = parseTupleData(data, offset, columnNames, columnTypes);
 
@@ -749,6 +1066,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             if (!pkColumns.isEmpty()) {
                 sb.append(" primary_keys:").append(String.join(",", pkColumns));
             }
+            appendColumnTypes(sb, columnTypes);
             sb.append(" new-tuple:{");
             for (int i = 0; i < values.size(); i++) {
                 if (i > 0) sb.append(",");
@@ -768,13 +1086,13 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         try {
             long relationId = readInt32BE(data, offset); offset += 4;
 
-            String[] schemaTable = resolveRelationId(relationId);
-            String schema = schemaTable[0];
-            String table = schemaTable[1];
+            TableMeta meta = metaOf(relationId);
+            String schema = meta.schema;
+            String table = meta.table;
 
-            List<String> columnNames = fetchTableColumns(schema, table);
-            List<String> columnTypes = fetchTableColumnTypes(schema, table);
-            List<String> pkColumns = fetchTablePrimaryKeys(schema, table);
+            List<String> columnNames = meta.columns;
+            List<String> columnTypes = meta.types;
+            List<String> pkColumns = meta.keys;
 
             List<String> oldValues = null;
             List<String> newValues = null;
@@ -803,6 +1121,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             if (!pkColumns.isEmpty()) {
                 sb.append(" primary_keys:").append(String.join(",", pkColumns));
             }
+            appendColumnTypes(sb, columnTypes);
 
             if (oldValues != null) {
                 sb.append(" old-tuple:{");
@@ -853,13 +1172,13 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             long relationId = readInt32BE(data, offset); offset += 4;
             char tupleType = (char) (data[offset] & 0xFF); offset++;
 
-            String[] schemaTable = resolveRelationId(relationId);
-            String schema = schemaTable[0];
-            String table = schemaTable[1];
+            TableMeta meta = metaOf(relationId);
+            String schema = meta.schema;
+            String table = meta.table;
 
-            List<String> columnNames = fetchTableColumns(schema, table);
-            List<String> columnTypes = fetchTableColumnTypes(schema, table);
-            List<String> pkColumns = fetchTablePrimaryKeys(schema, table);
+            List<String> columnNames = meta.columns;
+            List<String> columnTypes = meta.types;
+            List<String> pkColumns = meta.keys;
 
             List<String> oldValues = parseTupleData(data, offset, columnNames, columnTypes);
 
@@ -868,6 +1187,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             if (!pkColumns.isEmpty()) {
                 sb.append(" primary_keys:").append(String.join(",", pkColumns));
             }
+            appendColumnTypes(sb, columnTypes);
             sb.append(" old-tuple:{");
             for (int i = 0; i < oldValues.size(); i++) {
                 if (i > 0) sb.append(",");
@@ -950,6 +1270,63 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         return "'" + strValue.replace("'", "''") + "'";
     }
 
+    /**
+     * 行事件用到的表元数据。优先来自 Relation 消息（与行值同一时刻的权威信息），
+     * 没收到过 Relation 消息时才退回查源库当前定义 —— 那条路径就是"用现在的结构解释过去的事件"，
+     * 只作兜底。
+     */
+    private static final class TableMeta {
+        final String schema;
+        final String table;
+        final List<String> columns;
+        final List<String> types;
+        final List<String> keys;
+
+        TableMeta(String schema, String table, List<String> columns, List<String> types, List<String> keys) {
+            this.schema = schema;
+            this.table = table;
+            this.columns = columns;
+            this.types = types;
+            this.keys = keys;
+        }
+    }
+
+    private TableMeta metaOf(long relationId) {
+        RelationSchema rel = relationSchemas.get(relationId);
+        if (rel != null) {
+            // Relation 消息里 flags 的 bit0 就是"该列属于复制标识键"，与 pg_index 查出来的一致，
+            // 且是这一刻的定义 —— 不必再回查
+            List<String> keys = !rel.keyColumns.isEmpty()
+                    ? rel.keyColumns : fetchTablePrimaryKeys(rel.schema, rel.table);
+            return new TableMeta(rel.schema, rel.table, rel.columns, rel.types, keys);
+        }
+        String[] schemaTable = resolveRelationId(relationId);
+        String schema = schemaTable[0];
+        String table = schemaTable[1];
+        logger.warn("表 {}.{}(oid={}) 尚未收到 Relation 消息，回退查源库当前定义（结构若已变更会错位）",
+                schema, table, relationId);
+        return new TableMeta(schema, table,
+                fetchTableColumns(schema, table),
+                fetchTableColumnTypes(schema, table),
+                fetchTablePrimaryKeys(schema, table));
+    }
+
+    /**
+     * 把列类型随事件一起下发。
+     *
+     * <p>不下发的话 extract 只能自己回查源库当前定义 —— capture 这边按事件当时的结构解析出来的值，
+     * 到那边又被当前结构重新解释一遍，漂移窗口原封不动地搬了过去。
+     * 类型名里有空格（"character varying"），所以用花括号括起来，与 tuple 同一套取法。
+     */
+    private void appendColumnTypes(StringBuilder sb, List<String> columnTypes) {
+        if (columnTypes == null || columnTypes.isEmpty()) {
+            return;
+        }
+        sb.append(" column_types:{").append(String.join(",", columnTypes)).append("}");
+    }
+
+    private final Map<Long, RelationSchema> relationSchemas = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<Long, String> resolvedTypeNames = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<Long, String[]> relationIdCache = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, List<String>> tableColumnsCache = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, List<String>> tableColumnTypesCache = new java.util.concurrent.ConcurrentHashMap<>();
@@ -1092,6 +1469,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
 
     private String parseWalEventType(String walData) {
         if (walData == null || walData.isEmpty()) return "WAL_EVENT";
+        if (walData.startsWith("TRUNCATE")) return "TRUNCATE";
         if (walData.startsWith("BEGIN")) return "BEGIN";
         if (walData.startsWith("COMMIT")) return "COMMIT";
         if (walData.contains("\"I\"")) return "INSERT";

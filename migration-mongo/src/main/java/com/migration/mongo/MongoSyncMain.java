@@ -566,6 +566,9 @@ public final class MongoSyncMain {
 
         long lastFlush = System.currentTimeMillis();
         int sinceFlush = 0;
+        // 最后一条**处理完**的事件的 token。位点只能推进到这里，不能用 cursor 当前的 token ——
+        // 那个已经跑到失败事件之后了，用它落盘就等于把失败的那条永久跳过去
+        BsonDocument lastAppliedToken = null;
         ReplaceOptions upsert = new ReplaceOptions().upsert(true);
 
         // 防回环状态机：与 MySQL binlog / PG WAL 用的是同一个 BidiLoopGuard，
@@ -604,15 +607,29 @@ public final class MongoSyncMain {
                     }
 
                     if (propagate) {
-                        applyEvent(target, event, upsert);
+                        try {
+                            applyEvent(target, event, upsert);
+                        } catch (ApplyFailedException e) {
+                            // 位点只推进到"最后一条成功应用的事件"：把已经应用成功的那一批
+                            // 先落盘（否则重启会从更早的位置重放），失败的这条及其之后的一律不计入
+                            if (lastAppliedToken != null) {
+                                saveCheckpoint(lastAppliedToken,
+                                        guard.currentTxnMarked() ? currentTxnKey : null, sourceId);
+                            }
+                            throw e;
+                        }
                         incrEvents++;
                     }
+                    // 本条已处理完（应用成功、或按防回环规则有意跳过），它的位点才可以落盘
+                    lastAppliedToken = event.getResumeToken();
                     sinceFlush++;
                 }
 
                 // resume token 周期性持久化（含空闲时的 postBatchResumeToken，推进断点避免重放过多）
                 if (sinceFlush >= TOKEN_FLUSH_EVERY_EVENTS || now - lastFlush >= TOKEN_FLUSH_INTERVAL_MS) {
-                    BsonDocument token = cursor.getResumeToken();
+                    // 空闲时用 cursor 的 postBatchResumeToken 推进；有事件时只认最后一条**处理完**的，
+                    // cursor 的 token 可能已经跑到失败事件之后了
+                    BsonDocument token = sinceFlush > 0 ? lastAppliedToken : cursor.getResumeToken();
                     if (token != null) {
                         saveCheckpoint(token, guard.currentTxnMarked() ? currentTxnKey : null, sourceId);
                     }
@@ -667,9 +684,19 @@ public final class MongoSyncMain {
                 applyDml(target.getDatabase(db).getCollection(coll), db, coll, event, upsert, null);
             }
         } catch (Exception e) {
-            // 单事件失败记日志继续（upsert/delete 幂等，绝大多数为暂时性错误，
-            // 下轮 resume 重放可自愈；不因单事件卡死整个流）
-            logger.error("应用增量事件失败: {} {}.{}: {}", op, db, coll, e.getMessage());
+            // 这里绝不能"记个日志继续"：外层紧接着就把 cursor.getResumeToken() 落盘，
+            // 位点越过刚失败的这条，重放永远不会再碰到它 —— 目标端一次唯一索引冲突、
+            // 一次 WriteConflict、一次网络抖动 = 永久丢一条文档变更，而任务全绿。
+            // 与 MySQL/PG 链路的 fail-stop 语义对齐：停下、上报，位点停在最后一条成功应用的事件上。
+            throw new ApplyFailedException(String.format(
+                    "应用增量事件失败: %s %s.%s: %s", op, db, coll, e.getMessage()), e);
+        }
+    }
+
+    /** 单条增量事件应用失败。位点必须停在它之前，否则这条变更永久消失。 */
+    static class ApplyFailedException extends RuntimeException {
+        ApplyFailedException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
