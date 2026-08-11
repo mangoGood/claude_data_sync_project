@@ -1018,6 +1018,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
         try {
             fullMonitorDone.set(false);
+            markFullRunning(true);
             fullProcess = new ProcessManager(config.getMigrationFullJarPath(), "MigrationFull-" + taskId);
             fullProcess.setTaskId(taskId);
             fullProcess.start();
@@ -1059,6 +1060,35 @@ public abstract class AbstractTaskExecutor implements Runnable {
             sendStatus("FAILED", "全量迁移执行异常: " + e.getMessage(), 0);
             stopped.set(true);
             return false;
+        } finally {
+            markFullRunning(false);
+        }
+    }
+
+    /**
+     * "全量正在跑"的带外标记（{@code files/<taskId>/full_running}）。
+     *
+     * <p>唯一的用途是让 extract 在全量期间<b>不要对 capture 施加背压</b>。背压的判据是
+     * THL 积压文件数，而全量期间 increment 按设计还没起、THL 本来就该越堆越多——
+     * 让它去暂停 capture 是把"没有消费者"误判成"消费不过来"。真暂停了，源库 binlog
+     * 会继续前进而 capture 的位点原地不动，长全量下有被 purge 掉的风险
+     * （capture 启动时的 verifyBinlogFileRetained 拦的正是这一类）。
+     *
+     * <p>用文件而不是配置项：capture/extract 是独立 JVM，配置在任务启动时就写死了，
+     * 而这个状态要在任务生命周期<b>中间</b>翻转。与背压信号本身用的是同一套进程间通信方式。
+     */
+    private void markFullRunning(boolean running) {
+        java.nio.file.Path marker = java.nio.file.Paths.get("files", taskId, "full_running");
+        try {
+            if (running) {
+                java.nio.file.Files.createDirectories(marker.getParent());
+                java.nio.file.Files.write(marker, String.valueOf(System.currentTimeMillis()).getBytes());
+            } else {
+                java.nio.file.Files.deleteIfExists(marker);
+            }
+        } catch (Exception e) {
+            // 标记写不出来只影响背压判据（退回旧行为），不该挡住全量
+            logger.warn("[{}] 全量运行标记{}失败: {}", taskId, running ? "写入" : "清除", e.getMessage());
         }
     }
 

@@ -274,9 +274,20 @@ MySQL DDL 语法里最难的部分正是任意表达式，裁掉之后规模从 
   解析失败告警。
 * **DDL 事件与位点的先后**：版本的 `effectiveFrom` 取该 DDL 事件的位点，同位点上 DDL 版本
   优先于行事件——边界差一个事件就是整批错位。
-* **顺带该修的**：`FullMigrationTask` 里 extract 应与全量并行启动（apply 仍等
+* **顺带该修的（已完成）**：`FullMigrationTask` 里 extract 与全量**并行启动**（apply 仍等
   `FULL_COMPLETED`）。它把漂移窗口从"全量耗时几小时"压到"extract 落后量秒级"，
-  成本半天，与本方案正交，两者叠加是防御纵深。
+  与时序库正交，两者叠加是防御纵深。开关 `migration.extract.parallel.with.full`（默认开）。
+
+  落地时要处理一个连带问题：**背压会把"还没有消费者"误判成"消费不过来"**。
+  背压的判据是 THL 积压文件数，而全量期间 increment 按设计还没起，THL 本来就该只进不出；
+  真触发了会暂停 capture，源库 binlog 继续前进而 capture 位点原地不动，长全量下有被 purge
+  的风险（capture 启动时的 `verifyBinlogFileRetained` 拦的正是这一类）。
+  解法是 agent 维护一个带外标记 `files/<taskId>/full_running`，extract 见到它就不施加背压
+  （已处于 PAUSE 的还要主动解除，否则 capture 会被冻在全量全程）。用文件而不是配置项，
+  是因为这个状态要在任务生命周期**中间**翻转，而配置在启动时就写死了。
+
+  并行启动是**尽力而为**的：起不来就照旧在全量之后再起一次，不因此判任务失败——
+  这条改动只该减少风险窗口，不该新增一条让任务起不来的路径。
 
 ## 工期与风险
 
