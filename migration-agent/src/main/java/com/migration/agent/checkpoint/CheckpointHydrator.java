@@ -126,6 +126,7 @@ public class CheckpointHydrator {
         }
 
         logger.warn("[{}] 本地无位点但中心库有 {} 条：判定为跨机接管，开始回灌", taskId, central.size());
+        hydrateSchemaTimeline(taskId);
         int hydrated = 0;
         for (CheckpointRecord record : central) {
             if (!isHydratable(record)) {
@@ -269,6 +270,32 @@ public class CheckpointHydrator {
      * <p>给"取源库当前位点"这条路径当门禁用：中心库里有行就说明这条任务此前已经跑过、
      * 现在是接管而不是首启，此时再取源库当前位点就是丢数据。
      */
+    /**
+     * 跨机接管时把表结构时序库一并回灌到本地 {@code schema_history.jsonl}。
+     *
+     * <p><b>必须在这里做</b>，而不是等 extract 自己去拿：extract 是子进程，够不着元数据库；
+     * 而它一启动就会装载本地历史，本地是空的它就以为自己是首次启动，只拿 capture 的基线当
+     * 权威——那份基线是"现在"的结构，用它解析接管前积压的事件，正是时序库要根治的错位。
+     *
+     * <p>回灌不了不在这里拦（时序库缺失有自己的降级：{@code extract.schema.timeline.fallback}
+     * 决定是回查源库当前定义还是 E3022 停机），位点回灌本身的成败与它无关。
+     */
+    private void hydrateSchemaTimeline(String taskId) {
+        SchemaVersionStore schemaStore = SchemaVersionStore.getInstance();
+        if (schemaStore == null) {
+            return;   // 单机部署 / 中心存储没开
+        }
+        try {
+            int n = schemaStore.hydrate(taskId);
+            if (n < 0) {
+                logger.warn("[{}] 中心库没有表结构时序库可回灌——接管后该任务会按 "
+                        + "extract.schema.timeline.fallback 降级处置", taskId);
+            }
+        } catch (Exception e) {
+            logger.warn("[{}] 回灌表结构时序库失败（不影响位点回灌）: {}", taskId, e.getMessage());
+        }
+    }
+
     public boolean hasCentralPosition(String taskId) throws Exception {
         return store.hasAny(taskId);
     }

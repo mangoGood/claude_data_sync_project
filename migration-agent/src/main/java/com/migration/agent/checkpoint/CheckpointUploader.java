@@ -124,6 +124,7 @@ public class CheckpointUploader {
     public void uploadTask(String taskId) {
         try {
             int leaseEpoch = store.leaseEpoch(taskId);
+            uploadSchemaVersions(taskId, leaseEpoch);
             for (CheckpointRecord record : collectRecords(taskId)) {
                 String key = record.getTaskId() + "/" + record.getStage() + "/" + record.getStreamKey();
                 String fingerprint = record.getMonotonicKey() + "|" + record.payloadText();
@@ -172,6 +173,29 @@ public class CheckpointUploader {
             }
         }
         return records;
+    }
+
+    /**
+     * 把 extract 落在本地的表结构版本增量传到中心库。
+     *
+     * <p>跟着位点上卷的节奏走，但<b>不做"没变就跳过"的指纹优化</b>：DDL 稀疏（一天可能就几条），
+     * 攒批省不下什么，而丢一条版本，该表之后的每个版本都是错的。增量起点从中心库的
+     * 最大位点现取——它就是一次索引查询，比在内存里维护一个可能与库不一致的水位靠谱。
+     */
+    private void uploadSchemaVersions(String taskId, int leaseEpoch) {
+        SchemaVersionStore schemaStore = SchemaVersionStore.getInstance();
+        if (schemaStore == null) {
+            return;   // 单机部署 / 中心存储没开：只有本地 schema_history.jsonl
+        }
+        try {
+            long uploadedKey = schemaStore.maxUploadedKey(taskId);
+            int n = schemaStore.uploadSince(taskId, uploadedKey, agentId, leaseEpoch);
+            if (n < 0) {
+                rejectedTotal.incrementAndGet();
+            }
+        } catch (Exception e) {
+            logger.warn("[{}] 表结构版本上卷失败（不影响位点上卷）: {}", taskId, e.getMessage());
+        }
     }
 
     private void maybeSampleHistory(String key, CheckpointRecord record) {

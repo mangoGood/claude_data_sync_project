@@ -175,6 +175,13 @@ public class AgentMain {
                     Long.parseLong(agentConfig.getRawProperty("checkpoint.central.upload.interval.ms", "3000")),
                     Long.parseLong(agentConfig.getRawProperty("checkpoint.history.sample.interval.s", "300")) * 1000L,
                     () -> new java.util.HashSet<>(migrationAgentThreads.keySet()));
+            // 表结构时序库同理，而且比全量断点更要命：它不在中心库的话，接管方装载不到
+            // 历史版本，只能拿 capture 重新打的基线（"现在"的结构）去解析接管前积压的事件，
+            // 正是时序库要根治的那个错位。extract 是子进程够不着元数据库，上传与回灌都由这里代劳。
+            com.migration.agent.checkpoint.SchemaVersionStore.initialize(
+                    agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(),
+                    agentConfig.getMysqlDbPassword());
+
             // 全量表级断点也要能跨机：位点中心化只覆盖了增量，全量的断点还在本机 H2 里，
             // 接管方于是把已经搬完的表从头再搬一遍——正确但慢，10 亿行的表就是 7 小时
             com.migration.agent.checkpoint.FullProgressStore fullProgressStore =

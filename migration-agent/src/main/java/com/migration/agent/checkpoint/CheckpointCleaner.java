@@ -45,6 +45,28 @@ public final class CheckpointCleaner {
         if (fullProgress != null) {
             fullProgress.clear(taskId);
         }
-        logger.info("[{}] 位点已作废（{}）：统一载体 + 中心库 + 上卷缓存 + 全量表级断点", taskId, reason);
+
+        // 表结构时序库同理，而且后果更隐蔽：位点全作废意味着任务会从一个<b>更靠后</b>的位点
+        // 重启，而时序库最新版本停在很久以前——中间那段的 DDL 它一条都没见过。留着它，
+        // 抽取端会拿这份过期的结构去解析新事件，整行的值与列错位，写进目标库的是合法值、
+        // 看不出异常。必须一起清掉，让 capture 重新打基线。
+        //（注意：PITR 把位点往<b>前</b>调不走这里——那种情况时序库覆盖得到，保留才对。）
+        SchemaVersionStore schemaStore = SchemaVersionStore.getInstance();
+        if (schemaStore != null) {
+            schemaStore.deleteTask(taskId, reason);
+        }
+        deleteLocalSchemaHistory(taskId);
+
+        logger.info("[{}] 位点已作废（{}）：统一载体 + 中心库 + 上卷缓存 + 全量表级断点 + 表结构时序库",
+                taskId, reason);
+    }
+
+    /** 本地时序库文件也要删——中心库清了、本地留着，extract 一启动照样把过期版本装载回来。 */
+    private static void deleteLocalSchemaHistory(String taskId) {
+        try {
+            java.nio.file.Files.deleteIfExists(SchemaVersionStore.historyPath(taskId));
+        } catch (Exception e) {
+            logger.warn("[{}] 删除本地表结构历史失败: {}", taskId, e.getMessage());
+        }
     }
 }

@@ -108,7 +108,7 @@ MySQL DDL 语法里最难的部分正是任意表达式，裁掉之后规模从 
 | 0 决策与骨架 | ✅ | `TableSchema` / `ColumnSchema` / `TypeRenderMode` / `SchemaJson` / `SchemaTimelineConfig`；错误码 E3022~E3024（三处目录一致，CI 门禁通过） |
 | 1 CREATE TABLE 解析 + 自检 | ✅ | `MySqlDdl.g4` / `CreateTableParser` / `SchemaSelfCheck` / `SchemaSelfCheckMain`；单测 33 项通过 |
 | 2 ALTER 施加 | ✅ | `DdlApplier` / `SchemaChange`；单测 34 项通过（模块合计 180 项全绿） |
-| 3 时序库与位点查询 | ⏳ | |
+| 3 时序库与位点查询 | ✅ | `SchemaTimeline` / `SchemaHistoryFile` / `SchemaTracker`（extract）+ `SchemaVersionStore`（agent）+ `V18__task_schema_versions.sql`；capture 打基线；单测 39 项 |
 | 4 extract 切换 + 交叉校验 | ⏳ | |
 | 5 影子灰度 + 判据 | ⏳ | |
 
@@ -191,6 +191,21 @@ MySQL DDL 语法里最难的部分正是任意表达式，裁掉之后规模从 
 * 落盘 `files/<taskId>/schema_history.jsonl`，append-only，每条存**施加后的完整
   `TableSchema`**（不是只存 DDL）。DDL 稀疏，存全量换来"重启即加载、无需重放"，
   也顺带是一份审计日志。
+
+> **落地时定下来的三件事**：
+>
+> 1. **中心存储必须独立建表**（`V18__task_schema_versions.sql`），不能塞进
+>    `task_checkpoints.payload`——那一列是 `TEXT`（64KB），一张 50 列表的结构 JSON 就有
+>    5~6KB，几十张表直接撑爆。新表用 `MEDIUMTEXT`，一行一个版本，唯一键
+>    `(task_id, db_name, table_name, monotonic_key)` 让重放天然幂等。
+> 2. **上传与回灌由 agent 代劳**，extract 只写本地 jsonl。extract 是子进程，够不着元数据库
+>    （与阶段 1 自检那次是同一个约束）。`payload` 对 agent 是**不透明的原始行**——结构格式的
+>    知识只留在 migration-extract 一处，agent 只认 `db/tbl/f/p/kind` 这几个键。
+>    代价是位点折算函数两边各一份，靠两侧单测钉住同一组样例。
+> 3. **capture 侧比预想的简单**：起始位点在 capture 启动之前就由
+>    `AbstractTaskExecutor.initMysqlCheckpoint()` 取好并写进 `checkpoint.binlog.*` 了，
+>    "先读位点、后打基线"这条不变量现有流程天然满足，capture 只需在 `doStart()` 里
+>    对范围内每张表写一条 `SCHEMA_BASELINE`（`SHOW CREATE TABLE` 原文）。
 * **跨机接管**：随中心化 checkpoint 一起持久化与 hydrate。不能指望在新机器上重读 `.cap`
   重建——那些文件可能根本不在。这一类坑已经踩过（`d79e7a4` 的跨机接管丢数据），
   务必一次做对。

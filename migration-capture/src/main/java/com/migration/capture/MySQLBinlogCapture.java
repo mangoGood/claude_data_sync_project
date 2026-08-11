@@ -18,8 +18,10 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -502,6 +504,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
 
         openNewOutputFile();
+        writeSchemaBaseline();
 
         // 用 vendored 的流式客户端：上游 BinaryLogClient 会把跨 16MB 包的事件
         // 拼成一整块 byte[]，一个带 1GB 大字段的行事件在那里必 OOM。
@@ -908,6 +911,139 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             sweepOrphanLobTempQuietly();
         } catch (Exception e) {
             logger.error("处理binlog事件异常: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 给表结构时序库打基线：对同步范围内每张表写一条 {@code SCHEMA_BASELINE} 记录，
+     * 内容是 {@code SHOW CREATE TABLE} 的<b>原文</b>。
+     *
+     * <p>capture 只负责取原文，不解析——DDL 语法只存在于 migration-extract 一处，
+     * 两边各养一份迟早会漂，而漂了之后基线与后续 DDL 推出的版本对不上，还看不出来。
+     * 同理它也不认识 TableSchema，写进流里的就是一行 SQL 文本。
+     *
+     * <p><b>时序上的要害</b>：基线只能"新于或等于"它标注的位点，绝不能旧于。
+     * 这一点由现有流程保证——起始位点是 agent 在启动 capture <b>之前</b>就取好并写进
+     * {@code checkpoint.binlog.*} 的（{@code AbstractTaskExecutor.initMysqlCheckpoint}），
+     * 我们在这里取的表结构必然不早于它。反过来（先取结构、后定位点）中间那条 DDL 会
+     * 既不在基线里、也不在流里，永久丢失、模型从此全错。
+     *
+     * <p>基线比位点新造成的重叠（那段里的 DDL 既在基线里又在流里）由 {@code DdlApplier}
+     * 的幂等施加吸收；capture 重启后重发的基线则由 extract 忽略——已持久化的时序库优先，
+     * 基线只是兜底种子。
+     */
+    private void writeSchemaBaseline() {
+        if (!Boolean.parseBoolean(props.getProperty("capture.schema.baseline.enabled", "true"))) {
+            return;
+        }
+        List<String> tables = resolveBaselineTables();
+        if (tables.isEmpty()) {
+            logger.info("同步范围内没有表，跳过表结构基线");
+            return;
+        }
+
+        String url = "jdbc:mysql://" + host + ":" + port
+                + "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+        int ok = 0;
+        int failed = 0;
+        try (Connection conn = DriverManager.getConnection(url, user, password)) {
+            for (String qualified : tables) {
+                int dot = qualified.indexOf('.');
+                if (dot <= 0) {
+                    continue;
+                }
+                String db = qualified.substring(0, dot);
+                String table = qualified.substring(dot + 1);
+                try {
+                    String createSql = showCreateTable(conn, db, table);
+                    if (createSql == null) {
+                        // 表不存在或是视图：也要写一条带错误标记的记录。
+                        // 静默跳过的话，extract 那边分不清"这张表没有基线"和"这张表压根没在范围里"
+                        writeBaselineRecord(db, table, null, "SHOW CREATE TABLE 无结果（表不存在或为视图）");
+                        failed++;
+                    } else {
+                        writeBaselineRecord(db, table, createSql, null);
+                        ok++;
+                    }
+                } catch (Exception e) {
+                    writeBaselineRecord(db, table, null, "SHOW CREATE TABLE 失败: " + e.getMessage());
+                    failed++;
+                }
+            }
+        } catch (Exception e) {
+            logger.error("表结构基线连接源库失败，本次不打基线（抽取端会按 "
+                    + "extract.schema.timeline.fallback 降级）: {}", e.getMessage());
+            return;
+        }
+        logger.info("表结构基线已写入 {} 张表（失败 {} 张），位点 {}:{}",
+                ok, failed, binlogFile, binlogPosition);
+    }
+
+    /** 同步范围内的表清单：表级同步直接用清单，库级同步去库里枚举 BASE TABLE。 */
+    private List<String> resolveBaselineTables() {
+        List<String> out = new ArrayList<>();
+        if (!syncedTables.isEmpty()) {
+            out.addAll(syncedTables);
+            return out;
+        }
+        if (syncedDatabases.isEmpty()) {
+            return out;   // 全库捕获：范围未知，不打基线，由 CREATE TABLE / 降级路径兜底
+        }
+        String url = "jdbc:mysql://" + host + ":" + port
+                + "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+        try (Connection conn = DriverManager.getConnection(url, user, password)) {
+            for (String db : syncedDatabases) {
+                try (java.sql.PreparedStatement ps = conn.prepareStatement(
+                        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                                + "WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'")) {
+                    ps.setString(1, db);
+                    try (java.sql.ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            out.add(db + "." + rs.getString(1));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("枚举库级同步的表失败，本次不打基线: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    private String showCreateTable(Connection conn, String db, String table) throws SQLException {
+        String ref = "`" + db.replace("`", "``") + "`.`" + table.replace("`", "``") + "`";
+        try (java.sql.Statement st = conn.createStatement();
+             java.sql.ResultSet rs = st.executeQuery("SHOW CREATE TABLE " + ref)) {
+            return rs.next() ? rs.getString(2) : null;
+        }
+    }
+
+    /**
+     * 一条基线记录：{@code SCHEMA_BASELINE|file|pos|ts|serverId|db|table|error|CREATE TABLE 原文}
+     *
+     * <p>原文里的换行统一压成空格——{@code .cap} 是按行切记录的，一条跨多行会让其后所有记录
+     * 都读不出来（数据事件走的也是同一套压平，见 {@code eventDataStr.replace}）。
+     */
+    private synchronized void writeBaselineRecord(String db, String table, String createSql, String error) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("SCHEMA_BASELINE").append(FIELD_SEP);
+            sb.append(binlogFile == null ? "" : binlogFile).append(FIELD_SEP);
+            sb.append(binlogPosition).append(FIELD_SEP);
+            sb.append(System.currentTimeMillis()).append(FIELD_SEP);
+            sb.append(serverId).append(FIELD_SEP);
+            sb.append(db).append(FIELD_SEP);
+            sb.append(table).append(FIELD_SEP);
+            sb.append(error == null ? "" : error.replace("\n", " ").replace("\r", " ")
+                    .replace(String.valueOf(FIELD_SEP), " ")).append(FIELD_SEP);
+            sb.append(createSql == null ? ""
+                    : createSql.replace("\n", " ").replace("\r", " ")
+                            .replace(String.valueOf(FIELD_SEP), " "));
+            sb.append(RECORD_SEP);
+            writer.write(sb.toString());
+            writer.flush();
+        } catch (IOException e) {
+            logger.warn("写表结构基线记录失败 {}.{}: {}", db, table, e.getMessage());
         }
     }
 

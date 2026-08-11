@@ -91,6 +91,16 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         unknownEventSkip = "SKIP".equalsIgnoreCase(
                 props.getProperty("extract.unknown.event.policy", "FAIL_STOP").trim());
 
+        // 表结构时序库：本阶段只写不读——基线与 DDL 攒成按位点索引的版本链并落盘，
+        // 行事件的解析仍然走下面那几个 information_schema 查询。切换在阶段 4。
+        com.migration.extract.schema.SchemaTimelineConfig timelineConfig =
+                com.migration.extract.schema.SchemaTimelineConfig.load(props,
+                        props.getProperty("task.id", System.getProperty("task.id", "unknown")));
+        if (timelineConfig.isEnabled()) {
+            schemaTracker = new com.migration.extract.schema.SchemaTracker(props,
+                    props.getProperty("task.id", System.getProperty("task.id", "unknown")));
+        }
+
         PipelineContext pipelineContext = new PipelineContextImpl(props);
         ((PipelineContextImpl) pipelineContext).setSourceConnection(sourceConnection);
         pipeline = PipelineConfig.loadFromProperties(props, pipelineContext);
@@ -152,6 +162,17 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             if (shouldSkipEvent(binlogFile, binlogPosition)) {
                 return null;
             }
+        }
+
+        // 表结构基线：capture 在启动时为同步范围内每张表写的一条 SHOW CREATE TABLE 原文。
+        // 它是给表结构时序库播种用的<b>带内元数据</b>，不是 binlog 事件——必须在分配 seqno
+        // 之前消费掉并返回 null，否则 THL 里会多出下游不认识的事件；而如果先 seqno++ 再返回
+        // null，又会在 THL 里留下永久空洞（增量端按 seqno 连续性推进）。
+        if ("SCHEMA_BASELINE".equals(eventType)) {
+            if (schemaTracker != null) {
+                schemaTracker.onBaseline(fields, binlogFile, binlogPosition);
+            }
+            return null;
         }
 
         String eventData = fields.length > 5 ? fields[5] : "";
@@ -243,6 +264,13 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
     /** 未知事件类型是否只告警不停机（{@code extract.unknown.event.policy=SKIP}）。 */
     private boolean unknownEventSkip;
+
+    /** 表结构时序库；{@code extract.schema.timeline.mode=OFF}（默认）时为 null。 */
+    private com.migration.extract.schema.SchemaTracker schemaTracker;
+
+    public com.migration.extract.schema.SchemaTracker getSchemaTracker() {
+        return schemaTracker;
+    }
 
     /** 遇到不认识、且可能带数据的 binlog 事件类型：默认停下来上报，不静默丢。 */
     private void checkIgnorableEventType(String eventType, String binlogFile, long binlogPosition) {
@@ -1410,6 +1438,36 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             // ALTER/DROP/RENAME/TRUNCATE/CREATE TABLE 会改变列布局：失效该表的列元数据缓存，
             // 否则后续 WRITE/UPDATE_ROWS 会沿用 ALTER 前的旧列名，静默丢弃新增列的值。
             invalidateColumnCachesForDdl(sql, database);
+
+            // 同一条 DDL 也施加到表结构时序库上，推出该表的下一个版本。
+            // 与上面那行失效缓存的区别正是这次改造的要点：失效缓存之后重查的是源库<b>此刻</b>的
+            // 定义（可能已经又变过好几次），而施加式算出的是这条 DDL <b>当时</b>的结构。
+            feedSchemaTimeline(sql, database, thlEvent);
+        }
+    }
+
+    /**
+     * 把 DDL 喂给时序库。解析失败时按 {@code extract.schema.timeline.fallback} 处置：
+     * RESNAPSHOT 只告警（该表退回 information_schema 旧路径），FAIL_STOP 抛出让抽取停下。
+     *
+     * <p>阶段 3 里两者的实际后果一样——行事件本来就还走旧路径——但计数与告警要从现在起就准，
+     * 灰度期正是靠"解析失败数"这个指标判断语法够不够用。
+     */
+    private void feedSchemaTimeline(String sql, String database, THLEvent thlEvent) {
+        if (schemaTracker == null) {
+            return;
+        }
+        String binlogFile = String.valueOf(thlEvent.getMetadata().getOrDefault("binlog_file", ""));
+        long binlogPos = 0L;
+        Object pos = thlEvent.getMetadata().get("binlog_position");
+        if (pos instanceof Number) {
+            binlogPos = ((Number) pos).longValue();
+        }
+        boolean ok = schemaTracker.onDdl(sql, database, binlogFile, binlogPos);
+        if (!ok && schemaTracker.getConfig().getFallback()
+                == com.migration.extract.schema.SchemaTimelineConfig.Fallback.FAIL_STOP) {
+            throw new com.migration.extract.schema.DdlParseException(
+                    "表结构时序库施加 DDL 失败，且 extract.schema.timeline.fallback=FAIL_STOP", sql);
         }
     }
 
