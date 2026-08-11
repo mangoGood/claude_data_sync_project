@@ -71,8 +71,25 @@ public class SqlClassifier {
         ROLLBACK,
         START_TRANSACTION,
         SAVEPOINT,
+        /** XA 控制语句（XA START/END/PREPARE/COMMIT/ROLLBACK）——绝不能照原样打到目标库，见 {@link #XA_STATEMENT} */
+        XA,
         UNKNOWN_TX
     }
+
+    /**
+     * XA 控制语句。ANTLR 分类语法只认 BEGIN/COMMIT/ROLLBACK 这类裸事务语句，
+     * {@code XA START X'..',X'..',1} 会落进 {@code otherStatement} → {@code OTHER} →
+     * 被当成"不认识但照样执行"的语句原样打到目标库。后果不是报个错就完事：
+     * {@code XA START} 在目标端<b>会成功</b>，把应用连接推进 XA ACTIVE 态，随后的
+     * {@code COMMIT} 和 {@code ROLLBACK} 双双报 1399 XAER_RMFAIL，增量 fail-stop 且重试永远
+     * 撞同一堵墙（实测 MySQL 8.0.44）。所以在进 ANTLR 之前先把它认出来。
+     *
+     * <p>正常链路上 extract 端的 {@code XaTransactionBuffer} 已经把这些语句消化掉了，
+     * 这里是第二道闸：兜住存量 THL 里的残留，以及 {@code sync.xa.enabled=false} 的情形。
+     */
+    private static final java.util.regex.Pattern XA_STATEMENT = java.util.regex.Pattern.compile(
+            "^\\s*XA\\s+(START|BEGIN|END|PREPARE|COMMIT|ROLLBACK)\\b",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
 
     public static class ClassificationResult {
         private StatementType statementType;
@@ -139,6 +156,15 @@ public class SqlClassifier {
         if (sql == null || sql.trim().isEmpty()) {
             result.setStatementType(StatementType.OTHER);
             result.setParseSuccess(false);
+            return result;
+        }
+
+        // XA 控制语句：正则先行识别（见 XA_STATEMENT 注释），绝不能漏到 OTHER 的兜底执行路径
+        if (XA_STATEMENT.matcher(sql).find()) {
+            result.setStatementType(StatementType.TRANSACTION);
+            result.setTransactionSubType(TransactionSubType.XA);
+            result.setNeedsDatabaseSelection(false);
+            result.setParseSuccess(true);
             return result;
         }
 

@@ -40,6 +40,12 @@ public class ContinuousExtractMain {
     private Map<String, FileProgress> fileProgressMap = new LinkedHashMap<>();
     private String progressRecordFile;
 
+    /**
+     * XA 分支收集期间冻结的进度快照（见 {@link #saveProgress()}）。非 null 表示"进度不许往前落盘"，
+     * 分支收口（prepare）后立刻清空恢复实时落盘。
+     */
+    private String heldProgressSnapshot;
+
     private BackpressureController backpressureController;
 
     private THLFileWriter currentThlWriter;
@@ -257,6 +263,13 @@ public class ContinuousExtractMain {
                     logger.info("Extract thread interrupted");
                     Thread.currentThread().interrupt();
                     break;
+                } catch (XaTransactionBuffer.XaQuotaExceededException e) {
+                    // XA 缓冲配额突破：继续跑下去要么把分支丢掉（源库已提交的数据永久不到目标库），
+                    // 要么把磁盘撑爆。停下来上报，让人先处置源库的未决分支
+                    logger.error("XA 事务缓冲超限，停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3018", e.getMessage());
+                    running.set(false);
+                    break;
                 } catch (Exception e) {
                     logger.error("Error during file scanning", e);
                 }
@@ -339,8 +352,32 @@ public class ContinuousExtractMain {
             File[] thlFiles = outputDirFile.listFiles((dir, name) ->
                     name.endsWith(".thl") && !name.startsWith("."));
             writeLongMetric("extract_queue_depth", thlFiles != null ? thlFiles.length : 0);
+
+            // 未决 XA 分支：已 prepare、等源库给决议的分支数与最老分支的等待时长。
+            // 这两个数不为 0 是正常的（源库的分布式事务还没提交），但一直涨就说明源端有卡住的分支
+            if (mysqlExtractor != null) {
+                writeLongMetric("xa_pending_branches", mysqlExtractor.xaPendingBranchCount());
+                writeLongMetric("xa_pending_oldest_ms", mysqlExtractor.xaOldestPendingAgeMs());
+            }
         } catch (Exception e) {
             logger.debug("写入吞吐/积压指标失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 写 {@code binlog_output/error_status}（格式与 capture / increment 端一致），
+     * agent 轮询到即把任务上报 FAILED，而不是让 extract 无声地空转。
+     */
+    private void writeExtractErrorStatus(String errorCode, String message) {
+        try {
+            File dir = new File(inputDir);
+            if (!dir.exists()) dir.mkdirs();
+            com.migration.common.io.AtomicFileWriter.writeStringQuietly(
+                    new File(dir, "error_status"),
+                    System.currentTimeMillis() + "|" + errorCode + "|-1|"
+                            + message.replace("|", "/") + "|extract\n");
+        } catch (Exception e) {
+            logger.warn("写入 extract 错误状态文件失败: {}", e.getMessage());
         }
     }
 
@@ -416,7 +453,10 @@ public class ContinuousExtractMain {
             progress.stableCheckCount = 0;
         }
 
-        if (progress.stableCheckCount >= 3) {
+        // 正在收集 XA 分支时不标 completed、也不清理 .cap：崩溃重启要从分支起点把这些行重读一遍，
+        // 文件被当成"已处理完"或直接删掉，重读就无从谈起
+        boolean xaCollecting = mysqlExtractor != null && mysqlExtractor.isXaBranchActive();
+        if (progress.stableCheckCount >= 3 && !xaCollecting) {
             progress.completed = true;
             logger.info("Binlog file {} appears complete, marking as completed", binlogFile.getName());
             // 文件处理完成，清理旧的已完成cap文件
@@ -608,7 +648,7 @@ public class ContinuousExtractMain {
 
     private int readAndExtractNewLines(File binlogFile,
                                         FileProgress progress, int skipLines) throws Exception {
-        int eventCount = 0;
+        int[] eventCount = {0};
         int currentLine = 0;
         try (BufferedReader reader = new BufferedReader(new FileReader(binlogFile))) {
             String line;
@@ -623,26 +663,48 @@ public class ContinuousExtractMain {
                 byte[] eventBytes = line.getBytes("UTF-8");
                 THLEvent event = extractor.extract(eventBytes);
                 if (event != null) {
-                    ensureThlWriter();
-                    checkAndRotateThlFile();
-
-                    java.util.List<THLEvent> rowEvents = splitMultiRowEvent(event);
-                    if (rowEvents != null) {
-                        for (THLEvent rowEvent : rowEvents) {
-                            currentThlWriter.writeEvent(rowEvent);
-                            eventCount++;
-                            checkAndRotateThlFile();
+                    eventCount[0] += writeExtractedEvent(event);
+                }
+                // XA 事务：本行若是 XA COMMIT，整个分支在这里被重放成一个普通事务下发；
+                // 绝大多数行上这是一次空调用
+                if (mysqlExtractor != null) {
+                    mysqlExtractor.drainXaReplay(ev -> eventCount[0] += writeExtractedEvent(ev));
+                }
+                // .cap 读取进度的落盘要压在分支起点：分支还在收集时崩溃，重启得从 XA START
+                // 重新收集一遍（收集中的 .part 落盘文件启动时一律删除）。这里只冻结"要写进
+                // 进度文件的那一份"，内存里的读取位置照常前进，不影响本进程继续往下读。
+                if (mysqlExtractor != null) {
+                    if (mysqlExtractor.isXaBranchActive()) {
+                        if (heldProgressSnapshot == null) {
+                            heldProgressSnapshot = serializeProgress();
                         }
-                        progress.linesRead++;
-                        continue;
+                    } else {
+                        heldProgressSnapshot = null;
                     }
-                    currentThlWriter.writeEvent(event);
-                    eventCount++;
                 }
                 progress.linesRead++;
             }
         }
-        return eventCount;
+        return eventCount[0];
+    }
+
+    /** 把一个抽取出来的事件写进 THL（必要时先按行拆分、按大小轮转文件），返回实际写出的事件数。 */
+    private int writeExtractedEvent(THLEvent event) throws Exception {
+        ensureThlWriter();
+        checkAndRotateThlFile();
+
+        java.util.List<THLEvent> rowEvents = splitMultiRowEvent(event);
+        if (rowEvents != null) {
+            int written = 0;
+            for (THLEvent rowEvent : rowEvents) {
+                currentThlWriter.writeEvent(rowEvent);
+                written++;
+                checkAndRotateThlFile();
+            }
+            return written;
+        }
+        currentThlWriter.writeEvent(event);
+        return 1;
     }
 
     /** 确保 currentThlWriter 可用，若为空则创建新THL文件 */
@@ -703,15 +765,24 @@ public class ContinuousExtractMain {
             parentDir.mkdirs();
         }
 
+        // 正在收集 XA 分支时写的是"分支开始那一刻"的快照：崩溃重启后会从 XA START 重新读，
+        // 把整段分支重新收集完整。写实时进度就会让重启后从分支中间接着读，拼出半个事务。
+        String content = heldProgressSnapshot != null ? heldProgressSnapshot : serializeProgress();
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(recordFile))) {
-            for (FileProgress progress : fileProgressMap.values()) {
-                writer.write(progress.fileName + "|" + progress.linesRead + "|" +
-                        progress.lastFileSize + "|" + progress.completed);
-                writer.newLine();
-            }
+            writer.write(content);
         } catch (IOException e) {
             logger.warn("Error saving extract progress", e);
         }
+    }
+
+    private String serializeProgress() {
+        StringBuilder sb = new StringBuilder();
+        for (FileProgress progress : fileProgressMap.values()) {
+            sb.append(progress.fileName).append('|').append(progress.linesRead).append('|')
+                    .append(progress.lastFileSize).append('|').append(progress.completed)
+                    .append(System.lineSeparator());
+        }
+        return sb.toString();
     }
 
     private static class FileProgress {

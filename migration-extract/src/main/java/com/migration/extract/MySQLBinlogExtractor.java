@@ -51,6 +51,15 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
     protected long checkpointBinlogPosition;
     protected boolean skipBeforeCheckpoint = false;
 
+    /**
+     * 源库 XA 事务缓冲：{@code XA START … XA PREPARE} 之间的事件先扣下，等到 {@code XA COMMIT}
+     * 才按普通事务重放下发（{@code XA ROLLBACK} 则整段丢弃）。见 {@link XaTransactionBuffer}。
+     */
+    private XaTransactionBuffer xaBuffer;
+
+    /** 重放 XA 分支时置位：跳过 XA 拦截与位点跳过判定，并把 tx_id 钉在分支上。 */
+    private String replayTxId;
+
     @Override
     protected void doInitialize() throws Exception {
         inputDir = props.getProperty("extract.input.dir", "binlog_output");
@@ -73,6 +82,9 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
         loadSeqno();
         connectToSourceDatabase();
+
+        xaBuffer = new XaTransactionBuffer(props, outputDir);
+        xaBuffer.recover();
 
         PipelineContext pipelineContext = new PipelineContextImpl(props);
         ((PipelineContextImpl) pipelineContext).setSourceConnection(sourceConnection);
@@ -128,10 +140,24 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             // ignore
         }
 
-        if (skipBeforeCheckpoint && checkpointBinlogFile != null && !checkpointBinlogFile.isEmpty()) {
+        // 重放 XA 分支时不走位点跳过：分支的行事件位点停在 prepare 时刻，天然小于续传位点，
+        // 按位点跳会把一个源库<b>已提交</b>的事务整段丢掉。它该不该应用，由 XA COMMIT 的位点说了算。
+        if (skipBeforeCheckpoint && replayTxId == null
+                && checkpointBinlogFile != null && !checkpointBinlogFile.isEmpty()) {
             if (shouldSkipEvent(binlogFile, binlogPosition)) {
                 return null;
             }
+        }
+
+        String eventData = fields.length > 5 ? fields[5] : "";
+
+        // XA 事务：START…PREPARE 之间的事件整段扣下落盘，等 XA COMMIT 才重放成普通事务。
+        // 必须在分配 seqno <b>之前</b>判定——被扣下的行不能消耗 seqno，否则 THL 里留下永久空洞，
+        // 而增量端的 readEventAfter 是按 seqno 连续性推进的。
+        if (xaBuffer != null && replayTxId == null
+                && xaBuffer.inspect(eventType, eventData, eventStr, binlogFile, binlogPosition, timestamp)
+                        != XaTransactionBuffer.Verdict.PASS) {
+            return null;
         }
 
         THLEvent thlEvent = new THLEvent();
@@ -143,8 +169,6 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         thlEvent.addMetadata("binlog_file", binlogFile);
         thlEvent.addMetadata("binlog_position", binlogPosition);
         thlEvent.addMetadata("server_id", serverId);
-
-        String eventData = fields.length > 5 ? fields[5] : "";
 
         if ("SYNC_HEARTBEAT".equals(eventType)) {
             thlEvent.setType(THLEvent.HEARTBEAT_EVENT);
@@ -205,6 +229,13 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
      */
     private void stampTransaction(THLEvent thlEvent, String eventType,
                                   String binlogFile, long binlogPosition, String eventData) {
+        if (replayTxId != null) {
+            // XA 分支重放：整段共用分支的 tx_id，收尾的 tx_last 由合成的 COMMIT 事件承担
+            // （不能打在最后一个行事件上——多行事件会在 extract 主循环里被拆成 N 条，
+            // tx_last 会被复制到每一行，增量端看到第一行就提交，事务照样被切开）
+            thlEvent.addMetadata(TxnMetadata.TX_ID, replayTxId);
+            return;
+        }
         if ("QUERY".equals(eventType)) {
             Object sqlMeta = thlEvent.getMetadata().get("sql");
             String sql = sqlMeta != null ? sqlMeta.toString().trim() : "";
@@ -244,6 +275,116 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
     private static final java.util.regex.Pattern XID_VALUE =
             java.util.regex.Pattern.compile("xid=(\\d+)");
+
+    /** 重放 XA 分支时逐条接收事件的下游（由 extract 主循环负责落 THL、按大小轮转文件）。 */
+    public interface XaReplaySink {
+        void accept(THLEvent event) throws Exception;
+    }
+
+    /** 是否正在收集某个 XA 分支——extract 主循环据此压住 {@code .cap} 读取进度的落盘。 */
+    public boolean isXaBranchActive() {
+        return xaBuffer != null && xaBuffer.isBranchActive();
+    }
+
+    /** 已 prepare、等源库决议的 XA 分支数（落成指标供页面观测）。 */
+    public int xaPendingBranchCount() {
+        return xaBuffer == null ? 0 : xaBuffer.pendingBranchCount();
+    }
+
+    /** 最老的未决 XA 分支已经等了多久（毫秒）。 */
+    public long xaOldestPendingAgeMs() {
+        return xaBuffer == null ? 0 : xaBuffer.oldestPendingAgeMs();
+    }
+
+    /**
+     * 把已决议（源库 {@code XA COMMIT}）的 XA 分支重放成<b>一个普通事务</b>下发。
+     *
+     * <p>每次 {@code extract()} 之后调用一次：绝大多数时候没有分支可放，直接返回。
+     * 重放是流式的（边读落盘文件边下发），一个 1GB 的 XA 事务不会整段进堆。
+     *
+     * <p>重放出来的事件有三处被改写，都是为了让下游"看起来就是一个发生在提交点的普通事务"：
+     * <ul>
+     *   <li>{@code tx_id} 统一钉在分支上，末尾补一个 {@code XID} 事件带 {@code tx_last}
+     *       —— 增量端据此把整个 XA 事务原子提交；</li>
+     *   <li>{@code binlog_file/binlog_position} 与 {@code eventId} 改写成 <b>XA COMMIT 的位点</b>
+     *       —— 行事件原本的位点停在 prepare 时刻，照原样下发会让应用端位点<b>倒退</b>，
+     *       重启后从更早的位点重放一大段；原位点保留在 {@code xa_prepare_position} 里备查；</li>
+     *   <li>{@code sourceTstamp} 取提交时刻 —— 数据是在 XA COMMIT 那一刻才在源库可见的，
+     *       用 prepare 时间算延迟会把"事务一直没提交"错记成同步延迟。</li>
+     * </ul>
+     */
+    public void drainXaReplay(XaReplaySink sink) throws Exception {
+        if (xaBuffer == null) {
+            return;
+        }
+        XaTransactionBuffer.Branch branch;
+        while ((branch = xaBuffer.takeReplay()) != null) {
+            replayXaBranch(branch, sink);
+        }
+    }
+
+    private void replayXaBranch(XaTransactionBuffer.Branch branch, XaReplaySink sink) throws Exception {
+        String txId = "xa:" + branch.getKey();
+        int emitted = 0;
+        replayTxId = txId;
+        try (java.io.BufferedReader reader = xaBuffer.openReplayReader(branch)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+                THLEvent event = doExtract(line.getBytes("UTF-8"));
+                if (event == null) {
+                    continue;
+                }
+                rewriteToCommitPoint(event, branch, emitted++);
+                sink.accept(event);
+            }
+        } finally {
+            replayTxId = null;
+        }
+
+        if (emitted > 0) {
+            sink.accept(xaCommitEvent(branch, txId));
+        }
+        xaBuffer.finishReplay(branch);
+        logger.info("XA 分支 {} 按源库提交点整体下发: {} 个事件 @ {}:{}",
+                branch.getXid(), emitted, branch.getCommitFile(), branch.getCommitPos());
+    }
+
+    private void rewriteToCommitPoint(THLEvent event, XaTransactionBuffer.Branch branch, int index) {
+        Object prepareFile = event.getMetadata().get("binlog_file");
+        Object preparePos = event.getMetadata().get("binlog_position");
+        event.addMetadata("xa_xid", branch.getXid());
+        event.addMetadata("xa_prepare_position", prepareFile + ":" + preparePos);
+        event.addMetadata("binlog_file", branch.getCommitFile());
+        event.addMetadata("binlog_position", branch.getCommitPos());
+        event.setEventId(branch.getCommitFile() + ":" + branch.getCommitPos() + "#" + index);
+        if (branch.getCommitTimestamp() > 0) {
+            if (event.getSourceTstamp() != null) {
+                event.addMetadata("xa_prepare_timestamp", event.getSourceTstamp().getTime());
+            }
+            event.setSourceTstamp(new Timestamp(branch.getCommitTimestamp()));
+        }
+    }
+
+    /** 合成的事务收尾事件：形态与普通事务的 XID 完全一致，下游无需认识 XA。 */
+    private THLEvent xaCommitEvent(XaTransactionBuffer.Branch branch, String txId) {
+        THLEvent event = new THLEvent();
+        event.setSeqno(seqno++);
+        event.setEventId(branch.getCommitFile() + ":" + branch.getCommitPos() + "#c");
+        event.setSourceId("mysql");
+        event.setSourceTstamp(new Timestamp(branch.getCommitTimestamp() > 0
+                ? branch.getCommitTimestamp() : System.currentTimeMillis()));
+        event.addMetadata("event_type", "XID");
+        event.addMetadata("operation", "COMMIT");
+        event.addMetadata("binlog_file", branch.getCommitFile());
+        event.addMetadata("binlog_position", branch.getCommitPos());
+        event.addMetadata("xa_xid", branch.getXid());
+        event.addMetadata(TxnMetadata.TX_ID, txId);
+        event.addMetadata(TxnMetadata.TX_LAST, Boolean.TRUE);
+        return event;
+    }
 
     private boolean shouldSkipEvent(String binlogFile, long binlogPosition) {
         if (checkpointBinlogFile == null || checkpointBinlogFile.isEmpty()) {
@@ -1357,6 +1498,11 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
     public void close() {
         saveSeqno();
+        if (xaBuffer != null) {
+            // 收集中的分支只关句柄不做收口：那份 .part 落盘文件下次启动会被删掉，
+            // 由压回分支起点的 .cap 进度重新收集一遍
+            xaBuffer.close();
+        }
         if (pipeline != null) {
             pipeline.release();
         }

@@ -349,6 +349,9 @@ public class DiagnosticService {
             checks.add(checkColumnRefs(src, entries));
             checks.add(checkForeignKeyIntegrity(src, entries));
             checks.add(checkLargeObjectSupport(src, srcConn, tgtConn, entries, needsIncrement));
+            if (needsIncrement && "mysql".equalsIgnoreCase(workflow.getSourceType())) {
+                checks.add(checkPendingXaBranches(src));
+            }
         } catch (Exception e) {
             checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
         }
@@ -1162,6 +1165,37 @@ public class DiagnosticService {
         }
         return check("列处理引用列", "FAIL",
                 "列处理引用了不存在的源列（" + missing.size() + " 个）", String.join(", ", missing));
+    }
+
+    /**
+     * 未决 XA 分支检查（仅 mysql 源 + 需要增量）。
+     *
+     * <p>源库 XA 事务在 binlog 里是分两段写的：行事件在 {@code XA PREPARE} 时刻就落盘，
+     * 提交/回滚的决议要等到之后的 {@code XA COMMIT} / {@code XA ROLLBACK}。为了保证
+     * "源库提交时目标库才提交"，extract 会把未决分支整段缓冲到磁盘等决议——
+     * 所以任务启动时源库里<b>已经挂着</b>的长期未决分支值得先提醒一句：它们迟迟不决议，
+     * 缓冲就一直占着磁盘（超过 sync.xa.pending.* 配额会让增量停下来报 E3018），
+     * 而且这些分支持有行锁，全量阶段扫到同一批行也会被挡住。
+     *
+     * <p>只告警不阻断：未决分支本身是分布式事务的正常中间态，是不是"卡住了"只有业务能判断。
+     */
+    private Map<String, Object> checkPendingXaBranches(Connection src) {
+        List<String> branches = new ArrayList<>();
+        try (java.sql.Statement st = src.createStatement(); ResultSet rs = st.executeQuery("XA RECOVER")) {
+            while (rs.next() && branches.size() < 20) {
+                branches.add(rs.getString("data"));
+            }
+        } catch (Exception e) {
+            return check("未决 XA 分支", "WARNING", "无法执行 XA RECOVER: " + e.getMessage(), null);
+        }
+        if (branches.isEmpty()) {
+            return check("未决 XA 分支", "PASS", "源库没有已 prepare 未决议的 XA 分支", null);
+        }
+        return check("未决 XA 分支", "WARNING",
+                "源库存在 " + branches.size() + " 个已 prepare 未决议的 XA 分支。它们的数据要等源库"
+                        + "XA COMMIT 才会下发到目标库（这是正确行为），期间 extract 会把它们缓冲在磁盘上；"
+                        + "若这些分支实际已经卡死，请在源库处置后再启动任务",
+                String.join(", ", branches));
     }
 
     /**

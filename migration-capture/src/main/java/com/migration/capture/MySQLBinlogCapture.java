@@ -625,6 +625,15 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     /** 本任务是否允许把 DDL 传给对端（sync.bidi.ddl.direction=A_TO_B 且本任务是正向通道）。 */
     private boolean bidiDdlForwardAllowed = false;
 
+    /** XA 控制语句：{@code XA START/END/PREPARE/COMMIT/ROLLBACK}，在 binlog 里以 QUERY 事件出现。 */
+    private static final java.util.regex.Pattern XA_CONTROL = java.util.regex.Pattern.compile(
+            "^\\s*XA\\s+(START|BEGIN|END|PREPARE|COMMIT|ROLLBACK)\\b",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    private static boolean isXaControlStatement(String sql) {
+        return sql != null && XA_CONTROL.matcher(sql).find();
+    }
+
     /** 同步内部表的 DDL 永远不外传：它们是机制自身的表，传过去只会互相建表打架。 */
     private static boolean isInternalDdl(String sql) {
         if (sql == null) return false;
@@ -699,6 +708,11 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                     String sql = ((QueryEventData) eventData).getSql();
                     if (sql != null && "BEGIN".equalsIgnoreCase(sql.trim())) {
                         loopGuard.onTransactionBoundary();
+                    } else if (isXaControlStatement(sql)) {
+                        // XA 事务在 binlog 里没有 BEGIN/XID，边界靠 XA START/COMMIT/ROLLBACK 划：
+                        // 不复位的话标记状态会从上一个事务粘过来，把本事务的数据事件误判成"对端复制来的"直接跳过。
+                        // XA 控制语句本身照常外传，交给 extract 的 XaTransactionBuffer 处理
+                        loopGuard.onTransactionBoundary();
                     } else if (!bidiDdlForwardAllowed || isInternalDdl(sql)) {
                         // 默认双向模式只复制 DML，不传播 DDL（CREATE/ALTER/DROP…）：DDL 无法用行标记打标
                         // （隐式提交，与 DML 不同事务），在 active-active 里会无限回环。
@@ -707,7 +721,8 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                         // 内部表（__sync_origin/__sync_rowmeta/__sync_heartbeat）的 DDL 任何方向都不传。
                         return;
                     }
-                } else if (eventData instanceof XidEventData) {
+                } else if (eventData instanceof XidEventData
+                        || eventData instanceof com.github.shyiko.mysql.binlog.event.XAPrepareEventData) {
                     loopGuard.onTransactionBoundary();
                 }
                 // origin 标记行事件：置位并丢弃（标记表不外传），后续本事务数据事件将被跳过

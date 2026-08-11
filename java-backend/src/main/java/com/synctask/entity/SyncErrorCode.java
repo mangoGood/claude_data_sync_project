@@ -32,6 +32,7 @@ public enum SyncErrorCode {
     // E3012 未分配（历史空位，新增错误码请顺延，不要复用）
     LOB_TYPED_PIPELINE_UNAVAILABLE("E3012", "大字段事件缺少类型化值", "事件里带的是大字段引用（内容在磁盘上），但没有类型化值（rows_typed），只能走文本路径——文本路径把参数拼成 SQL 字面量，会把 \"@lob:...\" 这串引用本身当成内容写进目标 BLOB/TEXT 列，长度和语法都看不出问题，属于静默数据损坏，因此已停止应用。请确认源→目标是 mysql→mysql、increment.typed.pipeline.enabled 未被关掉、且源端 binlog_row_image 为 FULL/NOBLOB"),
     ROUTE_TYPED_PIPELINE_UNAVAILABLE("E3013", "汇聚/拆分事件缺少类型化值", "命中路由规则的表其事件没有类型化值（rows_typed），无法生成带来源标识列的 DML——文本路径的 UPDATE/DELETE 只按源主键定位，会改到同一张汇聚表里其它来源的同主键行，因此已停止应用。请检查该表的路由规则是否配错（不该汇聚的表被规则命中）、源端 binlog_row_image 是否为 FULL，以及该源→目标引擎对是否支持类型化管道（increment.typed.pipeline.enabled 是否被关掉）"),
+    XA_BUFFER_QUOTA_EXCEEDED("E3018", "XA事务缓冲超限", "源库的 XA 事务在 binlog 里是分两段写的：行事件在 XA PREPARE 时刻就落盘，提交/回滚决议要等到 XA COMMIT/ROLLBACK。为了保证\"源库提交时目标库才提交\"（否则源库回滚的 XA 会在目标库留下永久幻影行），extract 会把未决分支整段缓冲到磁盘。现在缓冲量突破了配额，说明源库存在长期未提交的 XA 分支。请在源库执行 XA RECOVER 排查并提交/回滚这些分支；确认需要更大缓冲时，调大 sync.xa.branch.max.bytes / sync.xa.pending.max.bytes / sync.xa.pending.max.branches"),
     UNIQUE_KEY_CONFLICT("E3017", "唯一键冲突（非主键）", "目标端存在源端没有的唯一索引/约束，把这一行挡住了。主键冲突属于幂等重放可以忽略，但唯一键冲突忽略掉就是永久丢一行，因此默认停下等人处置。请核对两端的唯一索引差异；确认可以丢弃这类行时，将 increment.unique.conflict.policy 设为 IGNORE"),
 
     CHECKPOINT_HYDRATE_FAILED("E3014", "位点回灌失败", "本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管。此时若按首次启动去取源库当前位点，会静默跳过崩溃到接管之间的全部变更，因此任务停在这里等人处置。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务；确认这确实是一个全新任务时，可临时将 checkpoint.hydrate.fail.stop 设为 false"),

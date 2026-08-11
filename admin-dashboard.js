@@ -427,6 +427,7 @@
             'E3012': { desc: '大字段事件缺少类型化值', solution: '事件带的是大字段引用（内容在磁盘上），却没有类型化值（rows_typed），只能走文本路径——那会把 @lob:... 这串引用当成内容写进目标 BLOB/TEXT 列（静默数据损坏），因此已停止应用。请确认源→目标是 mysql→mysql、increment.typed.pipeline.enabled 未被关掉、且源端 binlog_row_image 为 FULL 或 NOBLOB' },
             'E3013': { desc: '汇聚/拆分事件缺少类型化值', solution: '命中路由规则的表其事件没有类型化值（rows_typed），无法生成带来源标识列的 DML，已停止应用以免改坏同一汇聚表里其它来源的行。请检查该表的路由规则是否配错、源端 binlog_row_image 是否为 FULL，以及该源→目标引擎对是否支持类型化管道（increment.typed.pipeline.enabled 是否被关掉）' },
             'E3017': { desc: '唯一键冲突（非主键）', solution: '目标端存在源端没有的唯一索引/约束挡住了这一行。主键冲突是幂等重放可以忽略，唯一键冲突忽略掉则是永久丢一行，因此默认停下等人处置。请核对两端唯一索引差异；确认可丢弃时把 increment.unique.conflict.policy 设为 IGNORE' },
+            'E3018': { desc: 'XA事务缓冲超限', solution: '源库 XA 事务的行事件在 XA PREPARE 时刻就落 binlog，提交/回滚决议要等 XA COMMIT/ROLLBACK，因此未决分支会被整段缓冲到磁盘，等源库提交了才下发到目标库（否则源库回滚的 XA 会在目标库留下永久幻影行）。现在缓冲量超了配额，说明源库有长期未提交的 XA 分支。请在源库执行 XA RECOVER 排查并提交/回滚；确需更大缓冲时调大 sync.xa.branch.max.bytes / sync.xa.pending.max.bytes / sync.xa.pending.max.branches' },
             'E3014': { desc: '位点回灌失败', solution: '本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管；按首次启动去取源库当前位点会静默跳过崩溃到接管之间的全部变更，因此任务停在这里。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务' },
             'E3101': { desc: 'Elastic同步进程启动失败', solution: '请检查Agent日志，确认elastic模块JAR包存在且配置正确' },
             'E3102': { desc: 'Elastic同步失败', solution: '请检查Agent日志，确认Elasticsearch连接正常、索引可写且源库binlog可访问' },

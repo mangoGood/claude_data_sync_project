@@ -528,6 +528,11 @@ public class THLToSqlConverter {
             case "COMMIT":
                 sqlStatements.add("COMMIT;");
                 break;
+            case "XA_PREPARE":
+                // 源库 XA 的 prepare 标记：数据由 extract 端缓冲到 XA COMMIT 才整段下发，
+                // 这里没有任何目标端动作（正常链路上 extract 已经消化掉，不会走到这儿）
+                logger.debug("跳过 XA_PREPARE 事件 (seqno={})", event.getSeqno());
+                break;
             default:
                 logger.debug("Unsupported event type: {}", eventType);
                 break;
@@ -1319,6 +1324,13 @@ public class THLToSqlConverter {
 
         if (classification.isTransaction()) {
             SqlClassifier.TransactionSubType txType = classification.getTransactionSubType();
+            if (txType == SqlClassifier.TransactionSubType.XA) {
+                // XA 控制语句在目标端没有任何对应动作：源库 XA 事务的数据由 extract 端
+                // 缓冲到 XA COMMIT 才整段下发（已是普通事务形态）。照原样执行会把应用连接
+                // 卡进 XA ACTIVE 态，后续 COMMIT/ROLLBACK 全部失败、任务永久停摆。
+                logger.warn("跳过 XA 控制语句（目标端无对应动作）: {}", sql);
+                return statements;
+            }
             if (txType == SqlClassifier.TransactionSubType.BEGIN) {
                 logger.debug("Skipping BEGIN transaction marker");
                 return statements;
