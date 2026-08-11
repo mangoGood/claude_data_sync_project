@@ -99,6 +99,10 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         if (timelineConfig.isEnabled()) {
             schemaTracker = new com.migration.extract.schema.SchemaTracker(props,
                     props.getProperty("task.id", System.getProperty("task.id", "unknown")));
+            typeRenderMode = com.migration.extract.schema.TypeRenderMode
+                    .forServerVersion(readSourceVersion());
+            logger.info("表结构时序库 COLUMN_TYPE 渲染口径: {}（源库版本决定）", typeRenderMode);
+            runSchemaSelfCheck();
         }
 
         PipelineContext pipelineContext = new PipelineContextImpl(props);
@@ -111,6 +115,62 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
         logger.info("MySQL Binlog Extractor initialized - input: {}, output: {}, seqno: {}, skipBeforeCheckpoint: {}",
                 inputDir, outputDir, seqno, skipBeforeCheckpoint);
+    }
+
+    /**
+     * 启动时的语法覆盖度自检：对同步范围内每张表 {@code SHOW CREATE TABLE} → 解析 →
+     * 与 {@code information_schema} 逐列比对。
+     *
+     * <p>放在这里是因为它必须跑在<b>消费任何事件之前</b>：语法覆盖不了某张表时，
+     * 那张表的每个版本都会是错的，早一步知道就少一段错误解析。
+     *
+     * <p>默认<b>只报告不阻断</b>——自检失败说明语法有缺口，但运行期已经有分级降级
+     * （缺版本走 fallback、算错了被交叉校验 E3024 拦住）兜着，为它停机会把
+     * "有一张冷门表解析不了"升级成"整个任务起不来"。要严格把关就把
+     * {@code extract.schema.selfcheck.fail.stop} 置 true。
+     */
+    private void runSchemaSelfCheck() {
+        if (!Boolean.parseBoolean(props.getProperty("extract.schema.selfcheck.enabled", "true"))) {
+            return;
+        }
+        try {
+            java.util.List<String> tables =
+                    com.migration.extract.schema.SchemaSelfCheckMain.resolveTables(sourceConnection, props);
+            if (tables.isEmpty()) {
+                return;
+            }
+            com.migration.extract.schema.SchemaSelfCheck.Result result =
+                    new com.migration.extract.schema.SchemaSelfCheck().run(sourceConnection, tables);
+            if (result.allPassed()) {
+                logger.info("表结构语法自检通过：{} 张表", result.passed());
+                return;
+            }
+            logger.warn("表结构语法自检有 {} 张表对不上，这些表的时序库版本会失准：\n{}",
+                    result.failed(), result.report());
+            if (Boolean.parseBoolean(props.getProperty("extract.schema.selfcheck.fail.stop", "false"))) {
+                throw new com.migration.extract.schema.DdlParseException(
+                        "表结构语法自检未通过（extract.schema.selfcheck.fail.stop=true）: "
+                                + result.report(), "");
+            }
+        } catch (com.migration.extract.schema.DdlParseException e) {
+            throw e;
+        } catch (Exception e) {
+            logger.warn("表结构语法自检执行失败（不阻断启动）: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 源库版本号，决定 {@code COLUMN_TYPE} 里整数类型带不带显示宽度
+     * （8.0.19 起不再回显）。读不到时按新库口径，见 {@code TypeRenderMode}。
+     */
+    private String readSourceVersion() {
+        try (Statement st = sourceConnection.createStatement();
+             ResultSet rs = st.executeQuery("SELECT VERSION()")) {
+            return rs.next() ? rs.getString(1) : null;
+        } catch (SQLException e) {
+            logger.warn("读不到源库版本，COLUMN_TYPE 按 8.0.19+ 口径渲染: {}", e.getMessage());
+            return null;
+        }
     }
 
     private void connectToSourceDatabase() throws SQLException {
@@ -535,40 +595,24 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             tableInfo.put("table", table);
             tableMapCache.put(tableId, tableInfo);
 
-            List<String> columns = resolveColumns(database, table, eventData);
-            tableInfo.put("columns", String.join(",", columns));
+            String binlogFile = String.valueOf(thlEvent.getMetadata().getOrDefault("binlog_file", ""));
+            long binlogPos = thlEvent.getMetadata().get("binlog_position") instanceof Number
+                    ? ((Number) thlEvent.getMetadata().get("binlog_position")).longValue() : 0L;
 
-            List<String> columnTypes = getTableColumnTypes(database, table);
-            List<String> columnFullTypes = tableColumnFullTypeCache.get(database + "." + table);
+            ResolvedSchema resolved = resolveSchema(database, table, eventData, binlogFile, binlogPos);
 
-            // 用的是事件自带的列布局（与当前表定义不一致）时，类型必须按<b>列名</b>重新对齐，
-            // 否则列名对了、类型还错位，等于换了一种写坏方式
-            List<String> schemaColumns = getTableColumns(database, table);
-            if (!columns.equals(schemaColumns)) {
-                columnTypes = columnMetaByName(columns, schemaColumns, columnTypes);
-                if (columnFullTypes != null) {
-                    columnFullTypes = columnMetaByName(columns, schemaColumns, columnFullTypes);
-                }
+            tableInfo.put("columns", String.join(",", resolved.columns));
+            tableInfo.put("column_types", String.join(",", resolved.dataTypes));
+            if (resolved.fullTypes != null) {
+                tableInfo.put("column_full_types", String.join(",", resolved.fullTypes));
             }
-            tableInfo.put("column_types", String.join(",", columnTypes));
-            if (columnFullTypes != null) {
-                tableInfo.put("column_full_types", String.join(",", columnFullTypes));
+            tableInfo.put("primary_keys", String.join(",", resolved.primaryKeys));
+            if (resolved.generatedColumns != null && !resolved.generatedColumns.isEmpty()) {
+                tableInfo.put("generated_columns", String.join(",", resolved.generatedColumns));
             }
-
-            List<String> pkColumns = getTablePrimaryKeys(database, table);
-            tableInfo.put("primary_keys", String.join(",", pkColumns));
-
-            // 生成列随列类型一起查出来（getTableColumnTypes 里填的缓存），这里透传给下游
-            List<String> generatedColumns = generatedColumnCache.get(database + "." + table);
-            if (generatedColumns != null && !generatedColumns.isEmpty()) {
-                tableInfo.put("generated_columns", String.join(",", generatedColumns));
-            }
-
-            String cacheKey = database + "." + table;
-            Map<String, List<String>> enumSetValues = enumSetValuesCache.get(cacheKey);
-            if (enumSetValues != null && !enumSetValues.isEmpty()) {
+            if (resolved.enumSetValues != null && !resolved.enumSetValues.isEmpty()) {
                 StringBuilder sb = new StringBuilder();
-                for (Map.Entry<String, List<String>> entry : enumSetValues.entrySet()) {
+                for (Map.Entry<String, List<String>> entry : resolved.enumSetValues.entrySet()) {
                     if (sb.length() > 0) sb.append(";");
                     sb.append(entry.getKey()).append("=").append(String.join(",", entry.getValue()));
                 }
@@ -578,6 +622,215 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             thlEvent.addMetadata("database_name", database);
             thlEvent.addMetadata("table_name", table);
             thlEvent.addMetadata("table_id", tableId);
+        }
+    }
+
+    /**
+     * 下游要的六项元数据。两条产出路径共用这一个形状：
+     * 表结构时序库（按事件位点取"当时"的结构）与 {@code information_schema}（源库"此刻"的定义）。
+     */
+    private static final class ResolvedSchema {
+        List<String> columns;
+        List<String> dataTypes;
+        List<String> fullTypes;
+        List<String> primaryKeys;
+        List<String> generatedColumns;
+        Map<String, List<String>> enumSetValues;
+        /** 产出方，只用于日志与指标 */
+        String source;
+    }
+
+    /**
+     * 决定这张表的结构从哪儿来。
+     *
+     * <p>这是整个时序库方案的切换点。三档行为：
+     * <ul>
+     *   <li>{@code OFF}：完全走 {@code information_schema}，与改造前逐字一致；</li>
+     *   <li>{@code SHADOW}：两条路都算，<b>产出仍用旧路径</b>，只把差异记下来。灰度期靠
+     *       "差异数归零"来证明语法覆盖够用，这是单测覆盖率证明不了的；</li>
+     *   <li>{@code ON}：时序库说了算，旧路径退为降级兜底。</li>
+     * </ul>
+     *
+     * <p>无论哪一档，只要时序库给得出版本就做一次<b>交叉校验</b>：事件自带的列名
+     * （{@code binlog_row_metadata=FULL}）是与行值同一时刻的权威信息，与算出来的版本矛盾
+     * 就说明时序库跟丢了——这种情况硬解就是整行错位的静默数据损坏，一律 fail-stop（E3024）。
+     * 没有这道校验，一个语法 bug 就能悄悄把整张表写坏，比不上时序库还糟。
+     */
+    private ResolvedSchema resolveSchema(String database, String table, String eventData,
+                                         String binlogFile, long binlogPos) {
+        com.migration.extract.schema.TableSchema versioned = null;
+        if (schemaTracker != null) {
+            versioned = schemaTracker.at(database, table, binlogFile, binlogPos);
+            if (versioned != null && versioned.isUnusable()) {
+                versioned = null;   // 基线取不到 / 解析失败的表，按"没有版本"处置
+            }
+            if (versioned != null) {
+                crossCheckAgainstEvent(versioned, eventData, database, table, binlogFile, binlogPos);
+            }
+        }
+
+        boolean authoritative = schemaTracker != null
+                && schemaTracker.getConfig().isAuthoritative();
+
+        if (authoritative) {
+            if (versioned != null) {
+                timelineHit.increment();
+                return fromTimeline(versioned);
+            }
+            timelineMiss.increment();
+            String detail = String.format(
+                    "表结构时序库没有 %s.%s 在 %s:%d 处的版本（任务可能建于时序库启用之前、"
+                            + "该表基线不可用、或跨机接管时没有回灌）",
+                    database, table, binlogFile, binlogPos);
+            if (schemaTracker.getConfig().getFallback()
+                    == com.migration.extract.schema.SchemaTimelineConfig.Fallback.FAIL_STOP) {
+                throw new SchemaTimelineMissingException(detail);
+            }
+            logger.warn("{}——按 fallback=RESNAPSHOT 退回查源库当前定义（这会退回到"
+                    + "\"用现在的结构解释过去的事件\"）", detail);
+        }
+
+        ResolvedSchema legacy = fromInformationSchema(database, table, eventData);
+
+        // SHADOW：产出用旧路径，只记差异。差异率归零才是切 ON 的依据
+        if (versioned != null && schemaTracker != null && !authoritative) {
+            compareShadow(versioned, legacy, database, table, binlogFile, binlogPos);
+        }
+        return legacy;
+    }
+
+    /** 时序库版本 → 六项元数据。 */
+    private ResolvedSchema fromTimeline(com.migration.extract.schema.TableSchema versioned) {
+        ResolvedSchema r = new ResolvedSchema();
+        r.columns = versioned.columnNames();
+        r.dataTypes = versioned.dataTypes();
+        r.fullTypes = versioned.columnTypes(typeRenderMode);
+        r.primaryKeys = versioned.getPrimaryKey();
+        r.generatedColumns = versioned.generatedColumns();
+        r.enumSetValues = versioned.enumSetValues();
+        r.source = "timeline";
+        return r;
+    }
+
+    /** {@code information_schema} 的当前定义 → 六项元数据（改造前的原有逻辑，逐字保留）。 */
+    private ResolvedSchema fromInformationSchema(String database, String table, String eventData) {
+        ResolvedSchema r = new ResolvedSchema();
+        r.columns = resolveColumns(database, table, eventData);
+
+        List<String> columnTypes = getTableColumnTypes(database, table);
+        List<String> columnFullTypes = tableColumnFullTypeCache.get(database + "." + table);
+
+        // 用的是事件自带的列布局（与当前表定义不一致）时，类型必须按<b>列名</b>重新对齐，
+        // 否则列名对了、类型还错位，等于换了一种写坏方式
+        List<String> schemaColumns = getTableColumns(database, table);
+        if (!r.columns.equals(schemaColumns)) {
+            columnTypes = columnMetaByName(r.columns, schemaColumns, columnTypes);
+            if (columnFullTypes != null) {
+                columnFullTypes = columnMetaByName(r.columns, schemaColumns, columnFullTypes);
+            }
+        }
+        r.dataTypes = columnTypes;
+        r.fullTypes = columnFullTypes;
+        r.primaryKeys = getTablePrimaryKeys(database, table);
+        r.generatedColumns = generatedColumnCache.get(database + "." + table);
+        r.enumSetValues = enumSetValuesCache.get(database + "." + table);
+        r.source = "information_schema";
+        return r;
+    }
+
+    /**
+     * 用事件自带的列名校验时序库算出的版本。
+     *
+     * <p>事件列名只有 {@code binlog_row_metadata=FULL} 才有；没有时这道校验自动跳过
+     * （MINIMAL 下时序库仍然是对的，只是少了这层证据）。
+     */
+    private void crossCheckAgainstEvent(com.migration.extract.schema.TableSchema versioned,
+                                        String eventData, String database, String table,
+                                        String binlogFile, long binlogPos) {
+        List<String> eventColumns = parseEventColumnNames(eventData);
+        if (eventColumns.isEmpty()) {
+            return;
+        }
+        List<String> versionColumns = versioned.columnNames();
+        if (eventColumns.equals(versionColumns)) {
+            return;
+        }
+        timelineCrossCheckFailed.increment();
+        throw new SchemaVersionMismatchException(String.format(
+                "表 %s.%s 在 %s:%d：时序库算出的列布局 %s 与事件自带的列名 %s 不一致。"
+                        + "事件列名是与行值同一时刻的权威信息，两者矛盾说明时序库跟丢了源库的真实结构"
+                        + "（多半是某条 DDL 被漏施加或施加错了）。硬解就是整行错位的静默数据损坏",
+                database, table, binlogFile, binlogPos, versionColumns, eventColumns));
+    }
+
+    /** SHADOW 档的对算：只记差异，不改变产出。 */
+    private void compareShadow(com.migration.extract.schema.TableSchema versioned, ResolvedSchema legacy,
+                               String database, String table, String binlogFile, long binlogPos) {
+        List<String> diffs = new ArrayList<>();
+        if (!versioned.columnNames().equals(legacy.columns)) {
+            diffs.add("列名: 时序库=" + versioned.columnNames() + " 旧路径=" + legacy.columns);
+        }
+        if (!versioned.dataTypes().equals(legacy.dataTypes)) {
+            diffs.add("DATA_TYPE: 时序库=" + versioned.dataTypes() + " 旧路径=" + legacy.dataTypes);
+        }
+        List<String> versionedFull = versioned.columnTypes(typeRenderMode);
+        if (legacy.fullTypes != null && !versionedFull.equals(legacy.fullTypes)) {
+            diffs.add("COLUMN_TYPE: 时序库=" + versionedFull + " 旧路径=" + legacy.fullTypes);
+        }
+        if (!versioned.getPrimaryKey().equals(legacy.primaryKeys)) {
+            diffs.add("主键: 时序库=" + versioned.getPrimaryKey() + " 旧路径=" + legacy.primaryKeys);
+        }
+        if (diffs.isEmpty()) {
+            timelineHit.increment();
+            return;
+        }
+        timelineShadowDiff.increment();
+        // 影子期的差异<b>未必</b>是时序库错了——积压期做过 DDL 时，"旧路径不同"恰恰说明
+        // 时序库在干正事。所以这里只记录，由人看着判断，不自动升级成告警风暴（每表一次）
+        if (shadowDiffWarned.add(database + "." + table)) {
+            logger.warn("[SHADOW] 表 {}.{} 在 {}:{} 两条路算出的结构不同（产出仍用旧路径）:\n  {}",
+                    database, table, binlogFile, binlogPos, String.join("\n  ", diffs));
+        }
+    }
+
+    /** 时序库四项指标：命中 / 未命中降级 / 交叉校验失败 / 影子差异。 */
+    private final java.util.concurrent.atomic.LongAdder timelineHit = new java.util.concurrent.atomic.LongAdder();
+    private final java.util.concurrent.atomic.LongAdder timelineMiss = new java.util.concurrent.atomic.LongAdder();
+    private final java.util.concurrent.atomic.LongAdder timelineCrossCheckFailed =
+            new java.util.concurrent.atomic.LongAdder();
+    private final java.util.concurrent.atomic.LongAdder timelineShadowDiff =
+            new java.util.concurrent.atomic.LongAdder();
+    /** 影子差异每表只告警一次，避免刷屏淹掉真正的信号。 */
+    private final java.util.Set<String> shadowDiffWarned = new java.util.HashSet<>();
+
+    /** {@code COLUMN_TYPE} 的渲染口径，按源库版本定（8.0.19 起整数不回显显示宽度）。 */
+    private com.migration.extract.schema.TypeRenderMode typeRenderMode =
+            com.migration.extract.schema.TypeRenderMode.NO_DISPLAY_WIDTH;
+
+    public Map<String, Long> schemaTimelineMetrics() {
+        Map<String, Long> m = new java.util.LinkedHashMap<>();
+        m.put("timeline_hit", timelineHit.sum());
+        m.put("timeline_miss", timelineMiss.sum());
+        m.put("timeline_cross_check_failed", timelineCrossCheckFailed.sum());
+        m.put("timeline_shadow_diff", timelineShadowDiff.sum());
+        if (schemaTracker != null) {
+            m.put("timeline_ddl_parse_failed", schemaTracker.getDdlParseFailed());
+            m.put("timeline_idempotent_absorbed", schemaTracker.getApplier().getStats().total());
+        }
+        return m;
+    }
+
+    /** 时序库给不出该位点的版本，且 fallback=FAIL_STOP。由 ContinuousExtractMain 收成 E3022。 */
+    public static final class SchemaTimelineMissingException extends RuntimeException {
+        public SchemaTimelineMissingException(String message) {
+            super(message);
+        }
+    }
+
+    /** 时序库版本与事件自带列名矛盾。由 ContinuousExtractMain 收成 E3024。 */
+    public static final class SchemaVersionMismatchException extends RuntimeException {
+        public SchemaVersionMismatchException(String message) {
+            super(message);
         }
     }
 

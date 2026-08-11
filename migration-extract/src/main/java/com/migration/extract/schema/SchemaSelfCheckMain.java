@@ -86,7 +86,7 @@ public final class SchemaSelfCheckMain {
      * 库级同步要去库里枚举——注意只取 BASE TABLE，视图没有 binlog 行事件，
      * 把它们算进来只会得到一堆"SHOW CREATE TABLE 返回的是视图定义"的假失败。
      */
-    static List<String> resolveTables(Connection conn, Properties props) throws Exception {
+    public static List<String> resolveTables(Connection conn, Properties props) throws Exception {
         Set<String> out = new LinkedHashSet<>();
 
         for (String t : props.getProperty("migration.included.tables", "").split(",")) {

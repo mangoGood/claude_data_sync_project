@@ -109,7 +109,7 @@ MySQL DDL 语法里最难的部分正是任意表达式，裁掉之后规模从 
 | 1 CREATE TABLE 解析 + 自检 | ✅ | `MySqlDdl.g4` / `CreateTableParser` / `SchemaSelfCheck` / `SchemaSelfCheckMain`；单测 33 项通过 |
 | 2 ALTER 施加 | ✅ | `DdlApplier` / `SchemaChange`；单测 34 项通过（模块合计 180 项全绿） |
 | 3 时序库与位点查询 | ✅ | `SchemaTimeline` / `SchemaHistoryFile` / `SchemaTracker`（extract）+ `SchemaVersionStore`（agent）+ `V18__task_schema_versions.sql`；capture 打基线；单测 39 项 |
-| 4 extract 切换 + 交叉校验 | ⏳ | |
+| 4 extract 切换 + 交叉校验 | ✅ | `resolveSchema` 三档切换 + E3024 交叉校验 + 分级降级 + 四项指标 + 启动自检；单测 12 项 |
 | 5 影子灰度 + 判据 | ⏳ | |
 
 ## 分阶段
@@ -226,7 +226,18 @@ MySQL DDL 语法里最难的部分正是任意表达式，裁掉之后规模从 
 | DDL 解析失败 | 该表标记失效 → RESNAPSHOT（退回今天的行为）+ 告警 + E3023 计数 |
 | 该位点没有版本（时序库缺失 / 冷启动） | RESNAPSHOT + 告警 |
 
-指标四项：时序库命中率、降级次数、交叉校验失败数、幂等吸收数。灰度期就看这四个数。
+指标四项：时序库命中率、降级次数、交叉校验失败数、幂等吸收数。灰度期就看这四个数
+（`MySQLBinlogExtractor.schemaTimelineMetrics()`，实际落了六项，另两项是 DDL 解析失败数与影子差异数）。
+
+> **落地时补的两点**：
+>
+> * **交叉校验在 SHADOW 档也照做**。原计划只在 ON 档校验，但灰度期正是要提前知道"切过去
+>   会不会报"——SHADOW 下产出仍走旧路径，校验失败却照样 fail-stop，因为那说明时序库跟丢了，
+>   继续攒下去的每个版本都是错的，越晚发现越贵。
+> * **启动自检接在 extract 启动时**（`extract.schema.selfcheck.enabled`，默认开），
+>   默认只报告不阻断：自检失败说明语法有缺口，但运行期已经有分级降级与 E3024 兜着，
+>   为它停机会把"一张冷门表解析不了"升级成"整个任务起不来"。
+>   要严格把关置 `extract.schema.selfcheck.fail.stop=true`。
 
 ### 阶段 5：影子灰度 + 判据
 

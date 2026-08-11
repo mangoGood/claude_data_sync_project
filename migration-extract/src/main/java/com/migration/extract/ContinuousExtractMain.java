@@ -269,6 +269,27 @@ public class ContinuousExtractMain {
                     writeExtractErrorStatus("E3021", e.getMessage());
                     running.set(false);
                     break;
+                } catch (MySQLBinlogExtractor.SchemaVersionMismatchException e) {
+                    // 时序库算出的列布局与事件自带的列名矛盾：时序库跟丢了源库真实结构，
+                    // 硬解就是整行错位的静默数据损坏
+                    logger.error("表结构版本与事件列名不一致，停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3024", e.getMessage());
+                    running.set(false);
+                    break;
+                } catch (MySQLBinlogExtractor.SchemaTimelineMissingException e) {
+                    // 时序库给不出该位点的版本，且 fallback=FAIL_STOP：降级回查源库当前定义
+                    // 等于退回"用现在的结构解释过去的事件"，用户明确要求不接受这种退化
+                    logger.error("表结构时序库缺少该位点的版本，停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3022", e.getMessage());
+                    running.set(false);
+                    break;
+                } catch (com.migration.extract.schema.DdlParseException e) {
+                    // DDL 施加不了，且 fallback=FAIL_STOP：漏施加一条改列的 DDL，
+                    // 该表之后的每个版本都是错的
+                    logger.error("DDL 解析失败（表结构时序库），停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3023", e.getMessage());
+                    running.set(false);
+                    break;
                 } catch (MySQLBinlogExtractor.UnsupportedBinlogEventException e) {
                     // 不认识的事件类型：跳过去就是静默丢数据（源端开了压缩 binlog / PARTIAL_JSON
                     // 这类参数时会命中）。停下来上报，让人先确认源端配置
