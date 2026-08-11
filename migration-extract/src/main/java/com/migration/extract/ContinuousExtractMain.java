@@ -290,6 +290,13 @@ public class ContinuousExtractMain {
                     writeExtractErrorStatus("E3023", e.getMessage());
                     running.set(false);
                     break;
+                } catch (PostgresWalExtractor.UnreconstructableValueException e) {
+                    // PG 逻辑复制没把某列的值发过来（未变更的 TOAST），而这一列又是定位行必需的。
+                    // 猜一个值写下去就是改错行/丢行，且不会有任何报错
+                    logger.error("WAL 事件缺少必需的列值，停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3025", e.getMessage());
+                    running.set(false);
+                    break;
                 } catch (MySQLBinlogExtractor.UnsupportedBinlogEventException e) {
                     // 不认识的事件类型：跳过去就是静默丢数据（源端开了压缩 binlog / PARTIAL_JSON
                     // 这类参数时会命中）。停下来上报，让人先确认源端配置
@@ -475,7 +482,7 @@ public class ContinuousExtractMain {
                 binlogFile.getName(), newLines, progress.linesRead, totalLinesInFile);
 
         // 使用类级别 currentThlWriter 统一写入，按50MB大小轮转文件
-        int newEventCount = readAndExtractNewLines(binlogFile, progress, progress.linesRead);
+        int newEventCount = readAndExtractNewLines(binlogFile, progress, progress.linesRead, totalLinesInFile);
 
         long currentSize = binlogFile.length();
         boolean fileStoppedGrowing = (currentSize == progress.lastFileSize && currentSize > 0);
@@ -570,12 +577,39 @@ public class ContinuousExtractMain {
         }
     }
 
+    /**
+     * 文件里<b>已写完整</b>的行数（不含末尾那条还没写完的）。
+     *
+     * <p>capture 是一边写一边被读的：一条记录写进 {@code BufferedWriter} 时，若跨过 8192 字符的
+     * 缓冲边界，它会分两次落到文件上。读取方正好夹在两次之间扫到文件，就会看到半条记录 ——
+     * 而 {@code readLine()} 对"文件末尾没有换行符"和"一行正常结束"给出的结果一模一样。
+     * 把半行当完整事件消费掉，前半截会被当成合法事件写进 THL（字段够数时下游根本发现不了），
+     * 后半截在下一轮变成字段数不足的孤行被丢掉 —— 两头都是静默的。
+     *
+     * <p>所以以换行符为准：文件不以换行结束时，末行一律留到下一轮再读。
+     * （对照 THL 那一跳：分帧格式里半条记录是能被显式识别的，见 {@code THLFileReader}。）
+     */
     private int countLines(File file) throws IOException {
         int count = 0;
         try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
             while (reader.readLine() != null) count++;
         }
+        if (count > 0 && !endsWithNewline(file)) {
+            count--;
+        }
         return count;
+    }
+
+    /** 文件最后一个字节是否是换行符（空文件按"未结束"处理）。 */
+    private boolean endsWithNewline(File file) throws IOException {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "r")) {
+            long len = raf.length();
+            if (len == 0) {
+                return false;
+            }
+            raf.seek(len - 1);
+            return raf.read() == '\n';
+        }
     }
 
     /** 创建 THL 文件写入器（根据加密配置自动选择） */
@@ -680,14 +714,20 @@ public class ContinuousExtractMain {
         return one;
     }
 
-    private int readAndExtractNewLines(File binlogFile,
-                                        FileProgress progress, int skipLines) throws Exception {
+    /**
+     * @param maxLines 本轮最多读到第几行（即 {@link #countLines} 数出的完整行数）。
+     *                 读的时候 capture 可能又追加了内容，末行未必写完 —— 以进入本轮时数出的
+     *                 完整行数为准，多出来的留到下一轮，避免消费半行（见 {@link #countLines}）
+     */
+    private int readAndExtractNewLines(File binlogFile, FileProgress progress,
+                                       int skipLines, int maxLines) throws Exception {
         int[] eventCount = {0};
         int currentLine = 0;
         try (BufferedReader reader = new BufferedReader(new FileReader(binlogFile))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 currentLine++;
+                if (currentLine > maxLines) break;
                 if (currentLine <= skipLines) continue;
                 if (line.trim().isEmpty()) {
                     progress.linesRead++;

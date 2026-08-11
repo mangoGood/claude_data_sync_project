@@ -1103,7 +1103,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         for (Map.Entry<String, String> entry : values.entrySet()) {
             if (!first) sb.append(",");
             sb.append(entry.getKey()).append(":")
-              .append(entry.getValue() != null ? entry.getValue() : "[null]");
+              .append(entry.getValue() != null ? entry.getValue() : com.migration.common.wire.CapTupleMarkers.NULL);
             first = false;
         }
         return sb.toString();

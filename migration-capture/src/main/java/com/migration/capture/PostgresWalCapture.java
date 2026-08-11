@@ -753,7 +753,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             for (int i = 0; i < values.size(); i++) {
                 if (i > 0) sb.append(",");
                 String colName = (i < columnNames.size()) ? columnNames.get(i) : "col" + i;
-                sb.append(colName).append(":").append(values.get(i) != null ? values.get(i) : "[null]");
+                sb.append(colName).append(":").append(values.get(i) != null ? values.get(i) : com.migration.common.wire.CapTupleMarkers.NULL);
             }
             sb.append("}");
 
@@ -809,7 +809,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 for (int i = 0; i < oldValues.size(); i++) {
                     if (i > 0) sb.append(",");
                     String colName = (i < columnNames.size()) ? columnNames.get(i) : "col" + i;
-                    sb.append(colName).append(":").append(oldValues.get(i) != null ? oldValues.get(i) : "[null]");
+                    sb.append(colName).append(":").append(oldValues.get(i) != null ? oldValues.get(i) : com.migration.common.wire.CapTupleMarkers.NULL);
                 }
                 sb.append("}");
             }
@@ -819,7 +819,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 for (int i = 0; i < newValues.size(); i++) {
                     if (i > 0) sb.append(",");
                     String colName = (i < columnNames.size()) ? columnNames.get(i) : "col" + i;
-                    sb.append(colName).append(":").append(newValues.get(i) != null ? newValues.get(i) : "[null]");
+                    sb.append(colName).append(":").append(newValues.get(i) != null ? newValues.get(i) : com.migration.common.wire.CapTupleMarkers.NULL);
                 }
                 sb.append("}");
             }
@@ -872,7 +872,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             for (int i = 0; i < oldValues.size(); i++) {
                 if (i > 0) sb.append(",");
                 String colName = (i < columnNames.size()) ? columnNames.get(i) : "col" + i;
-                sb.append(colName).append(":").append(oldValues.get(i) != null ? oldValues.get(i) : "[null]");
+                sb.append(colName).append(":").append(oldValues.get(i) != null ? oldValues.get(i) : com.migration.common.wire.CapTupleMarkers.NULL);
             }
             sb.append("}");
 
@@ -907,8 +907,12 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                     logger.debug("  col[{}] NULL", i);
                     values.add(null);
                 } else if (colFlag == 'u') {
+                    // 行外存储（TOAST）里本次未被修改的值：PG **不发送**它。
+                    // 绝不能与真 NULL('n') 合流——那样下游会生成 SET col=NULL，
+                    // 把目标端已经正确的大字段抹掉，且全程无报错。用独立标记下发，
+                    // 由 extract 把该列整个从 SET 列表里摘掉。
                     logger.debug("  col[{}] UNCHANGED_TOAST", i);
-                    values.add(null);
+                    values.add(com.migration.common.wire.CapTupleMarkers.UNCHANGED);
                 } else {
                     logger.debug("  col[{}] UNKNOWN_FLAG={}", i, (int)colFlag);
                     values.add(null);
@@ -922,9 +926,10 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
 
     private String formatColumnValue(byte[] colData, String colType, String colName) {
         String strValue = new String(colData, StandardCharsets.UTF_8);
-        if (strValue.isEmpty()) {
-            return "NULL";
-        }
+        // 空串不能当成 NULL：wire 上空串是 't' + 长度 0，真 NULL 是 'n'，两者本来就分得开。
+        // 旧实现在这里返回不带引号的 "NULL"，extract 只认 [null] 前缀，于是它作为普通字符串
+        // 一路走到目标端，落成四个字符的 'NULL'（实测复现）。空串按类型正常渲染即可：
+        // 文本类型走下面的加引号分支得到 ''，数值类型交由 extract 的空值判断兜底。
         String lowerType = colType != null ? colType.toLowerCase() : "";
         if ("boolean".equalsIgnoreCase(lowerType)) {
             return strValue.equals("t") ? "true" : "false";

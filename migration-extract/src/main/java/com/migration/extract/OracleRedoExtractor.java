@@ -410,7 +410,7 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
                 value = value.substring(colonIdx + 1).trim();
             }
 
-            if (value.startsWith("[null]")) {
+            if (value.startsWith(com.migration.common.wire.CapTupleMarkers.NULL)) {
                 values.add(null);
             } else if (value.startsWith("'") && value.endsWith("'") && value.length() >= 2) {
                 values.add(value.substring(1, value.length() - 1));

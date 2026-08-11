@@ -40,6 +40,8 @@ public class ContinuousIncrementMain {
     private RowRateLimiter rowRateLimiter;
     /** {@code increment.unique.conflict.policy} = FAIL_STOP（默认）| IGNORE */
     private String uniqueConflictPolicy = "FAIL_STOP";
+    /** 数据变更事件在文本路径下没生成任何 SQL 时的处置：FAIL_STOP（默认）/ SKIP。 */
+    private String emptyStatementPolicy = "FAIL_STOP";
 
     /**
      * 这条重复键错误是不是<b>主键</b>冲突。
@@ -283,6 +285,7 @@ public class ContinuousIncrementMain {
         // 旧行为把主键冲突（幂等重放，忽略正确）和唯一键冲突（目标端多了一条源端没有的约束，
         // 忽略即永久丢一行）混成了一类。
         uniqueConflictPolicy = props.getProperty("increment.unique.conflict.policy", "FAIL_STOP");
+        emptyStatementPolicy = props.getProperty("increment.empty.statement.policy", "FAIL_STOP");
         if (!rowRateLimiter.isUnlimited()) {
             logger.info("增量限速已启用: {} 行/秒（配额落到执行层，避免应用过快打挂源库）", maxRowsPerSec);
         }
@@ -783,6 +786,16 @@ public class ContinuousIncrementMain {
                     continue;
                 }
 
+                // 转换出 0 条 SQL 的数据变更事件绝不能照常提交推进位点
+                if (isSilentlyDropped(event, typedDmls, sqlStatements)) {
+                    aborted = true;
+                    running.set(false);
+                    break;
+                }
+                if (sqlStatements == null) {
+                    sqlStatements = java.util.Collections.emptyList();
+                }
+
                 // 逐事件一条同样是长跑的日志膨胀源（BEGIN/COMMIT 也各占一条），降到 DEBUG；
                 // 进度看每 100 个事件一条的汇总行即可
                 if (typedDmls != null && !typedDmls.isEmpty()) {
@@ -896,9 +909,26 @@ public class ContinuousIncrementMain {
                             String errorMsg = e.getMessage();
                             boolean isRecoverable = false;
 
-                            if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contains("1062"))) {
-                                isRecoverable = true;
-                                logger.warn("重复键忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                            if (errorMsg != null && (errorMsg.contains("Duplicate entry")
+                                    || errorMsg.contains("duplicate key") || errorMsg.contains("1062"))) {
+                                // 与类型化路径同一套判定：主键冲突 = 幂等重放，忽略是对的；
+                                // **非主键唯一键**冲突不是——那是目标端有一条源端没有的约束把这一行挡住了，
+                                // 忽略掉就是永久丢一行。这条判定原先只加在类型化路径上，
+                                // 没走类型化管道的源→目标组合全从这个分支过，洞是活的
+                                if (isPrimaryKeyConflict(errorMsg)) {
+                                    isRecoverable = true;
+                                    logger.warn("主键重复忽略（幂等重放）(seqno={}): {}", event.getSeqno(), errorMsg);
+                                } else if ("IGNORE".equalsIgnoreCase(uniqueConflictPolicy)) {
+                                    isRecoverable = true;
+                                    logger.warn("唯一键冲突按策略忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                                } else {
+                                    txFailed = true;
+                                    logger.error("唯一键冲突（非主键）(seqno={}): {}。"
+                                            + "目标端存在源端没有的唯一约束，忽略它会永久丢掉这一行",
+                                            event.getSeqno(), errorMsg);
+                                    writeErrorStatus("E3017", "唯一键冲突（非主键）: " + errorMsg, event);
+                                    break;
+                                }
                             } else if ((sqlUpper.startsWith("UPDATE") || sqlUpper.startsWith("DELETE"))
                                     && errorMsg != null
                                     && (errorMsg.contains("0 rows affected") || errorMsg.contains("not found"))) {
@@ -1466,6 +1496,40 @@ public class ContinuousIncrementMain {
      * 会把所有类型化路径的事件误标为 UNKNOWN；这里优先看事件自身的类型，仅在缺失/不识别时才回退文本判断。
      */
     /** 是否为数据变更（INSERT/UPDATE/DELETE）事件——仅这类事件写 origin 标记；DDL/心跳等不写。 */
+    /**
+     * 一条数据变更事件走文本路径却一条 SQL 都没生成 —— 这是静默丢数的公共出口，必须停下。
+     *
+     * <p>{@link THLToSqlConverter} 的 INSERT/UPDATE/DELETE 三个入口各有"缺库表名"和"无行数据"
+     * 两条 {@code logger.warn} 完就返回空列表的路径。返回空列表之后这里的执行循环一次都不进，
+     * {@code txFailed} 保持 false，事务照常提交、位点照常推进 —— 上游任何一次解析退化
+     * （半行 .cap、TOAST 值缺失、列元数据查不到）都会在这里变成"一条 warn + 一行数据永久消失"。
+     *
+     * <p>只判**文本路径**（{@code typedDmls == null}）：类型化路径返回空列表是合法的，
+     * 列过滤把整行排除掉时本来就不该产生 SQL。
+     *
+     * @return true 表示应当停机
+     */
+    private boolean isSilentlyDropped(THLEvent event, List<ParameterizedDml> typedDmls,
+                                      List<String> sqlStatements) {
+        if (typedDmls != null || !isDataChangeEvent(event)) {
+            return false;
+        }
+        if (sqlStatements != null && !sqlStatements.isEmpty()) {
+            return false;
+        }
+        String detail = String.format("%s 事件未生成任何 SQL（seqno=%d, %s.%s），"
+                        + "继续提交会把这条变更静默丢掉",
+                event.getMetadata("event_type"), event.getSeqno(),
+                event.getMetadata("database_name"), event.getMetadata("table_name"));
+        if ("SKIP".equalsIgnoreCase(emptyStatementPolicy)) {
+            logger.error("{}（按 increment.empty.statement.policy=SKIP 放过）", detail);
+            return false;
+        }
+        logger.error("{}，停止应用", detail);
+        writeErrorStatus("E3026", detail, event);
+        return true;
+    }
+
     private boolean isDataChangeEvent(THLEvent event) {
         String t = (String) event.getMetadata("event_type");
         if (t == null) return false;
@@ -2031,6 +2095,14 @@ public class ContinuousIncrementMain {
                     if (!handleConvertFailure(event, convEx)) { aborted = true; break; }
                     continue;
                 }
+                // 与串行路径同：转换出 0 条 SQL 的数据变更事件停机，不能让它随批提交推进位点。
+                // 先把批里已转换的落库，位点才停在这条事件之前而不是把前面的一起丢掉
+                if (isSilentlyDropped(event, typedDmls, sqlStatements)) {
+                    flushBatch(batch);
+                    batch.clear();
+                    aborted = true;
+                    break;
+                }
                 batch.add(new WorkItem(event, typedDmls, sqlStatements));
             }
             if (!aborted) {
@@ -2074,6 +2146,11 @@ public class ContinuousIncrementMain {
         // 其余（DDL / 无表名的数据事件）：主线程转换 + 在 worker[0] 连接上串行应用
         List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
         List<String> sqlStatements = (typedDmls == null) ? sqlConverter.convertToSql(event) : null;
+        // 无表名的数据事件正是从这儿过的：转不出 SQL 还 advanceCheckpoint 就是静默丢一行
+        if (isSilentlyDropped(event, typedDmls, sqlStatements)) {
+            running.set(false);
+            return false;
+        }
         Connection conn = parallelExecutor.conns[0];
         try {
             applyEventTx(event, conn, typedDmls, sqlStatements);
