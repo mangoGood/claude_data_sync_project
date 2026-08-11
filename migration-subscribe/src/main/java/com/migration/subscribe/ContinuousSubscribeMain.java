@@ -1102,6 +1102,9 @@ public class ContinuousSubscribeMain {
     /**
      * ENUM / SET 的取值表：{@code col=v1,v2,v3;col2=a,b}（各 extractor 统一格式）。
      * 增量应用侧一直按它把数值还原成标签，订阅侧此前没跟上，下游拿到的是 {@code 3} 而不是 {@code "c"}。
+     *
+     * <p>{@code split(",", -1)}：取值可以是空串（{@code enum('a','')} → {@code "col=a,"}），
+     * 默认的 split 会把末尾空串丢掉，取值表少一位，其后的序号全部对不上。
      */
     private Map<String, String[]> parseEnumSetValues(Object metaValue) {
         Map<String, String[]> out = new LinkedHashMap<>();
@@ -1109,7 +1112,7 @@ public class ContinuousSubscribeMain {
         for (String entry : metaValue.toString().split(";")) {
             int eq = entry.indexOf('=');
             if (eq <= 0) continue;
-            out.put(entry.substring(0, eq).trim(), entry.substring(eq + 1).split(","));
+            out.put(entry.substring(0, eq).trim(), entry.substring(eq + 1).split(",", -1));
         }
         return out;
     }

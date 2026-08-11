@@ -934,7 +934,9 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                     valuesStr = valuesStr.substring(1, valuesStr.length() - 1);
                 }
                 List<String> values = new ArrayList<>();
-                for (String v : valuesStr.split(",")) {
+                // limit=-1：默认的 split(",") 会把<b>末尾</b>的空串整段丢掉，
+                // enum('a','') 序列化成 "col=a," 后会被解回 ["a"]，第 2 个取值凭空消失。
+                for (String v : valuesStr.split(",", -1)) {
                     values.add(v.trim());
                 }
                 map.put(colName, values);
@@ -1032,8 +1034,13 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             } else if (isEnumType(type) && enumValuesMap.containsKey(colName)) {
                 List<String> enumValues = enumValuesMap.get(colName);
                 try {
-                    int idx = Integer.parseInt(value.trim()) - 1;
-                    if (idx >= 0 && idx < enumValues.size()) {
+                    int ordinal = Integer.parseInt(value.trim());
+                    int idx = ordinal - 1;
+                    if (ordinal == 0) {
+                        // 序号 0 是 MySQL ENUM 的错误值 ''（非严格模式写入非法取值时留下的），
+                        // 不是"第 0 个标签"。原样输出会把字符串 '0' 写进目标列。
+                        sb.append("''");
+                    } else if (idx >= 0 && idx < enumValues.size()) {
                         sb.append("'").append(enumValues.get(idx).replace("'", "\\'")).append("'");
                     } else {
                         sb.append("'").append(value.replace("'", "\\'")).append("'");
@@ -1145,8 +1152,14 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             } else if (isEnumType(type) && enumValuesMap.containsKey(colName)) {
                 List<String> enumValues = enumValuesMap.get(colName);
                 try {
-                    int idx = Integer.parseInt(value.trim()) - 1;
-                    typed.add(idx >= 0 && idx < enumValues.size() ? enumValues.get(idx) : value);
+                    int ordinal = Integer.parseInt(value.trim());
+                    int idx = ordinal - 1;
+                    // 序号 0 = ENUM 的错误值 ''（见 formatRowData 同分支）
+                    if (ordinal == 0) {
+                        typed.add("");
+                    } else {
+                        typed.add(idx >= 0 && idx < enumValues.size() ? enumValues.get(idx) : value);
+                    }
                 } catch (NumberFormatException e) {
                     typed.add(value);
                 }
@@ -1617,6 +1630,16 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return columnTypes;
     }
 
+    /**
+     * 从 {@code enum('a','b')} / {@code set('x','y')} 里切出取值表。
+     *
+     * <p><b>空串取值必须保留占位</b>：MySQL 允许 {@code enum('','a')}，序号按声明顺序从 1 排
+     * （1='' 2='a'）。闭合引号处若加 {@code sb.length() > 0} 判断把空串跳过，取值表就塌成
+     * {@code ["a"]}——下游按序号还原时 1 会被解成 'a'（本该是 ''）、2 直接越界，整列静默写错。
+     *
+     * <p>与 {@code SchemaSelfCheck.parseEnumSetValues} 是同一套规则（含 {@code \\'} 转义），
+     * 改这里必须同步改那边，否则表结构语法自检会报出一堆假差异。
+     */
     private List<String> parseEnumSetValues(String columnType) {
         List<String> values = new ArrayList<>();
         int start = columnType.indexOf('(');
@@ -1631,7 +1654,7 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             char c = inner.charAt(i);
             if (c == '\'' && (i == 0 || inner.charAt(i - 1) != '\\')) {
                 inQuote = !inQuote;
-                if (!inQuote && sb.length() > 0) {
+                if (!inQuote) {
                     values.add(sb.toString());
                     sb = new StringBuilder();
                 }
