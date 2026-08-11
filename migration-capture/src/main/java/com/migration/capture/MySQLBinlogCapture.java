@@ -1,6 +1,6 @@
 package com.migration.capture;
 
-import com.github.shyiko.mysql.binlog.BinaryLogClient;
+import com.github.shyiko.mysql.binlog.StreamingBinaryLogClient;
 import com.github.shyiko.mysql.binlog.event.Event;
 import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
 import com.github.shyiko.mysql.binlog.event.EventData;
@@ -18,8 +18,10 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -49,12 +51,24 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     /** 位点落盘的时间兜底间隔：低流量任务下不足 1000 事件也要能看到当前位点。 */
     private static final long POSITION_SAVE_INTERVAL_MS = 5000;
     private volatile long lastPositionSaveTime = 0;
+    /** 位点保留期在线巡检：运行中日志被清理不会报错，只会等到重启才炸，所以要主动看。 */
+    private boolean retentionCheckEnabled = true;
+    private long retentionCheckIntervalMs = 60000;
+    private volatile long lastRetentionCheckMs = 0;
     private String outputDir;
     private String taskId;
     private long serverId;
     private String heartbeatDatabase;
 
-    private BinaryLogClient client;
+    private StreamingBinaryLogClient client;
+    /** 大字段落盘器；null = 关闭（完全走上游的"整值进堆"行为）。 */
+    private com.migration.capture.binlog.LobSpillWriter lobSpillWriter;
+    private int lobSpillThresholdBytes;
+    /** 当前事件内的大字段序号，用于生成按位点确定的落盘文件名。 */
+    private int lobCellSeq;
+    /** 孤儿临时文件清扫的节流。 */
+    private volatile long lastLobSweepMs = 0;
+    private static final long LOB_SWEEP_INTERVAL_MS = 30_000L;
     private BufferedWriter writer;
     private final AtomicLong eventCounter = new AtomicLong(0);
     private final AtomicLong fileCounter = new AtomicLong(0);
@@ -129,8 +143,14 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             gtidSet = "";
         }
         taskId = props.getProperty("task.id", "unknown");
+        retentionCheckEnabled = Boolean.parseBoolean(
+                props.getProperty("capture.position.health.enabled", "true"));
+        retentionCheckIntervalMs = Long.parseLong(
+                props.getProperty("capture.position.health.interval.ms", "60000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         serverId = Long.parseLong(props.getProperty("capture.server.id", "65535"));
+        deserializationFailureSkip = "SKIP".equalsIgnoreCase(
+                props.getProperty("capture.deserialization.failure.policy", "FAIL_STOP").trim());
         bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
         loopGuard = new com.migration.common.bidi.BidiLoopGuard(bidirectionalEnabled);
         // 双向 DDL 单向传播：只有"方向开了 A_TO_B"且"本任务是正向通道"时才放行
@@ -140,6 +160,26 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             logger.info("双向 DDL 传播: {}", bidiDdlForwardAllowed ? "本任务放行（A→B 正向）" : "不传播");
         }
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
+
+        // 大字段落盘：超过阈值的 BLOB/TEXT 边读边写到磁盘，事件里只留引用。
+        // 低于阈值的值按老路径走 byte[]（零回归），高于阈值的走落盘。
+        //
+        // 阈值默认 1MB，是<b>实测</b>定的而不是拍的：低于阈值的值要经过
+        // "0x 十六进制串 → .cap 整行 String → getBytes → 切分 → 还原 byte[] → 再拼一遍 SQL 字面量"
+        // 这一路，在 extract 里的峰值占用大约是值本身的 20~30 倍。
+        // 4MB 阈值配 -Xmx144m 时，一条 UPDATE（前后两个镜像各 4MB）就把 extract 顶到 273MB 并 OOM。
+        // 按 1MB 算，30 倍是 30MB，留得下。内存预算更小就把它再调小，代价只是更多小文件。
+        boolean lobSpillEnabled = Boolean.parseBoolean(props.getProperty("migration.lob.spill.enabled", "true"));
+        lobSpillThresholdBytes = Integer.parseInt(
+                props.getProperty("migration.lob.spill.threshold.bytes", "1048576"));
+        String lobSpillDir = props.getProperty("migration.lob.spill.dir", "files/" + taskId + "/lob");
+        lobSpillWriter = lobSpillEnabled
+                ? new com.migration.capture.binlog.LobSpillWriter(lobSpillDir) : null;
+        if (lobSpillWriter != null) {
+            int cleaned = lobSpillWriter.cleanupOrphanTemp(3600_000L);
+            logger.info("大字段落盘已启用: dir={} 阈值={}B，清理孤儿临时文件 {} 个",
+                    lobSpillDir, lobSpillThresholdBytes, cleaned);
+        }
 
         heartbeatDatabase = props.getProperty("source.db.database", "");
         if (heartbeatDatabase == null || heartbeatDatabase.isEmpty()) {
@@ -271,6 +311,34 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         CapturePositionUnavailableException(String message) {
             super(message);
         }
+    }
+
+    /** 反序列化失败是否只跳过不停机（{@code capture.deserialization.failure.policy=SKIP}）。 */
+    private boolean deserializationFailureSkip = false;
+
+    /** 已经在停机流程里，避免多个失败事件重复触发。 */
+    private final java.util.concurrent.atomic.AtomicBoolean failStopped =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 不可继续的故障：上报 error_status 后退出进程。
+     *
+     * <p>必须另起线程做退出动作——本方法是在连接器的事件线程上被调用的，
+     * 而 {@code System.exit} 触发的关闭钩子里会 {@code client.disconnect()} 等这个线程收工，
+     * 在原线程上直接退出会死锁。
+     *
+     * <p>位点不用特意回退：{@code currentBinlogPosition} 只在事件<b>成功处理</b>时才更新，
+     * 失败事件根本没走到那一步，所以关闭钩子里存下的仍是故障事件之前的位点，重启会重读它。
+     */
+    private void failStop(String errorCode, String message) {
+        if (!failStopped.compareAndSet(false, true)) {
+            return;
+        }
+        logger.error("capture fail-stop [{}]: {}", errorCode, message);
+        writeCaptureErrorStatus(errorCode, message);
+        Thread exit = new Thread(() -> System.exit(1), "capture-fail-stop");
+        exit.setDaemon(false);
+        exit.start();
     }
 
     /**
@@ -436,8 +504,12 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
 
         openNewOutputFile();
+        writeSchemaBaseline();
 
-        client = new BinaryLogClient(host, port, user, password);
+        // 用 vendored 的流式客户端：上游 BinaryLogClient 会把跨 16MB 包的事件
+        // 拼成一整块 byte[]，一个带 1GB 大字段的行事件在那里必 OOM。
+        // 差异只有一处（见 StreamingBinaryLogClient 类注释 [PATCH-1]）。
+        client = new StreamingBinaryLogClient(host, port, user, password);
         client.setServerId(serverId);
 
         // 反序列化模式改造：
@@ -448,24 +520,30 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         // 注意：兼容模式必须在注册自定义反序列化器之后设置，才能传播到它们。
         java.util.Map<Long, com.github.shyiko.mysql.binlog.event.TableMapEventData> tableMapShared =
                 new java.util.HashMap<>();
+        // 大字段落盘：超过阈值的 BLOB/TEXT 不进堆，边读边写到 files/<taskId>/lob/，
+        // 事件里只留引用。关掉即完全走上游行为（一个 1GB 的值分配 1GB byte[]）。
+        com.migration.capture.binlog.SignAwareRowsDeserializers.SpillPolicy spillPolicy =
+                lobSpillWriter == null ? null
+                        : new com.migration.capture.binlog.SignAwareRowsDeserializers.SpillPolicy(
+                                lobSpillWriter, lobSpillThresholdBytes);
         com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer eventDeserializer =
                 new com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer();
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.TABLE_MAP,
                 new com.migration.capture.binlog.SignAwareRowsDeserializers.SharedTableMapDeserializer(tableMapShared));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.WRITE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared));
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared, spillPolicy));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_WRITE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared)
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared, spillPolicy)
                         .setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.UPDATE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared));
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared, spillPolicy));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_UPDATE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared)
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared, spillPolicy)
                         .setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.DELETE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared));
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared, spillPolicy));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_DELETE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared)
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared, spillPolicy)
                         .setMayContainExtraInformation(true));
         eventDeserializer.setCompatibilityMode(
                 com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer.CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY);
@@ -485,24 +563,35 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
         client.registerEventListener(this::processEvent);
 
-        client.registerLifecycleListener(new BinaryLogClient.LifecycleListener() {
+        client.registerLifecycleListener(new StreamingBinaryLogClient.LifecycleListener() {
             @Override
-            public void onConnect(BinaryLogClient client) {
+            public void onConnect(StreamingBinaryLogClient client) {
                 logger.info("已连接到MySQL binlog流");
             }
 
             @Override
-            public void onCommunicationFailure(BinaryLogClient client, Exception ex) {
+            public void onCommunicationFailure(StreamingBinaryLogClient client, Exception ex) {
                 logger.error("MySQL通信失败: {}", ex.getMessage());
             }
 
             @Override
-            public void onEventDeserializationFailure(BinaryLogClient client, Exception ex) {
-                logger.error("事件反序列化失败: {}", ex.getMessage());
+            public void onEventDeserializationFailure(StreamingBinaryLogClient client, Exception ex) {
+                // 连接器在这个回调之后是 <b>continue</b>——该事件被永久跳过。只打一行日志的话，
+                // 一个解析不了的行事件就是一次静默丢数据：任务照常显示健康、位点照常前进、
+                // 下游少了几行没有任何人知道。实测源端开 binlog_row_value_options=PARTIAL_JSON
+                // 就会走到这里（PARTIAL_UPDATE_ROWS_EVENT），UPDATE 整条消失且 error_status 为空。
+                // 所以默认停下来上报，让人去处置源端；确实想放过时才配 SKIP。
+                if (deserializationFailureSkip) {
+                    logger.error("事件反序列化失败（按 capture.deserialization.failure.policy=SKIP 跳过，"
+                            + "该事件的数据将永久缺失）: {}", ex.getMessage());
+                    return;
+                }
+                failStop("E3019", "binlog 事件反序列化失败，该事件会被连接器跳过（等于静默丢数据），"
+                        + "已停止捕获: " + ex.getMessage());
             }
 
             @Override
-            public void onDisconnect(BinaryLogClient client) {
+            public void onDisconnect(StreamingBinaryLogClient client) {
                 logger.info("已断开MySQL binlog流连接");
             }
         });
@@ -580,6 +669,15 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     /** 本任务是否允许把 DDL 传给对端（sync.bidi.ddl.direction=A_TO_B 且本任务是正向通道）。 */
     private boolean bidiDdlForwardAllowed = false;
 
+    /** XA 控制语句：{@code XA START/END/PREPARE/COMMIT/ROLLBACK}，在 binlog 里以 QUERY 事件出现。 */
+    private static final java.util.regex.Pattern XA_CONTROL = java.util.regex.Pattern.compile(
+            "^\\s*XA\\s+(START|BEGIN|END|PREPARE|COMMIT|ROLLBACK)\\b",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    private static boolean isXaControlStatement(String sql) {
+        return sql != null && XA_CONTROL.matcher(sql).find();
+    }
+
     /** 同步内部表的 DDL 永远不外传：它们是机制自身的表，传过去只会互相建表打架。 */
     private static boolean isInternalDdl(String sql) {
         if (sql == null) return false;
@@ -611,7 +709,50 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         logger.info("背压监控线程已启动, taskId={}", taskId);
     }
 
+    /**
+     * 事件入口。压缩事务（{@code binlog_transaction_compression=ON}，MySQL 8.0.20+）在这里拆包。
+     *
+     * <p>开了压缩之后，<b>整个事务</b>在 binlog 里只有一个 {@code Transaction_payload} 事件
+     * （实测 8.0.44：ZSTD，内层的 BEGIN/Table_map/Write_rows/Xid 位点全等于外层）。而连接器
+     * 只把<b>外层</b>事件投给监听器，内层要调用方自己 {@code getUncompressedEvents()} 展开——
+     * 不展开的话整个事务连一行都到不了下游，而且不报错、位点照常前进，任务看着完全健康。
+     * 这是实测复现过的静默丢数据。
+     *
+     * <p>内层事件沿用外层的 binlog 位点（它们本来就在同一个位点上），所以位点语义、续传口径
+     * 都不变：重启从这个位点重来，整个事务原样重放一遍。
+     */
     private void processEvent(Event event) {
+        if (!running) {
+            return;
+        }
+        EventData data = event.getData();
+        if (data instanceof com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData) {
+            com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData payload =
+                    (com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData) data;
+            java.util.List<Event> inner = payload.getUncompressedEvents();
+            if (inner == null || inner.isEmpty()) {
+                failStop("E3019", "压缩事务 (TRANSACTION_PAYLOAD @ " + client.getBinlogFilename()
+                        + ":" + client.getBinlogPosition() + ") 解压后没有任何内层事件，"
+                        + "该事务的数据无法捕获");
+                return;
+            }
+            if (compressedTxLogged.compareAndSet(false, true)) {
+                logger.info("源端启用了压缩 binlog（binlog_transaction_compression），"
+                        + "已按内层事件逐个捕获（首个压缩事务含 {} 个内层事件）", inner.size());
+            }
+            for (Event e : inner) {
+                processSingleEvent(e);
+            }
+            return;
+        }
+        processSingleEvent(event);
+    }
+
+    /** 已经打过"源端开了压缩 binlog"这条提示（每进程一次，不刷屏）。 */
+    private final java.util.concurrent.atomic.AtomicBoolean compressedTxLogged =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private void processSingleEvent(Event event) {
         if (!running) {
             return;
         }
@@ -654,6 +795,11 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                     String sql = ((QueryEventData) eventData).getSql();
                     if (sql != null && "BEGIN".equalsIgnoreCase(sql.trim())) {
                         loopGuard.onTransactionBoundary();
+                    } else if (isXaControlStatement(sql)) {
+                        // XA 事务在 binlog 里没有 BEGIN/XID，边界靠 XA START/COMMIT/ROLLBACK 划：
+                        // 不复位的话标记状态会从上一个事务粘过来，把本事务的数据事件误判成"对端复制来的"直接跳过。
+                        // XA 控制语句本身照常外传，交给 extract 的 XaTransactionBuffer 处理
+                        loopGuard.onTransactionBoundary();
                     } else if (!bidiDdlForwardAllowed || isInternalDdl(sql)) {
                         // 默认双向模式只复制 DML，不传播 DDL（CREATE/ALTER/DROP…）：DDL 无法用行标记打标
                         // （隐式提交，与 DML 不同事务），在 active-active 里会无限回环。
@@ -662,7 +808,8 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                         // 内部表（__sync_origin/__sync_rowmeta/__sync_heartbeat）的 DDL 任何方向都不传。
                         return;
                     }
-                } else if (eventData instanceof XidEventData) {
+                } else if (eventData instanceof XidEventData
+                        || eventData instanceof com.github.shyiko.mysql.binlog.event.XAPrepareEventData) {
                     loopGuard.onTransactionBoundary();
                 }
                 // origin 标记行事件：置位并丢弃（标记表不外传），后续本事务数据事件将被跳过
@@ -727,6 +874,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
             String eventDataStr;
             if (eventData != null) {
+                lobCellSeq = 0;   // 落盘文件名按 (位点, 事件内序号) 定，每个事件从 0 起
                 eventDataStr = serializeEventData(eventType, eventData);
             } else {
                 eventDataStr = "";
@@ -759,8 +907,143 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                     lastPositionSaveTime = now;
                 }
             }
+            checkRetentionQuietly();
+            sweepOrphanLobTempQuietly();
         } catch (Exception e) {
             logger.error("处理binlog事件异常: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 给表结构时序库打基线：对同步范围内每张表写一条 {@code SCHEMA_BASELINE} 记录，
+     * 内容是 {@code SHOW CREATE TABLE} 的<b>原文</b>。
+     *
+     * <p>capture 只负责取原文，不解析——DDL 语法只存在于 migration-extract 一处，
+     * 两边各养一份迟早会漂，而漂了之后基线与后续 DDL 推出的版本对不上，还看不出来。
+     * 同理它也不认识 TableSchema，写进流里的就是一行 SQL 文本。
+     *
+     * <p><b>时序上的要害</b>：基线只能"新于或等于"它标注的位点，绝不能旧于。
+     * 这一点由现有流程保证——起始位点是 agent 在启动 capture <b>之前</b>就取好并写进
+     * {@code checkpoint.binlog.*} 的（{@code AbstractTaskExecutor.initMysqlCheckpoint}），
+     * 我们在这里取的表结构必然不早于它。反过来（先取结构、后定位点）中间那条 DDL 会
+     * 既不在基线里、也不在流里，永久丢失、模型从此全错。
+     *
+     * <p>基线比位点新造成的重叠（那段里的 DDL 既在基线里又在流里）由 {@code DdlApplier}
+     * 的幂等施加吸收；capture 重启后重发的基线则由 extract 忽略——已持久化的时序库优先，
+     * 基线只是兜底种子。
+     */
+    private void writeSchemaBaseline() {
+        if (!Boolean.parseBoolean(props.getProperty("capture.schema.baseline.enabled", "true"))) {
+            return;
+        }
+        List<String> tables = resolveBaselineTables();
+        if (tables.isEmpty()) {
+            logger.info("同步范围内没有表，跳过表结构基线");
+            return;
+        }
+
+        String url = "jdbc:mysql://" + host + ":" + port
+                + "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+        int ok = 0;
+        int failed = 0;
+        try (Connection conn = DriverManager.getConnection(url, user, password)) {
+            for (String qualified : tables) {
+                int dot = qualified.indexOf('.');
+                if (dot <= 0) {
+                    continue;
+                }
+                String db = qualified.substring(0, dot);
+                String table = qualified.substring(dot + 1);
+                try {
+                    String createSql = showCreateTable(conn, db, table);
+                    if (createSql == null) {
+                        // 表不存在或是视图：也要写一条带错误标记的记录。
+                        // 静默跳过的话，extract 那边分不清"这张表没有基线"和"这张表压根没在范围里"
+                        writeBaselineRecord(db, table, null, "SHOW CREATE TABLE 无结果（表不存在或为视图）");
+                        failed++;
+                    } else {
+                        writeBaselineRecord(db, table, createSql, null);
+                        ok++;
+                    }
+                } catch (Exception e) {
+                    writeBaselineRecord(db, table, null, "SHOW CREATE TABLE 失败: " + e.getMessage());
+                    failed++;
+                }
+            }
+        } catch (Exception e) {
+            logger.error("表结构基线连接源库失败，本次不打基线（抽取端会按 "
+                    + "extract.schema.timeline.fallback 降级）: {}", e.getMessage());
+            return;
+        }
+        logger.info("表结构基线已写入 {} 张表（失败 {} 张），位点 {}:{}",
+                ok, failed, binlogFile, binlogPosition);
+    }
+
+    /** 同步范围内的表清单：表级同步直接用清单，库级同步去库里枚举 BASE TABLE。 */
+    private List<String> resolveBaselineTables() {
+        List<String> out = new ArrayList<>();
+        if (!syncedTables.isEmpty()) {
+            out.addAll(syncedTables);
+            return out;
+        }
+        if (syncedDatabases.isEmpty()) {
+            return out;   // 全库捕获：范围未知，不打基线，由 CREATE TABLE / 降级路径兜底
+        }
+        String url = "jdbc:mysql://" + host + ":" + port
+                + "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+        try (Connection conn = DriverManager.getConnection(url, user, password)) {
+            for (String db : syncedDatabases) {
+                try (java.sql.PreparedStatement ps = conn.prepareStatement(
+                        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                                + "WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'")) {
+                    ps.setString(1, db);
+                    try (java.sql.ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            out.add(db + "." + rs.getString(1));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("枚举库级同步的表失败，本次不打基线: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    private String showCreateTable(Connection conn, String db, String table) throws SQLException {
+        String ref = "`" + db.replace("`", "``") + "`.`" + table.replace("`", "``") + "`";
+        try (java.sql.Statement st = conn.createStatement();
+             java.sql.ResultSet rs = st.executeQuery("SHOW CREATE TABLE " + ref)) {
+            return rs.next() ? rs.getString(2) : null;
+        }
+    }
+
+    /**
+     * 一条基线记录：{@code SCHEMA_BASELINE|file|pos|ts|serverId|db|table|error|CREATE TABLE 原文}
+     *
+     * <p>原文里的换行统一压成空格——{@code .cap} 是按行切记录的，一条跨多行会让其后所有记录
+     * 都读不出来（数据事件走的也是同一套压平，见 {@code eventDataStr.replace}）。
+     */
+    private synchronized void writeBaselineRecord(String db, String table, String createSql, String error) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("SCHEMA_BASELINE").append(FIELD_SEP);
+            sb.append(binlogFile == null ? "" : binlogFile).append(FIELD_SEP);
+            sb.append(binlogPosition).append(FIELD_SEP);
+            sb.append(System.currentTimeMillis()).append(FIELD_SEP);
+            sb.append(serverId).append(FIELD_SEP);
+            sb.append(db).append(FIELD_SEP);
+            sb.append(table).append(FIELD_SEP);
+            sb.append(error == null ? "" : error.replace("\n", " ").replace("\r", " ")
+                    .replace(String.valueOf(FIELD_SEP), " ")).append(FIELD_SEP);
+            sb.append(createSql == null ? ""
+                    : createSql.replace("\n", " ").replace("\r", " ")
+                            .replace(String.valueOf(FIELD_SEP), " "));
+            sb.append(RECORD_SEP);
+            writer.write(sb.toString());
+            writer.flush();
+        } catch (IOException e) {
+            logger.warn("写表结构基线记录失败 {}.{}: {}", db, table, e.getMessage());
         }
     }
 
@@ -877,6 +1160,16 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     private String serializeValue(Object value) {
         if (value == null) {
             return "null";
+        }
+        if (value instanceof com.migration.common.lob.LobRef) {
+            // 大字段：内容已在磁盘上，这里只写引用。
+            // 走到这一步才改名，是因为只有此刻才同时拿得到"这个值"和"它所属事件的位点"——
+            // 位点命名让 capture 重连重放时生成同名文件，覆盖即幂等，也让按位点批量清理成为一次范围扫描。
+            com.migration.common.lob.LobRef ref = (com.migration.common.lob.LobRef) value;
+            if (lobSpillWriter != null) {
+                ref = lobSpillWriter.finalizeName(ref, currentBinlogFile, currentBinlogPosition, lobCellSeq++);
+            }
+            return ref.toMarker();
         }
         if (value instanceof byte[]) {
             return "0x" + bytesToHex((byte[]) value);
@@ -999,6 +1292,90 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
     }
 
+    /**
+     * 位点保留期在线巡检：当前读到的 binlog 文件之前，源端还留着几个文件。
+     *
+     * <p>启动预检只能回答"现在能不能续上"；运行中源库 {@code PURGE BINARY LOGS} / 到期自动清理
+     * 会把位点推到边缘，而这件事要等下一次重启才会暴露——那时已经晚了，只能重做全量。
+     * 这里每 60s 看一眼余量，贴边就告警，让人还有时间去延长 {@code binlog_expire_logs_seconds}。
+     *
+     * <p>只预警不阻断：正在跑的任务被打成 FAILED 比告警晚一点更糟。真丢了由启动预检的 E3006 拦。
+     */
+    /**
+     * 周期性清掉没被改名的大字段临时文件。
+     *
+     * <p>落盘发生在<b>反序列化</b>阶段，而"这张表要不要同步"是在那之后才判的
+     * （{@code shouldCaptureDataEvent}）。于是非同步表里的大字段也会先落一份盘，
+     * 却永远走不到序列化那一步、拿不到最终名——一张不同步的大对象表就能把磁盘吃光。
+     * 同理，事件序列化异常回退到 {@code toString()} 时也会留下孤儿。
+     *
+     * <p>阈值取 60 秒：正常路径上"落盘 → 改名"发生在同一个事件的处理过程里，
+     * 相隔毫秒级；活过一分钟的临时文件必然是孤儿。
+     */
+    private void sweepOrphanLobTempQuietly() {
+        if (lobSpillWriter == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastLobSweepMs < LOB_SWEEP_INTERVAL_MS) {
+            return;
+        }
+        lastLobSweepMs = now;
+        try {
+            int removed = lobSpillWriter.cleanupOrphanTemp(60_000L);
+            if (removed > 0) {
+                logger.info("已清理未改名的大字段临时文件 {} 个（多半来自未同步表的事件）", removed);
+            }
+        } catch (Exception e) {
+            logger.warn("清理大字段临时文件失败: {}", e.getMessage());
+        }
+    }
+
+    private void checkRetentionQuietly() {
+        if (!retentionCheckEnabled || currentBinlogFile == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastRetentionCheckMs < retentionCheckIntervalMs) {
+            return;
+        }
+        lastRetentionCheckMs = now;
+
+        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        try (Connection conn = DriverManager.getConnection(url, user, password);
+             Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery("SHOW BINARY LOGS")) {
+            java.util.List<String> logs = new java.util.ArrayList<>();
+            while (rs.next()) {
+                logs.add(rs.getString(1));
+            }
+            int idx = logs.indexOf(currentBinlogFile);
+            if (idx < 0) {
+                com.migration.common.position.RetentionStatus.write(outputDir,
+                        com.migration.common.position.RetentionStatus.State.LOST, 0,
+                        "当前 binlog 文件 " + currentBinlogFile + " 已不在源端保留列表中");
+                logger.error("位点保留期告警：当前 binlog 文件 {} 已不在源端（共 {} 个文件），位点即将/已经失效",
+                        currentBinlogFile, logs.size());
+                return;
+            }
+            // 只有一个文件时 idx 必然为 0，但那是"还没轮转过"，不是贴边，别刷假告警
+            boolean atEdge = idx == 0 && logs.size() > 1;
+            com.migration.common.position.RetentionStatus.write(outputDir,
+                    atEdge ? com.migration.common.position.RetentionStatus.State.WARN
+                           : com.migration.common.position.RetentionStatus.State.OK,
+                    idx, "位点文件 " + currentBinlogFile + "，其前尚存 " + idx + " 个文件（共 " + logs.size() + "）");
+            if (atEdge) {
+                logger.warn("位点保留期告警：正读取最老的 binlog 文件 {}，下一次清理即可能使位点失效，"
+                        + "建议延长源库 binlog 保留期", currentBinlogFile);
+            }
+        } catch (Exception e) {
+            com.migration.common.position.RetentionStatus.write(outputDir,
+                    com.migration.common.position.RetentionStatus.State.UNKNOWN, -1,
+                    "巡检查询失败: " + e.getMessage());
+            logger.debug("位点保留期巡检跳过: {}", e.getMessage());
+        }
+    }
+
     private void savePosition() {
         if (currentBinlogFile == null) return;
 
@@ -1014,7 +1391,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
 
         com.migration.common.position.CapturePositionStore.save(
-                outputDir, posProps, "Capture position for task: " + taskId);
+                outputDir, posProps, "Capture position for task: " + taskId, taskId);
     }
 
     public String getCurrentBinlogFile() {

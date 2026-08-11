@@ -57,6 +57,21 @@ public class FullMigrationTask extends AbstractTaskExecutor {
             return;
         }
 
+        // extract 与全量<b>并行</b>启动。它只把 .cap 转成 THL，不碰目标库；apply 仍然等
+        // FULL_COMPLETED。这么做是为了压缩表结构漂移窗口：extract 原来在全量做完之后才开工，
+        // 于是要拿着几小时后的源库表定义去解析几小时前的事件，漂移窗口正好等于全量耗时
+        // （见 markdown/SCHEMA_TIMELINE_DESIGN_20260811.md）。并行之后窗口缩到 extract 的落后量。
+        //
+        // 尽力而为：起不来就照旧在全量之后再起一次，不因此判任务失败——这条改动只减少风险窗口，
+        // 不该新增一条让任务起不来的路径。
+        boolean extractStartedEarly = false;
+        if ("fullAndIncre".equals(migrationMode)
+                && Boolean.parseBoolean(config.getRawProperty("migration.extract.parallel.with.full", "true"))) {
+            extractStartedEarly = startExtractProcess();
+            logger.info("[{}] extract 与全量并行启动: {}", threadName,
+                    extractStartedEarly ? "成功" : "未就绪，全量结束后再试");
+        }
+
         if (!executeFullMigration()) {
             return;
         }
@@ -72,7 +87,7 @@ public class FullMigrationTask extends AbstractTaskExecutor {
 
         lastSuccessfulStatus = "FULL_COMPLETED";
 
-        if (!startExtractProcess()) {
+        if (!extractStartedEarly && !startExtractProcess()) {
             sendFailedStatus("E3002", "extract 进程启动失败，增量同步无法继续");
             stopped.set(true);
             return;
@@ -87,8 +102,12 @@ public class FullMigrationTask extends AbstractTaskExecutor {
     }
 
     /**
-     * 僵死看门狗的活性文件：进入增量阶段后 capture/extract/increment 各自的活性文件才出现，
-     * 全量阶段它们尚不存在，checkPipelineStalled 会因文件缺失而跳过、不误判。
+     * 僵死看门狗的活性文件。
+     *
+     * <p>每个文件该不该存在由 {@code livenessFileExpected} 按对应进程是否在跑来判定，
+     * 所以这里返回全套即可：全量阶段 increment 还没起、它的活性文件缺失属正常会被跳过；
+     * extract 与全量并行之后它的活性文件在全量期间就出现了，照常纳入监控——
+     * 那正是我们想要的，并行跑的 extract 冻住了同样得看得见。
      */
     @Override
     protected java.util.List<String> stallLivenessFiles() {

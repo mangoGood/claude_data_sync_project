@@ -74,6 +74,31 @@ class FailoverPositionCleanupTest {
     }
 
     @Test
+    @DisplayName("FailoverService.cleanFailoverFiles 也清掉统一位点载体")
+    void failoverServiceClearsUnifiedCheckpoint() throws Exception {
+        // 位点中心化之后，这条不变量的边界跟着扩了：本地清干净而统一载体留着，
+        // 下一拍上卷就把旧源位点又送回中心库，接管方回灌后照样拿旧源的 GTID 去连新源。
+        Properties payload = new Properties();
+        payload.setProperty("binlog.file", "binlog.000042");
+        payload.setProperty("binlog.position", "43310545");
+        com.migration.common.position.LocalCheckpointStore.save(
+                new com.migration.common.position.CheckpointRecord(taskId,
+                        com.migration.common.position.CheckpointRecord.Stage.CAPTURE, "mysql",
+                        com.migration.common.position.CheckpointRecord.Kind.BINLOG_FILE_POS,
+                        payload, 1L, 0));
+        assertTrue(new File("files/" + taskId + "/checkpoint/positions/capture.properties").isFile(),
+                "前置条件：统一位点应已写出");
+
+        FailoverService svc = new FailoverService(null, null, null, null);
+        Method m = FailoverService.class.getDeclaredMethod("cleanFailoverFiles", String.class);
+        m.setAccessible(true);
+        m.invoke(svc, taskId);
+
+        assertTrue(com.migration.common.position.LocalCheckpointStore.loadAll(taskId).isEmpty(),
+                "倒换后统一位点必须一并清掉，否则会被重新上卷到中心库");
+    }
+
+    @Test
     @DisplayName("倒换清理的 config 位点键覆盖三种源类型的 capture 起始位点")
     void staleKeysCoverAllSourceTypes() {
         java.util.List<String> keys = Arrays.asList(AgentMain.STALE_POSITION_KEYS_ON_FAILOVER);

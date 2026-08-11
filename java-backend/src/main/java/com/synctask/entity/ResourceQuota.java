@@ -42,6 +42,10 @@ public class ResourceQuota {
     @Column(name = "max_increment_rows_per_sec")
     private Integer maxIncrementRowsPerSec;
 
+    /** 全量装载限速（行/秒），null=不限速。全量提速 56× 之后，没有阀门本身就是风险。 */
+    @Column(name = "max_full_sync_rows_per_sec")
+    private Integer maxFullSyncRowsPerSec;
+
     /**
      * 全量同步并发表数上限：作为 migration.full.parallelism 的封顶值（只降不升，不会绕过
      * 工程默认值），避免全量并行搬数时对源库产生过多并发连接/查询。null 或 <=0 表示不封顶。
@@ -78,6 +82,8 @@ public class ResourceQuota {
     public void setMaxStorageMb(Long maxStorageMb) { this.maxStorageMb = maxStorageMb; }
     public Integer getApiRateLimitPerMin() { return apiRateLimitPerMin; }
     public void setApiRateLimitPerMin(Integer apiRateLimitPerMin) { this.apiRateLimitPerMin = apiRateLimitPerMin; }
+    public Integer getMaxFullSyncRowsPerSec() { return maxFullSyncRowsPerSec; }
+    public void setMaxFullSyncRowsPerSec(Integer v) { this.maxFullSyncRowsPerSec = v; }
     public Integer getMaxIncrementRowsPerSec() { return maxIncrementRowsPerSec; }
     public void setMaxIncrementRowsPerSec(Integer maxIncrementRowsPerSec) { this.maxIncrementRowsPerSec = maxIncrementRowsPerSec; }
     public Integer getMaxFullSyncConcurrentTables() { return maxFullSyncConcurrentTables; }

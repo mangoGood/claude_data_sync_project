@@ -42,6 +42,126 @@ public final class RouteCompareSupport {
     /** 拆分落点：全部分片表（对比时把各片行数加起来）。 */
     public static final class SplitTargets {
         public final List<String[]> shards = new ArrayList<>();   // [db, table]
+        /** 分片键列名（内容对比据此重算每行<b>应该</b>在哪一片，用来发现错片行） */
+        public String shardKeyColumn = "";
+        /** 分片算法：HASH_MOD / RANGE / LIST */
+        public String algo = "";
+        /** RANGE 的区间表，左闭右开 */
+        public final List<long[]> ranges = new ArrayList<>();
+        /** LIST 的枚举表：值 → 分片号 */
+        public final Map<String, Integer> listMapping = new LinkedHashMap<>();
+        /** 分片分布在多个目标实例上：对比只有一条目标连接，够不着别的实例 */
+        public boolean crossInstance;
+
+        /**
+         * 由分片键的值算出它<b>应该</b>落在哪一片；算不出返回 null（NULL 分片键 / 不在区间或枚举里）。
+         *
+         * <p>这是引擎侧 {@code SplitRule#resolveShard} + {@code hashOf} 的镜像实现，
+         * 两边必须逐字一致：口径差一点就会把正常行报成错片，比不报还糟。
+         */
+        public Integer shardOf(Object value) {
+            if (value == null || shards.isEmpty()) {
+                return null;
+            }
+            switch (algo.toUpperCase()) {
+                case "HASH_MOD":
+                    return (int) Math.floorMod(hashOf(value), (long) shards.size());
+                case "RANGE": {
+                    java.math.BigDecimal num = toNumber(value);
+                    if (num == null) {
+                        return null;
+                    }
+                    for (int i = 0; i < ranges.size(); i++) {
+                        long[] r = ranges.get(i);
+                        if (num.compareTo(java.math.BigDecimal.valueOf(r[0])) >= 0
+                                && num.compareTo(java.math.BigDecimal.valueOf(r[1])) < 0) {
+                            return i;
+                        }
+                    }
+                    return null;
+                }
+                case "LIST": {
+                    String s = String.valueOf(value);
+                    Integer idx = listMapping.get(s);
+                    if (idx == null) {
+                        for (Map.Entry<String, Integer> e : listMapping.entrySet()) {
+                            if (e.getKey().equalsIgnoreCase(s)) {
+                                return e.getValue();
+                            }
+                        }
+                    }
+                    return idx;
+                }
+                default:
+                    return null;
+            }
+        }
+    }
+
+    /**
+     * 哈希取模的值归一：<b>凡是整数一律按数值取模</b>，其余走 CRC32(UTF-8)。
+     *
+     * <p>镜像引擎侧 {@code SplitRule#hashOf}。那边的注释说得很清楚：同一个值在全量链路是 Long、
+     * 在增量链路可能是字符串或 BigDecimal，按 Java 类型分流会让同一行算到两个分片上。
+     * 对比这边读的是 JDBC 返回值（BigInteger/BigDecimal/String 都可能），归一口径差一点，
+     * 满屏都是假的"错片"。
+     */
+    static long hashOf(Object value) {
+        Long integral = asIntegral(value);
+        if (integral != null) {
+            return integral;
+        }
+        byte[] bytes = value instanceof byte[]
+                ? (byte[]) value
+                : String.valueOf(value).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(bytes, 0, bytes.length);
+        return crc.getValue();
+    }
+
+    private static Long asIntegral(Object value) {
+        if (value instanceof Byte || value instanceof Short
+                || value instanceof Integer || value instanceof Long) {
+            return ((Number) value).longValue();
+        }
+        if (value instanceof java.math.BigInteger) {
+            return ((java.math.BigInteger) value).longValue();
+        }
+        if (value instanceof java.math.BigDecimal) {
+            java.math.BigDecimal d = (java.math.BigDecimal) value;
+            return d.stripTrailingZeros().scale() <= 0 ? d.longValue() : null;
+        }
+        if (value instanceof Float || value instanceof Double) {
+            double d = ((Number) value).doubleValue();
+            return d == Math.rint(d) && !Double.isInfinite(d) ? (long) d : null;
+        }
+        if (value instanceof CharSequence) {
+            String s = value.toString().trim();
+            if (s.isEmpty()) {
+                return null;
+            }
+            try {
+                java.math.BigDecimal d = new java.math.BigDecimal(s);
+                return d.stripTrailingZeros().scale() <= 0 ? d.longValue() : null;
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static java.math.BigDecimal toNumber(Object value) {
+        if (value instanceof java.math.BigDecimal) {
+            return (java.math.BigDecimal) value;
+        }
+        if (value instanceof Number) {
+            return new java.math.BigDecimal(value.toString());
+        }
+        try {
+            return new java.math.BigDecimal(String.valueOf(value).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private RouteCompareSupport() {
@@ -155,6 +275,35 @@ public final class RouteCompareSupport {
                 String db = dbTemplate.isEmpty() ? defaultTargetDb : render(dbTemplate, shard);
                 String table = tableTemplate.isEmpty() ? sourceTable : render(tableTemplate, shard);
                 targets.shards.add(new String[]{db, table});
+            }
+            // 内容对比要按分片键重算落点（发现错片行），行数对比用不到这些，多填几个字段不影响它
+            targets.shardKeyColumn = str(rule.get("shardKey"));
+            targets.algo = str(rule.get("algo")).toUpperCase();
+            targets.crossInstance = !str(rule.get("targetGroup")).isEmpty();
+            if ("RANGE".equals(targets.algo)) {
+                for (String part : str(rule.get("range")).split(",")) {
+                    String[] bounds = part.trim().split(":");
+                    if (bounds.length == 2) {
+                        try {
+                            targets.ranges.add(new long[]{Long.parseLong(bounds[0].trim()),
+                                    Long.parseLong(bounds[1].trim())});
+                        } catch (NumberFormatException ignored) {
+                            // 非法区间由保存时的校验挡住
+                        }
+                    }
+                }
+            } else if ("LIST".equals(targets.algo)) {
+                for (String part : str(rule.get("list")).split(",")) {
+                    int colon = part.lastIndexOf(':');
+                    if (colon > 0) {
+                        try {
+                            targets.listMapping.put(part.substring(0, colon).trim(),
+                                    Integer.parseInt(part.substring(colon + 1).trim()));
+                        } catch (NumberFormatException ignored) {
+                            // 同上
+                        }
+                    }
+                }
             }
             return targets;
         }

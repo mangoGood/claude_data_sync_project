@@ -133,6 +133,75 @@ public class WorkflowService {
     @Autowired
     private AgentClusterService agentClusterService;
 
+    @Autowired
+    private CheckpointCentralService checkpointCentralService;
+
+    // 用 @Lazy 打断 WorkflowService ↔ DiagnosticService 的构造期循环依赖
+    // （DiagnosticService 要用 WorkflowRepository，而门禁又要用它跑预检）
+    @Autowired
+    @org.springframework.context.annotation.Lazy
+    private DiagnosticService diagnosticService;
+
+    @Autowired
+    private PrecheckResultService precheckResultService;
+
+    /**
+     * 启动前的对象级预检门禁。
+     *
+     * <p>三件事，缺一条这道门就形同虚设：
+     * ① FAIL 直接拒绝启动（除非显式 force）；
+     * ② 无论放行还是拦截都<b>落一条留档</b>——"这次启动是在什么前提下启动的"必须查得到；
+     * ③ 预检自身出错不阻断（连不上源库这类问题，连接级校验与任务本身都会再报一次），
+     *    但同样留档，避免"预检静默没跑"变成新的盲区。
+     */
+    private void runPrecheckGate(Workflow workflow, Long userId, boolean force) {
+        Map<String, Object> result;
+        try {
+            result = diagnosticService.schemaPrecheck(workflow.getId(), userId);
+        } catch (Exception e) {
+            logger.warn("启动前预检执行失败（不阻断启动）: {}", e.getMessage());
+            precheckResultService.record(workflow, "ERROR", force, "预检执行失败: " + e.getMessage(), null);
+            addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "启动前预检未能执行: " + e.getMessage());
+            return;
+        }
+        String overall = String.valueOf(result.getOrDefault("overall", "UNKNOWN"));
+        String summary = String.format("预检 %s：通过 %s / 失败 %s / 警告 %s",
+                overall, result.get("passed"), result.get("failed"), result.get("warnings"));
+        precheckResultService.record(workflow, overall, force, summary, result.get("checks"));
+
+        if (!"FAIL".equals(overall)) {
+            addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "启动前" + summary);
+            return;
+        }
+        String failed = failedCheckSummary(result);
+        if (force) {
+            // 强启也必须留痕：谁在什么时候忽略了哪条 FAIL，事后要查得到
+            addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING,
+                    "启动前预检 FAIL，已按显式 force 强制启动（风险自负）: " + failed);
+            return;
+        }
+        addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "启动被预检拦截: " + failed);
+        throw new RuntimeException("启动前预检未通过：" + failed
+                + "。修正后重试，或在明确知悉风险时以 force=true 强制启动");
+    }
+
+    @SuppressWarnings("unchecked")
+    private String failedCheckSummary(Map<String, Object> result) {
+        Object checks = result.get("checks");
+        if (!(checks instanceof List)) {
+            return "详见预检结果";
+        }
+        List<String> lines = new ArrayList<>();
+        for (Object c : (List<Object>) checks) {
+            if (c instanceof Map && "FAIL".equals(((Map<?, ?>) c).get("status"))) {
+                Map<?, ?> m = (Map<?, ?>) c;
+                lines.add(m.get("checkName") + "：" + m.get("message")
+                        + (m.get("detail") != null ? "（" + m.get("detail") + "）" : ""));
+            }
+        }
+        return lines.isEmpty() ? "详见预检结果" : String.join("；", lines);
+    }
+
     @Transactional
     public Workflow createWorkflow(String name, String sourceType, String targetType, Long userId, String taskType) {
         return createWorkflow(name, sourceType, targetType, userId, taskType, null, null);
@@ -401,6 +470,11 @@ public class WorkflowService {
                     workflow.getSnapshotMode()));
         }
 
+        // 路由与其余配置的兼容性要在<b>改完之后</b>再判一次：用户完全可能先存好路由配置，
+        // 再回到第 3 步加列处理、或把目标库类型改成 mongodb——只在保存路由时判就绕过去了。
+        RouteConfigValidator.assertApplicable(workflow.getRouteConfig(), workflow.getSourceType(),
+                workflow.getTargetType(), workflow.getTaskType(), workflow.getSyncObjects());
+
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务配置已更新");
         return workflowRepository.save(workflow);
     }
@@ -418,6 +492,8 @@ public class WorkflowService {
             throw new RuntimeException("只能修改配置中的任务的路由配置，当前状态: " + workflow.getStatus().name());
         }
         String normalized = RouteConfigValidator.validate(routeConfig);
+        RouteConfigValidator.assertApplicable(normalized, workflow.getSourceType(), workflow.getTargetType(),
+                workflow.getTaskType(), workflow.getSyncObjects());
         workflow.setRouteConfig(normalized);
         addLog(workflowId, WorkflowLog.LogLevel.INFO,
                 normalized == null ? "聚合路由已清除（回到 1:1 同步）" : "聚合路由配置已更新");
@@ -573,8 +649,15 @@ public class WorkflowService {
 
     @Transactional
     public Workflow launchWorkflow(String workflowId, Long userId) {
+        return launchWorkflow(workflowId, userId, false);
+    }
+
+    /**
+     * @param forcePrecheck true = 明知预检 FAIL 也要启动。会留审计，别当成普通开关用
+     */
+    public Workflow launchWorkflow(String workflowId, Long userId, boolean forcePrecheck) {
         Workflow workflow = getWorkflowById(workflowId, userId);
-        
+
         if (workflow.getStatus() != WorkflowStatus.CONFIGURING) {
             throw new RuntimeException("只能启动配置中的任务，当前状态: " + workflow.getStatus().name());
         }
@@ -614,6 +697,15 @@ public class WorkflowService {
             }
             workflow.setMigrationMode("subscribe");
         }
+
+        // 聚合路由的最后一道门：配置可以分多次改，只有启动这一刻的组合才是真正要跑的那个
+        RouteConfigValidator.assertApplicable(workflow.getRouteConfig(), workflow.getSourceType(),
+                workflow.getTargetType(), workflow.getTaskType(), workflow.getSyncObjects());
+
+        // 对象级预检门禁。此前预检只由前端弹窗调用（点"确定"即可强启），后端这里一行都没有——
+        // 于是调度、依赖任务、批量启动、集群改派四条自动化路径的预检拦截率是 0：
+        // 预检把问题算得很准，然后没有任何决策路径用它。
+        runPrecheckGate(workflow, userId, forcePrecheck);
 
         // 双向灾备：创建隐藏的反向影子任务（B→A，仅增量）。此刻只建行不启动——
         // 若立即启动，反向全量会把尚未初始化的 B 反灌回 A；等正向进入增量同步
@@ -1185,7 +1277,39 @@ public class WorkflowService {
     /** 同步位点可视化：代理 agent 的 /api/checkpoint/{taskId}（先做属主校验）。 */
     public Map<String, Object> getCheckpointVisualization(String id, Long userId) {
         getWorkflowById(id, userId);
-        return callAgentJson("/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）", id);
+        try {
+            Map<String, Object> live = callAgentJson(
+                    "/api/checkpoint/" + id, "查询同步位点失败（agent 不可达或未运行）", id);
+            live.put("source", "live");
+            live.put("degraded", false);
+            return live;
+        } catch (RuntimeException e) {
+            // agent 挂了恰恰是最需要知道"还能不能续、续到哪"的时刻，位点视图不该跟着一起瞎。
+            // 中心库里的位点最多旧几秒（上卷间隔），远好过一个 500。
+            try {
+                Map<String, Object> degraded =
+                        checkpointCentralService.degradedVisualization(id, e.getMessage());
+                logger.warn("[{}] agent 位点查询失败，降级读中心位点表: {}", id, e.getMessage());
+                return degraded;
+            } catch (Exception fallbackError) {
+                logger.warn("[{}] 中心位点降级读取也失败: {}", id, fallbackError.getMessage());
+                throw e;
+            }
+        }
+    }
+
+    /** 位点历史（回溯/审计），直接读中心库，不经 agent。 */
+    public java.util.List<Map<String, Object>> getCheckpointHistory(String id, Long userId,
+                                                                    String stage, int limit) {
+        getWorkflowById(id, userId);
+        return checkpointCentralService.history(id, stage, limit);
+    }
+
+    /** 位点重置（PITR）：唯一允许位点倒退的入口，必须留审计。 */
+    public Map<String, Object> resetCheckpoint(String id, Long userId, String stage, String streamKey,
+                                               Map<String, Object> target, String operator) {
+        Workflow workflow = getWorkflowById(id, userId);
+        return checkpointCentralService.reset(workflow, stage, streamKey, target, operator);
     }
 
     // ==================== 实时监控指标：代理 agent 的只读监控接口 ====================
@@ -1511,6 +1635,93 @@ public class WorkflowService {
         );
 
         return workflow;
+    }
+
+    /**
+     * 计划内主备切换（Switchover）的<b>第一步</b>：停写 + 等追平。零丢失。
+     *
+     * <p>与 {@link #failoverWorkflow} 的区别不是参数而是<b>语义</b>：
+     * 后者是计划外接管，源库可能已经不在了，丢掉"崩溃到接管之间"的变更是 RPO 的固有代价；
+     * 而计划内切换的源库好端端地跑着，还丢数据就纯属自找。旧实现只有一个按钮，
+     * 交换连接串之后 {@code cleanFailoverFiles()} 会把 {@code thl_output/} 整个清掉——
+     * 已捕获未应用的变更就此消失。
+     *
+     * <p>所以这里的顺序不能反：**先**让 agent 把旧主停写并等追平，**拿到确认之后**
+     * 才动数据库里的连接串（第二步由调用方接着调 {@link #failoverWorkflow}）。
+     * 追不平就抛异常，什么都不改，业务照常在旧主上跑。
+     *
+     * <p>刻意<b>不加</b> {@code @Transactional}：这一步要同步等 agent 停写+追平，
+     * 可能是分钟级；把一个数据库事务开着等 HTTP 是在拿连接池换命。
+     * 也正因为拆成两步，第二步才能走 Spring 代理真正进事务——
+     * 同类内部直接调 {@code failoverWorkflow} 会绕过代理，它里面的
+     * {@code registerSynchronization} 会直接抛 "Transaction synchronization is not active"。
+     */
+    public void switchoverDrain(String workflowId, Long userId, long drainTimeoutMs, boolean fence) {
+        Workflow workflow = getWorkflowById(workflowId, userId);
+        if (!"DR".equals(workflow.getTaskType())) {
+            throw new RuntimeException("只有灾备任务才能执行主备切换");
+        }
+        if ("BIDIRECTIONAL".equals(workflow.getDrMode())) {
+            throw new RuntimeException("双向灾备两端均可读写、实时互同步，无需主备切换");
+        }
+        if (workflow.getStatus() != WorkflowStatus.INCREMENT_RUNNING) {
+            throw new RuntimeException("只有增量同步中的灾备任务才能执行计划内切换，当前状态: "
+                    + workflow.getStatus().name());
+        }
+
+        addLog(workflowId, WorkflowLog.LogLevel.INFO, "计划内切换开始：正在停止旧主写入并等待链路追平");
+        Map<String, Object> drain = callAgentSwitchoverDrain(workflowId, drainTimeoutMs, fence);
+        if (!Boolean.TRUE.equals(drain.get("success"))) {
+            String reason = String.valueOf(drain.getOrDefault("message", "未知原因"));
+            addLog(workflowId, WorkflowLog.LogLevel.WARNING, "计划内切换已放弃（未追平，数据未受影响）: " + reason);
+            throw new RuntimeException("计划内切换未执行：" + reason);
+        }
+        addLog(workflowId, WorkflowLog.LogLevel.INFO,
+                "链路已追平，开始切换。旧主保持只读（它现在是备库，继续接受写入会造成双写分叉）");
+    }
+
+    /** 调 agent 的停写/追平端点。同步等待——切换与否取决于它的结论。 */
+    private Map<String, Object> callAgentSwitchoverDrain(String taskId, long timeoutMs, boolean fence) {
+        String agentUrl = agentBaseUrlFor(taskId) + "/api/agent/switchover-drain";
+        String agentToken = System.getenv("AGENT_API_TOKEN");
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        try {
+            java.net.HttpURLConnection conn =
+                    (java.net.HttpURLConnection) new java.net.URL(agentUrl).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            if (agentToken != null && !agentToken.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + agentToken);
+            }
+            conn.setConnectTimeout(5000);
+            // 读超时必须**远**比追平超时长：agent 那边除了等追平，还要停写和解除停写，
+            // 而 `SET GLOBAL read_only` 本身可能被旧主上的长事务卡住几十秒。
+            // 后端先断开、agent 还在动手，两边对"到底切没切、停写解没解"的认知就会岔开。
+            conn.setReadTimeout((int) Math.min(Integer.MAX_VALUE, timeoutMs + 300000L));
+            conn.setDoOutput(true);
+            String body = new com.google.gson.Gson().toJson(Map.of(
+                    "taskId", taskId, "timeoutMs", timeoutMs, "fence", fence));
+            try (java.io.OutputStream os = conn.getOutputStream()) {
+                os.write(body.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            int code = conn.getResponseCode();
+            java.io.InputStream is = code < 400 ? conn.getInputStream() : conn.getErrorStream();
+            String resp = is == null ? "" : new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            logger.info("Agent switchover-drain 响应 {}: {}", code, resp);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parsed = new com.google.gson.Gson().fromJson(resp, Map.class);
+            if (parsed != null) {
+                out.putAll(parsed);
+            }
+            out.put("success", code == 200 && Boolean.TRUE.equals(out.get("success")));
+            return out;
+        } catch (Exception e) {
+            // 连不上 agent 时绝不能"当作追平了"继续切——那正是要消灭的那类静默丢数据
+            logger.warn("调用 agent switchover-drain 失败: {}", e.getMessage());
+            out.put("success", false);
+            out.put("message", "无法与 agent 通信完成停写/追平: " + e.getMessage());
+            return out;
+        }
     }
 
     private boolean callAgentFailoverApi(TaskCreatedMessage message) {

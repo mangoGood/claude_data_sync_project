@@ -30,7 +30,12 @@ public class AgentConfig {
         props.setProperty("kafka.topic.task-created", "sync-task-created");
         props.setProperty("kafka.topic.task-status", "sync-task-status");
 
-        props.setProperty("mysql.db.url", "jdbc:mysql://localhost:33306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
+        // 元数据库连接（位点中心库、agent 注册、配额）。META_DB_SSL_MODE 缺省 DISABLED
+        // （= 历史行为的明文），设成 REQUIRED/VERIFY_CA/VERIFY_IDENTITY 即让这一跳走 TLS。
+        // 显式给 MIGRATION_AGENT_MYSQL_DB_URL 时以它为准。
+        props.setProperty("mysql.db.url", "jdbc:mysql://localhost:33306/sync_task_db?sslMode="
+                + System.getenv().getOrDefault("META_DB_SSL_MODE", "DISABLED")
+                + "&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
         props.setProperty("mysql.db.user", "root");
         props.setProperty("mysql.db.password", "rootpassword");
 
@@ -94,6 +99,22 @@ public class AgentConfig {
         props.setProperty("task.disk.check.interval.ms", "60000");
         // 任务进入终态后保留 files/<taskId> 的时长，到期由 agent 清理；0 表示不清理。
         props.setProperty("task.files.retention.hours", "72");
+
+        // 子进程 JVM 参数（见 ChildJvmOptions）。默认全空 = 保持历史行为（不传 -Xmx，
+        // 由 JVM 按物理内存 1/4 自决），要给某类进程设内存上界时在 agent.properties 里覆盖，
+        // 例如 proc.jvm.opts.full=-Xmx144m -XX:MaxMetaspaceSize=64m -XX:MaxDirectMemorySize=24m。
+        // 这些 key 必须在此登记默认值，loadFromEnv() 只遍历已存在的 key，不登记则环境变量覆盖失效。
+        props.setProperty("proc.jvm.opts.default", "");
+        props.setProperty("proc.jvm.opts.capture", "");
+        props.setProperty("proc.jvm.opts.full", "");
+        props.setProperty("proc.jvm.opts.extract", "");
+        props.setProperty("proc.jvm.opts.increment", "");
+        props.setProperty("proc.jvm.opts.subscribe", "");
+        props.setProperty("proc.jvm.opts.mongo", "");
+        props.setProperty("proc.jvm.opts.elastic", "");
+        props.setProperty("proc.jvm.opts.redis", "");
+        props.setProperty("proc.jvm.exit.on.oom", "true");
+        props.setProperty("proc.jvm.heapdump.dir", "");
     }
 
     private void loadFromFile() {

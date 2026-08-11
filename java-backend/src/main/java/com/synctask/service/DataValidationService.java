@@ -446,14 +446,14 @@ public class DataValidationService {
         if ("postgresql".equals(dbType)) {
             String db = (database != null && !database.isEmpty()) ? database : "postgres";
             jdbcUrl = "jdbc:postgresql://" + host + ":" + port + "/" + db +
-                    "?useSSL=false&stringtype=unspecified";
+                    "?" + com.synctask.util.JdbcSslOptions.postgres() + "&stringtype=unspecified";
         } else if ("oracle".equals(dbType)) {
             String service = (database != null && !database.isEmpty()) ? database : "ORCL";
             jdbcUrl = "jdbc:oracle:thin:@" + host + ":" + port + "/" + service;
         } else {
             String db = (database != null && !database.isEmpty()) ? database : "";
             jdbcUrl = "jdbc:mysql://" + host + ":" + port + "/" + db +
-                    "?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
+                    "?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
         }
         return new String[]{jdbcUrl, username, password, dbType};
     }

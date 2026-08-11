@@ -122,6 +122,8 @@ public final class RedisSyncMain {
     private volatile long lastProgressWriteMs;
     /** 增量阶段进度文件最长刷新间隔：PSYNC 每 ~10s 的 PING 会驱动刷新，据此让 agent 僵死看门狗有信号。 */
     private static final long PROGRESS_TIME_REFRESH_MS = 5000;
+    /** 复制流的 Configuration：replOffset 由 replicator 边消费边推进，位点就取自它。 */
+    private volatile Configuration replConfiguration;
 
     private RedisSyncMain(String taskId, Properties props) {
         this.taskId = taskId;
@@ -184,6 +186,8 @@ public final class RedisSyncMain {
                 // 这里禁用 replicator 内部无限重试，让致命错误快速冒泡为任务失败。
                 .setRetries(1);
         applyAuth(conf, "source");
+        replConfiguration = conf;
+        tryResumeFromPersistedOffset(conf);
 
         String host = props.getProperty("source.db.host", "localhost");
         int port = Integer.parseInt(props.getProperty("source.db.port", "6379"));
@@ -328,6 +332,80 @@ public final class RedisSyncMain {
 
     // ==================== 增量（复制命令流 verbatim 转发） ====================
 
+    /**
+     * 用已落盘的复制位点尝试<b>部分重同步</b>（PSYNC replid offset+1）。
+     *
+     * <p>Redis 这条链路此前<b>没有增量位点</b>：进程一重启就整库重来——清空目标、
+     * 把源库所有键重新 RESTORE 一遍。库越大越致命，而中断窗口里的变更还得靠随后的复制流补。
+     * 记下 replid + offset 之后，重启先试部分重同步：源端 backlog 还覆盖得住就直接从断点接着收，
+     * 一个键都不用重搬。
+     *
+     * <p>覆盖不住时源端回 +FULLRESYNC，走的还是原来那条路（PreRdbSyncEvent → 清目标库 → 全量），
+     * 所以这里失败没有额外代价，只是回到今天的行为。
+     *
+     * <p>只在<b>确实进入过增量</b>时才尝试：统一位点文件是在 applyCommand 里写的，
+     * 它存在本身就等于"上次跑到过增量阶段"，不必再引入别的标记。
+     */
+    private void tryResumeFromPersistedOffset(Configuration conf) {
+        if (!fullAndIncre) {
+            return;
+        }
+        com.migration.common.position.CheckpointRecord record =
+                com.migration.common.position.LocalCheckpointStore.load(
+                        taskId, com.migration.common.position.CheckpointRecord.Stage.CAPTURE);
+        if (record == null
+                || record.getKind() != com.migration.common.position.CheckpointRecord.Kind.REPL_OFFSET) {
+            return;
+        }
+        String replId = record.payloadValue("repl.id");
+        String offset = record.payloadValue("repl.offset");
+        if (replId == null || replId.trim().isEmpty() || offset == null || offset.trim().isEmpty()) {
+            return;
+        }
+        try {
+            long off = Long.parseLong(offset.trim());
+            conf.setReplId(replId.trim()).setReplOffset(off);
+            // 部分重同步成功时不会有 RDB 阶段（PreRdbSyncEvent/PostRdbSyncEvent 都不触发），
+            // 阶段要在这里就摆正，否则进度文件一直显示 FULL，agent 侧的判活与展示都会跟着错。
+            phase = "INCREMENT";
+            writeProgress();
+            logger.info("尝试部分重同步: replid={} offset={}（源端 backlog 不足会自动回退全量）", replId, off);
+        } catch (NumberFormatException e) {
+            logger.warn("已落盘的复制偏移格式异常，回退全量重同步: {}", offset);
+        }
+    }
+
+    /**
+     * 落盘复制位点（replid + offset）。
+     *
+     * <p>由 applyCommand 驱动：PSYNC 每 ~10s 的 PING 也会走到那里，所以源库空闲时位点照样保鲜。
+     * 按 1s 节流——offset 每条命令都在变，没必要每条都 fsync。
+     */
+    private void saveReplPosition() {
+        Configuration conf = replConfiguration;
+        if (conf == null || conf.getReplId() == null || conf.getReplId().isEmpty()) {
+            return;
+        }
+        try {
+            java.util.Properties payload = new java.util.Properties();
+            payload.setProperty("repl.id", conf.getReplId());
+            payload.setProperty("repl.offset", String.valueOf(conf.getReplOffset()));
+            payload.setProperty("carrier", "redis");
+            com.migration.common.position.LocalCheckpointStore.saveThrottled(
+                    new com.migration.common.position.CheckpointRecord(
+                            taskId,
+                            com.migration.common.position.CheckpointRecord.Stage.CAPTURE,
+                            "redis",
+                            com.migration.common.position.CheckpointRecord.Kind.REPL_OFFSET,
+                            payload,
+                            com.migration.common.position.MonotonicKey.ofNumeric(conf.getReplOffset()),
+                            0L),
+                    1000L, false);
+        } catch (Exception e) {
+            logger.debug("落盘 Redis 复制位点失败: {}", e.getMessage());
+        }
+    }
+
     private void applyCommand(DefaultCommand cmd) {
         // 按时间兜底刷新进度文件：PSYNC 每 ~10s 发 PING（也会走到这里），据此即便源库空闲、
         // 无数据命令，进度文件的 mtime 也会持续推进——agent 的僵死看门狗据此判活；引擎一旦冻结，
@@ -336,6 +414,7 @@ public final class RedisSyncMain {
         if (nowMs - lastProgressWriteMs >= PROGRESS_TIME_REFRESH_MS) {
             writeProgress();
         }
+        saveReplPosition();
 
         String name = new String(cmd.getCommand(), StandardCharsets.UTF_8).toUpperCase();
         byte[][] cargs = cmd.getArgs();

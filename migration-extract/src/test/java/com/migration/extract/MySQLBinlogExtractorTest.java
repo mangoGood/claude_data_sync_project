@@ -336,4 +336,87 @@ class MySQLBinlogExtractorTest {
 
         assertCached("test1.t5");
     }
+
+    // ---- enum/set 取值表：空串取值必须占住自己的序号 ----
+
+    @SuppressWarnings("unchecked")
+    private List<String> parseEnumSetValues(String columnType) throws Exception {
+        Method m = MySQLBinlogExtractor.class.getDeclaredMethod("parseEnumSetValues", String.class);
+        m.setAccessible(true);
+        return (List<String>) m.invoke(extractor, columnType);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, List<String>> parseEnumSetValuesMap(String wire) throws Exception {
+        Method m = MySQLBinlogExtractor.class.getDeclaredMethod("parseEnumSetValuesMap", String.class);
+        m.setAccessible(true);
+        return (Map<String, List<String>>) m.invoke(extractor, wire);
+    }
+
+    /** binlog 里 enum 列的值是序号；这里走 extractor 的文本路径把它还原成 SQL 字面量。 */
+    private String formatEnumOrdinal(String ordinal, List<String> enumValues) throws Exception {
+        Method m = MySQLBinlogExtractor.class.getDeclaredMethod("formatRowData",
+                List.class, String[].class, String[].class, String[].class, Map.class);
+        m.setAccessible(true);
+        Map<String, List<String>> enumMap = new HashMap<>();
+        enumMap.put("st", enumValues);
+        return (String) m.invoke(extractor, Arrays.asList(ordinal), new String[]{"enum"},
+                new String[]{"enum('','a','b')"}, new String[]{"st"}, enumMap);
+    }
+
+    /** 类型化路径（PreparedStatement 参数绑定）还原出的标签。 */
+    @SuppressWarnings("unchecked")
+    private Object typeEnumOrdinal(String ordinal, List<String> enumValues) throws Exception {
+        Method m = MySQLBinlogExtractor.class.getDeclaredMethod("typeRowValues",
+                List.class, String[].class, String[].class, String[].class, Map.class);
+        m.setAccessible(true);
+        Map<String, List<String>> enumMap = new HashMap<>();
+        enumMap.put("st", enumValues);
+        ArrayList<Object> typed = (ArrayList<Object>) m.invoke(extractor, Arrays.asList(ordinal),
+                new String[]{"enum"}, new String[]{"enum('','a','b')"}, new String[]{"st"}, enumMap);
+        assertNotNull(typed);
+        return typed.get(0);
+    }
+
+    @Test
+    @DisplayName("enum('','a','b') 的空串取值必须保留占位")
+    void emptyEnumValueKeepsItsSlot() throws Exception {
+        // MySQL 允许 enum('','a','b')，序号从 1 起按声明顺序排：1='' 2='a' 3='b'。
+        // 丢掉空串会让取值表塌成 ["a","b"]，1 被解成 'a'、3 直接越界——整列静默写错。
+        assertEquals(Arrays.asList("", "a", "b"), parseEnumSetValues("enum('','a','b')"));
+        // 与 SchemaSelfCheck.parseEnumSetValues 必须同口径，否则表结构自检会报假差异
+        assertEquals(Arrays.asList("", "a"), parseEnumSetValues("enum('','a')"));
+        assertEquals(Arrays.asList("a", "", "b"), parseEnumSetValues("set('a','','b')"));
+        // 末尾空串同样要占位
+        assertEquals(Arrays.asList("a", ""), parseEnumSetValues("enum('a','')"));
+        // 非空取值与转义规则不受影响
+        assertEquals(Arrays.asList("a", "b'c"), parseEnumSetValues("enum('a','b\\'c')"));
+    }
+
+    @Test
+    @DisplayName("enum 取值表的线格式 col=v1,v2 往返不能丢空串")
+    void enumSetValuesWireFormatRoundTripsEmptyValues() throws Exception {
+        // 线格式是 String.join(",", values)：空串在首、中、尾三个位置都要能原样解回来。
+        // 尤其是末尾——默认的 String.split(",") 会把结尾的空串整段丢掉。
+        assertEquals(Arrays.asList("", "a", "b"), parseEnumSetValuesMap("st=,a,b").get("st"));
+        assertEquals(Arrays.asList("a", "", "b"), parseEnumSetValuesMap("st=a,,b").get("st"));
+        assertEquals(Arrays.asList("a", "b", ""), parseEnumSetValuesMap("st=a,b,").get("st"));
+    }
+
+    @Test
+    @DisplayName("含空串取值的 enum 列，各序号都还原成正确标签")
+    void enumOrdinalsResolveAgainstEmptyValue() throws Exception {
+        List<String> values = parseEnumSetValues("enum('','a','b')");
+
+        assertEquals("''", formatEnumOrdinal("1", values));
+        assertEquals("'a'", formatEnumOrdinal("2", values));
+        assertEquals("'b'", formatEnumOrdinal("3", values));
+        // 序号 0 是 MySQL 的 ENUM 错误值 ''，不是"第 0 个标签"，更不是字符串 '0'
+        assertEquals("''", formatEnumOrdinal("0", values));
+
+        assertEquals("", typeEnumOrdinal("1", values));
+        assertEquals("a", typeEnumOrdinal("2", values));
+        assertEquals("b", typeEnumOrdinal("3", values));
+        assertEquals("", typeEnumOrdinal("0", values));
+    }
 }

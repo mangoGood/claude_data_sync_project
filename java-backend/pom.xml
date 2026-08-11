@@ -131,6 +131,14 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- 位点重置/历史的 SQL 要真跑一遍才算数（顺序、插入兜底、审计留档），
+             用内存 H2 的 MySQL 兼容模式跑，不连外部库。版本交给 spring-boot-starter-parent 管。 -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.security</groupId>
             <artifactId>spring-security-test</artifactId>

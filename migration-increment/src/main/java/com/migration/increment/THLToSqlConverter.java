@@ -528,6 +528,11 @@ public class THLToSqlConverter {
             case "COMMIT":
                 sqlStatements.add("COMMIT;");
                 break;
+            case "XA_PREPARE":
+                // 源库 XA 的 prepare 标记：数据由 extract 端缓冲到 XA COMMIT 才整段下发，
+                // 这里没有任何目标端动作（正常链路上 extract 已经消化掉，不会走到这儿）
+                logger.debug("跳过 XA_PREPARE 事件 (seqno={})", event.getSeqno());
+                break;
             default:
                 logger.debug("Unsupported event type: {}", eventType);
                 break;
@@ -571,12 +576,22 @@ public class THLToSqlConverter {
             columnNames = insertColsStr.split(",");
         }
 
+        // 生成列：列名、列类型、行值三者按同一组下标成对剔除（下标必须在列名映射之前算，
+        // 映射会把列改名，改完就对不上 generated_columns 里的源列名了）
+        int[] writable = writableColumnIndexes(metadata, columnNames);
+        if (writable != null) {
+            columnNames = keepIndexes(columnNames, writable);
+            columnTypes = keepIndexes(columnTypes, writable);
+            rowDataStr = keepValueIndexes(rowDataStr, writable);
+        }
+
         // 列处理（mysql→mysql 回退路径）：列名映射改写，保证与目标表结构一致
         columnNames = applyColumnProcessingToColumns(sourceDb, sourceTable, columnNames);
 
         // MySQL→PG：把 bool/bit 值转换为 PG 兼容字面量（tinyint(1)→true/false，bit→bytea）
         if (sourceIsMysql && targetIsPostgresql) {
-            String[] fullTypes = getColumnFullTypes(metadata);
+            // 完整类型也要按同一组下标裁剪，否则剔掉生成列之后值与类型会错位
+            String[] fullTypes = keepIndexes(getColumnFullTypes(metadata), writable);
             String[] insVals = parseRowDataValues(rowDataStr);
             boolean changed = false;
             for (int i = 0; i < insVals.length; i++) {
@@ -1074,6 +1089,16 @@ public class THLToSqlConverter {
         String[] whereColNames = (beforeColNamesStr != null && !beforeColNamesStr.isEmpty())
                 ? beforeColNamesStr.split("\\s*,\\s*") : columnNames;
 
+        // 生成列：只从 SET 一侧剔除（列名与后镜像值成对），WHERE 用的前镜像保持完整——
+        // 生成列可以是主键的一部分（STORED），前镜像少一列就定位不到行了
+        int[] writableSet = writableColumnIndexes(metadata, setColNames);
+        if (writableSet != null) {
+            setColNames = keepIndexes(setColNames, writableSet);
+            rowDataStr = keepValueIndexes(rowDataStr, writableSet);
+            // 类型数组按同一组下标裁剪，否则后面按 i 取类型会错位
+            columnTypes = keepIndexes(columnTypes, writableSet);
+        }
+
         // 列处理（mysql→mysql 回退路径）：输出用目标列名；主键匹配仍用源列名（primary_keys 是源列名）
         String[] setColNamesOut = applyColumnProcessingToColumns(sourceDb, sourceTable, setColNames);
         String[] whereColNamesOut = (whereColNames == setColNames)
@@ -1104,8 +1129,10 @@ public class THLToSqlConverter {
         // MySQL→PG：把 bool/bit 值转换为 PG 兼容字面量
         if (sourceIsMysql && targetIsPostgresql) {
             String[] fullTypes = getColumnFullTypes(metadata);
+            // SET 侧剔了生成列，类型数组按同一组下标裁剪；前镜像没剔，仍用完整类型
+            String[] setFullTypes = keepIndexes(fullTypes, writableSet);
             for (int i = 0; i < values.length; i++) {
-                String type = (fullTypes != null && i < fullTypes.length) ? fullTypes[i] : "";
+                String type = (setFullTypes != null && i < setFullTypes.length) ? setFullTypes[i] : "";
                 values[i] = translator.convertLiteral(values[i], type);
             }
             for (int i = 0; i < beforeValues.length; i++) {
@@ -1160,6 +1187,67 @@ public class THLToSqlConverter {
         statements.add(sql.toString());
 
         return statements;
+    }
+
+    /**
+     * 可写列的下标（剔掉生成列）。返回 null 表示无需过滤。
+     *
+     * <p>生成列（STORED/VIRTUAL）在 binlog 行事件里<b>带着值</b>，但目标库拒绝显式写入
+     * （MySQL 3105），照原样拼进 INSERT/SET 就是一条永远执行不了的语句 → 增量 fail-stop。
+     * 列名和值必须<b>成对</b>剔除：值是按全列顺序排的，只删列名会让后面所有列错位。
+     *
+     * <p>这是文本路径的兜底；mysql→mysql 默认走类型化管道，那边在 TypedDmlConverter 里处理。
+     */
+    private int[] writableColumnIndexes(Map<String, Object> metadata, String[] columnNames) {
+        String generatedMeta = (String) metadata.get("generated_columns");
+        if (generatedMeta == null || generatedMeta.isEmpty() || columnNames == null) {
+            return null;
+        }
+        java.util.Set<String> generated = new java.util.HashSet<>();
+        for (String name : generatedMeta.split("\\s*,\\s*")) {
+            if (!name.isEmpty()) {
+                generated.add(name.toLowerCase());
+            }
+        }
+        java.util.List<Integer> keep = new java.util.ArrayList<>(columnNames.length);
+        for (int i = 0; i < columnNames.length; i++) {
+            if (!generated.contains(columnNames[i].trim().toLowerCase())) {
+                keep.add(i);
+            }
+        }
+        if (keep.size() == columnNames.length || keep.isEmpty()) {
+            return null;
+        }
+        int[] idx = new int[keep.size()];
+        for (int i = 0; i < idx.length; i++) {
+            idx[i] = keep.get(i);
+        }
+        return idx;
+    }
+
+    /** 按下标裁剪数组；下标越界（列/值数量对不上）时返回原数组，交给原有校验去处理。 */
+    private static String[] keepIndexes(String[] arr, int[] keep) {
+        if (arr == null || keep == null) {
+            return arr;
+        }
+        String[] out = new String[keep.length];
+        for (int i = 0; i < keep.length; i++) {
+            if (keep[i] >= arr.length) {
+                return arr;
+            }
+            out[i] = arr[keep[i]];
+        }
+        return out;
+    }
+
+    /** 按下标裁剪逗号分隔的行值串。 */
+    private String keepValueIndexes(String rowData, int[] keep) {
+        if (rowData == null || keep == null) {
+            return rowData;
+        }
+        String[] values = parseRowDataValues(rowData);
+        String[] kept = keepIndexes(values, keep);
+        return kept == values ? rowData : String.join(",", kept);
     }
 
     private String[] parseRowDataValues(String rowDataStr) {
@@ -1319,8 +1407,21 @@ public class THLToSqlConverter {
 
         if (classification.isTransaction()) {
             SqlClassifier.TransactionSubType txType = classification.getTransactionSubType();
+            if (txType == SqlClassifier.TransactionSubType.XA) {
+                // XA 控制语句在目标端没有任何对应动作：源库 XA 事务的数据由 extract 端
+                // 缓冲到 XA COMMIT 才整段下发（已是普通事务形态）。照原样执行会把应用连接
+                // 卡进 XA ACTIVE 态，后续 COMMIT/ROLLBACK 全部失败、任务永久停摆。
+                logger.warn("跳过 XA 控制语句（目标端无对应动作）: {}", sql);
+                return statements;
+            }
             if (txType == SqlClassifier.TransactionSubType.BEGIN) {
                 logger.debug("Skipping BEGIN transaction marker");
+                return statements;
+            }
+            if (txType == SqlClassifier.TransactionSubType.SAVEPOINT) {
+                // 源端事务内的 savepoint 在目标端没有对应动作：目标事务是应用侧自己开的，
+                // 源端的 savepoint 名字那边根本不存在。原样执行 ROLLBACK TO 会报 1305
+                logger.debug("Skipping SAVEPOINT statement: {}", sql);
                 return statements;
             }
             if (txType == SqlClassifier.TransactionSubType.COMMIT) {

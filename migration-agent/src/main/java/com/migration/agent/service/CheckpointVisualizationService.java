@@ -70,6 +70,10 @@ public class CheckpointVisualizationService {
         // 各引擎写的是同一个文件契约，所以这里一处读取就覆盖 SQL/Mongo/ES/Redis 全部链路。
         result.put("fullSnapshot", readFullSnapshot(taskId));
 
+        // 8. 位点保留期在线巡检：位点还剩多少余量才会被源端清理掉。
+        // 启动预检只能回答"现在能不能续上"，运行中被清理要等下次重启才炸——那时只能重做全量。
+        result.put("retention", readRetention(taskId));
+
         logger.debug("Checkpoint visualization for task {}: status={}", taskId, linkStatus);
         return result;
     }
@@ -92,6 +96,26 @@ public class CheckpointVisualizationService {
         snapshot.put("position", record.position);
         snapshot.put("timestamp", record.timestamp);
         return snapshot;
+    }
+
+    /**
+     * 读取位点保留期巡检结果（{@code binlog_output/retention_metric}）。
+     * 没有该文件 = 这条链路没跑巡检（关闭了 / 单进程引擎 / 老任务），返回 available=false。
+     */
+    private Map<String, Object> readRetention(String taskId) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("available", false);
+        com.migration.common.position.RetentionStatus.Record rec =
+                com.migration.common.position.RetentionStatus.read("./files/" + taskId + "/binlog_output");
+        if (rec == null) {
+            return out;
+        }
+        out.put("available", true);
+        out.put("state", rec.state.name());
+        out.put("headroom", rec.headroom);
+        out.put("detail", rec.detail);
+        out.put("timestamp", rec.timestamp);
+        return out;
     }
 
     /** 读取 capture 进程的当前 binlog 位点 */

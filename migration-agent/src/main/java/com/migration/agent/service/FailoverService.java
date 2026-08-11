@@ -167,6 +167,10 @@ public class FailoverService {
         for (String dbFile : checkpointDbFiles) {
             deleteFileIfExists(dbFile);
         }
+
+        // 统一位点与中心位点一并作废：本地清干净而中心库留着，接管方一回灌就把旧源位点请回来，
+        // 旧源的 GTID 拿到新源上会让服务端从 binlog 最开头整段重放。
+        com.migration.agent.checkpoint.CheckpointCleaner.clear(taskId, "FAILOVER");
         logger.info("All checkpoint DB files deleted for failover task: {}", taskId);
     }
 

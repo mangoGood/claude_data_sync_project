@@ -57,6 +57,26 @@ public class ColumnProcessingConfig {
         }
 
         /**
+         * CUSTOM 附加列的实际落库值：{@code 输入值@源库@源表}。
+         *
+         * <p>汇聚下这个值<b>必须逐行注</b>，不能靠建表 DEFAULT：合并表只由第一个来源建出来，
+         * DEFAULT 里烤的是那一个来源的库表名，其余来源的行会全部带上错误的来源标识——
+         * 而"标识来源"正是这个列存在的理由。
+         */
+        public String resolvedValue(String sourceDb, String sourceTable) {
+            return (customValue == null ? "" : customValue) + "@" + sourceDb + "@" + sourceTable;
+        }
+
+        /**
+         * 建表列定义，但<b>不带 DEFAULT</b>（值由 DML 逐行注）。
+         * CREATE_TIME/UPDATE_TIME 与来源无关，仍走 DEFAULT，不受影响。
+         */
+        public String toColumnDefWithoutDefault(boolean postgres) {
+            return postgres ? "\"" + name + "\" VARCHAR(512)"
+                            : "`" + name + "` VARCHAR(512) COMMENT '来源标识列'";
+        }
+
+        /**
          * 生成 MySQL 建表列定义（不含前导逗号）。
          * CREATE_TIME/UPDATE_TIME 用 DATETIME 默认值语义，CUSTOM 为常量 DEFAULT。
          */
@@ -248,6 +268,20 @@ public class ColumnProcessingConfig {
     public List<ExtraColumn> getExtraColumns(String db, String table) {
         List<ExtraColumn> list = lookup(extras, extrasLower, db, table);
         return list != null ? list : Collections.emptyList();
+    }
+
+    /**
+     * 该表<b>需要逐行注值</b>的附加列（列名 → 值），即 CUSTOM 类型的那些。
+     * 汇聚下由 DML 带值写入；1:1 与拆分下仍由建表 DEFAULT 承载，本方法不参与。
+     */
+    public java.util.LinkedHashMap<String, String> perRowExtraValues(String db, String table) {
+        java.util.LinkedHashMap<String, String> values = new java.util.LinkedHashMap<>();
+        for (ExtraColumn extra : getExtraColumns(db, table)) {
+            if (extra.kind == ExtraColumnKind.CUSTOM) {
+                values.put(extra.name, extra.resolvedValue(db, table));
+            }
+        }
+        return values;
     }
 
     /** 映射单个列名；未配置返回原列名（大小写回退查找源列名）。 */

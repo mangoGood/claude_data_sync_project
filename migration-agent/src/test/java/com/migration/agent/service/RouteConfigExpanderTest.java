@@ -96,6 +96,45 @@ class RouteConfigExpanderTest {
     }
 
     @Test
+    @DisplayName("下发时只挡真正不支持的库类型（Redis/Oracle），异构与文档型库对放行")
+    void inapplicableLinksFailAtDispatch() {
+        String merge = "{\"mode\":\"MERGE\",\"merge\":[{\"match\":\"db_*.t_*\",\"target\":\"dw.t\"}]}";
+
+        Properties redis = new Properties();
+        redis.setProperty("source.db.type", "redis");
+        redis.setProperty("target.db.type", "redis");
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                () -> RouteConfigExpander.expand(redis, merge, null)).getMessage().contains("Redis"));
+
+        Properties oracle = new Properties();
+        oracle.setProperty("source.db.type", "oracle");
+        oracle.setProperty("target.db.type", "oracle");
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                () -> RouteConfigExpander.expand(oracle, merge, null)).getMessage().contains("upsert"));
+
+        // 异构关系库对与文档型库对现已支持，下发时放行
+        Properties hetero = new Properties();
+        hetero.setProperty("source.db.type", "mysql");
+        hetero.setProperty("target.db.type", "postgresql");
+        RouteConfigExpander.expand(hetero, merge, null);
+        assertEquals("MERGE", hetero.getProperty("route.mode"));
+
+        Properties mongo = new Properties();
+        mongo.setProperty("source.db.type", "mongodb");
+        mongo.setProperty("target.db.type", "mongodb");
+        RouteConfigExpander.expand(mongo, merge, null);
+        assertEquals("MERGE", mongo.getProperty("route.mode"));
+
+        // 列处理与路由现已可以叠加，下发时不再拦
+        Properties withColumnProcessing = new Properties();
+        withColumnProcessing.setProperty("source.db.type", "mysql");
+        withColumnProcessing.setProperty("target.db.type", "mysql");
+        withColumnProcessing.setProperty("column.filter.db_1.t_1", "amount|<|100");
+        RouteConfigExpander.expand(withColumnProcessing, merge, null);
+        assertEquals("MERGE", withColumnProcessing.getProperty("route.mode"));
+    }
+
+    @Test
     @DisplayName("来源标识列（tagColumns）按逗号拼接下发")
     void expandTagColumns() {
         Properties props = new Properties();

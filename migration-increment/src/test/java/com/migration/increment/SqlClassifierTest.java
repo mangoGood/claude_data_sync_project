@@ -200,6 +200,47 @@ class SqlClassifierTest {
         assertFalse(result.isParseSuccess());
     }
 
+    /**
+     * XA 控制语句必须被认出来，绝不能落进 OTHER。
+     *
+     * <p>OTHER 在 {@code THLToSqlConverter#generateQuerySql} 里是"不认识但照样执行"的兜底路径。
+     * {@code XA START X'..',X'..',1} 走这条路会在目标端<b>执行成功</b>，把应用连接推进 XA ACTIVE 态，
+     * 随后的 COMMIT 与 ROLLBACK 双双报 1399 XAER_RMFAIL，增量 fail-stop 且重试永远撞同一堵墙
+     * （实测 MySQL 8.0.44）。正常链路上 extract 端已把这些语句消化掉，这里是第二道闸。
+     */
+    @Test
+    @DisplayName("XA 控制语句应分类为 TRANSACTION/XA，不能落进 OTHER 兜底执行")
+    void xaStatementsShouldBeClassifiedAsXaTransaction() {
+        String[] xaStatements = {
+                "XA START X'67747269645f41',X'627175616c5f41',1",
+                "XA END X'67747269645f41',X'627175616c5f41',1",
+                "XA PREPARE X'67747269645f41',X'627175616c5f41',1",
+                "XA COMMIT X'67747269645f41',X'627175616c5f41',1",
+                "XA COMMIT X'67747269645f43',X'627175616c5f43',1 ONE PHASE",
+                "XA ROLLBACK X'67747269645f42',X'627175616c5f42',1",
+                "xa start 'gtrid','bqual',1",
+        };
+
+        for (String sql : xaStatements) {
+            SqlClassifier.ClassificationResult result = classifier.classify(sql);
+            assertTrue(result.isTransaction(), "应分类为事务语句: " + sql);
+            assertEquals(SqlClassifier.TransactionSubType.XA, result.getTransactionSubType(),
+                    "应识别为 XA 子类型: " + sql);
+            assertFalse(result.isNeedsDatabaseSelection(), "XA 语句与库无关: " + sql);
+        }
+    }
+
+    @Test
+    @DisplayName("普通 BEGIN/COMMIT 不受 XA 识别影响")
+    void plainTransactionStatementsAreUnaffected() {
+        assertEquals(SqlClassifier.TransactionSubType.BEGIN,
+                classifier.classify("BEGIN").getTransactionSubType());
+        assertEquals(SqlClassifier.TransactionSubType.COMMIT,
+                classifier.classify("COMMIT").getTransactionSubType());
+        assertEquals(SqlClassifier.TransactionSubType.ROLLBACK,
+                classifier.classify("ROLLBACK").getTransactionSubType());
+    }
+
     @Test
     @DisplayName("ClassificationResult toString 应包含关键信息")
     void classificationResultToStringShouldContainKeyInfo() {

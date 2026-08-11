@@ -41,6 +41,21 @@
 对标大厂后，**缺失的关键能力**按优先级是：事务一致性投递 → 集群化/任务级 HA →
 位点与资源的全生命周期治理 → 双向冲突消解 → 可观测性与 SLA 闭环。
 
+> **2026-08-09 第二轮复审已完成，结论与新增缺陷见 §12；
+> 2026-08-10 热修 + 第 6/7 批已全部实施完成并实测通过，见 §13 / §14。**
+> 最要紧的一条：**位点中心化那一批要消灭的"跨机接管静默丢数据"至今仍在**——
+> 它的验收脚本此前从未真正跑通过（脚本自身有致命缺陷，见 §12.6），
+> 本轮修好脚本后连跑三次，每次都稳定丢掉崩溃窗口里的 196 行（§12.1 N0）。
+> 除此之外，剩下的问题**几乎全在"边界与门禁"上**：
+> 一条源端 `DROP DATABASE` 会把目标库连同不在同步范围的表一起删掉（**已实测复现**）、
+> 无主键表的一条 DELETE 在目标端删掉全部重复行（**已实测**）、
+> 计划内主备倒换既不等追平也不冻结旧主、预检算得很准但后端启动路径根本不调它
+> （自动化路径拦截率 **0**，**已实测**）。新的优先级是：
+> **破坏性 DDL 护栏 → 无主键行定位 → Switchover/Failover 拆分 → 预检门禁**（第 6 批），
+> 而后是全量断点中心化、传输加密、全量限流、订阅 schema 事件（第 7 批）。
+> 其中 **N0 与 N1 已按热修处理**（§13.1 / §13.2）：跨机接管从"稳定丢 196 行"变成
+> `checkpoint_durability.py` 8/8 全绿且对照组仍复现丢数据；`DROP DATABASE` 不再直穿目标库。
+
 ---
 
 ## 1. 架构速览（便于定位下文改动点）
@@ -409,6 +424,10 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 **差距集中在三块**：事务语义、集群化、位点与资源治理。功能广度（引擎种类、校验、预检、
 死信、脱敏、双向）其实已经很接近商用产品；缺的是**"能长期无人值守跑在生产上"的那部分**。
 
+> 上表是 2026-07-30 的口径。五批实施完成后，事务语义、集群化、位点治理三块已经补齐；
+> **2026-08-09 复审后的差异行见 §12.3**（新暴露的差距是：破坏性 DDL 护栏、无主键行定位、
+> 计划内切换零丢失、预检门禁、全量断点跨节点、全量限流、传输加密、订阅 schema 事件）。
+
 ---
 
 ## 5. 补齐方案（按优先级，落到类/文件级）
@@ -621,6 +640,8 @@ rowEvent.addMetadata("row_data", rowsData.get(i));  // 文本路径正确：只�
 | **第 3 批** ✅ | P1-2 熔断自愈 + P1-3 转换死信 + P2-1 资源治理 | 都是独立小改动，可并行 —— **已完成，见 §9** |
 | **第 4 批** ✅ | P1-1 集群化 + P1-4 冲突消解 | 需要元数据表变更（Flyway V3+）与较多联调 —— **已完成，见 §10** |
 | **第 5 批** ✅ | P2-2 批量装载与状态单调 + P2-3 一致性快照 + P2-4 可观测闭环 | 锦上添花，但决定能不能对外承诺 SLA —— **已完成，见 §11**（全量 291→38,365 行/秒） |
+| **热修 + 第 6 批** ✅ | P0-3b 回灌判据坐实 + P0-4 破坏性 DDL 护栏 + P0-5 无主键行定位 + P0-6 Switchover/Failover 拆分 + P0-7 预检门禁 | 2026-08-09 复审新增 —— **已完成，见 §13**（跨机接管从丢 196 行到 8/8 全绿；DROP DATABASE 不再直穿目标库） |
+| **第 7 批** ✅ | P1-5 全量断点中心化 + P1-6 唯一键冲突 + P1-7 传输加密 + P1-8 全量限流 + P1-9 订阅 schema 事件 | **已完成，见 §14**。P1-6 在实测中被改写：MySQL 上真实后果不是"丢一行"而是"毁掉一行又把两行并成一行"，只能在预检拦 |
 
 每批都应在 `test_scripts/fault_injection/` 里补对应的判据脚本，
 并入 `e2e_smoke.py` 的 CI 门禁场景表。
@@ -1155,3 +1176,904 @@ B 变成 A 的值，两端永远不一致，而且看起来还像"同步成功"�
    `SimpMessagingTemplate` / `KafkaProducerService`），与本批改动无关；用 `start.sh` 同款 JDK 21 即可。
    另外 `SimpMessagingTemplate` 本身 mock 不了，测试里用真实实例 + mock 的 `MessageChannel`
    （`send` 必须返回 true，否则模板抛 `MessageDeliveryException`）。
+
+---
+
+## 12. 2026-08-09 复审（第二轮全链路通读 + 实测）
+
+范围：五批补齐 + 位点中心化（`ed26c6b`）+ 分库分表路由（`04513b6`）**全部落地之后**的代码，
+约 76K 行 Java（引擎 55K + backend 21K）。方法：逐模块通读 + 现网实测，新增 4 个判据脚本。
+
+**一句话结论**：结构性的东西（事务语义、集群化、位点、资源治理、批量装载）已经补得差不多了；
+这一轮找到的窟窿**几乎全在"边界与门禁"上**——不是链路跑不通，而是
+
+| | 症状 |
+|---|---|
+| **以为修好了其实没修** | 位点中心化那一批要消灭的"跨机接管静默丢数据"**还在**——验收脚本此前从未跑通，所以没人知道（§12.1 N0，**已实测，连跑三次丢同样的 196 行**） |
+| **该拦的时候没拦** | 一条 `DROP DATABASE` 从源库原样打到目标实例，把整个目标库连同不在同步范围的表一起删掉（§12.1 N1，**已实测复现**） |
+| **该等的时候没等** | 计划内主备倒换不等追平、不冻结旧主写入，还把未应用的 THL 直接删掉（§12.1 N3） |
+| **该管的时候没管** | 预检算得很准，但后端 `launchWorkflow` 根本不调它——调度/依赖/批量/改派四条自动化路径的拦截率是 **0**（§12.1 N4，**已实测**） |
+| **该细的地方太粗** | 无主键表的一条 DELETE 在目标端删掉全部重复行（§12.1 N2，**已实测**） |
+
+这五条有一个共同形状：**一切日志都显示"成功" + 静默的破坏**。这正是前五批一直在消灭、
+但还剩最后几处的那类缺陷。
+
+而 N0 还多一层教训：**一个写好但从未跑通过的判据脚本，比没有判据更糟**——
+它让所有人以为那条路径有人守着。详见 §12.6。
+
+---
+
+### 12.1 新发现的缺陷
+
+> 编号 **N0 排在最前面是因为它最该先读**（虽然是本轮最后才定位到的）：
+> 位点中心化那一批（`ed26c6b`）要解决的**核心问题至今没有被解决**，
+> 而它的验收脚本此前从未真正跑通过，所以没人知道。
+
+#### N0【致命·正确性】跨机接管仍然静默丢数据 —— B2 的核心目标未达成
+
+`CHECKPOINT_DURABILITY_DESIGN §2 G1` 把"跨机接管 = 静默丢数据"列为**全平台最严重的一处**，
+B2 一整批（中心位点 + 回灌 + fencing）就是为它做的。**本轮第一次真正跑通验收脚本，它还在。**
+
+**实测**（[checkpoint_durability.py](test_scripts/fault_injection/checkpoint_durability.py)，
+真起两个 agent 实例，agent-B 有独立工作目录与空的 `files/`）：
+
+```
+   ✗ 尺子1 跨机接管不丢数据: 源 (1300, 2967596298) != 目标 (1104, 1617177539)
+   ✗ 尺子2 位点来自中心库: agent-B 未出现回灌日志（可能又取了源库当前位点）
+   ✓ 尺子3 对照组: 如期复现丢数据      ← 开不开中心位点，结果一样
+   ✓ 尺子4 上卷活性 / ✓ 尺子6 保留期巡检
+```
+
+按标签拆开看，丢的正是**崩溃窗口**那一段：
+
+| 标签 | 写入时机 | 源 | 目标 |
+|---|---|---|---|
+| seed | 全量前 | 600 | 600 |
+| before | A 崩溃前 | 200 | 200 |
+| **gap** | **A 崩溃后、B 接管前** | **400** | **204** |
+| after | B 接管后 | 100 | 100 |
+
+**196 行永久消失**，三次独立运行数字完全一致（1104 / 1300），是确定性的，不是时序抖动。
+
+**根因**（agent-B 的日志把整条链摆得很清楚）：
+
+```
+[TaskExecutor-ffed82bf] 中心位点回灌判定: NOT_NEEDED          ← 认为"本地有位点 = 同机重启"
+CheckpointManager - 保存 Checkpoint 成功: BinlogPositionInfo{filename='binlog.000041', position=90467575}
+[ffed82bf] 首启位点已写入中心库: binlog.000041:90467575 (ACCEPTED)   ← 还把这个位点写回了中心库
+```
+
+**已经坐实的两件事**：
+
+1. `hydrate()` 在一台 `files/` 全空的接管机上返回了 `NOT_NEEDED`，也就是走进了
+   `if (localExists)` 分支 —— 它**认为本地已有位点**，于是完全绕过回灌；
+   而紧随其后的 `initMysqlCheckpoint()` 里 `loadCheckpoint()` 却拿到 `null`，
+   只好走 `getCurrentPositionFromSource()` 去源库取当前位点 —— **正是 G1 描述的那条路**。
+   **同一个问题（"本地到底有没有位点"）由两个函数给出了相反的答案**，回灌就在这道缝里被跳过了。
+2. 接管方随后把这个"取自源库当前时刻"的位点当作**首启位点写回中心库，且被 `ACCEPTED`**——
+   单调守卫只比大小，而这个位点恰恰是**更大**的。于是中心库里那份正确的、偏旧的位点
+   被一个**超前**的位点覆盖掉，`I5`（中心位点必须落后或等于本地）被打破，
+   连"再来一次接管"的补救机会都没有了。
+
+**最可能的具体原因**（修复第一步就是把它坐实）：`hasLocalPosition()` 判的是**文件存不存在**
+（`checkpoint/positions/*.properties`、`binlog_output/capture_position.properties`、
+`checkpoint/checkpoint.mv.db` 等 legacy 文件，用 `File.isFile()`），
+而续传真正读的是这些载体里的**内容**。H2 一 connect 就会把 `.mv.db` 文件建出来，
+空库和"有位点"在 `File.isFile()` 眼里完全一样；ConfigService 在拉起执行器前也会先把
+`binlog_output/`、`checkpoint/` 这些目录建好。**"文件存在"被当成了"位点存在"。**
+
+**这条必须最先修**，修法不止一处：
+
+- `hasLocalPosition()` 改成判**内容**：H2 要真去读出一行、properties 要解析出位点键才算数；
+- 这条判据与 `initXxxCheckpoint()` 的读取口**收敛到同一处**，
+  杜绝"两个函数对同一个问题给出不同答案"——这是本缺陷的形状，不修形状还会再长出来；
+- `publishInitialPosition()` 只允许在 `hydrate()` 明确返回 `FIRST_START` 时调用；
+  中心库里**已存在该任务的行**时一律不得当作首启（宁可 `E3014` 停下来等人）；
+- 单调守卫补一条方向性规则：**首启位点不得覆盖已有行**（首启按定义就是"中心库没有这条任务"）；
+- 判据脚本把"agent-B 日志出现回灌记录"从"提示"升级为**硬门禁**，
+  并新增一把尺子直接断言"接管后中心位点没有变得比接管前更超前"。
+
+> 附带一条同源的小问题：位点重置接口的状态白名单是「PAUSED / FAILED / CONFIGURING」，
+> 漏了 **COMPLETED / STOPPED**——而"任务跑完了才发现某段数据不对、想回退位点重跑"恰恰是
+> PITR 最常见的用法。本轮 尺子5 就是被这条卡住的（`只有已暂停/已失败/配置中的任务才能重置位点，当前状态: COMPLETED`）。
+
+#### N1【致命·正确性】源端 `DROP DATABASE` 被原样应用到目标实例
+
+**根因**：[SchemaEvolutionService.applyDdl()](migration-increment/src/main/java/com/migration/increment/schema/SchemaEvolutionService.java:192)
+的表级同步守卫只挡「源库**不在**同步范围」的 DDL：
+
+```java
+} else if (sourceDb != null && !includedDatabases.isEmpty()
+           && !includedDatabases.contains(sourceDb.toLowerCase())) {
+    return ApplyResult.skipped("库 " + sourceDb + " 不在表级同步范围，DDL 不应用");
+}
+```
+
+范围**之内**的库级 DDL 走不到任何一道闸：`isTableScopedDdl()`
+（[同文件:552](migration-increment/src/main/java/com/migration/increment/schema/SchemaEvolutionService.java:552)）
+只列了 `CREATE/ALTER/DROP_TABLE`、`TRUNCATE`、`RENAME_TABLE`、`*_INDEX`，
+`DROP_DATABASE` 不在其中；`DdlIdentifierRewriter` 只改写**限定名** `db.table`，
+`DROP DATABASE x` 里那个裸库名不被改写。于是语句**原封不动**打到目标连接上。
+
+汇聚/拆分链路早就拦了破坏性 DDL（§十二之二第 7 条：`DROP TABLE`/`TRUNCATE`/`RENAME` 一律 skip），
+**1:1 这条最主流的链路反而一处都没拦**。
+
+**实测复现**（新增 [ddl_blast_radius.py](test_scripts/fault_injection/ddl_blast_radius.py)，
+两个独立实例 33320→33321、两端库名同为 `blast_db`、表级同步只选了一张表）：
+
+```
+   ✓ 对照：清单内表的 ALTER 照常同步
+   ✓ 对照：范围外库的 DDL 未波及目标实例（既有守卫有效）
+   ✓ 源端 CREATE DATABASE 未在目标实例造出 blast_created
+   ✗ 源端 DROP DATABASE 未删掉目标实例的同名库 blast_db（含无关表 bystander）
+     目标实例库变化: 消失 ['blast_db']
+```
+
+日志里写的是：
+
+```
+SchemaEvolutionService - DDL 应用成功: subtype=DROP_DATABASE | sql=DROP DATABASE IF EXISTS ckpt_src
+SchemaEvolutionService - 表级同步：库 ckpt_tgt 不在同步范围，DDL 跳过: subtype=DROP_DATABASE
+```
+
+两行并排看得最清楚：**在范围内的库被删掉了，不在范围内的被拦住了**——守卫的方向恰好反了。
+（这条不是推演出来的：本轮跑 `checkpoint_durability.py` 时，一个残留任务就是这样把
+新用例刚建好的 `ckpt_src` 库删掉的，脚本报 `Unknown database 'ckpt_src'` 才顺藤摸到这里。）
+
+**爆炸半径**（三种都是现实配置，不是极端构造）：
+
+| 场景 | 后果 |
+|---|---|
+| **灾备（单向/双向）** | 灾备要求两端库名一致（倒换的前提）。主库一条 `DROP DATABASE app`（含"删库重建"这类常规运维）**把整个备库清空**——灾备的反义词 |
+| 同实例迁移 / 库名映射 | 源与目标在同一实例时，删掉的是**源库** |
+| 多任务共用目标实例 | 目标端恰有同名库 → 删掉别的任务的数据 |
+
+**没有任何补救**：不报错、不告警、不进死信，任务状态保持 `INCREMENT_RUNNING`。
+
+#### N2【严重·正确性】无主键表的一条 DELETE/UPDATE 命中目标端全部重复行
+
+**根因**：[TypedDmlConverter.appendWhere()](migration-increment/src/main/java/com/migration/increment/TypedDmlConverter.java:971)
+在无主键时按**整行前镜像**拼 WHERE，且没有 `LIMIT 1`。而无主键表天然允许完全重复的行：
+
+```
+源端 3 条完全相同的行，DELETE 掉其中 1 条
+  → binlog 是一条"删 1 行"的事件
+  → 目标端 DELETE FROM t WHERE c1=? AND c2=?  ← 删掉全部 3 条
+```
+
+**实测**（新增 [nopk_dup_rows.py](test_scripts/fault_injection/nopk_dup_rows.py)）：
+
+```
+   ✗ 无主键表 DELETE 一条重复行：源剩 2 条，目标剩 0 条
+   ✗ 无主键表 UPDATE 一条重复行：源端 1 行为 'y'，目标端 0 行
+   ✓ 对照组（有主键表）：行数 3/3，改中行数 1/1
+```
+
+预检里"无主键"目前只是 **WARNING**（[DiagnosticService.checkPrimaryKeys](java-backend/src/main/java/com/synctask/service/DiagnosticService.java:437)），
+措辞是"可能同步异常"——实际是确定性的数据损坏，而且损坏方向是**多删**，不是少同步。
+叠加 N4（预检拦不住自动化启动），这条在生产上是可以一路跑到底的。
+
+#### N3【严重·恢复能力】计划内主备倒换：不等追平、不冻结旧主、直接丢弃未应用的 THL
+
+现在的倒换就是三步：交换连接串 → 清位点与中间态 → 重新拉起。
+[WorkflowService.failoverWorkflow()](java-backend/src/main/java/com/synctask/service/WorkflowService.java:1475)
+从头到尾没有任何 RPO/lag 判断；UI 的确认框
+（[dashboard-dr.js:33](dashboard-dr.js:33) `confirmDrFailover`）只显示"这是第几次倒换"。
+
+而 agent 侧 [FailoverService.cleanFailoverFiles()](migration-agent/src/main/java/com/migration/agent/service/FailoverService.java:143)
+会 `cleanDirectory("files/<taskId>/thl_output")` —— **已捕获但尚未应用的变更被直接删掉**，
+随后 `clearBinlogPositionInConfig()` 让新 capture 从新源的当前位点起跑。
+
+于是：
+
+| | 大厂语义 | 本平台现状 |
+|---|---|---|
+| 计划内切换（Switchover） | 停写 → 追平 → 校验 → 切，**零丢失** | 无停写、无追平、无校验；在途 THL 丢弃 |
+| 计划外接管（Failover） | 有损，但要**告诉用户丢了多少** | 有损，且不告诉 |
+
+两件事被合成了一个按钮。灾备的核心承诺（"计划内切换不丢数据"）目前给不出来。
+
+#### N4【严重·预检】预检拦不住任何自动化启动路径，也不留档，非 MySQL 源覆盖率为 0
+
+三层问题叠在一起：
+
+1. **门禁只在前端**。对象级预检唯一的调用点是 `admin-dashboard.js` 的
+   [schemaPrecheckGate](admin-dashboard.js:4430)，而且是个 `confirm()`——点"确定"就强启。
+   后端 [WorkflowService.launchWorkflow()](java-backend/src/main/java/com/synctask/service/WorkflowService.java)
+   **一行预检都没有**，于是 `TaskScheduleService`（调度）、
+   [TaskDependencyService:133](java-backend/src/main/java/com/synctask/service/TaskDependencyService.java:133)（依赖任务）、
+   [BatchOperationService:37](java-backend/src/main/java/com/synctask/service/BatchOperationService.java:37)（批量启动）、
+   以及集群改派全部直接走 `launchWorkflow` —— **拦截率 0**。
+2. **强启不留痕**。`audit_logs.action` 是 MySQL ENUM，枚举里压根没有"忽略预检强启"这种动作，
+   事后查不到是谁在什么时候忽略了哪条 FAIL。
+3. **覆盖面只有 MySQL 源的 6 项**。`schemaPrecheck` 开头就
+   `if (!srcConn.startsWith("mysql://")) return 一条 WARNING`——
+   PostgreSQL / Oracle / TiDB / MongoDB 源的对象级预检覆盖率是 **0**。
+   （连接级 `validateForMigration` 有 33 个检查方法、覆盖 8 种链路，做得相当扎实；
+   **对象级**这一层才是短板，而"跑起来才炸"的问题大多在对象级。）
+
+**实测**（新增 [precheck_gate.py](test_scripts/fault_injection/precheck_gate.py)）：
+
+```
+   ✓ 预检能查出问题：overall=FAIL（failed=1, warnings=0）
+   ✗ 预检 FAIL 的任务经 API 直启被拒  ← 实际启动成功
+   ✗ 忽略预检强制启动留痕            ← audit_logs 无记录
+   ✗ 非 MySQL 源有实质预检项（共 1 项）← "仅支持 MySQL 源库，已跳过"
+```
+
+第一条通过、后三条失败，说明**检查算法本身是好的，坏的是它没有被接进任何一条决策路径**。
+这就是"预检拦截效率"的真实数字：人工点击路径 ≈ 100%（但可一键忽略且无痕），
+自动化路径 = 0%，非 MySQL 源 = 0%。
+
+#### N5【中·正确性】非主键唯一键冲突被静默吞掉
+
+[ContinuousIncrementMain:783](migration-increment/src/main/java/com/migration/increment/ContinuousIncrementMain.java:783)：
+`Duplicate entry` 一律 `logger.warn("重复键忽略")` 后继续。对**主键**冲突这是幂等重放该有的语义；
+但目标表若有源端没有的唯一索引：
+
+- **PG 目标**：`INSERT ... ON CONFLICT (pk) DO NOTHING` 只覆盖主键，唯一索引冲突抛异常 →
+  落进这条 warn → **这一行永久丢失**；
+- **MySQL 目标**：`ON DUPLICATE KEY UPDATE col=VALUES(col)`（含主键列）在**非主键唯一冲突**时
+  会去改**那一行别的行**、连主键一起改掉 —— 一次写入毁掉两行（MySQL 文档明确说多唯一索引下
+  该语句不确定）。
+
+冲突键是主键还是别的唯一键，处置方式必须分开，现在完全没分。
+
+#### N6【中·恢复能力】全量阶段的跨机接管 = 整个全量从零重做
+
+位点中心化解决了增量的跨机接管，但全量的表级/分片级断点在 `files/<taskId>/migration_progress.mv.db`，
+是本机 H2，**设计上明确没有中心化**（`CHECKPOINT_DURABILITY_DESIGN §9`：
+"全量重跑是幂等的、代价可接受"）。实际接管时：
+
+- agent-B 的 `files/` 是空的 → `resetIfIncompleteProgress()` 取到 `existing == null` 直接 return
+  （[DataMigration:462](migration-full/src/main/java/com/migration/full/migration/DataMigration.java:462)）
+  → **连"清表重搬"都不做**，直接从头 INSERT，全靠目标端主键冲突逐行吸收；
+- 已搬完的表也要重来一遍。
+
+正确性没问题（幂等），但 RTO 是"整个全量的时长"。第 5 批把全量提到 38K 行/秒之后，
+一张 10 亿行的表仍要 ~7 小时——把这 7 小时因为一次 agent 崩溃重来一遍，是产品级的问题。
+**"重跑幂等"只保证正确性，不保证 RTO**，这个取舍值得改。
+
+#### N7【中·安全合规】到源/目标库的连接强制明文
+
+全仓 **34 处硬编码 `useSSL=false`**（capture / extract / increment / full / agent / backend 全都有），
+且没有任何 SSL 相关配置项——`grep -r 'sslmode\|requireSSL\|verifyServerCertificate'` 命中数为 **0**。
+
+这与平台已有的安全能力形成割裂：凭证 AES-GCM 落库加密、THL 文件可加密、JWT/agent token 持久化，
+唯独**真正流动的业务数据在网络上是明文的**。金融/政企客户的入网评审基本过不了这一关，
+而 DTS/DMS/OGG/Debezium 全部支持 TLS + 客户端证书。
+
+#### N8【中·长跑】全量链路没有任何限速阀门
+
+`migration-full` 里 `RowRateLimiter` 引用数为 **0**；`ResourceQuota` 只有
+`max_increment_rows_per_sec`（增量）与 `max_full_sync_concurrent_tables`（并发表数），
+**没有全量的行/秒或字节/秒**。第 5 批把全量从 291 提到 38,365 行/秒（56×）之后，
+这个缺口的性质变了：**提速本身成了新的风险**——一个没人看着的全量任务可以把源库 IO 打满。
+DTS 把"全量限流 + 源库负载自适应降速"当作一等配置项，本平台连开关都没有。
+
+顺带一个运维尖角：`max_increment_rows_per_sec` 一旦被设过就长期生效，
+本机残留着一个 **50 行/秒** 的测试值（`updated_at=2026-08-01`），
+下发时只有一行 INFO 日志，任务详情页看不到"我正被限速"。
+
+#### N9【中·订阅】订阅流里没有 schema 变更事件
+
+[ContinuousSubscribeMain.convertToCdcEvent()](migration-subscribe/src/main/java/com/migration/subscribe/ContinuousSubscribeMain.java:439)
+的 `switch (operation)` 只认 `INSERT/UPDATE/DELETE`，`default: return null`——
+**DDL 事件被整体丢弃**，全仓订阅模块里 `ddl` 引用数为 0。
+
+后果：下游按订阅流建镜像表的消费者，在源端 `ADD COLUMN` 之后收到的消息突然多出一个字段，
+而它完全不知道发生了什么；`DROP COLUMN` 则是字段悄悄消失。Debezium 有专门的 schema change topic，
+DTS 的订阅通道也投递 DDL。第 2 批已经把事务元数据补齐到 Debezium 口径了，schema 这一半还缺着。
+
+#### N10【低·可用性】目标库重连发生在事务中途时，事务状态与连接脱节
+
+[reconnectTargetDatabase()](migration-increment/src/main/java/com/migration/increment/ContinuousIncrementMain.java:1530)
+关掉旧连接（未提交事务被服务端回滚）后新建连接，但 `pendingTxOpen` 仍是 true、
+`openPendingTx()` 不会再被调用，新连接的 `autoCommit` 是 true。于是重试的那条 DML **立刻自动提交**，
+随后 `commitPendingTx()` 在 autoCommit 连接上 `commit()` 必然抛错 → `txFailed` → fail-stop。
+
+结果不是丢数据（位点不推进，重启后重放，幂等收敛），但**一次目标库的短暂抖动被升级成
+"进程失败 + 等 ProcessGuard 拉起"**，而这条路径本来该是无感自愈的。修法是重连后
+`resetPendingTx()` 让整条事务重放，而不是接着往下写。
+
+#### N11【低·性能】事务一致档位把并行事务分片钉成了串行
+
+第 2 批花大力气实现了 TRANSACTION 模式下的并行应用（`TxGroup` + 表并查集，§8.3），
+但 [ConfigService.applyConsistencyMode()](migration-agent/src/main/java/com/migration/agent/service/ConfigService.java:808)
+在 `TRANSACTIONAL` 档位直接 `increment.apply.parallelism=1`：
+
+```java
+props.setProperty("apply.transaction.mode", "TRANSACTION");
+props.setProperty("increment.apply.parallelism", "1");   // ← 并行事务分片就此不可达
+```
+
+也就是说 `TransactionShardingTest` 锁死的那四条性质，**没有任何产品配置路径能走到**。
+实测两档吞吐 6,392 → 3,957 行/秒（§12.2），差的这一档本可以不用付。
+
+#### N12【低·校验】校验只有"数行数"与"全表逐行"两档，没有抽样
+
+`ValidationTask.compareType` 只有 `ROW_COUNT` / `CONTENT`。
+亿级表要么只数一个总数（发现不了内容漂移），要么逐行扫全表（跑不完）。
+DTS 的三档是 行数 / 抽样 / 全量，中间那档才是能常态化跑的那个。
+
+---
+
+### 12.2 本轮实测记录
+
+| 用例 | 结果 | 关键数据 |
+|---|---|---|
+| [ddl_blast_radius.py](test_scripts/fault_injection/ddl_blast_radius.py)（**新增**，跨实例 33320→33321，两端同名库） | **通过 3 / 失败 1** | 源端 `DROP DATABASE` 把目标实例的同名库连同不在同步范围的 `bystander` 表一起删光；`CREATE DATABASE` 与范围外 DDL 均被正确拦下 |
+| [nopk_dup_rows.py](test_scripts/fault_injection/nopk_dup_rows.py)（**新增**） | **通过 1 / 失败 2** | 无主键表删 1 条重复行 → 目标端 3 条全没（源剩 2 / 目标剩 0）；有主键对照组完全正确 |
+| [precheck_gate.py](test_scripts/fault_injection/precheck_gate.py)（**新增**） | **通过 1 / 失败 3** | 预检 `overall=FAIL` 的任务经 `POST /launch` 直接启动成功；无审计留痕；PG 源预检只有 1 项"已跳过" |
+| [apply_throughput.py](test_scripts/fault_injection/apply_throughput.py)（**新增**，EVENTUAL） | **通过 3 / 失败 0** | 20,000 行 INSERT **6,392 行/秒**（3.1s 追平）、UPDATE **6,913 行/秒**；两端指纹 `(20000, 3837335846)` 相等 |
+| `apply_throughput.py --consistency TRANSACTIONAL` | **通过 3 / 失败 0** | INSERT **3,957 行/秒**、UPDATE **4,127 行/秒** —— 事务一致档位的代价约 **1.6×**，且全部来自被钉死的串行（N11） |
+| [checkpoint_durability.py](test_scripts/fault_injection/checkpoint_durability.py)（**本轮首次真正跑通**） | **通过 4 / 失败 3** | 改派与接管机制本身是好的（改派给 `agent-b-ckpt-test`、`lease_epoch` 递增、子进程全部拉起、上卷活性与保留期巡检都过），但**尺子1 跨机接管丢 196 行、尺子2 接管方没有回灌**（见 N0，连跑三次数字完全一致）；尺子5 被"重置接口不接受 COMPLETED 状态"卡住 |
+
+全量构建 `./build.sh` 通过；`./test.sh all` **678 通过 / 0 失败**（引擎 601 + backend 77）。
+本轮只改判据脚本、未改产品代码，单测数据作为基线记录在此。
+
+**吞吐坐标系**（本机 macOS + Docker MySQL，同机回环，仅供横向比较）：
+
+```
+全量装载   38,365 行/秒   ← 第 5 批语句重写通道
+增量应用    6,392 行/秒   ← 最终一致档（4 并发，每行一次往返）
+增量应用    3,957 行/秒   ← 事务一致档（被钉成串行）
+```
+
+增量应用比原先估计的好得多（此前从未量过），**不是数量级瓶颈**；
+但每行仍是一次 `prepareStatement → executeUpdate → close`，
+目标连接串上既没有 `cachePrepStmts` 也没有 `rewriteBatchedStatements`
+（[buildTargetJdbcUrl](migration-increment/src/main/java/com/migration/increment/ContinuousIncrementMain.java:367)），
+攒批还能再要一档。对标 DTS 宣称的万级 RPS，差距约 3~5 倍，属于优化项而非结构缺陷。
+
+---
+
+### 12.3 对标表更新（只列本轮有变化的行）
+
+| 能力 | 本平台（2026-08-09） | DTS | DMS | OGG | Debezium |
+|---|---|---|---|---|---|
+| 事务一致性投递 | ✅ 已实现，但档位强制串行（N11） | ✅ | ⚠️ | ✅ | ⚠️ |
+| 位点跨节点可用 / fencing / 重置 | ⚠️ 机制已建（中心化 + epoch + PITR），但**接管路径实测未生效且仍丢数据**（N0） | ✅ | ✅ | ✅ | ✅ |
+| **任务级故障转移的端到端正确性** | ❌ 改派/接管都对，接管方却没回灌（N0） | ✅ | ✅ | ✅ | ✅ |
+| **全量断点跨节点续传** | ❌ 接管即整段重做（N6） | ✅ | ✅ | ✅ | — |
+| **破坏性 DDL 护栏** | ❌ 1:1 链路零护栏，`DROP DATABASE` 直穿（N1） | ✅ 可配置 DDL 黑名单 | ✅ | ✅ | n/a（只产事件） |
+| **无主键表行定位** | ❌ 整行 WHERE 且无 `LIMIT 1`（N2） | ✅ ROWID/隐藏列 + 拒绝策略 | ✅ | ✅ | ⚠️ |
+| **计划内切换零丢失** | ❌ 不停写、不追平、丢在途 THL（N3） | ✅ | ✅ | ✅ | — |
+| **预检作为启动门禁** | ❌ 仅前端弹窗，自动化路径 0 拦截（N4） | ✅ 服务端强门禁 + 报告留档 | ✅ | — | — |
+| 对象级预检覆盖的源类型 | ⚠️ 仅 MySQL（连接级覆盖 8 条链路 33 项） | ✅ 全部 | ✅ | — | — |
+| **全量限流 / 源库负载自适应** | ❌ 无（N8） | ✅ | ✅ | ✅ | — |
+| **传输层加密（TLS）** | ❌ 34 处硬编码 `useSSL=false`（N7） | ✅ | ✅ | ✅ | ✅ |
+| **订阅 schema 变更事件** | ❌ DDL 被丢弃（N9） | ✅ | — | — | ✅ schema change topic |
+| 数据校验档位 | ⚠️ 行数 / 全量两档（N12） | ✅ 行数 / 抽样 / 全量 | ✅ | ✅ | ❌ |
+| 消息格式 | ⚠️ JSON（Debezium 兼容 / SIMPLE） | ✅ +Avro | — | — | ✅ +Avro/Protobuf + Schema Registry |
+| 湖仓目标（Doris/CK/Iceberg/Hudi） | ❌ | ✅ | ⚠️ | — | ✅（经 Flink） |
+
+---
+
+### 12.4 第 6 批（P0 止血）：不该动手的地方别动手
+
+五条改动面都不大、风险低，但每一条不修都能单独造成生产事故。
+其中 **P0-3b 与 P0-4 建议直接热修**，不必等批次。
+
+#### P0-3b　把"本地到底有没有位点"这个判据坐实（N0）　【热修】
+
+| 改动 | 说明 |
+|---|---|
+| `CheckpointHydrator.hasLocalPosition()` | 从"文件存不存在"改成"读得出内容"：H2 要真 `SELECT` 出一行、properties 要解析出位点键；空 H2 库、空目录一律算**没有位点** |
+| 判据收敛 | 这条判据与 `AbstractTaskExecutor.initXxxCheckpoint()` 的读取口抽成同一个方法。**两个函数对同一个问题给出不同答案**是这条缺陷的形状，不改形状还会再长 |
+| `publishInitialPosition()` | 只在 `hydrate()` 返回 `FIRST_START` 时才允许调用；且中心库里已有该任务的行时一律不认首启，改判 `E3014` 停下来等人 |
+| `CentralCheckpointStore` 单调守卫 | 补方向性规则：**标记为"首启"的写入不得覆盖已有行**（首启按定义就是中心库里没有这条任务）。现在只比大小，而"取自源库当前时刻"的位点恰好总是更大，于是把正确的旧位点覆盖掉 |
+| 位点重置的状态白名单 | 加上 `COMPLETED` / `STOPPED`——"跑完才发现某段数据不对、想回退重跑"正是 PITR 最常见的用法 |
+| 判据脚本 | `checkpoint_durability.py` 的尺子2（回灌日志）升级为硬门禁；新增一把尺子断言"接管后中心位点不得比接管前更超前"（`I5`） |
+
+验收：`checkpoint_durability.py` 六把尺子全绿，且**对照组（关掉中心位点）必须仍然丢数据**——
+主用例与对照组同时通过，才说明测到的是这条路径本身。
+
+#### P0-4　破坏性 DDL 护栏（N1）　【热修】
+
+1. **`SchemaEvolutionService` 新增库级 DDL 判定与闸门**，位置在所有作用域判断之后、执行之前：
+   - `isDatabaseScopedDdl(subtype)` = `CREATE_DATABASE | DROP_DATABASE | ALTER_DATABASE`；
+   - **表级同步**：库级 DDL 一律 skip（表级同步的语义就是"只同步这几张表"，删库越界到没边）；
+   - **库级同步**：`CREATE DATABASE` 按库名映射改写后放行；`DROP/ALTER DATABASE` 走下面的破坏性策略。
+2. **统一 `schema.ddl.destructive.policy = BLOCK（默认）| DEAD_LETTER | ALLOW`**，
+   管住 `DROP DATABASE / DROP TABLE / TRUNCATE / RENAME TABLE`。
+   把汇聚（§十二之二第 7 条）与拆分路径里已有的分散拦截**收敛到这一处**，
+   避免"某条链路拦了、另一条没拦"这种按链路碰运气的局面。
+   **灾备任务（`taskType=DR`）强制 BLOCK 且不可改**——备库被清空是灾备的反义词。
+3. **库名改写补齐**：`DdlIdentifierRewriter` 加一条 token 规则，识别 `DATABASE`/`SCHEMA` 关键字
+   之后的裸库名并按映射改写。这条独立于 2，是为了让"允许放行"的场景也别打错库。
+4. 新增错误码 **`E3015 破坏性 DDL 已拦截`**（携带被拦语句与建议），落死信页面。
+5. 预检加一项：**目标实例上是否存在与源库同名的库**（灾备/同实例场景必然存在）→ 提示 N1 风险等级。
+
+判据：`ddl_blast_radius.py` 四把尺子全绿，且回归 `column_processing` / `sharding` 的 DDL 用例。
+
+#### P0-5　无主键表的行定位（N2）
+
+`increment.nopk.row.match = LIMIT_ONE（默认）| STRICT | REJECT`：
+
+| 档位 | 行为 |
+|---|---|
+| `LIMIT_ONE` | MySQL 目标 `DELETE/UPDATE ... LIMIT 1`；PG 用 `WHERE ctid = (SELECT ctid ... LIMIT 1)`；Oracle 用 `ROWID`。**语义正确性的下限**：源端删一行，目标端就删一行 |
+| `STRICT` | 先数命中行数，>1 即 fail-stop（新错误码 `E3016`），交人工裁决——适合"重复行本不该存在"的表 |
+| `REJECT` | 预检阶段直接拒绝无主键表进增量 |
+
+同时把预检的"无主键"从 WARNING **升级为增量任务的 ERROR**（除非显式选了 `LIMIT_ONE` 并二次确认）。
+落点：[TypedDmlConverter.appendWhere()](migration-increment/src/main/java/com/migration/increment/TypedDmlConverter.java:971)
+产出 SQL 时按方言追加限量子句；`THLToSqlConverter` 的文本回退路径同改。
+
+#### P0-6　把"倒换"拆成 Switchover 与 Failover（N3）
+
+**新增计划内切换（零丢失）**，状态机 `SWITCH_DRAINING → SWITCH_FENCED → SWITCHING → INCREMENT_RUNNING`：
+
+1. **冻结旧主**：`SET GLOBAL read_only=ON`（PG 用 `ALTER SYSTEM SET default_transaction_read_only`；
+   Mongo 用 `fsyncLock`）。没有权限就退化成"请自行停业务"并要求人工确认——**不能默默跳过**。
+2. **等追平**：capture 位点 ≥ 冻结时刻的源端坐标，且 extract 队列深度、
+   未应用 THL 文件数、apply 低水位三者全部归零（这三个数 `CheckpointVisualizationService` 已经有）。
+   超时 `switchover.drain.timeout.ms`（默认 300s）→ **中止并回滚 read_only**，绝不半途切过去。
+3. **可选校验** `switchover.verify = NONE | ROW_COUNT | CHECKSUM`，复用 `ValidationTaskService`。
+4. 追平确认之后才交换连接串、清位点；`cleanFailoverFiles` 里那句
+   `cleanDirectory(thl_output)` 必须在**确认已应用完**之后才执行。
+5. 切换后旧主保持 `read_only`，并自动建立反向通道（旧主变备），人工解除。
+
+**保留计划外接管（有损）**，但确认框里必须先算出并显示：当前 RPO、未应用事件数、
+将被丢弃的 THL 字节数。让人知道自己在丢什么，是"有损"和"不知道有没有损"的区别。
+
+落点：`WorkflowService.failoverWorkflow()` 拆成 `switchoverWorkflow()` / `failoverWorkflow()`；
+agent 侧 `FailoverService` 前置 `drainAndFence()`；新增 `POST /api/workflows/{id}/switchover`。
+
+#### P0-7　预检从"建议"升级为"门禁"（N4）
+
+1. **后端接门禁**：`launchWorkflow()` 进来先跑预检，`overall=FAIL` 直接 409 返回检查项明细；
+   `force=true` 才放行。调度/依赖/批量/改派四条路径自动继承。
+2. **留档**：新表 `task_precheck_results`（任务 id / 配置版本 / 检查项 JSON / 结论 / 执行人 / 时刻），
+   任务详情可查；`audit_logs.action` 枚举加 `PRECHECK_OVERRIDE`（Flyway V15）。
+   "这次启动是在什么前提下启动的"必须留得下证据。
+3. **覆盖面**：`DiagnosticService.schemaPrecheck` 抽出 `SourceObjectInspector` 接口，
+   按源类型五套实现（MySQL / PostgreSQL `pg_catalog` / Oracle `ALL_*` / TiDB / MongoDB `listCollections`）。
+4. **运行中复检**：`PrecheckRecheckJob` 每 6h 对运行中任务重跑只读检查项
+   （源表被删、权限被回收、binlog 保留期被调短、目标表结构漂移），差异走告警而不是等下次重启才炸。
+
+**对象级检查项按 DTS 对齐补齐**（现有 6 项 → 目标 ~20 项）：
+
+| 类别 | 补充项 |
+|---|---|
+| 结构兼容 | 目标已存在表的**列集/类型/长度**兼容性、字符集与排序规则差异、生成列/虚拟列、分区表、触发器 |
+| 命名 | 标识符长度上限、目标方言保留字、大小写敏感（`lower_case_table_names` 两端一致性） |
+| 类型 | 异构对的**不可映射类型**清单（MySQL `SET`/`GEOMETRY` → PG、PG 数组/自定义类型 → MySQL） |
+| 容量 | 源表体积估算 vs 目标剩余空间、目标端连接数余量、源端 binlog 保留期 vs 预估全量时长 |
+| 安全 | 连接是否加密（配合 N7）、目标实例上是否存在与源库同名的库（配合 N1） |
+
+---
+
+### 12.5 第 7 批（P1/P2）：把"能跑"变成"能承诺"
+
+| 编号 | 内容 | 落点 |
+|---|---|---|
+| **P1-5** | **全量断点中心化**（N6）：新增 `task_full_progress`（task/表/分片 → 状态 + lastId），agent 侧 `FullProgressUploader` 按表粒度低频上卷（全量进度变化慢，代价可忽略），`CheckpointHydrator` 一并回灌；`full_snapshot_position` 纳入统一位点载体。接管方跳过已完成表，RTO 从"整个全量"降到"一张表" | `migration-full/progress`、`migration-agent/checkpoint` |
+| **P1-6** | **唯一键冲突显式处置**（N5）：`increment.unique.conflict.policy = FAIL_STOP（默认）\| DEAD_LETTER \| OVERWRITE`；按冲突键是否主键分流，PG 侧补 `ON CONFLICT` 之外的唯一约束处置 | `ContinuousIncrementMain` / `TypedDmlConverter` |
+| **P1-7** | **传输加密**（N7）：34 处硬编码 `useSSL=false` 收敛到 `JdbcUrlBuilder`；连接串支持 `?sslmode=` 等参数；新增 `ssl.mode/ca/cert/key`；Kafka 侧 SASL_SSL。预检加"传输加密"项 | `migration-common/db`、`ConnectionStringParser` |
+| **P1-8** | **全量限流与源库负载自适应**（N8）：`ResourceQuota` 加 `max_full_sync_rows_per_sec` / `_bytes_per_sec`，`DataMigration` 读侧与 `BatchWriter.flush` 各挂一个 `RowRateLimiter`；再加一层自适应——源库 `Threads_running` / 目标库延迟越阈值自动降档。任务详情页显式展示"当前限速档位"（避免 N8 尾注那种"被限速了但没人知道"） | `migration-full`、`ConfigService`、dashboard |
+| **P1-9** | **订阅 schema 变更事件**（N9）：`convertToCdcEvent` 放行 DDL，投 `<prefix>.<taskId>.schema-changes`（对齐 Debezium 的 `ddl` + `tableChanges`）；数据消息补 `schema_version` | `ContinuousSubscribeMain` |
+| **P2-5** | **重连即重放事务**（N10）：`reconnectTargetDatabase()` 后若 `pendingTxOpen` 则 `resetPendingTx()` + 读游标回落低水位；新连接按事务态设 `autoCommit` | `ContinuousIncrementMain:1530` |
+| **P2-6** | **事务一致档位放开并行**（N11）：`applyConsistencyMode` 不再硬钉 `parallelism=1`，让第 2 批的 `TxGroup`+并查集分片真正生效；串行仅作 `sync.transactional.serial.fallback` 兜底 | `ConfigService:808` |
+| **P2-7** | **校验抽样档**（N12）：`compareType` 增 `SAMPLE`（按主键区间分层随机，`validation.sample.ratio` 默认 1%），复用内容对比的行摘要；接 `TaskScheduleService` 做增量期常态对账 | `ValidationTaskService` / `ContentCompareService` |
+
+---
+
+### 12.6 判据脚本自身的缺陷（本轮修掉）
+
+`checkpoint_durability.py` 写好后一直"尚未在本机执行过"，本轮第一次跑就发现**它跑不通**，
+而且原因在脚本自己：
+
+```python
+# 旧：靠命令行区分 A 和 B
+if AGENT_B_DIR in cmd: continue   # ← 这个条件永远不成立
+```
+
+agent-B 是用**同一个绝对路径的 jar** 起的，只有 `cwd` 不同，而 `cwd` 根本不出现在
+`ps -o command=` 里。于是每次"杀 A"都把 B 一起杀了，接管自然永远等不到——
+一个从未跑通过的判据脚本，和没有判据是一回事。改为按**进程组**排除（B 用 `setsid` 独立成组）后，
+跨机接管立刻正常发生：任务改派给 `agent-b-ckpt-test`，`lease_epoch` 1→4，接管方拉起全套子进程。
+
+同一个脚本还有两处会让它"只能跑一个用例"的问题，一并修了：
+
+- **杀完 A 之后没人再把 A 拉起来**，而后面三个用例（对照组、位点重置、保留期巡检）
+  都还需要一个常驻 agent 才能把任务跑进增量 —— 表现为"一堆判据失败"，实际什么也没测到。
+  改为每个用例开头 `ensure_agent_a()`。
+- **agent-B 的日志用 `"w"` 打开**，一次运行里 B 会被重启多次，后一个用例把前一个用例的日志冲掉，
+  事后完全没法排查。改成追加。（本轮定位 N0 时就先栽在这上面，重跑了一次才拿到证据。）
+
+记一条通用教训：**判据脚本必须至少完整跑通一次才算写完**。
+"写好了但没跑过"的脚本在 CI 里是负资产——它会以"跳过/失败"的形式长期存在，
+让人误以为那条路径有人守着。N0 就是被这样掩盖了整整一个批次：
+机制建好了、单测全绿、设计文档写得很细，唯独没有人真的把两台 agent 摆在一起跑一次。
+
+---
+
+### 12.7 对标大厂后，仍然缺的**能力**（不是缺陷）
+
+前面 N0~N12 是"做了但做错/做漏"；下面这些是"压根没做"，按对业务的价值排：
+
+| 能力 | 说明 | 谁有 |
+|---|---|---|
+| **表级重同步 / 数据订正（backfill）** | 单张表重新拉一次全量而不重建整个任务、不影响其它表的增量。现在发现某张表对不上，只能重建任务从头来 | DTS ✅ / DMS ✅ |
+| **湖仓目标**（Doris / StarRocks / ClickHouse / Iceberg / Hudi） | 现在 9 种引擎全是 OLTP + ES/Kafka。实时数仓入湖是 CDC 最大的落地场景，也是与 Flink CDC 竞争的战场 | DTS ✅ / Flink CDC ✅ |
+| **Schema Registry + Avro/Protobuf 订阅格式** | 现在只有 JSON。大数据下游（Flink/Spark）普遍要 Avro + registry 做 schema 演进 | Debezium ✅ / DTS ✅ |
+| **分片在线扩缩容** | 改 `route.split.*.count` 需要数据重分布，目前必须重建任务（`SHARDING_ROUTE_DESIGN §十一` 已声明） | DTS ✅ |
+| **容量规划与 SLA 基线** | 建任务时按源表体积/变更率估算全量时长、所需 binlog 保留期、稳态延迟，并把它写进任务的 SLA 承诺；现在这些数只能事后从指标里看 | DTS ✅（评估报告） |
+| **Oracle 作为路由目标** | 汇聚的幂等 upsert 需要 `MERGE INTO`，未实现（`SHARDING_ROUTE_DESIGN §十二之八` 已声明） | OGG ✅ |
+
+---
+
+### 12.8 建议的实施顺序
+
+| 阶段 | 内容 | 理由 |
+|---|---|---|
+| **热修** | **P0-3b 回灌判据坐实（N0）** + **P0-4 破坏性 DDL 护栏（N1）** | 两条都是**正在丢数据/毁数据**且都已实测复现。N0 让"故障转移"这个卖点目前是负资产（转移越成功丢得越干净）；N1 是一句 SQL 清空整个目标库。这两条不该等一个批次 |
+| **第 6 批** | P0-5 无主键行定位 → P0-6 Switchover/Failover 拆分 → P0-7 预检门禁 | 全是"加闸"，互不耦合可并行 |
+| **第 7 批** | P1-5 全量断点中心化 + P1-6 唯一键冲突 + P1-7 传输加密 + P1-8 全量限流 + P1-9 订阅 schema 事件 | 都是能力补齐，其中 P1-7/P1-8 决定能不能进金融政企的入网评审 |
+| **第 8 批** | P2-5/6/7 三个小项 + §12.7 的能力项按业务优先级取舍 | 锦上添花 |
+
+四个新判据脚本（`ddl_blast_radius.py` / `nopk_dup_rows.py` / `precheck_gate.py` /
+`apply_throughput.py`）应同时并入 `e2e_smoke.py` 的 CI 场景表。
+其中 `apply_throughput.py` 兼作**性能回归基线**——本轮的
+6,392（最终一致）/ 3,957（事务一致）行每秒是第一次有的数，后续任何改动都不该让它掉下去。
+
+---
+
+## 13. 热修 + 第 6 批实施记录（N0/N1 热修 + P0-5/P0-6/P0-7）
+
+日期：2026-08-10。全量构建 `./build.sh` 通过，`./test.sh all` **695 通过 / 0 失败**
+（复审时基线 678，新增 17 例）。元数据表变更走 Flyway
+[V15__precheck_results.sql](java-backend/src/main/resources/db/migration/V15__precheck_results.sql)。
+
+### 13.1　热修 P0-3b：把"本地到底有没有位点"这个判据坐实（N0）
+
+| 改动 | 说明 |
+|---|---|
+| [CheckpointManager.hasStoredCheckpoint()](migration-agent/src/main/java/com/migration/agent/checkpoint/CheckpointManager.java) | 新增：**判内容不判文件**。文件不存在直接返回 false 且<b>不建库</b>——探测本身不能有副作用，否则探完一次"文件存在"就永远成立了 |
+| [CheckpointHydrator.hasLocalPosition()](migration-agent/src/main/java/com/migration/agent/checkpoint/CheckpointHydrator.java) | 三类载体一律判内容：统一载体要解析得出记录、capture 位点文件要真含位点键、H2 走上面那个唯一读取口、mongo/es 的 json 要非空 |
+| `CheckpointHydrator.publishInitialPosition()` | 中心库已有该任务的行时**拒绝写入首启位点** |
+| [AbstractTaskExecutor.assertFirstStartAllowed()](migration-agent/src/main/java/com/migration/agent/thread/AbstractTaskExecutor.java) | 三处"取源库当前位点"之前的最后一道门：直接问中心库有没有行。回灌逻辑再出 bug，也不会从这条路上悄悄丢一段数据——最坏是停在 E3014 等人 |
+| [CheckpointCentralService](java-backend/src/main/java/com/synctask/service/CheckpointCentralService.java) | 位点重置的状态白名单补 `COMPLETED`——"跑完才发现某段数据不对、想回退重跑"正是 PITR 的主场景 |
+
+**为什么要两道**（`hasLocalPosition` 改对了还要 `assertFirstStartAllowed`）：
+前者修的是这一次的 bug，后者管的是这一类。"本地有没有位点"这个判断只要还散在两个函数里，
+就还会再岔开一次；而"中心库有行 = 这条任务此前跑过"是个不依赖任何本地状态的独立证据。
+
+**实测**（[checkpoint_durability.py](test_scripts/fault_injection/checkpoint_durability.py)）：
+修复前 **通过 4 / 失败 3**（跨机接管丢 196 行、接管方没有回灌、重置被状态白名单卡住），
+修复后 **通过 8 / 失败 0**，且**对照组仍如期复现丢数据**——主用例与对照组同时成立，
+才说明测到的确实是这条路径本身。
+
+单测新增 4 例（`CheckpointHydratorTest`：空 H2 文件不算位点 / 有行才算 /
+只有注释的位点文件不算 / 中心库已有行时不许写首启位点）。
+
+### 13.2　热修 P0-4：破坏性 DDL 护栏（N1）
+
+| 改动 | 说明 |
+|---|---|
+| [SchemaEvolutionService.guardDatabaseScopedDdl()](migration-increment/src/main/java/com/migration/increment/schema/SchemaEvolutionService.java) | 新增库级 DDL 闸门，位置在两个作用域分支**之后**——范围外的库已被拦掉，这里管的正是<b>范围之内</b>那类此前一个闸都没有的 |
+| 表级同步 | 库级 DDL 一律不应用。表级同步的语义就是"只同步这几张表"，建库删库越界到没边 |
+| 库级同步 | `CREATE DATABASE` 放行（走库名改写）；`DROP/ALTER DATABASE` 按 `schema.ddl.destructive.policy`（默认 **BLOCK**）处置，**灾备任务强制 BLOCK 且配置改不动** |
+| [DdlIdentifierRewriter](migration-increment/src/main/java/com/migration/increment/schema/DdlIdentifierRewriter.java) | 补一条 token 规则：`DATABASE`/`SCHEMA` 关键字后的**裸库名**也做映射改写。原先只认限定名 `db.table` 里的 db，库级 DDL 里的库名一个都碰不到 |
+| 留痕 | 被拦下的语句写进人工 DDL 日志——拦住不等于当没发生过，运维需要知道"源端删了库、目标端我没跟着删" |
+
+**一个刻意的收窄**：方案原文说这个策略统管 `DROP DATABASE / DROP TABLE / TRUNCATE / RENAME`，
+实施时只把**库级**的纳入默认 BLOCK。表级破坏性 DDL 的传播是 DDL 同步的正常语义
+（源端删表、目标端跟着删，DTS 也这么做），把它默认改掉会让所有存量任务的行为变样，
+而证据只支持库级那一条。表级仍由既有的 `schema.ddl.apply.policy` 与汇聚/拆分路径的
+既有拦截管着。**没有新增错误码**：拦截是 skip 而不是失败，为一件我们主动不做的事发一个 FAILED 码不诚实。
+
+**实测**（[ddl_blast_radius.py](test_scripts/fault_injection/ddl_blast_radius.py)，跨实例、两端同名库）：
+修复前 **通过 3 / 失败 1**（目标库连同无关表被整个删掉），修复后 **通过 4 / 失败 0**，
+"目标实例库变化: 消失 []"。单测 +4（表级/库级/显式 ALLOW/灾备强制 BLOCK）与 +4（裸库名改写）。
+
+### 13.3　P0-5：无主键表的行定位（N2）
+
+`increment.nopk.row.match = LIMIT_ONE（默认）| ALL_MATCHING`。
+[TypedDmlConverter.limitToSingleRow()](migration-increment/src/main/java/com/migration/increment/TypedDmlConverter.java)
+在 WHERE **全部拼完之后**才追加限量（汇聚还要往 WHERE 里补来源标识列，早追加就成了语法错）：
+
+- MySQL：`... LIMIT 1`
+- PostgreSQL：`WHERE ctid IN (SELECT ctid FROM t WHERE <原条件> LIMIT 1)`——PG 的 UPDATE/DELETE
+  不支持 LIMIT；子查询条件与原 WHERE 完全一致，所以参数顺序不用动
+
+**顺带发现**：文本回退路径（`THLToSqlConverter`）一直有 `LIMIT 1`，是类型化管道接手时把这条丢了。
+所以这几例单测同时也是"别再丢一次"的回归锁。
+
+方案里的第三档 `REJECT` 放到了**预检**层而不是引擎层：把"这张表根本不该进增量"判在启动前
+比判在跑起来之后更有用，也不用为它新造一个错误码。对应地，预检的"增量主键"
+从 WARNING **升级为 FAIL**（MySQL 与 PG 两条链路都改）。
+
+**实测**（[nopk_dup_rows.py](test_scripts/fault_injection/nopk_dup_rows.py)）：
+修复前 **通过 1 / 失败 2**（源剩 2 条 / 目标剩 0 条），修复后 **通过 3 / 失败 0**。单测 +5。
+
+### 13.4　P0-6：Switchover 与 Failover 拆开（N3）
+
+新增 `POST /api/workflows/{id}/switchover`，与既有的 `/failover`（计划外接管，行为不变）并列。
+计划内切换三步：
+
+1. **停写**：[SwitchoverService](migration-agent/src/main/java/com/migration/agent/service/SwitchoverService.java)
+   把旧主置为只读（MySQL `SET GLOBAL read_only`，PG `default_transaction_read_only`）。
+   拿不到权限就**如实报错**让人自己停业务——绝不"装作停了"继续往下走。
+2. **等追平**：两把独立的尺子都要归零——`pending_events`（THL 最新 seqno − 已应用 checkpoint seqno，
+   复用位点可视化那三段位点）与"还有几个 .thl 文件没被标成已应用完"。
+   任一读不出来都<b>不算追平</b>：那正好是最危险的误判方向。
+3. 追平确认之后才交换连接串、走原来那套倒换动作。
+
+超时没追平就**解除只读并放弃切换**，什么都不改。切换成功后旧主**保持只读**——
+它现在是备库，让它继续接受业务写入就是双写分叉。
+
+三个实现上的坑：
+
+- **`SET GLOBAL read_only` 会等所有写事务提交**，默认能等到天荒地老（`lock_wait_timeout` 默认一年）。
+  会话里先钉一个 30s 的短超时，让它要么很快成功要么明确报错——切换流程不能挂在一条 SET 上。
+- **后端到 agent 的读超时必须远大于追平超时**（现为 `timeout + 300s`）。后端先断开而 agent 还在动手，
+  两边对"到底切没切、停写解没解"的认知就会岔开。
+- **不能在同一个 bean 里调 `failoverWorkflow`**：它是 `@Transactional` 的，
+  同类内部调用绕过 Spring 代理 → 里面的 `registerSynchronization` 直接抛
+  "Transaction synchronization is not active"。拆成 `switchoverDrain`（不带事务，长耗时）
+  + 控制器再调 `failoverWorkflow`（走代理进事务）。
+
+**实测**（[dr_switchover.py](test_scripts/fault_injection/dr_switchover.py)，跨实例灾备）**通过 5 / 失败 0**：
+有积压时切换被拒且只读被解除、追平后切换成功、切换前的 600 行指纹一致（`0xfde99509`）、
+切换后旧主保持只读。
+
+> 判据脚本本身也换过一次方法：最初用 SIGSTOP 冻住 increment 制造积压，
+> 结果冻太久触发僵死看门狗把任务判 FAILED，测的就不是切换语义了。改成把增量限速压到
+> 20 行/秒——积压是真的，进程始终健康。
+
+### 13.5　P0-7：预检从"建议"升级为"门禁"（N4）
+
+| 改动 | 说明 |
+|---|---|
+| [WorkflowService.runPrecheckGate()](java-backend/src/main/java/com/synctask/service/WorkflowService.java) | `launchWorkflow` 里接门禁：`overall=FAIL` 拒绝启动，`force=true` 才放行。调度 / 依赖任务 / 批量启动 / 集群改派四条自动化路径自动继承 |
+| [PrecheckResultService](java-backend/src/main/java/com/synctask/service/PrecheckResultService.java) + V15 | 每次启动都落一行 `task_precheck_results`（结论 / 是否强启 / 检查项明细 / 时刻），无论放行、拦截还是强启 |
+| `POST /{id}/launch?force=true` | 强启在审计里带 `precheckOverride` 标记；前端弹窗确认后自动带上这个参数 |
+| [DiagnosticService.pgSchemaPrecheck()](java-backend/src/main/java/com/synctask/service/DiagnosticService.java) | **PostgreSQL 源的对象级预检**：对象存在性、增量主键、列处理引用列，外加一条 PG 特有的 **REPLICA IDENTITY**（无主键表不设 FULL 时逻辑复制根本不记前镜像，增量会直接哑掉） |
+| 新增检查项 | **目标唯一索引**（见 §14.3）、**传输加密**（WARNING，见 §14.2） |
+
+预检自身出错**不阻断**（连不上源库这类问题连接级校验与任务本身都会再报一次），但同样留档——
+避免"预检静默没跑"变成新的盲区。
+
+**实测**（[precheck_gate.py](test_scripts/fault_injection/precheck_gate.py)）：
+修复前 **通过 1 / 失败 3**，修复后 **通过 5 / 失败 0**（预检能查出问题 / API 直启被拒 /
+被拦有留档 / force 可强启且留 forced 标记 / PG 源产出 4 项实质检查）。
+
+**仍未做**：Oracle 与 MongoDB 源的对象级预检（仍返回"暂不支持该源类型，已跳过"）。
+TiDB 走 MySQL 协议，已被 MySQL 那套覆盖。
+
+---
+
+## 14. 第 7 批实施记录（P1-5 ~ P1-9）
+
+日期：2026-08-10。Flyway [V16__full_sync_rate_quota.sql](java-backend/src/main/resources/db/migration/V16__full_sync_rate_quota.sql)
+与 [V17__task_full_progress.sql](java-backend/src/main/resources/db/migration/V17__task_full_progress.sql)。
+
+### 14.1　P1-8　全量限流（N8）
+
+`resource_quotas.max_full_sync_rows_per_sec` → `migration.full.rate.limit.rows.per.sec` →
+[DataMigration.throttle()](migration-full/src/main/java/com/migration/full/migration/DataMigration.java)，
+限在**每次 flush 之后按实际写入行数计费**：限在读侧会让页缓冲攒着不写、内存和事务都拖长；
+限在 add 上则每行一次判定，热路径开销白花。
+
+**限速器必须全进程共享一个**（[FullRateLimiter](migration-full/src/main/java/com/migration/full/migration/FullRateLimiter.java)）：
+全量是多表并行 + 单表分片并行的，每个 worker 各建一个等于把配额乘以并发数——
+配 1000 行/秒开 4 个 worker 实际跑 4000，限速形同虚设。
+
+**实测**：1200 行 @ 200 行/秒 耗时 39.6s（不限速时同样的量几秒搬完），两表各 600 行数据正确。
+
+### 14.2　P1-7　传输加密（N7）
+
+`source.db.ssl.mode` / `target.db.ssl.mode` = `DISABLED（默认）| PREFERRED | REQUIRED |
+VERIFY_CA | VERIFY_IDENTITY`，外加 `*.ssl.root.cert`。
+[DatabaseConfig](migration-common/src/main/java/com/migration/config/DatabaseConfig.java) 按方言展开
+（MySQL 的 `sslMode`、PG 的 `sslmode`），增量自己拼的那条目标 URL 也认同一组配置——
+否则"配了 TLS"只对全量生效而增量还是明文，比不支持更糟（以为加密了其实没有）。
+预检新增"传输加密"项：未启用只报 WARNING（内网不开 TLS 是常见且合理的选择），
+但"当初知不知道自己没开"现在留得下痕迹。
+
+**范围**：只覆盖**数据面**（capture / full / increment 的源目标连接）。
+控制面的元数据库、H2、诊断类连接仍是原样——那些不是这条发现要解决的问题，
+一次性铺开 34 处反而是风险。
+
+### 14.3　P1-6　唯一键冲突（N5）——实测把它改写了
+
+原方案说的是"非主键唯一冲突被静默吞掉，加个策略让它 fail-stop"。做出来跑一遍才发现
+**MySQL 上根本走不到那条异常路径，而真实后果比"丢一行"严重得多**：
+
+目标端有一个源端没有的唯一索引时，增量的 `INSERT ... ON DUPLICATE KEY UPDATE 全部列`
+撞上它**不会报错**——而是把那条冲突的旧行整行改掉，**连主键一起改成新行的主键**。
+
+实测：目标表加 `UNIQUE(email)`，源端插一条 email 重复的新行 `id=99991`：
+
+```
+源:   id=0     email=t1-0@x  v=v0
+      id=99991 email=t1-0@x  v=dup
+目标: id=99991 email=t1-0@x  v=dup        ← id=0 那一行没了
+```
+
+**一条语句毁掉一行、又把两行并成一行，全程零错误零告警。**
+运行期分辨不了"主键冲突（幂等重放，该忽略）"与"唯一键冲突（该停）"——MySQL 的 upsert 两种都返回成功。
+所以这条只能在**启动前**拦：预检新增 **目标唯一索引**（FAIL），
+逐表对比两端的唯一索引列签名，目标端多出来的一律点名。
+
+运行期那半仍然做了，因为它对 **PG 目标**是真的有效：PG 的 `ON CONFLICT (pk) DO NOTHING`
+兜不住唯一约束，异常会被"重复键忽略"吞掉。现在按冲突键是不是主键分流，
+非主键冲突走 `increment.unique.conflict.policy = FAIL_STOP（默认）| IGNORE`，报新错误码 **E3017**
+（三份错误码目录已同步，CI 门禁盯着）。认不出错误文案时按**主键**处理——
+保持既有的幂等重放行为，不因为一条没见过的文案把正常任务打停。
+
+### 14.4　P1-5　全量表级断点中心化（N6）
+
+[FullProgressStore](migration-agent/src/main/java/com/migration/agent/checkpoint/FullProgressStore.java)
++ `task_full_progress`（V17）。做法与位点一致：**引擎侧一个字都不改**，agent 读/写它那个 H2——
+上卷只读已落盘的行（每 30s 一拍，表级进度变化远比位点慢），
+回灌在拉起子进程之前把行写回本地 H2，`ProgressManager` 照常走"已完成的表跳过、未完成的表清表重搬"。
+
+**只在本地完全没有时回灌**：本地有就是同机重启，它一定比中心库新。
+倒换/重做全量时由 `CheckpointCleaner` 一并作废中心行——留着会让下次接管跳过其实需要重搬的表。
+
+与位点回灌的关键区别：**位点灌不上必须 fail-stop**（会静默丢数据），
+**全量断点灌不上只是慢**（退回整段重做，数据仍正确），所以这里绝不阻断启动。
+
+这条正是 `CHECKPOINT_DURABILITY_DESIGN §9` 明确划在范围外的那一项，理由是"全量重跑是幂等的、
+代价可接受"。它保证的是**正确性**、不是 RTO——全量提到 38K 行/秒之后，
+一张 10 亿行的表仍要约 7 小时，因为一次 agent 崩溃重来一遍是产品级的问题。
+
+**实测**：`task_full_progress` 里如期出现该任务两张表的行。
+
+### 14.5　P1-9　订阅的 schema 变更事件（N9）
+
+[ContinuousSubscribeMain.sendSchemaChange()](migration-subscribe/src/main/java/com/migration/subscribe/ContinuousSubscribeMain.java)：
+`convertToCdcEvent` 的 `default: return null` 此前把 DDL 整个丢掉，
+下游按订阅流建镜像表的消费者因此完全不知道源端结构变了。现在 DDL 投到
+`<prefix>.<taskId>.schema-changes`（对齐 Debezium 的 schema change topic），
+消息含 `ddl` / `database` / `table` / `txId` / `ts_ms`。
+
+两个细节：**key 用库名**（同一个库的 DDL 落同一分区，下游按分区顺序重放就是源端的 DDL 顺序）；
+投递失败**计入 `sendErrors`**，与数据消息同等对待——位点推进的前提是"这一批全部落到 Kafka"，
+schema 变更丢了比数据丢了更难排查（下游要到很久以后才发现自己在按错的结构解析）。
+
+### 14.6　判据脚本与全量回归
+
+| 脚本 | 覆盖 | 结果 |
+|---|---|---|
+| [checkpoint_durability.py](test_scripts/fault_injection/checkpoint_durability.py) | 跨机接管六把尺子（含对照组必须复现丢数据） | **8 / 0** |
+| [ddl_blast_radius.py](test_scripts/fault_injection/ddl_blast_radius.py) | 库级 DDL 爆炸半径 | **4 / 0** |
+| [nopk_dup_rows.py](test_scripts/fault_injection/nopk_dup_rows.py) | 无主键表重复行定位 | **3 / 0** |
+| [dr_switchover.py](test_scripts/fault_injection/dr_switchover.py) | 计划内切换零丢失 | **5 / 0** |
+| [precheck_gate.py](test_scripts/fault_injection/precheck_gate.py) | 预检门禁 / 留档 / PG 源覆盖 | **5 / 0** |
+| [batch7_capabilities.py](test_scripts/fault_injection/batch7_capabilities.py) | 全量限流、全量断点上卷、目标唯一索引拦截 | **4 / 0** |
+| [apply_throughput.py](test_scripts/fault_injection/apply_throughput.py)（性能基线回归） | 增量应用吞吐 | **3 / 0**（INSERT 5,873 / UPDATE 5,624 行每秒，与复审基线 6,392 / 6,913 同量级） |
+| `sql_resume.py mysql --minutes 3`（既有回归） | 2 次 SIGKILL 后崩溃续传 | **3 / 0**（23,241 行两端指纹相等） |
+| `txn_atomicity.py --txns 120 --mode TRANSACTION`（既有回归） | 事务原子性 | **1 / 0**（120 事务 / 120 提交点，66,074 次抓拍零破缺） |
+
+单测 `./test.sh all` **695 通过 / 0 失败**（复审基线 678，本轮新增 17 例）。
+
+> **判据脚本自身又修了一处**：`checkpoint_durability.py` 的 `kill_agent_a` 只杀 agent、不杀它的子进程，
+> 而子进程靠 ParentWatchdog 每 5s 探活自杀——那 5s 里 capture/extract/increment 还在正常干活，
+> 崩溃窗口里写入的行会被它们捡走一部分。主用例与对照组的判定因此都变成了"看运气"
+> （实测对照组偶发"没丢数据"，把一条本该复现丢数据的尺子判成失效）。
+> 改成连子进程一起杀——"整机失联"的语义本来就是这台机器上的一切同时消失。
+
+### 14.7　第 7 批收尾时仍未做的三项 —— **已在 §15 补完**
+
+- ~~Oracle / MongoDB 源的对象级预检~~ → §15.1
+- ~~传输加密只覆盖数据面~~ → §15.2
+- ~~订阅消息仍是 JSON~~ → §15.3
+
+§12.7 那六项"压根没做"的能力（表级重同步、湖仓目标、分片在线扩缩容、
+容量规划与 SLA 基线、Oracle 作为路由目标）仍然一项没动。
+
+---
+
+## 15. 收尾三项（Oracle/Mongo 预检 · 控制面加密 · Avro 订阅）
+
+日期：2026-08-10。`./test.sh all` **703 通过 / 0 失败**（第 7 批为 695，新增 8 例）。
+
+### 15.1　Oracle / MongoDB 源的对象级预检
+
+对象级预检此前只覆盖 MySQL/TiDB 与 PostgreSQL，Oracle 与 MongoDB 仍是一句
+"暂不支持该源类型，已跳过"——这两条链路的对象级预检覆盖率是 **0**。
+
+**Oracle**（`ALL_TABLES` / `ALL_CONSTRAINTS` / `ALL_TAB_COLUMNS`）：与 MySQL 同一批判据
+（对象存在性、增量主键、列处理引用列），外加两条 Oracle 特有的：
+
+| 检查项 | 为什么值得单独有一条 |
+|---|---|
+| **补充日志** | 没有最小补充日志时 LogMiner 的 UPDATE/DELETE 记录**不带行标识**，增量表现为"任务健康、位点一直推进、目标端一行不动"。这是 Oracle 源最难查的一类故障，而且只有跑起来才暴露 |
+| **标识符大小写** | Oracle 对象名默认大写存储。用户在向导里填小写表名会查不到，但那不是"表不存在"——不单独提示的话，用户会去建一张本来就有的表 |
+
+**MongoDB**（`hello` / `listCollections` / `local.oplog.rs`）：关系库那套"主键 / 列存在性"
+在这里没有对应物（`_id` 必然存在、文档无固定列），所以判据换成 Mongo 自己会炸的那几条：
+
+| 检查项 | 为什么 |
+|---|---|
+| **副本集/分片集群** | Change Streams 只在副本集/分片集群可用。单机 mongod 上增量任务**起得来但一条变更都收不到** |
+| **集合类型** | 视图不产生 change stream，不能作为同步源 |
+| **oplog 窗口** | 窗口比全量耗时还短时，全量还没搬完 resume token 就滚出去了，增量接不上只能重做全量。这条只有事后才发现，所以要在启动前量一次 |
+
+仍未覆盖：Elasticsearch 与 Redis 源（ES 只能作目标；Redis 没有"对象"这个概念，
+它的预检在连接级已经做了）。
+
+### 15.2　传输加密覆盖控制面
+
+第 7 批的 TLS 只覆盖了数据面（capture / full / increment 的源目标连接）。
+但**后端自己也直连用户数据库**——元数据探查、连接校验、数据校验、
+以及**内容对比（逐行把两端业务数据读回来比）**。数据面加密而控制面明文，
+等于同一批数据换条路又明文走了一遍，比不加密更容易让人误判。
+
+| 链路 | 开关 | 落点 |
+|---|---|---|
+| 后端直连用户库（探查/校验/**内容对比**） | `CONTROL_PLANE_DB_SSL_MODE` + `CONTROL_PLANE_DB_SSL_ROOT_CERT` | [JdbcSslOptions](java-backend/src/main/java/com/synctask/util/JdbcSslOptions.java)，9 处硬编码 `useSSL=false` 收敛到这里 |
+| 后端 / agent 到元数据库 | `META_DB_SSL_MODE` | `application.yml` 与 `AgentConfig` 的默认 URL（显式给 `DB_URL` / `MIGRATION_AGENT_MYSQL_DB_URL` 时以它为准） |
+| Kafka（后端生产/消费、agent 消费、**订阅生产**） | `KAFKA_SECURITY_PROTOCOL` / `KAFKA_SSL_*` / `KAFKA_SASL_*` | [KafkaSecurity](migration-common/src/main/java/com/migration/common/security/KafkaSecurity.java) |
+
+三个刻意的选择：
+
+- **档位与数据面完全一致**（`DISABLED | PREFERRED | REQUIRED | VERIFY_CA | VERIFY_IDENTITY`），
+  不给控制面另造一套说法。
+- **取值来自环境变量而不是任务配置**：控制面的连接是后端进程发起的，一个部署环境要么整体走 TLS、
+  要么整体不走；按任务配会出现"同一个库有的连接加密有的不加密"这种没人能推理的状态。
+- **关闭主机名校验是独立开关**（`KAFKA_SSL_VERIFY_HOSTNAME=false`），
+  免得有人为了跑通把 `security.protocol` 一路降回 PLAINTEXT。
+
+预检的"传输加密"项相应改成**四条一起判**（数据面源/目标 + 控制面到用户库/到元数据库/Kafka），
+全开才 PASS，明细里逐条列出当前档位。
+
+`KafkaSecurity` 在引擎侧与后端侧是**同一份逻辑的两个副本**——两个工程互不依赖（见 `build.sh`），
+为十几行参数拉一条工程依赖不划算，但两边键名必须逐字一致，类注释里写明了要一起改。
+
+### 15.3　订阅支持 Avro + Schema Registry
+
+`subscribe.format=AVRO`：产出 **Confluent wire format**（`0x00` + 4 字节大端 schema id +
+Avro binary），下游可以直接用 Confluent 官方的 Avro 反序列化器读。
+
+**不引 Confluent 的序列化器**：那要额外挂一个 Confluent 私有 maven 仓库，把整条构建链绑到
+第三方仓库的可用性上；而真正需要的只有"向 registry 注册 schema 换一个整型 id"
+和"按 wire format 拼字节"两件事，加起来不到两百行
+（[SchemaRegistryClient](migration-subscribe/src/main/java/com/migration/subscribe/avro/SchemaRegistryClient.java)
++ [AvroCdcSerializer](migration-subscribe/src/main/java/com/migration/subscribe/avro/AvroCdcSerializer.java)）。
+
+三个设计点：
+
+1. **schema 按"事件里实际出现的列集"生成**并按 (topic, 列集) 缓存。订阅侧拿到的是 THL 事件、
+   没有目标端 DDL，只能这么来。列集变了（源端 ADD/DROP COLUMN）就是新版本，
+   注册到同一个 subject——兼容性该由 Schema Registry 管，不该由我们猜。
+2. **每个列字段都是可空且带 `default: null`**，所以加列对老消费者是**向后兼容**的
+   （registry 的 BACKWARD 检查能过）。
+3. **列值是 union `["null","boolean","long","double","string"]` 而不是全 string**。
+   全 string 最省事，但这个项目在订阅链路上专门修过"整数变浮点""NULL 被丢"这类值保真缺陷，
+   压平回字符串等于把修过的东西又丢一遍。分支由 JSON 里值的**字面形态**决定
+   （有小数点/指数才是 double），与 JSON 输出的判定口径一致；
+   超出 long 的整数（`DECIMAL(38,0)` 之类）按字符串原样带过去，**不转 double 丢精度**。
+
+**生产者的值类型从 `String` 改成 `byte[]`**（Avro 是二进制）。JSON 路径改成 UTF-8 编码后发送——
+`StringSerializer` 本来就是 UTF-8，所以线上字节逐字节相同；
+`subscribe_txn_metadata.py` 5/0 回归确认了这一点。
+
+**Avro 序列化失败计入 `sendErrors`**：schema 注册不上就意味着下游拿到的字节没人能读，
+与其投一堆读不出来的消息，不如让位点停在这里（`saveProgress` 前会检查 `sendErrors` 增量）。
+同理 `subscribe.format=AVRO` 而没配 registry 地址时**直接抛**而不是悄悄退回 JSON——
+"我以为在发 Avro，其实发的是 JSON"是最难查的一类问题。
+
+新增 `docker-compose-synctask-kafka-sub.yml` 里的 `synctask-schema-registry`（宿主 38081），
+只有 Avro 用例需要它。**镜像刻意用的是 Apicurio 而不是 Confluent 自家的**：
+Apicurio 提供一套 Confluent 兼容 API（`/apis/ccompat/v7`），拿它来验能同时回答两个问题——
+我们产出的 wire format 对不对、以及"Confluent 兼容"是不是只对 Confluent 自己成立。
+**换一家实现照样跑通，才说明这个格式是通用的**，而不是自说自话。
+
+### 15.4　判据脚本
+
+| 脚本 | 覆盖 |
+|---|---|
+| [precheck_coverage.py](test_scripts/fault_injection/precheck_coverage.py) | Oracle/Mongo 源产出实质检查项（而不是"已跳过"）、Oracle 补充日志、Mongo 副本集、不存在的对象被判 FAIL、传输加密项覆盖控制面 —— **6 / 0** |
+| [subscribe_avro.py](test_scripts/fault_injection/subscribe_avro.py) | wire format、subject 注册、用 registry 返回的 schema 解码、值保真、UPDATE 前后镜像、加列产生新版本 —— **7 / 0**（实测 `qty=7` 是 int 不是 float、`note=None` 保住了 NULL、加列后 subject 版本 `[1] → [1,2]`） |
+
+单测新增 [AvroCdcSerializerTest](migration-subscribe/src/test/java/com/migration/subscribe/avro/AvroCdcSerializerTest.java)（8 例）。
+
+> 实施时踩的一个坑：Avro 的具名类型只能定义一次，`before` 与 `after` 都展开写行记录会直接
+> `SchemaParseException`；`after` 必须按**名字**引用，而且引用要是带引号的字符串
+> （`["null","OrdersRow"]`，不是 `["null",OrdersRow]`）。

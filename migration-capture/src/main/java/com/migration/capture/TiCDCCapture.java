@@ -501,7 +501,7 @@ public class TiCDCCapture extends AbstractCapture<byte[]> {
         posProps.setProperty("ticdc.commit.ts", String.valueOf(currentCommitTs));
         posProps.setProperty("last.update", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
         com.migration.common.position.CapturePositionStore.save(
-                outputDir, posProps, "TiCDC capture position for task: " + taskId);
+                outputDir, posProps, "TiCDC capture position for task: " + taskId, taskId);
     }
 
     private long loadResumeTs() {

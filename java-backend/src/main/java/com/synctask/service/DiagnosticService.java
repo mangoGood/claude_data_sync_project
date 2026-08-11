@@ -297,10 +297,14 @@ public class DiagnosticService {
         List<Map<String, Object>> checks = new ArrayList<>();
 
         String srcConn = workflow.getSourceConnection();
+        // TiDB 讲 MySQL 协议，连接串同为 mysql://，走同一套 information_schema 查询
         boolean mysqlSource = srcConn != null && srcConn.startsWith("mysql://");
-        if (!mysqlSource) {
+        boolean pgSource = srcConn != null && srcConn.startsWith("postgresql://");
+        boolean oracleSource = srcConn != null && srcConn.startsWith("oracle://");
+        boolean mongoSource = srcConn != null && srcConn.startsWith("mongodb://");
+        if (!mysqlSource && !pgSource && !oracleSource && !mongoSource) {
             checks.add(check("schema 预检", "WARNING",
-                    "schema 预检当前仅支持 MySQL 源库，已跳过（不影响启动）", null));
+                    "对象级预检暂不支持该源类型（当前支持 MySQL/TiDB/PostgreSQL/Oracle/MongoDB），已跳过（不影响启动）", null));
             return summarize(result, checks, workflow);
         }
 
@@ -314,6 +318,16 @@ public class DiagnosticService {
         if (entries.isEmpty()) {
             checks.add(check("同步对象", "FAIL", "未选择任何同步对象", null));
             return summarize(result, checks, workflow);
+        }
+
+        if (pgSource) {
+            return summarize(result, pgSchemaPrecheck(workflow, srcConn, entries, checks), workflow);
+        }
+        if (oracleSource) {
+            return summarize(result, oracleSchemaPrecheck(workflow, srcConn, entries, checks), workflow);
+        }
+        if (mongoSource) {
+            return summarize(result, mongoSchemaPrecheck(workflow, srcConn, entries, checks), workflow);
         }
 
         String mode = workflow.getMigrationMode();
@@ -334,20 +348,663 @@ public class DiagnosticService {
             }
             checks.add(checkColumnRefs(src, entries));
             checks.add(checkForeignKeyIntegrity(src, entries));
+            checks.add(checkLargeObjectSupport(src, srcConn, tgtConn, entries, needsIncrement));
+            if (needsIncrement && "mysql".equalsIgnoreCase(workflow.getSourceType())) {
+                checks.add(checkPendingXaBranches(src));
+                if ("BIDIRECTIONAL".equalsIgnoreCase(workflow.getDrMode())) {
+                    checks.add(checkBidiAutoIncrement(src, tgtConn, entries));
+                }
+            }
         } catch (Exception e) {
             checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
         }
 
+        checks.add(checkTransportEncryption(workflow));
+
         // 目标同名表预存在（仅关系型目标；异构/kafka 跳过）——目标库名按 per-db 映射解析
         if (relationalTarget && tgtConn.startsWith("mysql://")) {
-            try (Connection tgt = openConn(tgtConn)) {
+            try (Connection tgt = openConn(tgtConn); Connection src2 = openConn(srcConn)) {
                 checks.add(checkTargetConflicts(tgt, entries, workflow));
+                checks.add(checkTargetUniqueIndexes(src2, tgt, entries));
             } catch (Exception e) {
                 checks.add(check("目标库 schema 检查", "WARNING", "连接目标库失败，跳过目标冲突检查: " + e.getMessage(), null));
             }
         }
 
         return summarize(result, checks, workflow);
+    }
+
+    /**
+     * 大字段（LONGBLOB/LONGTEXT/MEDIUM*）能不能搬得动。
+     *
+     * <p>这一项拦的都是"跑到一半才炸、且炸得看不懂"的情况：
+     * <ul>
+     *   <li><b>max_allowed_packet 不够</b>：MySQL 的这个参数同时限制单值上限与
+     *       {@code CONCAT()} 结果上限，分块追加也绕不过去。撞上时服务端只回一句
+     *       "Result of concat() was larger than max_allowed_packet - truncated"，
+     *       既不说是哪张表哪一列，也不说该调多大。它的上限就是 1GB，
+     *       所以超过 1GB 的单值<b>根本无法通过 SQL 协议写入</b>；</li>
+     *   <li><b>大字段表没有主键</b>：增量靠主键定位行，没有主键就要拿 1GB 的值去做全列匹配，
+     *       既不可行也没有意义；</li>
+     *   <li><b>binlog 事务压缩开着</b>：压缩事务在连接器里是整块解压进堆的，
+     *       大字段的流式改造对这条路径完全无效；</li>
+     *   <li><b>binlog_row_image=FULL</b>：UPDATE 会把没改动的大字段前后镜像都写进 binlog，
+     *       网络与磁盘各多一倍。改 NOBLOB 能直接省掉，但不阻断。</li>
+     * </ul>
+     */
+    private Map<String, Object> checkLargeObjectSupport(Connection src, String srcConn, String tgtConn,
+                                                        List<DbEntry> entries, boolean needsIncrement) {
+        List<String> lobTables = new ArrayList<>();
+        List<String> noPkLobTables = new ArrayList<>();
+        long maxValueBytes = 0;
+        String maxValueWhere = null;
+        try {
+            for (DbEntry entry : entries) {
+                for (String table : entry.tables) {
+                    List<String> lobCols = new ArrayList<>();
+                    try (PreparedStatement ps = src.prepareStatement(
+                            "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
+                                    + "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? "
+                                    + "AND DATA_TYPE IN ('longblob','longtext','mediumblob','mediumtext')")) {
+                        ps.setString(1, entry.sourceDb);
+                        ps.setString(2, table);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                lobCols.add(rs.getString(1));
+                            }
+                        }
+                    }
+                    if (lobCols.isEmpty()) {
+                        continue;
+                    }
+                    lobTables.add(entry.sourceDb + "." + table);
+                    if (!hasPrimaryKey(src, entry.sourceDb, table)) {
+                        noPkLobTables.add(entry.sourceDb + "." + table + "(" + String.join(",", lobCols) + ")");
+                    }
+                    // 实际最大值：OCTET_LENGTH 会让服务端把 LOB 读一遍，所以只在
+                    // 确实存在大字段列的表上做，且一张表一条语句。
+                    for (String col : lobCols) {
+                        try (java.sql.Statement st = src.createStatement();
+                             ResultSet rs = st.executeQuery("SELECT IFNULL(MAX(OCTET_LENGTH(`"
+                                     + col.replace("`", "``") + "`)),0) FROM `"
+                                     + entry.sourceDb.replace("`", "``") + "`.`" + table.replace("`", "``") + "`")) {
+                            if (rs.next() && rs.getLong(1) > maxValueBytes) {
+                                maxValueBytes = rs.getLong(1);
+                                maxValueWhere = entry.sourceDb + "." + table + "." + col;
+                            }
+                        } catch (Exception ignored) {
+                            // 单列量不到不影响其余判据
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return check("大字段搬运能力", "WARNING", "大字段检查失败，已跳过: " + e.getMessage(), null);
+        }
+
+        if (lobTables.isEmpty()) {
+            return check("大字段搬运能力", "PASS", "所选对象里没有 LONGBLOB/LONGTEXT/MEDIUM* 列", null);
+        }
+
+        List<String> errors = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+        StringBuilder detail = new StringBuilder("含大字段的表: " + String.join(", ", lobTables));
+        if (maxValueWhere != null) {
+            detail.append("；实测最大单值 ").append(maxValueBytes).append(" 字节（").append(maxValueWhere).append("）");
+        }
+
+        long srcPacket = globalLong(src, "max_allowed_packet");
+        long tgtPacket = -1;
+        if (tgtConn != null && tgtConn.startsWith("mysql://")) {
+            try (Connection tgt = openConn(tgtConn)) {
+                tgtPacket = globalLong(tgt, "max_allowed_packet");
+            } catch (Exception e) {
+                warnings.add("读不到目标端 max_allowed_packet: " + e.getMessage());
+            }
+        }
+        detail.append("；max_allowed_packet 源=").append(srcPacket).append(" 目标=").append(tgtPacket);
+
+        if (maxValueBytes > 1073741824L) {
+            errors.add("存在超过 1GB 的单值（" + maxValueBytes + " 字节 @ " + maxValueWhere
+                    + "）。MySQL 的 max_allowed_packet 上限就是 1GB，这种值无法通过 SQL 协议写入目标端");
+        } else if (maxValueBytes > 0) {
+            if (srcPacket > 0 && srcPacket < maxValueBytes) {
+                errors.add("源端 max_allowed_packet=" + srcPacket + " 小于最大单值 " + maxValueBytes
+                        + "，读取会被截断，请调到 >= " + maxValueBytes);
+            }
+            if (tgtPacket > 0 && tgtPacket < maxValueBytes) {
+                errors.add("目标端 max_allowed_packet=" + tgtPacket + " 小于最大单值 " + maxValueBytes
+                        + "，写入必失败（该参数同时限制 CONCAT 结果上限，分块追加也绕不过），请调到 >= " + maxValueBytes);
+            }
+        }
+
+        if (needsIncrement && !noPkLobTables.isEmpty()) {
+            errors.add("下列表含大字段却没有主键，增量无法按行定位: " + String.join(", ", noPkLobTables));
+        }
+
+        if (needsIncrement && maxValueBytes > 0) {
+            // 复制协议的硬上限：单个 binlog 事件不能超过 replica_max_allowed_packet（最大 1GB）。
+            // 实测过：1GB 的 LONGBLOB 加上其余 9 列，行事件是 1073742110 字节——比 1GB 上限多 286 字节，
+            // 源端的 dump 线程直接断开连接，capture 侧表现为"读取线程无声无息地没了"。
+            // 注意这与全量无关：全量走的是普通 SQL，1GB 是搬得动的（已验证）。
+            long replicaLimit = globalLong(src, "replica_max_allowed_packet");
+            if (replicaLimit <= 0) {
+                replicaLimit = globalLong(src, "slave_max_allowed_packet");
+            }
+            String rowImage0 = globalString(src, "binlog_row_image");
+            boolean fullImage = rowImage0 == null || "FULL".equalsIgnoreCase(rowImage0);
+            // UPDATE 的前后镜像在<b>同一个事件</b>里；FULL 下未改动的大字段也会两份都写进去
+            long worstEvent = fullImage ? maxValueBytes * 2 : maxValueBytes;
+            detail.append("；replica_max_allowed_packet=").append(replicaLimit)
+                    .append("，最坏事件约 ").append(worstEvent).append(" 字节")
+                    .append(fullImage ? "（FULL 下 UPDATE 带前后两份镜像）" : "（NOBLOB）");
+            if (replicaLimit > 0 && worstEvent >= replicaLimit) {
+                errors.add("增量搬不动：单值 " + maxValueBytes + " 字节，在 binlog_row_image="
+                        + (rowImage0 == null ? "FULL" : rowImage0) + " 下一个 UPDATE 事件约 " + worstEvent
+                        + " 字节，超过 replica_max_allowed_packet=" + replicaLimit
+                        + "（MySQL 上限就是 1GB）。这是复制协议本身的限制，与同步工具无关——"
+                        + "源端 dump 线程会直接断开。可行的做法：把 binlog_row_image 改成 NOBLOB "
+                        + "（UPDATE 只带一份后镜像，上限翻倍）、把单值控制在 1GB 以内并留出行开销余量，"
+                        + "或该表只做全量不做增量（全量走普通 SQL，不受这条限制）");
+            }
+        }
+
+        if (needsIncrement) {
+            String compression = globalString(src, "binlog_transaction_compression");
+            if (compression != null && ("ON".equalsIgnoreCase(compression) || "1".equals(compression))) {
+                errors.add("源端 binlog_transaction_compression=ON：压缩事务在连接器里是整块解压进内存的，"
+                        + "大字段的流式读取对这条路径无效，请关闭");
+            }
+            String rowImage = globalString(src, "binlog_row_image");
+            if (rowImage != null && "FULL".equalsIgnoreCase(rowImage)) {
+                warnings.add("源端 binlog_row_image=FULL：UPDATE 会把未改动的大字段前后镜像都写进 binlog，"
+                        + "网络与磁盘各多一倍；改成 NOBLOB 可直接省掉（不影响正确性）");
+            }
+        }
+
+        if (!errors.isEmpty()) {
+            return check("大字段搬运能力", "FAIL", String.join("；", errors), detail.toString());
+        }
+        if (!warnings.isEmpty()) {
+            return check("大字段搬运能力", "WARNING", String.join("；", warnings), detail.toString());
+        }
+        return check("大字段搬运能力", "PASS", "大字段可搬运（单值未超过两端 max_allowed_packet，且均有主键）",
+                detail.toString());
+    }
+
+    private long globalLong(Connection conn, String var) {
+        String v = globalString(conn, var);
+        try {
+            return v == null ? -1 : Long.parseLong(v.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private String globalString(Connection conn, String var) {
+        try (java.sql.Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT @@GLOBAL." + var)) {
+            return rs.next() ? rs.getString(1) : null;
+        } catch (Exception e) {
+            return null;   // 变量不存在（版本差异）不算失败
+        }
+    }
+
+    /**
+     * 传输层加密。
+     *
+     * <p>平台把凭证 AES-GCM 落库加密、THL 文件也能加密，唯独<b>真正流动的业务数据</b>
+     * 长期是明文的（全仓 34 处硬编码 {@code useSSL=false}，且没有任何 SSL 配置项）。
+     * 金融政企的入网评审基本过不了这一关。
+     *
+     * <p>只报 WARNING 不阻断：内网环境不开 TLS 是常见且合理的选择，
+     * 但"当初知不知道自己没开"必须留下痕迹（预检结果现在会落 {@code task_precheck_results}）。
+     */
+    private Map<String, Object> checkTransportEncryption(Workflow workflow) {
+        String src = System.getenv("SOURCE_DB_SSL_MODE");
+        String tgt = System.getenv("TARGET_DB_SSL_MODE");
+        boolean srcOn = on(src);
+        boolean tgtOn = on(tgt);
+        // 控制面：后端自己也直连用户库（元数据探查、连接校验、数据校验、**内容对比逐行读业务数据**），
+        // 以及后端/agent 到元数据库与 Kafka 的那几跳。数据面加密而控制面明文，
+        // 等于同一批数据换条路又明文走了一遍——所以四项一起判，只报"全开"才算 PASS。
+        String control = com.synctask.util.JdbcSslOptions.mode();
+        String meta = System.getenv("META_DB_SSL_MODE");
+        String kafka = com.synctask.util.KafkaSecurity.protocol();
+        boolean controlOn = on(control);
+        boolean metaOn = on(meta);
+        boolean kafkaOn = com.synctask.util.KafkaSecurity.enabled();
+
+        String detail = String.format(
+                "数据面 源=%s 目标=%s；控制面 到用户库=%s 到元数据库=%s Kafka=%s",
+                srcOn ? src : "DISABLED", tgtOn ? tgt : "DISABLED",
+                controlOn ? control : "DISABLED", metaOn ? meta : "DISABLED", kafka);
+
+        if (srcOn && tgtOn && controlOn && metaOn && kafkaOn) {
+            return check("传输加密", "PASS", "数据面与控制面均已启用 TLS", detail);
+        }
+        return check("传输加密", "WARNING",
+                "以下链路未启用 TLS，数据在网络上是明文传输", detail
+                        + "。开关：SOURCE_DB_SSL_MODE / TARGET_DB_SSL_MODE（数据面）、"
+                        + "CONTROL_PLANE_DB_SSL_MODE（后端直连用户库）、META_DB_SSL_MODE（元数据库）、"
+                        + "KAFKA_SECURITY_PROTOCOL=SSL|SASL_SSL（Kafka）");
+    }
+
+    private static boolean on(String v) {
+        return v != null && !v.isEmpty() && !"DISABLED".equalsIgnoreCase(v);
+    }
+
+    /**
+     * PostgreSQL 源的对象级预检。
+     *
+     * <p>与 MySQL 版是<b>同一批判据、不同的目录表</b>：PG 里 syncObjects 的 key 是 schema，
+     * 所以查的是 {@code pg_catalog}/{@code information_schema} 而不是 {@code information_schema.schemata} 那套。
+     * 之前这条链路整个被一句"仅支持 MySQL 源库，已跳过"打发掉——对象级预检覆盖率为 0，
+     * 而"跑起来才炸"的问题恰恰大多在对象级。
+     *
+     * <p>多一条 MySQL 没有的检查：<b>REPLICA IDENTITY</b>。PG 的逻辑复制默认只在 WAL 里带主键列，
+     * 无主键表若不设 {@code REPLICA IDENTITY FULL}，UPDATE/DELETE 根本没有前镜像可用，
+     * 增量会直接哑掉——这是 PG 特有、且必炸的一条。
+     */
+    private List<Map<String, Object>> pgSchemaPrecheck(Workflow workflow, String srcConn,
+                                                       List<DbEntry> entries,
+                                                       List<Map<String, Object>> checks) {
+        String mode = workflow.getMigrationMode();
+        boolean needsIncrement = mode != null
+                && (mode.toLowerCase().contains("incre") || mode.equalsIgnoreCase("subscribe"));
+        try (Connection src = openPgConn(srcConn)) {
+            List<String> missing = new ArrayList<>();
+            List<String> noPk = new ArrayList<>();
+            List<String> weakIdentity = new ArrayList<>();
+            List<String> missingCols = new ArrayList<>();
+
+            for (DbEntry de : entries) {
+                if (!pgSchemaExists(src, de.sourceDb)) {
+                    missing.add("schema " + de.sourceDb);
+                    continue;
+                }
+                if (de.dbLevel) continue;
+                for (String t : de.tables) {
+                    if (!pgTableExists(src, de.sourceDb, t)) {
+                        missing.add(de.sourceDb + "." + t);
+                        continue;
+                    }
+                    if (needsIncrement) {
+                        if (!pgHasPrimaryKey(src, de.sourceDb, t)) {
+                            noPk.add(de.sourceDb + "." + t);
+                            if (!"f".equalsIgnoreCase(pgReplicaIdentity(src, de.sourceDb, t))) {
+                                weakIdentity.add(de.sourceDb + "." + t);
+                            }
+                        }
+                    }
+                }
+                for (Map.Entry<String, java.util.Set<String>> te : de.referencedColumns.entrySet()) {
+                    if (!pgTableExists(src, de.sourceDb, te.getKey())) continue;
+                    java.util.Set<String> cols = pgTableColumns(src, de.sourceDb, te.getKey());
+                    for (String ref : te.getValue()) {
+                        if (!cols.contains(ref.toLowerCase())) {
+                            missingCols.add(de.sourceDb + "." + te.getKey() + "." + ref);
+                        }
+                    }
+                }
+            }
+
+            checks.add(missing.isEmpty()
+                    ? check("源库对象存在性", "PASS", "所有同步对象均存在于源库", null)
+                    : check("源库对象存在性", "FAIL",
+                            "源库不存在以下对象（" + missing.size() + " 个）", String.join(", ", missing)));
+
+            if (needsIncrement) {
+                checks.add(noPk.isEmpty()
+                        ? check("增量主键", "PASS", "增量同步的表均有主键", null)
+                        : check("增量主键", "FAIL",
+                                "以下表无主键，增量 UPDATE/DELETE 只能按整行匹配定位（存在完全重复行时无法区分是哪一条，"
+                                        + "引擎默认限量成只影响一行）。建议加主键或唯一索引（" + noPk.size() + " 个）",
+                                String.join(", ", noPk)));
+                checks.add(weakIdentity.isEmpty()
+                        ? check("REPLICA IDENTITY", "PASS", "无主键表均已设置 REPLICA IDENTITY FULL", null)
+                        : check("REPLICA IDENTITY", "FAIL",
+                                "以下无主键表未设置 REPLICA IDENTITY FULL，逻辑复制不会记录前镜像，"
+                                        + "UPDATE/DELETE 无法同步（" + weakIdentity.size() + " 个）",
+                                String.join(", ", weakIdentity)));
+            }
+
+            checks.add(missingCols.isEmpty()
+                    ? check("列处理引用列", "PASS", "列过滤/映射引用的源列均存在", null)
+                    : check("列处理引用列", "FAIL",
+                            "列处理引用了不存在的源列（" + missingCols.size() + " 个）", String.join(", ", missingCols)));
+        } catch (Exception e) {
+            checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
+        }
+        return checks;
+    }
+
+    /**
+     * Oracle 源的对象级预检。
+     *
+     * <p>与 MySQL/PG 同一批判据（对象存在性、增量主键、列处理引用列），换成 {@code ALL_*} 数据字典。
+     * 两条 Oracle 特有的：
+     *
+     * <ul>
+     *   <li><b>补充日志</b>：LogMiner 默认只记录被改的列，没有最小补充日志时
+     *       UPDATE/DELETE 拿不到行标识，增量根本定位不到目标行。这是 Oracle 源最常见的
+     *       "任务起得来但增量一条都不同步"的原因，且只有跑起来才会暴露。</li>
+     *   <li><b>标识符大小写</b>：Oracle 的对象名默认大写存储，用户在向导里填小写表名
+     *       会查不到——但这不是"表不存在"，只是大小写问题，所以单独提示，
+     *       否则用户看到"源库不存在以下对象"会去建一张本来就有的表。</li>
+     * </ul>
+     */
+    private List<Map<String, Object>> oracleSchemaPrecheck(Workflow workflow, String srcConn,
+                                                           List<DbEntry> entries,
+                                                           List<Map<String, Object>> checks) {
+        String mode = workflow.getMigrationMode();
+        boolean needsIncrement = mode != null
+                && (mode.toLowerCase().contains("incre") || mode.equalsIgnoreCase("subscribe"));
+        try (Connection src = openOracleConn(srcConn)) {
+            List<String> missing = new ArrayList<>();
+            List<String> caseHint = new ArrayList<>();
+            List<String> noPk = new ArrayList<>();
+            List<String> missingCols = new ArrayList<>();
+
+            for (DbEntry de : entries) {
+                if (de.dbLevel) continue;
+                String owner = de.sourceDb == null ? "" : de.sourceDb.toUpperCase();
+                for (String t : de.tables) {
+                    String table = t.toUpperCase();
+                    if (!oracleTableExists(src, owner, table)) {
+                        missing.add(de.sourceDb + "." + t);
+                        continue;
+                    }
+                    if (!table.equals(t)) {
+                        caseHint.add(de.sourceDb + "." + t + " → " + table);
+                    }
+                    if (needsIncrement && !oracleHasPrimaryKey(src, owner, table)) {
+                        noPk.add(owner + "." + table);
+                    }
+                }
+                for (Map.Entry<String, java.util.Set<String>> te : de.referencedColumns.entrySet()) {
+                    String table = te.getKey().toUpperCase();
+                    if (!oracleTableExists(src, owner, table)) continue;
+                    java.util.Set<String> cols = oracleTableColumns(src, owner, table);
+                    for (String ref : te.getValue()) {
+                        if (!cols.contains(ref.toUpperCase())) {
+                            missingCols.add(owner + "." + table + "." + ref);
+                        }
+                    }
+                }
+            }
+
+            checks.add(missing.isEmpty()
+                    ? check("源库对象存在性", "PASS", "所有同步对象均存在于源库", null)
+                    : check("源库对象存在性", "FAIL",
+                            "源库不存在以下对象（" + missing.size() + " 个）", String.join(", ", missing)));
+
+            if (!caseHint.isEmpty()) {
+                checks.add(check("标识符大小写", "WARNING",
+                        "Oracle 对象名默认以大写存储，以下对象按大写匹配成功（" + caseHint.size() + " 个）；"
+                                + "若源端确实建的是带引号的小写名，请在同步对象里填写实际大小写",
+                        String.join(", ", caseHint)));
+            }
+
+            if (needsIncrement) {
+                checks.add(noPk.isEmpty()
+                        ? check("增量主键", "PASS", "增量同步的表均有主键", null)
+                        : check("增量主键", "FAIL",
+                                "以下表无主键，增量 UPDATE/DELETE 只能按整行匹配定位（存在完全重复行时无法区分是哪一条，"
+                                        + "引擎默认限量成只影响一行）。建议加主键或唯一索引（" + noPk.size() + " 个）",
+                                String.join(", ", noPk)));
+                checks.add(checkOracleSupplementalLog(src));
+            }
+
+            checks.add(missingCols.isEmpty()
+                    ? check("列处理引用列", "PASS", "列过滤/映射引用的源列均存在", null)
+                    : check("列处理引用列", "FAIL",
+                            "列处理引用了不存在的源列（" + missingCols.size() + " 个）", String.join(", ", missingCols)));
+        } catch (Exception e) {
+            checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
+        }
+        return checks;
+    }
+
+    /**
+     * 最小补充日志。没有它，LogMiner 的 UPDATE/DELETE 记录里没有行标识，
+     * 增量表现为"任务健康、位点在推进、目标端一行不动"——是 Oracle 源最难查的一类故障。
+     */
+    private Map<String, Object> checkOracleSupplementalLog(Connection conn) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT supplemental_log_data_min FROM v$database");
+             ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+                String v = rs.getString(1);
+                if (v != null && !"NO".equalsIgnoreCase(v)) {
+                    return check("补充日志", "PASS", "supplemental_log_data_min=" + v, null);
+                }
+                return check("补充日志", "FAIL",
+                        "源库未开启最小补充日志（supplemental_log_data_min=NO）：LogMiner 的 UPDATE/DELETE "
+                                + "记录里不带行标识，增量会表现为「位点一直推进、目标端一行不动」",
+                        "执行 ALTER DATABASE ADD SUPPLEMENTAL LOG DATA; 后重试");
+            }
+        } catch (Exception e) {
+            return check("补充日志", "WARNING", "无法查询补充日志状态（需要 v$database 读权限）: " + e.getMessage(), null);
+        }
+        return check("补充日志", "WARNING", "无法确定补充日志状态", null);
+    }
+
+    private Connection openOracleConn(String connStr) throws Exception {
+        // oracle://user:pass@host:port/service
+        String rest = connStr.substring("oracle://".length());
+        int at = rest.indexOf('@');
+        String[] up = rest.substring(0, at).split(":", 2);
+        String hostPortService = rest.substring(at + 1);
+        String service = hostPortService.contains("/")
+                ? hostPortService.substring(hostPortService.indexOf('/') + 1) : "ORCL";
+        String hostPort = hostPortService.contains("/")
+                ? hostPortService.substring(0, hostPortService.indexOf('/')) : hostPortService;
+        return DriverManager.getConnection("jdbc:oracle:thin:@" + hostPort + "/" + service,
+                up[0], up.length > 1 ? up[1] : "");
+    }
+
+    private boolean oracleTableExists(Connection c, String owner, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM all_tables WHERE owner = ? AND table_name = ?")) {
+            ps.setString(1, owner);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private boolean oracleHasPrimaryKey(Connection c, String owner, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM all_constraints WHERE owner = ? AND table_name = ? "
+                        + "AND constraint_type = 'P' AND status = 'ENABLED'")) {
+            ps.setString(1, owner);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private java.util.Set<String> oracleTableColumns(Connection c, String owner, String table) throws Exception {
+        java.util.Set<String> cols = new java.util.HashSet<>();
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT column_name FROM all_tab_columns WHERE owner = ? AND table_name = ?")) {
+            ps.setString(1, owner);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) cols.add(rs.getString(1).toUpperCase());
+            }
+        }
+        return cols;
+    }
+
+    /**
+     * MongoDB 源的对象级预检。
+     *
+     * <p>关系库那套"主键 / 列存在性"在这里没有对应物（{@code _id} 必然存在、文档无固定列），
+     * 所以判据换成 Mongo 自己会炸的那几条：
+     *
+     * <ul>
+     *   <li><b>副本集</b>：Change Streams 只在副本集/分片集群可用。单机 mongod 上增量任务
+     *       起得来但一条变更都收不到。</li>
+     *   <li><b>集合存在性</b>与<b>集合类型</b>：视图（view）与 capped 集合都不能作为同步源，
+     *       但表现各不相同——视图直接读不出 change stream，capped 集合会在写满回卷时丢事件。</li>
+     *   <li><b>oplog 窗口</b>：窗口太短时，全量搬运还没跑完 resume token 就已经滚出窗口，
+     *       增量接不上只能重做全量。这条只有事后才发现，所以要在启动前量一次。</li>
+     * </ul>
+     */
+    private List<Map<String, Object>> mongoSchemaPrecheck(Workflow workflow, String srcConn,
+                                                          List<DbEntry> entries,
+                                                          List<Map<String, Object>> checks) {
+        String mode = workflow.getMigrationMode();
+        boolean needsIncrement = mode != null
+                && (mode.toLowerCase().contains("incre") || mode.equalsIgnoreCase("subscribe"));
+        com.mongodb.client.MongoClient client = null;
+        try {
+            client = com.mongodb.client.MongoClients.create(srcConn);
+            org.bson.Document hello = client.getDatabase("admin")
+                    .runCommand(new org.bson.Document("hello", 1));
+
+            if (needsIncrement) {
+                boolean replicaSet = hello.get("setName") != null || hello.getBoolean("isreplicaset", false)
+                        || "isdbgrid".equals(hello.getString("msg"));
+                checks.add(replicaSet
+                        ? check("副本集/分片集群", "PASS",
+                                "源端是副本集或分片集群（setName=" + hello.getString("setName") + "），Change Streams 可用", null)
+                        : check("副本集/分片集群", "FAIL",
+                                "源端不是副本集/分片集群：Change Streams 不可用，增量任务会起得来但一条变更都收不到",
+                                "把源端 mongod 配成副本集（哪怕单节点 rs.initiate()）后重试"));
+            }
+
+            List<String> missing = new ArrayList<>();
+            List<String> notCollections = new ArrayList<>();
+            for (DbEntry de : entries) {
+                com.mongodb.client.MongoDatabase db = client.getDatabase(de.sourceDb);
+                Map<String, String> types = new java.util.HashMap<>();
+                for (org.bson.Document d : db.listCollections()) {
+                    types.put(d.getString("name"), d.getString("type"));
+                }
+                if (types.isEmpty() && !de.dbLevel && !de.tables.isEmpty()) {
+                    missing.add("库 " + de.sourceDb);
+                    continue;
+                }
+                if (de.dbLevel) continue;
+                for (String t : de.tables) {
+                    if (!types.containsKey(t)) {
+                        missing.add(de.sourceDb + "." + t);
+                    } else if (types.get(t) != null && !"collection".equals(types.get(t))) {
+                        notCollections.add(de.sourceDb + "." + t + "(" + types.get(t) + ")");
+                    }
+                }
+            }
+            checks.add(missing.isEmpty()
+                    ? check("源库对象存在性", "PASS", "所有同步集合均存在于源库", null)
+                    : check("源库对象存在性", "FAIL",
+                            "源库不存在以下集合（" + missing.size() + " 个）", String.join(", ", missing)));
+            checks.add(notCollections.isEmpty()
+                    ? check("集合类型", "PASS", "同步对象均为普通集合", null)
+                    : check("集合类型", "FAIL",
+                            "以下对象不是普通集合（视图不产生 change stream，无法作为同步源）（"
+                                    + notCollections.size() + " 个）", String.join(", ", notCollections)));
+
+            if (needsIncrement) {
+                checks.add(checkMongoOplogWindow(client));
+            }
+        } catch (Exception e) {
+            checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
+        } finally {
+            if (client != null) {
+                try { client.close(); } catch (Exception ignored) { }
+            }
+        }
+        return checks;
+    }
+
+    /** oplog 窗口：小于 1 小时时全量还没搬完 resume token 就可能已经滚出去了。 */
+    private Map<String, Object> checkMongoOplogWindow(com.mongodb.client.MongoClient client) {
+        try {
+            com.mongodb.client.MongoCollection<org.bson.Document> oplog =
+                    client.getDatabase("local").getCollection("oplog.rs");
+            org.bson.Document first = oplog.find().sort(new org.bson.Document("$natural", 1)).first();
+            org.bson.Document last = oplog.find().sort(new org.bson.Document("$natural", -1)).first();
+            if (first == null || last == null) {
+                return check("oplog 窗口", "WARNING", "无法读取 oplog（需要 local.oplog.rs 读权限）", null);
+            }
+            org.bson.BsonTimestamp t0 = first.get("ts", org.bson.BsonTimestamp.class);
+            org.bson.BsonTimestamp t1 = last.get("ts", org.bson.BsonTimestamp.class);
+            long windowSec = (long) t1.getTime() - t0.getTime();
+            String human = (windowSec / 3600) + "h" + ((windowSec % 3600) / 60) + "m";
+            if (windowSec >= 3600) {
+                return check("oplog 窗口", "PASS", "oplog 覆盖约 " + human, null);
+            }
+            return check("oplog 窗口", "WARNING",
+                    "oplog 窗口只有约 " + human + "：全量搬运耗时超过这个窗口时，"
+                            + "resume token 会滚出 oplog，增量接不上只能重做全量",
+                    "调大 replSetResizeOplog 的 size，或先在业务低峰期跑全量");
+        } catch (Exception e) {
+            return check("oplog 窗口", "WARNING", "无法评估 oplog 窗口: " + e.getMessage(), null);
+        }
+    }
+
+    private Connection openPgConn(String connStr) throws Exception {
+        String url = connStr.replace("postgresql://", "");
+        int at = url.indexOf('@');
+        String[] up = url.substring(0, at).split(":", 2);
+        String hostDb = url.substring(at + 1);
+        if (!hostDb.contains("/")) {
+            hostDb = hostDb + "/postgres";
+        }
+        return DriverManager.getConnection("jdbc:postgresql://" + hostDb, up[0], up.length > 1 ? up[1] : "");
+    }
+
+    private boolean pgSchemaExists(Connection c, String schema) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name = ?")) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private boolean pgTableExists(Connection c, String schema, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    private boolean pgHasPrimaryKey(Connection c, String schema, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid "
+                        + "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                        + "WHERE n.nspname = ? AND t.relname = ? AND i.indisprimary LIMIT 1")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
+        }
+    }
+
+    /** relreplident: d=default(主键) / f=full / i=index / n=nothing */
+    private String pgReplicaIdentity(Connection c, String schema, String table) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT t.relreplident FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace "
+                        + "WHERE n.nspname = ? AND t.relname = ?")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) { return rs.next() ? rs.getString(1) : "d"; }
+        }
+    }
+
+    private java.util.Set<String> pgTableColumns(Connection c, String schema, String table) throws Exception {
+        java.util.Set<String> cols = new java.util.HashSet<>();
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ?")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) cols.add(rs.getString(1).toLowerCase());
+            }
+        }
+        return cols;
     }
 
     /** 单库同步 entry（预检用）。tables 为空 + dbLevel=true 表示整库同步。 */
@@ -438,8 +1095,15 @@ public class DiagnosticService {
         if (noPk.isEmpty()) {
             return check("增量主键", "PASS", "增量同步的表均有主键", null);
         }
-        return check("增量主键", "WARNING",
-                "以下表无主键，增量 UPDATE/DELETE 无法按主键定位行，可能同步异常（" + noPk.size() + " 个）",
+        // 从 WARNING 升级为 FAIL：无主键表的增量 UPDATE/DELETE 只能按整行前镜像定位，
+        // 而无主键表允许完全重复的行——源端删 1 条，目标端会把所有重复行一起删掉（实测源剩 2/目标剩 0）。
+        // 引擎侧已默认限量成"只影响一行"（increment.nopk.row.match=LIMIT_ONE），
+        // 但"删哪一条"仍然是不确定的，行序也无法保证，所以这依旧是需要人明确知情并确认的事，
+        // 不该是一条划过去就没了的黄字。
+        return check("增量主键", "FAIL",
+                "以下表无主键，增量 UPDATE/DELETE 只能按整行匹配定位（存在完全重复行时无法区分是哪一条，"
+                        + "引擎默认限量成只影响一行）。建议加主键或唯一索引；确需继续请强制启动并知悉风险（"
+                        + noPk.size() + " 个）",
                 String.join(", ", noPk));
     }
 
@@ -504,6 +1168,126 @@ public class DiagnosticService {
         }
         return check("列处理引用列", "FAIL",
                 "列处理引用了不存在的源列（" + missing.size() + " 个）", String.join(", ", missing));
+    }
+
+    /**
+     * 双向同步的自增碰撞检查（仅 BIDIRECTIONAL + 有自增列的表）。
+     *
+     * <p>active-active 下两端各自分配自增 ID：A 端插到 id=5、B 端也插到 id=5，两条<b>内容不同</b>
+     * 的行复制到对端时撞主键。而应用侧对主键冲突的处理是 upsert 覆盖 / 当成"幂等重放"忽略——
+     * 两种都会让一侧的那行数据静默消失，没有任何冲突告警（冲突裁决管的是 UPDATE 的写写冲突，
+     * 不是这种"两端各自新增了不同的行却拿到同一个 ID"）。
+     *
+     * <p>解法是 MySQL 双主/组复制的老办法：两端 {@code auto_increment_increment} 都设成 ≥2，
+     * {@code auto_increment_offset} 互相错开，各自只用一个同余类的 ID，从源头上不可能撞。
+     *
+     * <p>只在同步对象里确实存在自增列时才拦——没有自增列就不存在这个问题。
+     */
+    private Map<String, Object> checkBidiAutoIncrement(Connection src, String tgtConn, List<DbEntry> entries) {
+        List<String> autoIncTables = new ArrayList<>();
+        try {
+            for (DbEntry de : entries) {
+                if (!schemaExists(src, de.sourceDb)) continue;
+                try (PreparedStatement ps = src.prepareStatement(
+                        "SELECT TABLE_NAME FROM information_schema.columns " +
+                        "WHERE TABLE_SCHEMA = ? AND EXTRA LIKE '%auto_increment%'")) {
+                    ps.setString(1, de.sourceDb);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            String t = rs.getString(1);
+                            if (de.dbLevel || de.tables.contains(t)) {
+                                autoIncTables.add(de.sourceDb + "." + t);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return check("双向自增错开", "WARNING", "无法读取源库自增列信息: " + e.getMessage(), null);
+        }
+        if (autoIncTables.isEmpty()) {
+            return check("双向自增错开", "PASS", "同步对象里没有自增列，不存在两端分配同一个 ID 的问题", null);
+        }
+
+        long srcInc, srcOff, tgtInc, tgtOff;
+        try (Connection tgt = openConn(tgtConn)) {
+            srcInc = longVariable(src, "auto_increment_increment");
+            srcOff = longVariable(src, "auto_increment_offset");
+            tgtInc = longVariable(tgt, "auto_increment_increment");
+            tgtOff = longVariable(tgt, "auto_increment_offset");
+        } catch (Exception e) {
+            return check("双向自增错开", "WARNING", "无法读取两端自增参数: " + e.getMessage(), null);
+        }
+
+        boolean staggered = autoIncrementStaggered(srcInc, srcOff, tgtInc, tgtOff);
+        String detail = String.format("源端 increment=%d offset=%d；目标端 increment=%d offset=%d；"
+                + "涉及自增列的表 %d 个（%s）", srcInc, srcOff, tgtInc, tgtOff, autoIncTables.size(),
+                String.join(", ", autoIncTables.subList(0, Math.min(10, autoIncTables.size()))));
+        if (staggered) {
+            return check("双向自增错开", "PASS", "两端自增步长与偏移已错开，不会分配到同一个 ID", detail);
+        }
+        return check("双向自增错开", "FAIL",
+                "双向同步下两端会分配到同一个自增 ID，复制到对端时撞主键，被当成幂等重放/upsert 覆盖掉——"
+                        + "一侧的数据会静默消失。请把两端设成错开的同余类，例如 "
+                        + "A 端 SET GLOBAL auto_increment_increment=2, auto_increment_offset=1；"
+                        + "B 端 SET GLOBAL auto_increment_increment=2, auto_increment_offset=2（并写进配置文件持久化）",
+                detail);
+    }
+
+    /**
+     * 两端的自增分配是否互不相交。
+     *
+     * <p>条件是"各自只用一个同余类"：步长都 ≥2、偏移互不相同、且偏移落在 [1, 步长] 内
+     * （MySQL 对 offset > increment 的配置是<b>直接忽略 offset</b> 的，写成 3/5 看着错开、
+     * 实际两端都从同一个序列取值，所以必须一起校验）。
+     */
+    static boolean autoIncrementStaggered(long srcInc, long srcOff, long tgtInc, long tgtOff) {
+        if (srcInc < 2 || tgtInc < 2) {
+            return false;
+        }
+        if (srcOff < 1 || tgtOff < 1 || srcOff > srcInc || tgtOff > tgtInc) {
+            return false;
+        }
+        // 步长不同的话同余类照样会相交（例如 2/1 与 3/1 都会产出 7），要求两端步长一致
+        return srcInc == tgtInc && srcOff != tgtOff;
+    }
+
+    private long longVariable(Connection conn, String name) throws Exception {
+        try (java.sql.Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT @@" + name)) {
+            return rs.next() ? rs.getLong(1) : 1L;
+        }
+    }
+
+    /**
+     * 未决 XA 分支检查（仅 mysql 源 + 需要增量）。
+     *
+     * <p>源库 XA 事务在 binlog 里是分两段写的：行事件在 {@code XA PREPARE} 时刻就落盘，
+     * 提交/回滚的决议要等到之后的 {@code XA COMMIT} / {@code XA ROLLBACK}。为了保证
+     * "源库提交时目标库才提交"，extract 会把未决分支整段缓冲到磁盘等决议——
+     * 所以任务启动时源库里<b>已经挂着</b>的长期未决分支值得先提醒一句：它们迟迟不决议，
+     * 缓冲就一直占着磁盘（超过 sync.xa.pending.* 配额会让增量停下来报 E3018），
+     * 而且这些分支持有行锁，全量阶段扫到同一批行也会被挡住。
+     *
+     * <p>只告警不阻断：未决分支本身是分布式事务的正常中间态，是不是"卡住了"只有业务能判断。
+     */
+    private Map<String, Object> checkPendingXaBranches(Connection src) {
+        List<String> branches = new ArrayList<>();
+        try (java.sql.Statement st = src.createStatement(); ResultSet rs = st.executeQuery("XA RECOVER")) {
+            while (rs.next() && branches.size() < 20) {
+                branches.add(rs.getString("data"));
+            }
+        } catch (Exception e) {
+            return check("未决 XA 分支", "WARNING", "无法执行 XA RECOVER: " + e.getMessage(), null);
+        }
+        if (branches.isEmpty()) {
+            return check("未决 XA 分支", "PASS", "源库没有已 prepare 未决议的 XA 分支", null);
+        }
+        return check("未决 XA 分支", "WARNING",
+                "源库存在 " + branches.size() + " 个已 prepare 未决议的 XA 分支。它们的数据要等源库"
+                        + "XA COMMIT 才会下发到目标库（这是正确行为），期间 extract 会把它们缓冲在磁盘上；"
+                        + "若这些分支实际已经卡死，请在源库处置后再启动任务",
+                String.join(", ", branches));
     }
 
     /**
@@ -585,6 +1369,71 @@ public class DiagnosticService {
         return check("目标表冲突", "WARNING",
                 "目标库已存在同名表，全量同步可能产生重复或冲突数据，请确认（" + existing.size() + " 个）",
                 String.join(", ", existing));
+    }
+
+    /**
+     * 目标端存在源端没有的唯一索引。
+     *
+     * <p>这条比它看起来严重得多，而且<b>只能在这里拦</b>。MySQL 目标的增量 INSERT 是
+     * {@code INSERT ... ON DUPLICATE KEY UPDATE 全部列}，撞上一个源端没有的唯一索引时它
+     * <b>不报错</b>——而是把那条冲突的旧行整行改掉，<b>连主键一起改成新行的主键</b>。
+     *
+     * <p>实测：目标表加 {@code UNIQUE(email)} 后，源端插入一条 email 重复的新行（id=99991），
+     * 目标端原来的 id=0 那一行直接变成了 id=99991——<b>一条语句毁掉一行、又把两行并成一行</b>，
+     * 全程没有任何错误或告警。PG 目标则是 {@code ON CONFLICT (pk) DO NOTHING} 兜不住唯一约束，
+     * 抛异常后被"重复键忽略"吞掉（那条已由 E3017 修）。
+     *
+     * <p>运行期分辨不了"主键冲突（幂等重放，该忽略）"与"唯一键冲突（该停）"——
+     * MySQL 的 upsert 两种情况都返回成功。所以必须在启动前把结构差异摆出来。
+     */
+    private Map<String, Object> checkTargetUniqueIndexes(Connection src, Connection tgt,
+                                                         List<DbEntry> entries) throws Exception {
+        List<String> extra = new ArrayList<>();
+        for (DbEntry de : entries) {
+            if (de.dbLevel || !schemaExists(tgt, de.targetDb)) continue;
+            for (String t : de.tables) {
+                String tgtTable = de.tableMapping.getOrDefault(t, t);
+                if (!tableExists(tgt, de.targetDb, tgtTable) || !tableExists(src, de.sourceDb, t)) continue;
+                java.util.Set<String> srcKeys = uniqueIndexSignatures(src, de.sourceDb, t);
+                for (Map.Entry<String, String> e : uniqueIndexColumns(tgt, de.targetDb, tgtTable).entrySet()) {
+                    if (!srcKeys.contains(e.getValue())) {
+                        extra.add(de.targetDb + "." + tgtTable + "." + e.getKey() + "(" + e.getValue() + ")");
+                    }
+                }
+            }
+        }
+        if (extra.isEmpty()) {
+            return check("目标唯一索引", "PASS", "目标端没有源端不存在的唯一索引", null);
+        }
+        return check("目标唯一索引", "FAIL",
+                "目标端存在源端没有的唯一索引：增量 upsert 撞上它时不会报错，"
+                        + "而是把冲突的旧行整行改掉（连主键一起改），等于毁掉一行又把两行并成一行（"
+                        + extra.size() + " 个）",
+                String.join(", ", extra));
+    }
+
+    /** 表上所有唯一索引（不含主键）的列签名集合，用于两端对比。 */
+    private java.util.Set<String> uniqueIndexSignatures(Connection conn, String schema, String table) throws Exception {
+        return new java.util.HashSet<>(uniqueIndexColumns(conn, schema, table).values());
+    }
+
+    /** 索引名 → 列签名（按 seq_in_index 排序后小写逗号拼接）。 */
+    private Map<String, String> uniqueIndexColumns(Connection conn, String schema, String table) throws Exception {
+        Map<String, String> out = new java.util.LinkedHashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT index_name, GROUP_CONCAT(LOWER(column_name) ORDER BY seq_in_index) cols "
+                        + "FROM information_schema.statistics "
+                        + "WHERE table_schema = ? AND table_name = ? AND non_unique = 0 "
+                        + "AND index_name <> 'PRIMARY' GROUP BY index_name")) {
+            ps.setString(1, schema);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.put(rs.getString("index_name"), rs.getString("cols"));
+                }
+            }
+        }
+        return out;
     }
 
     // ---- information_schema 查询辅助（标识符经参数化，避免注入与 LIKE 通配符误匹配）----
@@ -673,7 +1522,7 @@ public class DiagnosticService {
         String username = up[0];
         String password = up.length > 1 ? up[1] : "";
 
-        String jdbcUrl = "jdbc:mysql://" + hostDb + "?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
+        String jdbcUrl = "jdbc:mysql://" + hostDb + "?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
 
         return new String[]{jdbcUrl, username, password};
     }

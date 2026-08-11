@@ -1,5 +1,6 @@
 package com.synctask.config;
 
+import com.synctask.util.KafkaSecurity;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -36,6 +37,8 @@ public class KafkaConfig {
         config.put(ProducerConfig.ACKS_CONFIG, "all");
         config.put(ProducerConfig.RETRIES_CONFIG, 3);
         config.put(ProducerConfig.LINGER_MS_CONFIG, 1);
+        // 控制面到 Kafka 的传输加密/认证（默认全空 = PLAINTEXT，与之前逐字节相同）
+        KafkaSecurity.apply(config);
         return new DefaultKafkaProducerFactory<>(config);
     }
 
@@ -56,6 +59,7 @@ public class KafkaConfig {
         props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
         props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
         props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "java.lang.Object");
+        KafkaSecurity.apply(props);
         return new DefaultKafkaConsumerFactory<>(props, new StringDeserializer(), new JsonDeserializer<>(Object.class, false));
     }
 

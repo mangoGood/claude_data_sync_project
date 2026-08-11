@@ -412,7 +412,7 @@
             'E2005': { desc: 'Checkpoint初始化失败', solution: '请检查源数据库连接是否正常，确认用户有REPLICATION权限' },
             'E2006': { desc: 'PostgreSQL WAL LSN获取失败', solution: '请检查PostgreSQL连接是否正常，确认用户有replication权限' },
             'E2007': { desc: 'Oracle SCN获取失败', solution: '请检查Oracle连接是否正常，确认用户有SELECT ANY DICTIONARY权限且数据库处于ARCHIVELOG模式' },
-            'E2008': { desc: 'Oracle LogMiner会话启动失败', solution: '请确认数据库处于ARCHIVELOG模式，用户具有EXECUTE CATALOG ROLE权限，且redo日志可访问' },
+            'E2008': { desc: 'Oracle LogMiner会话启动失败', solution: '请确认数据库处于ARCHIVELOG模式，用户具有EXECUTE_CATALOG_ROLE权限，且redo日志可访问' },
             'E3001': { desc: 'Capture进程启动失败', solution: '请检查Agent日志，确认capture模块JAR包存在且配置正确' },
             'E3002': { desc: 'Capture进程异常退出', solution: '请检查Agent日志，确认源数据库连接正常且binlog/WAL可访问' },
             'E3003': { desc: 'Extract进程启动失败', solution: '请检查Agent日志，确认extract模块JAR包存在且配置正确' },
@@ -424,6 +424,19 @@
             'E3009': { desc: '增量事件转换失败', solution: '该事件无法转换成目标端SQL（未知类型/结构不匹配）。可在死信页面裁决跳过，或将 increment.convert.error.policy 设为 DEAD_LETTER 自动记死信并跳过' },
             'E3010': { desc: 'THL文件读取中断', solution: 'THL文件损坏或读取异常，已在断点处停止且未跳过剩余事件。请检查磁盘与 thl_output 目录，必要时重新初始化增量' },
             'E3011': { desc: '双向同步写写冲突', solution: '两端同时改了同一行且策略为 ERROR（不自动丢写）。请人工确认保留哪一端，或改用 LWW_SOURCE_TS/NODE_PRIORITY 自动裁决' },
+            'E3012': { desc: '大字段事件缺少类型化值', solution: '事件带的是大字段引用（内容在磁盘上），却没有类型化值（rows_typed），只能走文本路径——那会把 @lob:... 这串引用当成内容写进目标 BLOB/TEXT 列（静默数据损坏），因此已停止应用。请确认源→目标是 mysql→mysql、increment.typed.pipeline.enabled 未被关掉、且源端 binlog_row_image 为 FULL 或 NOBLOB' },
+            'E3013': { desc: '汇聚/拆分事件缺少类型化值', solution: '命中路由规则的表其事件没有类型化值（rows_typed），无法生成带来源标识列的 DML，已停止应用以免改坏同一汇聚表里其它来源的行。请检查该表的路由规则是否配错、源端 binlog_row_image 是否为 FULL，以及该源→目标引擎对是否支持类型化管道（increment.typed.pipeline.enabled 是否被关掉）' },
+            'E3017': { desc: '唯一键冲突（非主键）', solution: '目标端存在源端没有的唯一索引/约束挡住了这一行。主键冲突是幂等重放可以忽略，唯一键冲突忽略掉则是永久丢一行，因此默认停下等人处置。请核对两端唯一索引差异；确认可丢弃时把 increment.unique.conflict.policy 设为 IGNORE' },
+            'E3021': { desc: '列布局与源库当前定义不一致', solution: '行事件的列数与源库当前表定义对不上，说明表结构在抽取过程中变更过（链路有延迟时做了 ALTER TABLE 加列/删列）。列清单按当前定义查，硬解会让整行的值与列错位，写进去的是合法值、看不出异常，属于静默数据损坏。请把源库 binlog_row_metadata 设为 FULL（列名随事件一起下发），或等积压追平后再做 DDL' },
+            'E3019': { desc: 'binlog事件反序列化失败', solution: 'binlog 连接器解析不了这个事件，而它的默认行为是跳过——跳过一个行事件就是永久少同步几行且不报错，因此已停止捕获。最常见原因是源库开了 binlog_row_value_options=PARTIAL_JSON（JSON 差量更新，连接器不支持）。请把该参数置空后重启任务；确认这些事件可丢弃时可把 capture.deserialization.failure.policy 设为 SKIP' },
+            'E3020': { desc: '不支持的binlog事件类型', solution: '抽取时遇到不在已知可忽略清单里的事件类型，继续跑等于把它携带的数据静默丢掉。常见来源：源库开了 binlog_transaction_compression（TRANSACTION_PAYLOAD）、binlog_row_value_options=PARTIAL_JSON（PARTIAL_UPDATE_ROWS_EVENT），或源库版本新增了事件类型。请核对错误信息里的类型名与源库参数；确认该类型不带数据时可把 extract.unknown.event.policy 设为 SKIP' },
+            'E3018': { desc: 'XA事务缓冲超限', solution: '源库 XA 事务的行事件在 XA PREPARE 时刻就落 binlog，提交/回滚决议要等 XA COMMIT/ROLLBACK，因此未决分支会被整段缓冲到磁盘，等源库提交了才下发到目标库（否则源库回滚的 XA 会在目标库留下永久幻影行）。现在缓冲量超了配额，说明源库有长期未提交的 XA 分支。请在源库执行 XA RECOVER 排查并提交/回滚；确需更大缓冲时调大 sync.xa.branch.max.bytes / sync.xa.pending.max.bytes / sync.xa.pending.max.branches' },
+            'E3022': { desc: '表结构时序库缺少该位点的版本', solution: '时序库里没有这条事件所在位点的表结构版本，无法按"事件当时"的结构解析。常见原因：任务建于时序库启用之前（缺基线）、该表基线推不出结构被标记不可用（如 CREATE TABLE ... AS SELECT）、跨机接管时时序库没随位点一起回灌。降级回查源库当前定义等于退回"用现在的结构解释过去的事件"，因此在 extract.schema.timeline.fallback=FAIL_STOP 下停止抽取；允许降级时改为 RESNAPSHOT' },
+            'E3023': { desc: 'DDL 解析失败（表结构时序库）', solution: '时序库解析不了这条 DDL，无法把它施加到表结构模型上，该表之后的版本都会失准，通常意味着遇到了语法覆盖之外的 DDL 形态。错误信息里带原始语句，请据此补语法；补齐之前该表按 extract.schema.timeline.fallback 降级回查源库当前定义（RESNAPSHOT）或停止抽取（FAIL_STOP）' },
+            'E3024': { desc: '表结构版本与事件列名不一致', solution: '时序库算出的列布局与 binlog 事件自带的列名（binlog_row_metadata=FULL）对不上，说明时序库跟丢了源库真实结构，多半是某条 DDL 被漏施加或施加错了。事件列名是与行值同一时刻的权威信息，两者矛盾时硬解就是整行错位的静默数据损坏，因此已停止抽取。请对照错误信息里的两份列清单与该表 DDL 历史，把漏掉的形态补进语法' },
+            'E3014': { desc: '位点回灌失败', solution: '本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管；按首次启动去取源库当前位点会静默跳过崩溃到接管之间的全部变更，因此任务停在这里。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务' },
+            'E3101': { desc: 'Elastic同步进程启动失败', solution: '请检查Agent日志，确认elastic模块JAR包存在且配置正确' },
+            'E3102': { desc: 'Elastic同步失败', solution: '请检查Agent日志，确认Elasticsearch连接正常、索引可写且源库binlog可访问' },
             'E4001': { desc: '全量同步失败', solution: '请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常' },
             'E4002': { desc: '全量同步超时', solution: '请检查数据量是否过大，考虑分批同步或优化网络带宽' },
             'E4003': { desc: '目标数据库写入失败', solution: '请检查目标数据库磁盘空间、表结构是否与源库一致、是否有写入权限' },
@@ -2283,7 +2296,31 @@
             const pendingEvents = gaps.pending_events != null ? gaps.pending_events : '-';
             const binlogGap = gaps.binlog_gap != null ? gaps.binlog_gap : '-';
 
-            el.innerHTML = `
+            // agent 不可达时后端会降级读中心位点表。必须显式标出来：这是"几秒前的快照"，
+            // 不是实时值，而 agent 挂掉恰恰是最需要看清"还能不能续、续到哪"的时刻。
+            const degradedBanner = d.degraded ? `
+                <div style="margin-bottom:10px;padding:8px 12px;border-radius:4px;
+                            background:#fffbe6;border:1px solid #ffe58f;color:#874d00;font-size:12px;">
+                    ⚠ agent 不可达，以下位点来自中心库快照（${d.binlog && d.binlog.updatedAt
+                        ? new Date(d.binlog.updatedAt).toLocaleString() : '时间未知'}），
+                    THL/积压等实时项不可用。原因：${d.degradedReason || '-'}
+                </div>` : '';
+
+            // 位点保留期预警：源端日志被清掉之后位点就永久失效、只能重做全量，
+            // 而这件事平时一点征兆都没有——贴边时必须显眼地说出来，此时延长保留期还来得及。
+            const ret = d.retention || {};
+            const retentionBanner = (ret.available && (ret.state === 'WARN' || ret.state === 'LOST')) ? `
+                <div style="margin-bottom:10px;padding:8px 12px;border-radius:4px;
+                            background:${ret.state === 'LOST' ? '#fff1f0' : '#fffbe6'};
+                            border:1px solid ${ret.state === 'LOST' ? '#ffa39e' : '#ffe58f'};
+                            color:${ret.state === 'LOST' ? '#a8071a' : '#874d00'};font-size:12px;">
+                    ${ret.state === 'LOST' ? '✕ 位点已失效' : '⚠ 位点即将失效'}：${ret.detail || ''}
+                    ${ret.state === 'LOST'
+                        ? '<br>源端日志已被清理，需重新初始化全量同步。'
+                        : '<br>建议尽快延长源端日志保留期（binlog_expire_logs_seconds / max_slot_wal_keep_size / 归档保留策略）。'}
+                </div>` : '';
+
+            el.innerHTML = degradedBanner + retentionBanner + `
                 <div class="adv-metric-grid">
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">Binlog 位点</div>
@@ -2333,7 +2370,68 @@
                     <span class="adv-link-arrow">→</span>
                     <div class="adv-link-node ${cp.available ? 'ok' : ''}">checkpoint</div>
                 </div>
+                <div id="ckptHistoryBox" style="margin-top:14px;"></div>
             `;
+            loadCheckpointHistory(d.taskId);
+        }
+
+        // ---- 位点历史 / 重置（PITR）----
+        // 重置是全平台唯一允许位点倒退的入口：任务必须先停下来，且每次重置都会留审计。
+        async function loadCheckpointHistory(taskId) {
+            const box = document.getElementById('ckptHistoryBox');
+            if (!box || !taskId) return;
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/checkpoint/history?limit=20`);
+                if (!resp) return;
+                const rows = await resp.json();
+                if (!Array.isArray(rows) || !rows.length) {
+                    box.innerHTML = '<div style="font-size:12px;color:#999;">位点历史：暂无采样（任务跑满一个采样周期后出现）</div>';
+                    return;
+                }
+                box.innerHTML = `
+                    <div style="font-weight:600;margin-bottom:6px;font-size:13px;">位点历史（可回溯到任一采样点）</div>
+                    <table class="data-table" style="font-size:12px;">
+                        <thead><tr><th>时间</th><th>段</th><th>类型</th><th>位点</th><th>原因</th><th>操作</th></tr></thead>
+                        <tbody>${rows.map(r => `
+                            <tr>
+                                <td>${new Date(r.recordedAt).toLocaleString()}</td>
+                                <td>${r.stage}</td>
+                                <td>${r.reason === 'RESET' ? 'RESET' : r.kind}</td>
+                                <td style="font-family:monospace;">${(r.payload || '').replace(/\n/g, ' ').slice(0, 60)}</td>
+                                <td>${r.reason}${r.operator ? '（' + r.operator + '）' : ''}</td>
+                                <td>${r.reason === 'SAMPLE'
+                                    ? `<button class="btn-test" onclick="resetCheckpointTo('${taskId}','${r.stage}',${r.id})">重置到此</button>`
+                                    : '-'}</td>
+                            </tr>`).join('')}</tbody>
+                    </table>`;
+            } catch (e) {
+                box.innerHTML = `<div style="font-size:12px;color:#999;">位点历史加载失败: ${e.message}</div>`;
+            }
+        }
+
+        async function resetCheckpointTo(taskId, stage, historyId) {
+            if (!confirm('确认把 ' + stage + ' 段的位点重置到该历史点？\n\n'
+                    + '任务必须处于已暂停/已失败状态；重置后下次启动会从该位点重放，'
+                    + '期间的变更会被再次投递（下游按幂等吸收）。此操作会记入审计。')) {
+                return;
+            }
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}/checkpoint/reset`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ stage: stage, target: { type: 'HISTORY_ID', value: historyId } })
+                });
+                if (!resp) return;
+                const data = await resp.json();
+                if (data.success === false) {
+                    alert('重置失败: ' + (data.message || '未知错误'));
+                    return;
+                }
+                alert('位点已重置，任务下次启动时按该位点续传');
+                loadCheckpoint(taskId);
+            } catch (e) {
+                alert('重置失败: ' + e.message);
+            }
         }
 
         // ---- 同步延迟热力图 ----
@@ -3038,6 +3136,7 @@
             cfgRenderFilterList();
             cfgRenderMappingRows();
             cfgRenderExtraList();
+            cfgRefreshRouteExclusion();
         }
 
         // ==================== 分库分表路由（步骤3 的第四个页签） ====================
@@ -3050,6 +3149,80 @@
                 cfgRouteConfig.mode === 'MERGE' ? 'block' : 'none';
             document.getElementById('cfgRouteSplitBody').style.display =
                 cfgRouteConfig.mode === 'SPLIT' ? 'block' : 'none';
+            cfgRefreshRouteExclusion();
+        };
+
+        // 聚合路由已实现的库对：关系库 mysql/pg 任意组合（含异构）、mongodb→mongodb（集合级）、
+        // mysql→elasticsearch（索引级）。Redis 不在其列——它没有表的概念。
+        // 与后端 RouteConfigValidator / 引擎 RoutingConfig 的白名单保持一致。
+        function cfgRouteSupported() {
+            const s = (cfgSourceType || 'mysql').toLowerCase();
+            const t = (cfgTargetType || 'mysql').toLowerCase();
+            const relational = ['mysql', 'postgresql'];
+            return (relational.includes(s) && relational.includes(t))
+                || (s === 'mongodb' && t === 'mongodb')
+                || (s === 'mysql' && t === 'elasticsearch');
+        }
+
+        function cfgHasColumnProcessing() {
+            const nonEmpty = obj => Object.keys(obj || {}).some(k => {
+                const v = obj[k];
+                return Array.isArray(v) ? v.length > 0 : (v && Object.keys(v).length > 0);
+            });
+            return nonEmpty(cfgColumnFilters) || nonEmpty(cfgColumnMappings) || nonEmpty(cfgExtraColumns);
+        }
+
+        /** 在页签顶部插/删一条互斥提示（没有就建，文本为空就移除）。 */
+        function cfgPaneNotice(paneId, text) {
+            const pane = document.getElementById(paneId);
+            if (!pane) return;
+            let el = pane.querySelector('.route-exclusive-notice');
+            if (!text) {
+                if (el) el.remove();
+                return;
+            }
+            if (!el) {
+                el = document.createElement('div');
+                el.className = 'route-exclusive-notice';
+                el.style.cssText = 'padding:8px 10px;margin-bottom:10px;border:1px solid #ffe58f;'
+                    + 'background:#fffbe6;color:#fa8c16;border-radius:4px;font-size:12px;';
+                pane.insertBefore(el, pane.firstChild);
+            }
+            el.textContent = text;
+        }
+
+        /**
+         * 路由页签的可用性联动。
+         *
+         * <p>列处理与路由现已<b>可以叠加</b>（汇聚下 CUSTOM 附加列改为逐行注值、
+         * 列处理规则按表取源库名），只在两者一起用时给一条说明；引擎对不支持路由的仍隐藏页签。
+         */
+        window.cfgRefreshRouteExclusion = function() {
+            const routeBtn = document.getElementById('cfgColTabRouteBtn');
+            const supported = cfgRouteSupported();
+            if (routeBtn) routeBtn.style.display = supported ? '' : 'none';
+            // 只支持路由、不支持列处理的库对（mysql→pg / mysql→es）：把列处理三个页签藏掉，
+            // 第 3 步就只剩路由，不给用户看一堆填了也不生效的输入框
+            const colProcOn = cfgColProcSupported();
+            ['Filter', 'Mapping', 'Extra'].forEach(p => {
+                const btn = document.getElementById('cfgColTab' + p + 'Btn');
+                if (btn) btn.style.display = colProcOn ? '' : 'none';
+            });
+            if (!colProcOn && supported) {
+                cfgSwitchColTabInternal('route');
+            }
+            if (!supported && cfgRouteConfig.mode !== 'NONE') {
+                // 引擎对不支持路由（如 mongodb→mongodb）：清掉残留配置，否则保存/启动会被后端拒
+                cfgRouteConfig = { mode: 'NONE', merge: [], split: [], legs: [] };
+                const sel = document.getElementById('cfgRouteMode');
+                if (sel) sel.value = 'NONE';
+            }
+            const bothOn = supported && cfgRouteConfig.mode !== 'NONE' && cfgHasColumnProcessing();
+            const note = bothOn
+                ? '已同时启用列处理与分库分表路由：汇聚下"自定义附加列"的值按各自来源逐行写入'
+                  + '（不再由建表默认值承载），列名映射对汇入同一张目标表的各源表必须一致。'
+                : '';
+            ['Filter', 'Mapping', 'Extra', 'Route'].forEach(p => cfgPaneNotice('cfgColPane' + p, note));
         };
 
         window.cfgAddMergeRule = function() {
@@ -3163,6 +3336,7 @@
                     : cfgRouteConfig.legs.map((l, i) => row(
                         `${l.nodeId} — ${l.host}:${l.port}`, 'legs', i)).join('');
             }
+            cfgRefreshRouteExclusion();
         }
 
         /** 保存路由配置到后端（校验不过时后端会把原因原样返回）。 */
@@ -3224,13 +3398,20 @@
         window.cfgLoadRouteConfig = cfgLoadRouteConfig;
         // ==================== 分库分表路由结束 ====================
 
-        window.cfgSwitchColTab = function(tab) {
+        /** 只切页签，不回头重算可用性（供 cfgRefreshRouteExclusion 内部调用，避免相互递归）。 */
+        function cfgSwitchColTabInternal(tab) {
             ['filter', 'mapping', 'extra', 'route'].forEach(t => {
                 const btn = document.getElementById('cfgColTab' + t.charAt(0).toUpperCase() + t.slice(1) + 'Btn');
                 const pane = document.getElementById('cfgColPane' + t.charAt(0).toUpperCase() + t.slice(1));
-                btn.className = 'colproc-tab' + (t === tab ? ' active' : '');
-                pane.className = 'colproc-pane' + (t === tab ? ' active' : '');
+                if (btn) btn.className = 'colproc-tab' + (t === tab ? ' active' : '');
+                if (pane) pane.className = 'colproc-pane' + (t === tab ? ' active' : '');
             });
+        }
+
+        window.cfgSwitchColTab = function(tab) {
+            cfgSwitchColTabInternal(tab);
+            // 页签可用性可能在别的页签里被改过（加了过滤条件、改了路由模式），切过来时重算
+            cfgRefreshRouteExclusion();
         }
 
         // 加载表的列信息（带缓存）
@@ -3934,13 +4115,14 @@
             });
         }
 
-        // 向导步骤序列：1连接 2对象 [3列处理] [4账号同步] 5校验。
-        //   mysql→mysql：1→2→3→4→5（含列处理+账号同步）
-        //   pg→pg / mongo→mongo：1→2→3→5（含列处理，无账号同步）
+        // 向导步骤序列：1连接 2对象 [3列处理/路由] [4账号同步] 5校验。
+        //   mysql→mysql：1→2→3→4→5（含列处理+路由+账号同步）
+        //   pg→pg / mongo→mongo：1→2→3→5（含列处理+路由，无账号同步）
+        //   mysql→pg / mysql→es：1→2→3→5（只有路由页签，列处理三页签不适用）
         //   其余库对：1→2→5
         function cfgStepSequence() {
             const seq = [1, 2];
-            if (cfgColProcSupported()) seq.push(3);
+            if (cfgColProcSupported() || cfgRouteSupported()) seq.push(3);
             if (cfgAccountSyncSupported()) seq.push(4);
             seq.push(5);
             return seq;
@@ -4252,8 +4434,14 @@
         }
 
 
-        // 启动前 schema 预检门禁：返回 true=可继续启动，false=中止。
-        // PASS 直接放行；WARNING 提示后由用户确认；FAIL 需明确二次确认强制启动。
+        // 启动前 schema 预检门禁。
+        //
+        // 注意这里只是"提前告诉用户"，**真正的门禁在后端** launchWorkflow 里：
+        // 早先只有这个弹窗，于是调度/依赖/批量启动/集群改派四条自动化路径的拦截率是 0。
+        // 现在 FAIL 必须由调用方显式带 force=true 才放行，所以这里除了"要不要继续"
+        // 还得把"用户是不是明确选择了强制"传回去。
+        //
+        // 返回 {proceed, force}
         async function schemaPrecheckGate(workflowId) {
             let data;
             try {
@@ -4262,16 +4450,16 @@
                 });
                 const j = await resp.json();
                 if (!j.success) {
-                    // 预检自身出错不应硬卡启动，提示后交由用户决定
-                    return confirm('schema 预检未能完成：' + (j.message || '未知错误') + '\n\n仍要启动吗？');
+                    // 预检自身出错不应硬卡启动（后端同样不因此阻断），提示后交由用户决定
+                    return { proceed: confirm('schema 预检未能完成：' + (j.message || '未知错误') + '\n\n仍要启动吗？'), force: false };
                 }
                 data = j.data;
             } catch (e) {
-                return confirm('schema 预检请求异常，仍要启动吗？');
+                return { proceed: confirm('schema 预检请求异常，仍要启动吗？'), force: false };
             }
 
             const overall = data.overall;
-            if (overall === 'PASS') return true;
+            if (overall === 'PASS') return { proceed: true, force: false };
 
             const lines = (data.checks || [])
                 .filter(c => c.status === 'FAIL' || c.status === 'WARNING')
@@ -4279,10 +4467,12 @@
                 .join('\n');
 
             if (overall === 'FAIL') {
-                return confirm(`schema 预检发现严重问题（可能导致同步失败）：\n\n${lines}\n\n确定要忽略并强制启动吗？`);
+                const ok = confirm(`schema 预检发现严重问题（可能导致同步失败）：\n\n${lines}\n\n`
+                    + `确定要忽略并强制启动吗？\n（强制启动会记入审计与预检留档）`);
+                return { proceed: ok, force: ok };
             }
-            // WARNING
-            return confirm(`schema 预检有警告：\n\n${lines}\n\n确定继续启动吗？`);
+            // WARNING：后端不拦，这里只是知情确认
+            return { proceed: confirm(`schema 预检有警告：\n\n${lines}\n\n确定继续启动吗？`), force: false };
         }
 
         async function launchTask() {
@@ -4298,9 +4488,11 @@
 
                 // 启动前 schema 预检：把结构问题（源表缺失、无主键、列处理引用不存在的列、
                 // 目标同名表冲突）挡在启动前。FAIL 需二次确认强制启动，WARNING 提示后可继续。
-                if (!await schemaPrecheckGate(cfgWorkflowId)) return;
+                const gate = await schemaPrecheckGate(cfgWorkflowId);
+                if (!gate.proceed) return;
 
-                const response = await fetchWithAuth(`${API_BASE_URL}/workflows/${cfgWorkflowId}/launch`, {
+                const response = await fetchWithAuth(
+                    `${API_BASE_URL}/workflows/${cfgWorkflowId}/launch${gate.force ? '?force=true' : ''}`, {
                     method: 'POST',
                     headers: getAuthHeaders()
                 });
@@ -5374,10 +5566,20 @@
             
             html += `<div style="background: #fff2f0; padding: 4px 8px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #ffe7e7;">`;
             html += `<span style="color: #999;">#${globalIdx + 1}</span>`;
-            const typeLabel = diffType === 'CONTENT_DIFF' ? '内容差异' : (diffType === 'SOURCE_ONLY' ? '仅源库存在' : (diffType === 'TARGET_ONLY' ? '仅目标库存在' : diffType));
+            const DIFF_TYPE_LABELS = {
+                CONTENT_DIFF: '内容差异', SOURCE_ONLY: '仅源库存在',
+                TARGET_ONLY: '仅目标库存在', WRONG_SHARD: '落在错误的分片'
+            };
+            const typeLabel = DIFF_TYPE_LABELS[diffType] || diffType;
             html += `<span style="background: #f5222d22; color: #f5222d; padding: 0 4px; border-radius: 2px; font-size: 11px;">${typeLabel}</span>`;
             if (pkValue) {
                 html += `<span style="color: #333;">主键: ${pkValue}</span>`;
+            }
+            // 拆分任务：这行实际在哪一片、按分片键本该在哪一片——只给主键的话没法定位
+            if (diff.targetShard) {
+                html += `<span style="color: #999;">所在分片: ${escapeHtml(diff.targetShard)}`
+                     + (diff.expectedShard ? ` → 应在: <b>${escapeHtml(diff.expectedShard)}</b>` : '')
+                     + `</span>`;
             }
             if (diffFields.length > 0) {
                 html += `<span style="color: #fa8c16;">差异字段: ${diffFields.join(', ')}</span>`;

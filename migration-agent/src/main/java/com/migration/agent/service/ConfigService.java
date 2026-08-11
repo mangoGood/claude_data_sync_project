@@ -373,10 +373,6 @@ public class ConfigService {
             }
         }
 
-        // 聚合路由（分库分表汇聚/拆分）：JSON 展开成 route.*，并用引擎的解析器当场校验。
-        // 配置非法直接抛——路由错了就是数据写错地方，不能让任务带着坏规则起来。
-        RouteConfigExpander.expand(props, taskMessage.getRouteConfig(), taskMessage.getRouteNodeId());
-
         String rawSourceType = taskMessage.getSourceType() != null ? taskMessage.getSourceType() : "mysql";
         String targetType = taskMessage.getTargetType() != null ? taskMessage.getTargetType() : "mysql";
         // TiDB 讲 MySQL 协议：驱动、方言、类型映射、全量迁移、增量应用全部与 mysql→mysql 同构，
@@ -390,6 +386,12 @@ public class ConfigService {
         props.setProperty("target.db.type", targetType);
         logger.info("Source database type: {} (flavor={}), Target database type: {}",
                 sourceType, props.getProperty("source.db.flavor"), targetType);
+
+        // 聚合路由（分库分表汇聚/拆分）：JSON 展开成 route.*，并用引擎的解析器当场校验。
+        // 配置非法直接抛——路由错了就是数据写错地方，不能让任务带着坏规则起来。
+        // 必须排在库类型与列处理之后：引擎的 RoutingConfig 要靠 source.db.type/target.db.type
+        // 判引擎对是否支持路由、靠 column.* 判是否与列处理冲突，排在前面这两道校验会全部落空。
+        RouteConfigExpander.expand(props, taskMessage.getRouteConfig(), taskMessage.getRouteNodeId());
 
         // 账号同步（仅 mysql→mysql）：sync.account.enabled 打开后，全量阶段同步存量账号、
         // 增量阶段同步账号管理语句；sync.account.super 决定是否连同超级/管理权限。
@@ -519,6 +521,11 @@ public class ConfigService {
         if (taskMessage.getSubscribeFormat() != null && !taskMessage.getSubscribeFormat().isEmpty()) {
             props.setProperty("subscribe.format", taskMessage.getSubscribeFormat());
         }
+        // Avro（Confluent wire format）需要 Schema Registry 才能拿到 schema id。
+        // 地址是部署环境级的，不随任务走——同一个环境接的就是那一个 registry。
+        writeStringPropFromEnv(props, "subscribe.schema.registry.url", "SUBSCRIBE_SCHEMA_REGISTRY_URL");
+        writeStringPropFromEnv(props, "subscribe.schema.registry.user", "SUBSCRIBE_SCHEMA_REGISTRY_USER");
+        writeStringPropFromEnv(props, "subscribe.schema.registry.password", "SUBSCRIBE_SCHEMA_REGISTRY_PASSWORD");
 
         props.setProperty("subscribe.thl.dir", "files/" + taskId + "/thl_output");
 
@@ -646,6 +653,25 @@ public class ConfigService {
         // 订阅侧事务标记 topic（BEGIN/END），供下游重组源事务
         writeEnumPropFromEnv(props, "subscribe.transaction.topic.enabled",
                 "SUBSCRIBE_TRANSACTION_TOPIC_ENABLED", "true", "false");
+
+        // 传输层加密（agent 级开关，随任务 config 下发）。默认不写 = DISABLED（历史行为，明文）。
+        // 全仓此前 34 处硬编码 useSSL=false 且没有任何 SSL 配置项——凭证与 THL 都能加密，
+        // 唯独真正流动的业务数据在网络上是明文的。
+        writeEnumPropFromEnv(props, "source.db.ssl.mode", "SOURCE_DB_SSL_MODE",
+                "DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY");
+        writeEnumPropFromEnv(props, "target.db.ssl.mode", "TARGET_DB_SSL_MODE",
+                "DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY");
+        // 非主键唯一键冲突的处置（默认 FAIL_STOP：忽略它就是永久丢一行）
+        writeEnumPropFromEnv(props, "increment.unique.conflict.policy",
+                "INCREMENT_UNIQUE_CONFLICT_POLICY", "FAIL_STOP", "IGNORE");
+        // 无主键表的行定位（默认 LIMIT_ONE：整行 WHERE 会命中所有重复行）
+        writeEnumPropFromEnv(props, "increment.nopk.row.match",
+                "INCREMENT_NOPK_ROW_MATCH", "LIMIT_ONE", "ALL_MATCHING");
+
+        // 库级破坏性 DDL（DROP/ALTER DATABASE）的处置。默认 BLOCK——实测源端一条
+        // DROP DATABASE 会被原样打到目标实例、把整个目标库连同无关表删光。灾备任务强制 BLOCK。
+        writeEnumPropFromEnv(props, "schema.ddl.destructive.policy",
+                "SCHEMA_DDL_DESTRUCTIVE_POLICY", "BLOCK", "ALLOW");
 
         // 转换失败（毒事件）处置策略：默认 FAIL_STOP（停下等人裁决），
         // DEAD_LETTER 让此类事件写死信后自动跳过（愿意用少量丢弃换不中断）。
@@ -853,6 +879,20 @@ public class ConfigService {
         return id;
     }
 
+    /**
+     * 从环境变量/系统属性读取字符串写入 props（未设则不写）。
+     *
+     * <p>值可能是口令（Schema Registry 的 basic auth），所以<b>只记键名不记值</b>——
+     * config.properties 里的口令由 CredentialCipher 负责加密，日志里不该再泄一遍。
+     */
+    private void writeStringPropFromEnv(java.util.Properties props, String key, String envName) {
+        String v = System.getenv(envName);
+        if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);
+        if (v == null || v.trim().isEmpty()) return;
+        props.setProperty(key, v.trim());
+        logger.info("引擎参数已写入配置: {}（值不记录）", key);
+    }
+
     /** 从环境变量/系统属性读取整数写入 props（未设或非法则不写，保持子进程默认）。 */
     private void writeIntPropFromEnv(java.util.Properties props, String key, String envName) {
         String v = System.getenv(envName);
@@ -1001,6 +1041,7 @@ public class ConfigService {
      * 该表由 backend 的 JPA ddl-auto 建/改表结构，agent 侧只读），把配额转换为具体的执行层限制：
      * <ul>
      *   <li>{@code increment.rate.limit.rows.per.sec} = max_increment_rows_per_sec（增量应用限速）；</li>
+     *   <li>{@code migration.full.rate.limit.rows.per.sec} = max_full_sync_rows_per_sec（全量装载限速）；</li>
      *   <li>{@code migration.full.parallelism} = min(工程默认值, max_full_sync_concurrent_tables)
      *       ——配额只降不升，不会绕过/超过工程默认的全量并行度。</li>
      * </ul>
@@ -1014,8 +1055,8 @@ public class ConfigService {
 
         try (Connection conn = DriverManager.getConnection(url, agentConfig.getMysqlDbUser(), agentConfig.getMysqlDbPassword());
              PreparedStatement ps = conn.prepareStatement(
-                     "SELECT max_increment_rows_per_sec, max_full_sync_concurrent_tables " +
-                     "FROM resource_quotas WHERE user_id = ?")) {
+                     "SELECT max_increment_rows_per_sec, max_full_sync_concurrent_tables, " +
+                     "max_full_sync_rows_per_sec FROM resource_quotas WHERE user_id = ?")) {
             ps.setLong(1, userId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) {
@@ -1026,6 +1067,13 @@ public class ConfigService {
                 if (!rs.wasNull() && rowsPerSec > 0) {
                     props.setProperty("increment.rate.limit.rows.per.sec", String.valueOf(rowsPerSec));
                     logger.info("配额限速已下发: userId={}, 增量限速 {} 行/秒", userId, rowsPerSec);
+                }
+                // 全量装载限速。第 5 批把全量提到 38K 行/秒之后，"没有阀门"本身成了风险：
+                // 一个没人看着的全量任务可以把源库 IO 打满。
+                int fullRowsPerSec = rs.getInt("max_full_sync_rows_per_sec");
+                if (!rs.wasNull() && fullRowsPerSec > 0) {
+                    props.setProperty("migration.full.rate.limit.rows.per.sec", String.valueOf(fullRowsPerSec));
+                    logger.info("配额限速已下发: userId={}, 全量限速 {} 行/秒", userId, fullRowsPerSec);
                 }
                 int maxTables = rs.getInt("max_full_sync_concurrent_tables");
                 if (!rs.wasNull() && maxTables > 0) {

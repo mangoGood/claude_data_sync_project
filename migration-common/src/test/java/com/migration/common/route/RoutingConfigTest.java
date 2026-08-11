@@ -233,4 +233,94 @@ class RoutingConfigTest {
         assertFalse(config.isValid());
         assertTrue(config.getErrors().get(0).contains("ghost"));
     }
+
+    // ==================== 适用范围拦截 ====================
+
+    private static Properties mergePropsWith(String... kv) {
+        Properties p = mergeProps();
+        for (int i = 0; i < kv.length; i += 2) {
+            p.setProperty(kv[i], kv[i + 1]);
+        }
+        return p;
+    }
+
+    private static String errorsOf(Properties p) {
+        RoutingConfig config = RoutingConfig.loadFromProperties(p);
+        assertFalse(config.isValid(), "应判为非法配置");
+        return String.join("; ", config.getErrors());
+    }
+
+    @Test
+    @DisplayName("同构 mysql→mysql / pg→pg：放行")
+    void homogeneousPairsAllowed() {
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "mysql", "target.db.type", "mysql")).isValid());
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "postgresql", "target.db.type", "postgresql")).isValid());
+    }
+
+    @Test
+    @DisplayName("mongo↔mongo 与 mysql→es：放行（各自引擎按集合/索引实现同一套规则）")
+    void documentEnginesAllowed() {
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "mongodb", "target.db.type", "mongodb")).isValid());
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "mysql", "target.db.type", "elasticsearch")).isValid());
+    }
+
+    @Test
+    @DisplayName("Redis：拒绝——没有表的概念，汇聚/拆分不是分库分表那回事")
+    void redisRejected() {
+        assertTrue(errorsOf(mergePropsWith("source.db.type", "redis", "target.db.type", "redis"))
+                .contains("Redis"));
+    }
+
+    @Test
+    @DisplayName("异构关系库对 mysql↔pg：放行（来源标识列进得了翻译器产出的 DDL）")
+    void heterogeneousRelationalAllowed() {
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "mysql", "target.db.type", "postgresql")).isValid());
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "postgresql", "target.db.type", "mysql")).isValid());
+    }
+
+    @Test
+    @DisplayName("Oracle 与不成对的文档型库对：拒绝")
+    void unsupportedPairsRejected() {
+        assertTrue(errorsOf(mergePropsWith("source.db.type", "oracle", "target.db.type", "oracle"))
+                .contains("upsert"));
+        assertTrue(errorsOf(mergePropsWith("source.db.type", "mongodb", "target.db.type", "mysql"))
+                .contains("mongodb→mysql"));
+    }
+
+    @Test
+    @DisplayName("库类型缺失：不判——单测与直驱场景不下发库类型，把\"没声明\"当\"不支持\"会误伤")
+    void missingDbTypeIsNotJudged() {
+        assertTrue(RoutingConfig.loadFromProperties(mergeProps()).isValid());
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith("source.db.type", "mysql")).isValid());
+    }
+
+    @Test
+    @DisplayName("叠加列处理：放行（列处理规则已按表取源库名，两者可以同时用）")
+    void columnProcessingCanCoexist() {
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "mysql", "target.db.type", "mysql",
+                "column.filter.shard_db_1.order_001", "amount|<|100")).isValid());
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "mysql", "target.db.type", "mysql",
+                "column.mapping.db.t", "a:b")).isValid());
+        assertTrue(RoutingConfig.loadFromProperties(mergePropsWith(
+                "source.db.type", "mysql", "target.db.type", "mysql",
+                "column.extra.db.t", "c:CUSTOM:src")).isValid());
+    }
+
+    @Test
+    @DisplayName("route.mode=NONE 时不做任何适用性判断：1:1 任务配了列处理照常跑")
+    void noneModeSkipsApplicabilityChecks() {
+        Properties p = new Properties();
+        p.setProperty("source.db.type", "mongodb");
+        p.setProperty("target.db.type", "mongodb");
+        p.setProperty("column.filter.db.t", "a|<|1");
+        assertTrue(RoutingConfig.loadFromProperties(p).isValid());
+    }
 }

@@ -122,4 +122,74 @@ class RouteCompareSupportTest {
         assertFalse(RouteCompareSupport.matches("db1.t1", "db1x", "t1"));
         assertTrue(RouteCompareSupport.matches("regex:shard_db_\\d+\\.order_\\d{3}", "shard_db_7", "order_042"));
     }
+
+    // ==================== 内容对比：按分片键重算落点 ====================
+
+    @Test
+    @DisplayName("哈希取模：与引擎侧同口径（整数按数值取模）")
+    void hashModShardOf() {
+        RouteCompareSupport.SplitTargets t = RouteCompareSupport.splitTargetsOf(SPLIT, "app", "orders", "dw");
+        assertEquals("user_id", t.shardKeyColumn);
+        assertEquals(5, t.shardOf(5L));
+        assertEquals(1, t.shardOf(9L));
+        assertEquals(0, t.shardOf(0L));
+    }
+
+    @Test
+    @DisplayName("值的表示形式不同不能算到不同分片——这正是错片误报的来源")
+    void hashModIsStableAcrossRepresentations() {
+        RouteCompareSupport.SplitTargets t = RouteCompareSupport.splitTargetsOf(SPLIT, "app", "orders", "dw");
+        Integer expected = t.shardOf(5L);
+        // 对比读的是 JDBC 返回值，修复读的是 JSON（gson 把数字解成 Double）——都要落到同一片
+        assertEquals(expected, t.shardOf(5));
+        assertEquals(expected, t.shardOf("5"));
+        assertEquals(expected, t.shardOf(java.math.BigInteger.valueOf(5)));
+        assertEquals(expected, t.shardOf(new java.math.BigDecimal("5.00")));
+        assertEquals(expected, t.shardOf(5.0d));
+    }
+
+    @Test
+    @DisplayName("字符串分片键走 CRC32（不是 String#hashCode）")
+    void stringShardKeyUsesCrc32() {
+        String json = "{\"mode\":\"SPLIT\",\"split\":[{\"match\":\"app.orders\",\"shardKey\":\"code\","
+                + "\"algo\":\"HASH_MOD\",\"count\":4,\"targetTable\":\"orders_${shard}\"}]}";
+        RouteCompareSupport.SplitTargets t = RouteCompareSupport.splitTargetsOf(json, "app", "orders", "dw");
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update("ab-1".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals((int) (crc.getValue() % 4), t.shardOf("ab-1"));
+    }
+
+    @Test
+    @DisplayName("RANGE 左闭右开；落在区间外返回 null（算不出落点，不硬判成错片）")
+    void rangeShardOf() {
+        String json = "{\"mode\":\"SPLIT\",\"split\":[{\"match\":\"app.orders\",\"shardKey\":\"amount\","
+                + "\"algo\":\"RANGE\",\"range\":\"0:100,100:1000\",\"targetTable\":\"orders_${shard}\"}]}";
+        RouteCompareSupport.SplitTargets t = RouteCompareSupport.splitTargetsOf(json, "app", "orders", "dw");
+        assertEquals(0, t.shardOf(0));
+        assertEquals(0, t.shardOf(99));
+        assertEquals(1, t.shardOf(100));
+        assertNull(t.shardOf(5000));
+        assertNull(t.shardOf(null));
+    }
+
+    @Test
+    @DisplayName("LIST 按枚举表，大小写回退（与引擎侧一致）")
+    void listShardOf() {
+        String json = "{\"mode\":\"SPLIT\",\"split\":[{\"match\":\"app.orders\",\"shardKey\":\"country\","
+                + "\"algo\":\"LIST\",\"list\":\"CN:0,US:1,JP:2\",\"targetTable\":\"orders_${shard}\"}]}";
+        RouteCompareSupport.SplitTargets t = RouteCompareSupport.splitTargetsOf(json, "app", "orders", "dw");
+        assertEquals(1, t.shardOf("US"));
+        assertEquals(2, t.shardOf("jp"));
+        assertNull(t.shardOf("KR"));
+    }
+
+    @Test
+    @DisplayName("跨实例拆分被标出来：对比只有一条目标连接，够不着别的实例")
+    void crossInstanceSplitFlagged() {
+        String json = "{\"mode\":\"SPLIT\",\"split\":[{\"match\":\"app.orders\",\"shardKey\":\"user_id\","
+                + "\"algo\":\"HASH_MOD\",\"count\":2,\"targetGroup\":\"g1\",\"targetNode\":\"${shard}\","
+                + "\"targetTable\":\"orders_${shard}\"}]}";
+        assertTrue(RouteCompareSupport.splitTargetsOf(json, "app", "orders", "dw").crossInstance);
+        assertFalse(RouteCompareSupport.splitTargetsOf(SPLIT, "app", "orders", "dw").crossInstance);
+    }
 }

@@ -65,6 +65,15 @@ public class SchemaMigration {
                 || ("postgresql".equalsIgnoreCase(src) && "postgresql".equalsIgnoreCase(tgt));
     }
 
+    /**
+     * 列处理规则的源库 key：<b>按表取</b>。汇聚一条通道要搬多个源库，
+     * 连接上的 database 只有一个，拿它当 key 会让其余源库的规则静默失效。
+     */
+    private String columnProcessingDbOf(TableInfo table) {
+        String srcDb = table.getSourceDatabase();
+        return srcDb != null && !srcDb.isEmpty() ? srcDb : sourceConnection.getConfig().getDatabase();
+    }
+
     public void migrateAllTables(List<TableInfo> tables) throws SQLException {
         logger.info("开始迁移表结构，共 {} 个表", tables.size());
 
@@ -178,16 +187,24 @@ public class SchemaMigration {
      * 逐分片改名 + <b>剥掉 AUTO_INCREMENT</b>（每片各自发号必然撞主键）。
      */
     private void createShardTables(TableInfo table) throws SQLException {
-        String createSql = table.getCreateSql();
-        if (createSql == null || createSql.isEmpty()) {
-            throw new SQLException("表 " + table.getTableName() + " 没有建表语句，无法预建分片表");
+        String createSql;
+        if (!translator.isHomogeneous()) {
+            // 异构库对：源端建表语句用不了（方言不同，Oracle 源甚至根本没有），
+            // 与 1:1 异构建表走同一个翻译器产出目标方言 DDL，再逐分片改名
+            createSql = translator.generateCreateTable(table, targetDialect);
+        } else {
+            createSql = table.getCreateSql();
+            if (createSql == null || createSql.isEmpty()) {
+                throw new SQLException("表 " + table.getTableName() + " 没有建表语句，无法预建分片表");
+            }
+            createSql = cleanCreateSql(createSql);
+            if (columnProcessingApplicable()) {
+                String srcDb = columnProcessingDbOf(table);
+                createSql = rewriteColumnNamesInCreateSql(createSql, srcDb, table.getTableName());
+                createSql = appendExtraColumnsToCreateSql(createSql, srcDb, table.getTableName());
+            }
         }
-        createSql = cleanCreateSql(createSql);
-        if (columnProcessingApplicable()) {
-            String srcDb = sourceConnection.getConfig().getDatabase();
-            createSql = rewriteColumnNamesInCreateSql(createSql, srcDb, table.getTableName());
-            createSql = appendExtraColumnsToCreateSql(createSql, srcDb, table.getTableName());
-        }
+        // 异构翻译器本身就不会产出自增属性（PG 侧不生成 SERIAL），这一步对它是空操作
         createSql = com.migration.common.route.SplitDdlRewriter.stripAutoIncrement(createSql);
 
         java.util.Set<String> ensuredDbs = new java.util.HashSet<>();
@@ -278,8 +295,11 @@ public class SchemaMigration {
         if (targetIsPostgresql && (schema == null || schema.isEmpty())) {
             schema = "public";
         }
+        // catalog 必须显式给：留 null 时 MySQL 会把<b>所有库里</b>同名表的列都返回，
+        // 别的库里恰好有张同名表就能让这道 fail-stop 校验静默通过（实测拿到了 5 个库的列并集）
+        String catalog = targetIsPostgresql ? null : mergeTargetCatalog(table);
         try (java.sql.ResultSet cols = targetConnection.getConnection().getMetaData()
-                .getColumns(null, schema, targetTable, null)) {
+                .getColumns(catalog, schema, targetTable, null)) {
             while (cols.next()) {
                 targetColumns.add(cols.getString("COLUMN_NAME").toLowerCase());
             }
@@ -288,19 +308,47 @@ public class SchemaMigration {
             logger.warn("汇聚目标表 {} 未读到列信息，跳过结构一致性校验", targetTable);
             return;
         }
+        // 比对的是<b>映射后</b>的列名：配了列名映射时目标表建的就是映射后的名字，
+        // 拿源列名去比会把每一个映射列都报成"缺失"，报错和真实原因完全对不上
+        boolean mapped = columnProcessingApplicable();
+        String srcDb = columnProcessingDbOf(table);
         java.util.List<String> missing = new java.util.ArrayList<>();
         for (com.migration.model.ColumnInfo col : table.getColumns()) {
-            if (!targetColumns.contains(col.getColumnName().toLowerCase())) {
-                missing.add(col.getColumnName());
+            String targetName = mapped
+                    ? columnProcessing.mapColumn(srcDb, table.getTableName(), col.getColumnName())
+                    : col.getColumnName();
+            if (!targetColumns.contains(targetName.toLowerCase())) {
+                missing.add(mapped && !targetName.equals(col.getColumnName())
+                        ? col.getColumnName() + "→" + targetName : col.getColumnName());
+            }
+        }
+        // 附加列同样要在目标表上存在：汇聚下 CUSTOM 列由 DML 逐行注值，列不在就是写入直接失败
+        if (mapped) {
+            for (com.migration.config.ColumnProcessingConfig.ExtraColumn extra
+                    : columnProcessing.getExtraColumns(srcDb, table.getTableName())) {
+                if (!targetColumns.contains(extra.name.toLowerCase())) {
+                    missing.add(extra.name + "（附加列）");
+                }
             }
         }
         if (!missing.isEmpty()) {
             throw new SQLException("汇聚结构不一致：源表 " + table.getSourceDatabase() + "."
                     + table.getTableName() + " 的列 " + missing + " 在目标表 " + targetTable
-                    + " 上不存在，这些列的数据会整列丢失");
+                    + " 上不存在，这些列的数据会整列丢失"
+                    + (mapped ? "；配了列名映射时，汇入同一张目标表的各源表映射结果必须一致" : ""));
         }
         logger.info("汇聚结构一致性校验通过: {}.{} -> {}",
                 table.getSourceDatabase(), table.getTableName(), targetTable);
+    }
+
+    /** 汇聚目标表所在的库（MySQL 的 catalog）：路由指定的目标库优先，其次目标连接所在库。 */
+    private String mergeTargetCatalog(TableInfo table) {
+        String db = table.getTargetDatabase();
+        if (db != null && !db.isEmpty()) {
+            return db;
+        }
+        String connDb = targetConnection.getConfig().getDatabase();
+        return connDb != null && !connDb.isEmpty() ? connDb : null;
     }
 
     private void dropTableIfExists(String tableName) throws SQLException {
@@ -315,6 +363,11 @@ public class SchemaMigration {
         // 异构迁移：按源→目标库对的翻译器生成目标建表 SQL
         if (!translator.isHomogeneous()) {
             String createSql = translator.generateCreateTable(table, targetDialect);
+            // 汇聚的来源标识列这里也要追加。此前这条分支直接 return，异构库对下目标表根本
+            // 没有这几列，跑到写数据才报 Unknown column——报的还是个跟原因无关的列名。
+            // 翻译器产出的语句形态与同构路径一致（CREATE TABLE x (\n 列...,\n PRIMARY KEY (..)\n)），
+            // 同一套改写对两边都成立
+            createSql = applyMergeTagColumns(createSql, table);
             logger.debug("跨库生成建表SQL: {}", createSql);
             targetConnection.execute(createSql);
             logger.debug("已创建表: {}", table.getTableName());
@@ -331,9 +384,10 @@ public class SchemaMigration {
         createSql = cleanCreateSql(createSql);
         createSql = renameTableInCreateSql(createSql, table.getTableName(), table.getTargetTableName());
         if (columnProcessingApplicable()) {
-            String srcDb = sourceConnection.getConfig().getDatabase();
+            String srcDb = columnProcessingDbOf(table);
             createSql = rewriteColumnNamesInCreateSql(createSql, srcDb, table.getTableName());
-            createSql = appendExtraColumnsToCreateSql(createSql, srcDb, table.getTableName());
+            createSql = appendExtraColumnsToCreateSql(createSql, srcDb, table.getTableName(),
+                    isMergeTable(table));
         }
         createSql = applyMergeTagColumns(createSql, table);
         targetConnection.execute(createSql);
@@ -401,6 +455,16 @@ public class SchemaMigration {
      * CUSTOM 为常量 DEFAULT '输入值@源库@源表'，全量与增量 INSERT 均无需注值。
      */
     private String appendExtraColumnsToCreateSql(String createSql, String srcDb, String srcTable) {
+        return appendExtraColumnsToCreateSql(createSql, srcDb, srcTable, false);
+    }
+
+    /**
+     * @param mergeTarget 目标表是汇聚表：CUSTOM 附加列<b>不带 DEFAULT</b>（值由 DML 逐行注）。
+     *                    合并表只由第一个来源建出来，DEFAULT 里烤的是那一个来源的库表名，
+     *                    其余来源的行会全带上错的来源标识——而标识来源正是这个列存在的理由。
+     */
+    private String appendExtraColumnsToCreateSql(String createSql, String srcDb, String srcTable,
+                                                 boolean mergeTarget) {
         java.util.List<com.migration.config.ColumnProcessingConfig.ExtraColumn> extraColumns =
                 columnProcessing.getExtraColumns(srcDb, srcTable);
         if (extraColumns.isEmpty()) {
@@ -417,7 +481,11 @@ public class SchemaMigration {
         }
         StringBuilder defs = new StringBuilder();
         for (com.migration.config.ColumnProcessingConfig.ExtraColumn extra : extraColumns) {
-            defs.append(",\n  ").append(extra.toColumnDef(srcDb, srcTable, targetIsPostgresql));
+            boolean perRow = mergeTarget
+                    && extra.kind == com.migration.config.ColumnProcessingConfig.ExtraColumnKind.CUSTOM;
+            defs.append(",\n  ").append(perRow
+                    ? extra.toColumnDefWithoutDefault(targetIsPostgresql)
+                    : extra.toColumnDef(srcDb, srcTable, targetIsPostgresql));
         }
         logger.info("附加列已加入建表语句: {}.{} 共 {} 列", srcDb, srcTable, extraColumns.size());
         return createSql.substring(0, closeIdx) + defs + createSql.substring(closeIdx);

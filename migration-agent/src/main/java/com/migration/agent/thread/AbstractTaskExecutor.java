@@ -1,5 +1,6 @@
 package com.migration.agent.thread;
 
+import com.migration.agent.checkpoint.CheckpointHydrator;
 import com.migration.agent.checkpoint.CheckpointManager;
 import com.migration.agent.checkpoint.CheckpointManager.BinlogPositionInfo;
 import com.migration.agent.manager.ProcessManager;
@@ -105,6 +106,16 @@ public abstract class AbstractTaskExecutor implements Runnable {
         MetricsService.TaskMetrics taskMetrics = MetricsService.getInstance().getOrCreateTaskMetrics(taskId);
 
         try {
+            // 位点回灌必须在<b>任何</b>子进程拉起之前，且要覆盖每一种执行器：
+            // Mongo/ES/Redis 这些单进程链路根本不走 initCheckpoint()，
+            // 只在那里挂钩会让它们在跨机接管时悄悄从"源库当前位点"重来。
+            // 放在 try 内是为了让 finally 照常收尾（MDC 不清会串到线程池里的下一个任务）。
+            if (!hydrateCheckpoint(threadName)) {
+                stopped.set(true);
+                return;
+            }
+            hydrateFullProgress(threadName);
+
             doRun();
 
             // 进入持续监控循环（由子类控制是否进入）
@@ -437,6 +448,12 @@ public abstract class AbstractTaskExecutor implements Runnable {
         String threadName = "TaskExecutor-" + taskId;
         logger.info("[{}] 初始化 checkpoint, sourceType={}", threadName, sourceType);
 
+        // 回灌已在 run() 里做过（覆盖全部执行器）；这里再判一次是为了那些绕过 run()
+        // 直接调 initCheckpoint 的路径（恢复流程、单测），重复调用返回 NOT_NEEDED，无副作用。
+        if (!hydrateCheckpoint(threadName)) {
+            return false;
+        }
+
         if ("postgresql".equals(sourceType)) {
             return initPostgresCheckpoint(threadName);
         } else if ("oracle".equals(sourceType)) {
@@ -444,6 +461,119 @@ public abstract class AbstractTaskExecutor implements Runnable {
         } else {
             return initMysqlCheckpoint(threadName);
         }
+    }
+
+    /**
+     * 回灌中心位点：本地没有位点、而中心库有，说明这是<b>跨机接管</b>，必须先把位点灌回本地
+     * 再让下面的 {@code initXxxCheckpoint} 走"发现已存在 checkpoint"的分支。
+     *
+     * <p>不灌会怎样：接管方 {@code loadCheckpoint()} 返回 null → 去取"源库此刻的位点" →
+     * 崩溃到接管之间的全部变更被跳过，不报错、不告警、进度条 100%。故障转移越成功丢得越干净。
+     *
+     * @return false 表示必须 fail-stop（宁可任务起不来，也不能静默丢一段数据）
+     */
+    private boolean hydrateCheckpoint(String threadName) {
+        CheckpointHydrator hydrator = CheckpointHydrator.getInstance();
+        if (hydrator == null) {
+            return true;   // 中心位点未启用：回到本地位点的老行为
+        }
+        CheckpointHydrator.Result result = hydrator.hydrate(taskId);
+        if (result == CheckpointHydrator.Result.FAILED) {
+            // 措辞里必须留下"位点回灌失败"这几个字：SyncErrorCodeMapper 按关键词映射成 E3014，
+            // 前端才认得出这条错误并给出"检查元数据库连通性"的处置建议
+            String detail = "位点回灌失败：本地无位点且无法从中心库回灌，"
+                    + "拒绝按首次启动取源库当前位点（那会跳过崩溃到接管之间的全部变更）";
+            logger.error("[{}] {}", threadName, detail);
+            sendStatus("FAILED", detail, 0);
+            return false;
+        }
+        logger.info("[{}] 中心位点回灌判定: {}", threadName, result);
+        return true;
+    }
+
+    /**
+     * 全量表级断点的回灌。
+     *
+     * <p>与位点回灌的区别：位点灌不上必须 fail-stop（会静默丢数据），
+     * 全量断点灌不上只是<b>慢</b>——退回"整个全量重做"，数据仍然正确。
+     * 所以这里绝不阻断启动，失败只留一行日志。
+     */
+    private void hydrateFullProgress(String threadName) {
+        com.migration.agent.checkpoint.FullProgressStore store =
+                com.migration.agent.checkpoint.FullProgressStoreHolder.get();
+        if (store == null) {
+            return;
+        }
+        try {
+            int n = store.hydrate(taskId);
+            if (n > 0) {
+                logger.info("[{}] 已回灌全量表级断点 {} 条", threadName, n);
+            }
+        } catch (Exception e) {
+            logger.warn("[{}] 全量断点回灌异常（退回整段重做，数据仍正确）: {}", threadName, e.getMessage());
+        }
+    }
+
+    /**
+     * 首启位点<b>立刻</b>进中心库，不等上卷那一拍。
+     *
+     * <p>否则留下一个几秒的窗口：任务刚起来还没上卷就崩了、又被别的 agent 接管，
+     * 中心库里没有这条任务的任何行，接管方判成"真·首启"，再取一次源库当前位点——
+     * 这几秒里的变更就这么没了。
+     */
+    private void publishInitialPosition(BinlogPositionInfo position) {
+        CheckpointHydrator hydrator = CheckpointHydrator.getInstance();
+        if (hydrator == null || position == null) {
+            return;
+        }
+        try {
+            hydrator.publishInitialPosition(taskId, sourceType,
+                    position.getFilename(), position.getPosition(), position.getGtid());
+        } catch (Exception e) {
+            logger.warn("[{}] 首启位点写入中心库失败（不阻断启动）: {}", taskId, e.getMessage());
+        }
+    }
+
+    /**
+     * "取源库当前位点"这条路的最后一道门禁。
+     *
+     * <p>本地没有 checkpoint 有两种可能：<b>真首启</b>（该取源库当前位点）和
+     * <b>跨机接管但回灌没生效</b>（取了就等于跳过崩溃到接管之间的全部变更）。
+     * 两者在本地看起来一模一样，唯一能分辨的证据在中心库：那里有行 = 这条任务此前跑过。
+     *
+     * <p>所以这里不信任上游任何判断，直接问中心库。回灌逻辑再出 bug，
+     * 也不会从这条路上悄悄丢一段数据——最坏是任务停在 E3014 等人来看。
+     *
+     * @return false 表示必须 fail-stop
+     */
+    private boolean assertFirstStartAllowed(String threadName) {
+        CheckpointHydrator hydrator = CheckpointHydrator.getInstance();
+        if (hydrator == null) {
+            return true;   // 中心位点未启用：没有别的证据可用，回到老行为
+        }
+        boolean centralHasRows;
+        try {
+            centralHasRows = hydrator.hasCentralPosition(taskId);
+        } catch (Exception e) {
+            if (!hydrator.isFailStop()) {
+                logger.warn("[{}] 无法确认中心库是否已有位点，按首启继续（fail-stop 已关）: {}",
+                        threadName, e.getMessage());
+                return true;
+            }
+            String detail = "位点回灌失败：本地无 checkpoint，又读不到中心库，判不出这是首次启动还是跨机接管，"
+                    + "拒绝按首次启动取源库当前位点";
+            logger.error("[{}] {}", threadName, detail);
+            sendStatus("FAILED", detail, 0);
+            return false;
+        }
+        if (!centralHasRows) {
+            return true;   // 中心库确认没有这条任务：真首启
+        }
+        String detail = "位点回灌失败：中心库已存在该任务的位点，但本地没有 checkpoint 且回灌未生效；"
+                + "此时取源库当前位点会跳过崩溃到接管之间的全部变更，因此停止启动";
+        logger.error("[{}] {}", threadName, detail);
+        sendStatus("FAILED", detail, 0);
+        return false;
     }
 
     protected boolean initMysqlCheckpoint(String threadName) {
@@ -459,6 +589,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 logger.info("[{}] 发现已存在的 checkpoint: {}", threadName, existingCheckpoint);
             } else {
                 logger.info("[{}] 未找到 checkpoint，从源数据库获取当前位点", threadName);
+                if (!assertFirstStartAllowed(threadName)) {
+                    return false;
+                }
                 String[] sourceCreds = getSourceCredentials(threadName);
                 String sourceHost = sourceCreds[0];
                 int sourcePort = Integer.parseInt(sourceCreds[1]);
@@ -476,6 +609,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前位点作为 checkpoint: {}", threadName, currentPosition);
+                publishInitialPosition(currentPosition);
             }
 
             updateCheckpointConfig(checkpointToUse);
@@ -504,6 +638,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 logger.info("[{}] 发现已存在的 PostgreSQL checkpoint: {}", threadName, existingCheckpoint);
             } else {
                 logger.info("[{}] 未找到 checkpoint，从 PostgreSQL 源数据库获取当前 WAL LSN", threadName);
+                if (!assertFirstStartAllowed(threadName)) {
+                    return false;
+                }
                 String[] sourceCreds = getSourceCredentials(threadName);
                 String sourceHost = sourceCreds[0];
                 int sourcePort = Integer.parseInt(sourceCreds[1]);
@@ -521,6 +658,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前 PostgreSQL WAL LSN 作为 checkpoint: {}", threadName, currentPosition);
+                publishInitialPosition(currentPosition);
             }
 
             updateCheckpointConfig(checkpointToUse);
@@ -549,6 +687,9 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 logger.info("[{}] 发现已存在的 Oracle checkpoint: {}", threadName, existingCheckpoint);
             } else {
                 logger.info("[{}] 未找到 checkpoint，从 Oracle 源数据库获取当前 SCN", threadName);
+                if (!assertFirstStartAllowed(threadName)) {
+                    return false;
+                }
                 String[] sourceCreds = getSourceCredentials(threadName);
                 String sourceHost = sourceCreds[0];
                 int sourcePort = Integer.parseInt(sourceCreds[1]);
@@ -567,6 +708,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前 Oracle SCN 作为 checkpoint: {}", threadName, currentPosition);
+                publishInitialPosition(currentPosition);
             }
 
             updateCheckpointConfig(checkpointToUse);
@@ -876,6 +1018,7 @@ public abstract class AbstractTaskExecutor implements Runnable {
 
         try {
             fullMonitorDone.set(false);
+            markFullRunning(true);
             fullProcess = new ProcessManager(config.getMigrationFullJarPath(), "MigrationFull-" + taskId);
             fullProcess.setTaskId(taskId);
             fullProcess.start();
@@ -917,6 +1060,35 @@ public abstract class AbstractTaskExecutor implements Runnable {
             sendStatus("FAILED", "全量迁移执行异常: " + e.getMessage(), 0);
             stopped.set(true);
             return false;
+        } finally {
+            markFullRunning(false);
+        }
+    }
+
+    /**
+     * "全量正在跑"的带外标记（{@code files/<taskId>/full_running}）。
+     *
+     * <p>唯一的用途是让 extract 在全量期间<b>不要对 capture 施加背压</b>。背压的判据是
+     * THL 积压文件数，而全量期间 increment 按设计还没起、THL 本来就该越堆越多——
+     * 让它去暂停 capture 是把"没有消费者"误判成"消费不过来"。真暂停了，源库 binlog
+     * 会继续前进而 capture 的位点原地不动，长全量下有被 purge 掉的风险
+     * （capture 启动时的 verifyBinlogFileRetained 拦的正是这一类）。
+     *
+     * <p>用文件而不是配置项：capture/extract 是独立 JVM，配置在任务启动时就写死了，
+     * 而这个状态要在任务生命周期<b>中间</b>翻转。与背压信号本身用的是同一套进程间通信方式。
+     */
+    private void markFullRunning(boolean running) {
+        java.nio.file.Path marker = java.nio.file.Paths.get("files", taskId, "full_running");
+        try {
+            if (running) {
+                java.nio.file.Files.createDirectories(marker.getParent());
+                java.nio.file.Files.write(marker, String.valueOf(System.currentTimeMillis()).getBytes());
+            } else {
+                java.nio.file.Files.deleteIfExists(marker);
+            }
+        } catch (Exception e) {
+            // 标记写不出来只影响背压判据（退回旧行为），不该挡住全量
+            logger.warn("[{}] 全量运行标记{}失败: {}", taskId, running ? "写入" : "清除", e.getMessage());
         }
     }
 

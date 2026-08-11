@@ -66,6 +66,27 @@ public final class CapturePositionStore {
         AtomicFileWriter.writePropertiesQuietly(fileIn(outputDir), posProps, comment);
     }
 
+    /**
+     * 原子写出位点文件，并<b>顺带</b>写一份统一位点记录（{@link LocalCheckpointStore}）。
+     *
+     * <p>四种源的 capture 都汇到这一个出口，所以统一载体只需在这里挂一次；
+     * 位点文件本身是自描述的（wal.lsn / redo.scn / ticdc.commit.ts / binlog.file 谁在就是谁），
+     * 因此除 taskId 外不需要额外上下文。
+     *
+     * <p>统一载体按 1s 节流：它只被 agent 用来上卷和回灌，比原位点文件旧一点只意味着
+     * 接管时多重放一点，而多一次 fsync 却要落在 capture 的热路径上。
+     */
+    public static void save(String outputDir, Properties posProps, String comment, String taskId) {
+        save(outputDir, posProps, comment);
+        if (taskId == null || taskId.isEmpty() || "unknown".equals(taskId)) {
+            return;
+        }
+        CheckpointRecord record = LocalCheckpointStore.fromCapturePosition(taskId, posProps);
+        if (record != null) {
+            LocalCheckpointStore.saveThrottled(record, 1000L, false);
+        }
+    }
+
     public static boolean preferPersisted(Properties config) {
         return Boolean.parseBoolean(config.getProperty(PREFER_PERSISTED_KEY, "true"));
     }

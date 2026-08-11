@@ -91,6 +91,7 @@ public class KafkaConsumerService {
         // 避免"处理失败但 offset 已自动提交 → 消息永久丢失、任务静默不启动"。
         props.put("enable.auto.commit", "false");
         props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        com.migration.common.security.KafkaSecurity.apply(props);
         props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
 
         initDlqProducer();

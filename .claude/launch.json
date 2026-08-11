@@ -6,6 +6,12 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "http.server", "4173", "-d", "/private/tmp/claude-501/-Users-finn-Documents-claudecode-project-test-git/61ab4f76-110b-4ad0-8b69-b1a8294d7920/scratchpad/divider-demo"],
       "port": 4173
+    },
+    {
+      "name": "admin-dashboard",
+      "comment": "后端自己就把 admin-dashboard.html 当静态资源发出来了，且 CORS 白名单只放行 38080/3000；用别的端口起静态服务会被 CORS 挡在登录那一步，直接连后端这个",
+      "url": "http://localhost:38080",
+      "port": 38080
     }
   ]
 }

@@ -52,6 +52,13 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <!-- Avro：订阅侧 subscribe.format=AVRO 用。显式钉版本而不是跟 Spring Boot BOM——
+                 消息格式一旦被下游 Schema Registry 认过，序列化实现的版本漂移就是兼容性事故。 -->
+            <dependency>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro</artifactId>
+                <version>1.11.3</version>
+            </dependency>
             <!-- MongoDB 驱动三件套版本必须一致：Spring Boot 3.1.5 BOM 会把 driver-core/bson
                  压到 4.9.1，与显式引入的 driver-sync 4.11.1 混包导致 NoClassDefFoundError
                  （StreamFactoryHelper 等 4.10+ 类缺失）。此处显式管理覆盖 BOM。 -->

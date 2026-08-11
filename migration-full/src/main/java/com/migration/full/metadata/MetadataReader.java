@@ -300,7 +300,11 @@ public class MetadataReader {
                 column.setDataType(rs.getString("Type"));
                 column.setNullable("YES".equals(rs.getString("Null")));
                 column.setDefaultValue(rs.getString("Default"));
-                column.setAutoIncrement("auto_increment".equalsIgnoreCase(rs.getString("Extra")));
+                String extra = rs.getString("Extra");
+                column.setAutoIncrement("auto_increment".equalsIgnoreCase(extra));
+                // DESCRIBE 的 Extra 对生成列给的是 "STORED GENERATED" / "VIRTUAL GENERATED"。
+                // 这类列的值由库按表达式自己算，显式写入会被 MySQL 拒绝（3105）
+                column.setGenerated(extra != null && extra.toUpperCase().contains("GENERATED"));
                 tableInfo.addColumn(column);
             }
         }

@@ -26,6 +26,10 @@ public class ContinuousIncrementMain {
     private static final Logger logger = LoggerFactory.getLogger(ContinuousIncrementMain.class);
 
     private String thlDirectory;
+    /** 大字段落盘目录（见 migration.lob.spill.dir）。静态：类型化绑定入口是静态方法，并行 worker 共用。 */
+    private static String lobSpillDir = "files/unknown/lob";
+    /** 按已应用位点回收落盘文件。 */
+    private com.migration.common.lob.LobSpillJanitor lobSpillJanitor;
     private String targetHost;
     private int targetPort;
     private String targetDatabase;
@@ -34,6 +38,28 @@ public class ContinuousIncrementMain {
     private long scanInterval;
     /** 增量应用限速（行/秒配额落到执行层）：避免应用过快反压到 capture/binlog 读取而打挂源库。 */
     private RowRateLimiter rowRateLimiter;
+    /** {@code increment.unique.conflict.policy} = FAIL_STOP（默认）| IGNORE */
+    private String uniqueConflictPolicy = "FAIL_STOP";
+
+    /**
+     * 这条重复键错误是不是<b>主键</b>冲突。
+     *
+     * <p>MySQL 报 {@code Duplicate entry 'x' for key 'PRIMARY'}（或 {@code t.PRIMARY}），
+     * PG 报 {@code violates unique constraint "t_pkey"}。认不出来时按<b>主键</b>处理——
+     * 保持既有的幂等重放行为，不因为一条没见过的错误文案把正常任务打停。
+     */
+    private static boolean isPrimaryKeyConflict(String msg) {
+        if (msg == null) {
+            return true;
+        }
+        String lower = msg.toLowerCase();
+        if (lower.contains("for key 'primary'") || lower.contains("for key \"primary\"")
+                || lower.contains(".primary'") || lower.contains("_pkey")) {
+            return true;
+        }
+        // 能明确指出是别的键名，才判成非主键冲突
+        return !(lower.contains("for key ") || lower.contains("unique constraint"));
+    }
     /** 双向同步/环路防护：启用后每个应用事务先写 origin 标记，供对端 capture 识别并跳过，防止回环。 */
     private boolean bidirectionalEnabled;
     /** 双向写写冲突消解（P1-4）：只在双向模式下初始化，单向同步完全不受影响。 */
@@ -241,6 +267,10 @@ public class ContinuousIncrementMain {
         taskId = props.getProperty("task.id", "unknown");
         thlDirectory = props.getProperty("increment.thl.dir",
                 "files/" + taskId + "/thl_output");
+        // 大字段落盘目录：与 capture 侧同一个目录，事件里的引用按它解析成本地文件。
+        // 静态字段是因为 executeTypedOn 是静态的（并行 worker 共用同一条绑定路径）。
+        lobSpillDir = props.getProperty("migration.lob.spill.dir", "files/" + taskId + "/lob");
+        lobSpillJanitor = new com.migration.common.lob.LobSpillJanitor(lobSpillDir);
         targetHost = props.getProperty("target.db.host", "localhost");
         targetPort = Integer.parseInt(props.getProperty("target.db.port", "3306"));
         targetDatabase = props.getProperty("target.db.database", "");
@@ -249,6 +279,10 @@ public class ContinuousIncrementMain {
         scanInterval = Long.parseLong(props.getProperty("increment.scan.interval", "3000"));
         long maxRowsPerSec = Long.parseLong(props.getProperty("increment.rate.limit.rows.per.sec", "0"));
         rowRateLimiter = new RowRateLimiter(maxRowsPerSec);
+        // 非主键唯一键冲突的处置：默认 FAIL_STOP（停下等人看），IGNORE 回到旧的"warn 一句继续"。
+        // 旧行为把主键冲突（幂等重放，忽略正确）和唯一键冲突（目标端多了一条源端没有的约束，
+        // 忽略即永久丢一行）混成了一类。
+        uniqueConflictPolicy = props.getProperty("increment.unique.conflict.policy", "FAIL_STOP");
         if (!rowRateLimiter.isUnlimited()) {
             logger.info("增量限速已启用: {} 行/秒（配额落到执行层，避免应用过快打挂源库）", maxRowsPerSec);
         }
@@ -364,6 +398,32 @@ public class ContinuousIncrementMain {
                 thlDirectory, targetHost, targetPort, targetDatabase, lastExecutedSeqno);
     }
 
+    /**
+     * 目标库连接的 TLS 参数（{@code target.db.ssl.mode}，默认 DISABLED = 历史行为）。
+     *
+     * <p>这条 URL 是增量自己拼的，不走 {@code DatabaseConfig}，所以加密档位得在这里也认一次——
+     * 否则"配了 TLS"只对全量生效、增量还是明文，比不支持更糟（以为加密了其实没有）。
+     */
+    private String targetSslParams() {
+        String mode = props.getProperty("target.db.ssl.mode", "DISABLED").trim().toUpperCase();
+        String cert = props.getProperty("target.db.ssl.root.cert", "");
+        if (isPostgresql) {
+            String pg;
+            switch (mode) {
+                case "PREFERRED":       pg = "prefer"; break;
+                case "REQUIRED":        pg = "require"; break;
+                case "VERIFY_CA":       pg = "verify-ca"; break;
+                case "VERIFY_IDENTITY": pg = "verify-full"; break;
+                default:                pg = "disable";
+            }
+            return "sslmode=" + pg + (cert.isEmpty() || "disable".equals(pg) ? "" : "&sslrootcert=" + cert);
+        }
+        if ("DISABLED".equals(mode)) {
+            return "useSSL=false";
+        }
+        return "sslMode=" + mode + (cert.isEmpty() ? "" : "&trustCertificateKeyStoreUrl=file:" + cert);
+    }
+
     /** 目标库 JDBC URL（串行主连接与并行 worker 连接共用，避免 URL 口径漂移）。 */
     private String buildTargetJdbcUrl() {
         if (isPostgresql) {
@@ -373,10 +433,13 @@ public class ContinuousIncrementMain {
             }
             // stringtype=unspecified：字符串参数由 PG 按列类型推断（interval/jsonb/时间等绑定依赖）
             return "jdbc:postgresql://" + targetHost + ":" + targetPort + "/" + targetDatabase
-                    + "?stringtype=unspecified";
+                    + "?stringtype=unspecified&" + targetSslParams();
         }
-        return "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
-                "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+        // useServerPrepStmts=true 是大字段流式写入的<b>前提</b>而非调优：客户端预编译下驱动会把
+        // setBinaryStream 的内容整个读进内存再组包，1GB 的值照样 OOM（有对照实测）。
+        return com.migration.common.lob.LobJdbc.withStreamingParams(
+                "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
+                "?" + targetSslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true");
     }
 
     private void connectToTargetDatabase() throws SQLException {
@@ -652,6 +715,7 @@ public class ContinuousIncrementMain {
                             binlogPosition != null ? binlogPosition : 0,
                             event.getEventId() != null ? event.getEventId() : ""
                     );
+                    saveUnifiedApplyCheckpoint(event);
 
                     if (event.getSourceTstamp() != null) {
                         long rtoMs = System.currentTimeMillis() - event.getSourceTstamp().getTime();
@@ -681,6 +745,7 @@ public class ContinuousIncrementMain {
                             skipBinlogPosition != null ? skipBinlogPosition : 0,
                             event.getEventId() != null ? event.getEventId() : ""
                     );
+                    saveUnifiedApplyCheckpoint(event);
                     continue;
                 }
 
@@ -695,10 +760,13 @@ public class ContinuousIncrementMain {
                     // UPDATE/DELETE 只按源主键定位，会改到/删掉同一张汇聚表里其它来源的同主键行。
                     // 宁可停任务，也不能让它静默改坏别的来源的数据。
                     if (typedDmls == null && typedDmlConverter.requiresTypedPipeline(event)) {
-                        logger.error("汇聚表事件无法走类型化管道（seqno={}），停止应用以免写坏其它来源的数据",
-                                event.getSeqno());
-                        writeErrorStatus("E3013",
-                                "汇聚表事件缺少类型化值（rows_typed），无法安全生成带来源标识的 DML", event);
+                        boolean lobEvent = Boolean.TRUE.equals(event.getMetadata().get("has_lob"));
+                        logger.error("{}事件无法走类型化管道（seqno={}），停止应用以免写坏数据",
+                                lobEvent ? "大字段" : "汇聚表", event.getSeqno());
+                        writeErrorStatus(lobEvent ? "E3012" : "E3013",
+                                lobEvent
+                                        ? "大字段事件缺少类型化值（rows_typed），文本路径会把 @lob 引用当成内容写进目标列"
+                                        : "汇聚表事件缺少类型化值（rows_typed），无法安全生成带来源标识的 DML", event);
                         aborted = true;
                         running.set(false);
                         break;
@@ -780,7 +848,22 @@ public class ContinuousIncrementMain {
                             } catch (SQLException e) {
                                 String errorMsg = e.getMessage();
                                 if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contains("duplicate key"))) {
-                                    logger.warn("重复键忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                                    // 主键冲突 = 幂等重放，忽略是对的；但**非主键唯一键**冲突不是——
+                                    // 那说明目标端有一条源端没有的约束把这一行挡住了，忽略掉就是永久丢一行
+                                    // （PG 尤其明显：ON CONFLICT (pk) DO NOTHING 只覆盖主键，
+                                    // 唯一索引冲突会抛异常然后被这条 warn 吞掉）。
+                                    if (isPrimaryKeyConflict(errorMsg)) {
+                                        logger.warn("主键重复忽略（幂等重放）(seqno={}): {}", event.getSeqno(), errorMsg);
+                                    } else if ("IGNORE".equalsIgnoreCase(uniqueConflictPolicy)) {
+                                        logger.warn("唯一键冲突按策略忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                                    } else {
+                                        txFailed = true;
+                                        logger.error("唯一键冲突（非主键）(seqno={}): {}。"
+                                                + "目标端存在源端没有的唯一约束，忽略它会永久丢掉这一行",
+                                                event.getSeqno(), errorMsg);
+                                        writeErrorStatus("E3017", "唯一键冲突（非主键）: " + errorMsg, event);
+                                        break;
+                                    }
                                 } else if (errorMsg != null && (errorMsg.contains("Connection") || errorMsg.contains("timed out"))) {
                                     logger.error("目标库连接异常 (seqno={}): {}, 尝试重连", event.getSeqno(), errorMsg);
                                     reconnectTargetDatabase();
@@ -1272,10 +1355,13 @@ public class ContinuousIncrementMain {
     }
 
     private static int executeTypedOn(Connection conn, String sql, List<Object> params) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            for (int i = 0; i < params.size(); i++) {
-                ps.setObject(i + 1, params.get(i));
-            }
+        try (PreparedStatement ps = conn.prepareStatement(sql);
+             com.migration.common.lob.LobParamBinder binder =
+                     new com.migration.common.lob.LobParamBinder(lobSpillDir)) {
+            // 大字段参数走 setBinaryStream：配合连接上的 useServerPrepStmts=true，
+            // 驱动按 COM_STMT_SEND_LONG_DATA 分片推送，1GB 的值也不会进堆。
+            // 其余参数照旧 setObject，行为不变。
+            binder.bindAll(ps, params);
             return ps.executeUpdate();
         }
     }
@@ -2403,6 +2489,47 @@ public class ContinuousIncrementMain {
                 binlogPosition != null ? binlogPosition : 0,
                 event.getEventId() != null ? event.getEventId() : ""
         );
+        saveUnifiedApplyCheckpoint(event);
+        // 位点推进之后，早于该位点的大字段落盘文件就再也用不到了。
+        // 回收判据只能是位点：删早了重放会取不到内容，不删则一个文件就是 1GB，很快吃光磁盘。
+        if (lobSpillJanitor != null && binlogFile != null && binlogPosition != null) {
+            lobSpillJanitor.cleanupUpTo(binlogFile, binlogPosition);
+        }
+    }
+
+    /**
+     * 并行写一份统一位点（APPLY 段），供 agent 上卷到元数据库、以及接管方回灌。
+     *
+     * <p><b>必须跟在 {@code checkpointManager.saveCheckpoint} 之后</b>：H2 那份才是本进程续传的权威，
+     * 这份只是它的影子。按 1s 节流是因为本方法在<b>每个事件</b>上都会被调到，
+     * 而 apply 的热路径经不起每事件一次 fsync；节流的后果只是这份位点更旧，
+     * 而更旧只会带来重放、不会丢数据。
+     */
+    private void saveUnifiedApplyCheckpoint(THLEvent event) {
+        try {
+            java.util.Properties payload = new java.util.Properties();
+            payload.setProperty("seqno", String.valueOf(event.getSeqno()));
+            String binlogFile = (String) event.getMetadata("binlog_file");
+            Long binlogPosition = (Long) event.getMetadata("binlog_position");
+            payload.setProperty("binlog.file", binlogFile != null ? binlogFile : "");
+            payload.setProperty("binlog.position",
+                    String.valueOf(binlogPosition != null ? binlogPosition : 0L));
+            payload.setProperty("event.id", event.getEventId() != null ? event.getEventId() : "");
+            long sourceTs = event.getSourceTstamp() != null ? event.getSourceTstamp().getTime() : 0L;
+            com.migration.common.position.CheckpointRecord record =
+                    new com.migration.common.position.CheckpointRecord(
+                            taskId,
+                            com.migration.common.position.CheckpointRecord.Stage.APPLY,
+                            props.getProperty("source.db.type", "mysql"),
+                            com.migration.common.position.CheckpointRecord.Kind.SEQNO,
+                            payload,
+                            com.migration.common.position.MonotonicKey.ofNumeric(event.getSeqno()),
+                            sourceTs);
+            com.migration.common.position.LocalCheckpointStore.saveThrottled(record, 1000L, false);
+        } catch (Exception e) {
+            // 影子载体写失败绝不能影响应用：权威位点已经落在 H2 里了
+            logger.debug("统一位点（APPLY）落盘失败: {}", e.getMessage());
+        }
     }
 
     private void acquireRateLimit(long rows) {

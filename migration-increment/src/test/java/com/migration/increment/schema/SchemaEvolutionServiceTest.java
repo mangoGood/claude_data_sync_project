@@ -13,6 +13,7 @@ import java.sql.SQLException;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -83,6 +84,81 @@ class SchemaEvolutionServiceTest {
         SchemaEvolutionService.ApplyResult inScope = service.applyDdl(
                 "CREATE TABLE ta (id INT PRIMARY KEY)", "CREATE_TABLE", "dbm1");
         assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED, inScope.getStatus());
+    }
+
+    @Test
+    @DisplayName("表级同步：范围**之内**的库级 DDL 同样不应用——这条此前一个闸都没有")
+    void tableLevelSkipsInScopeDatabaseDdl() throws SQLException {
+        // 实测缺陷：作用域守卫只挡"库不在同步范围"的 DDL，而 isTableScopedDdl() 又不认 DROP_DATABASE，
+        // 于是 `DROP DATABASE <正在同步的源库>` 一路落到执行处、连库名都不改写地打到目标连接上，
+        // 把整个目标库连同不在同步范围的表一起删掉，日志还写「DDL 应用成功」。
+        // 灾备两端库名一致，这等于主库一句话清空整个备库。
+        Properties props = baseProps();
+        props.setProperty("migration.included.databases", "dbm1");
+        props.setProperty("migration.included.tables", "dbm1.ta");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult dropInScope = service.applyDdl(
+                "DROP DATABASE IF EXISTS dbm1", "DROP_DATABASE", "dbm1");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, dropInScope.getStatus());
+
+        SchemaEvolutionService.ApplyResult createInScope = service.applyDdl(
+                "CREATE DATABASE dbm1", "CREATE_DATABASE", "dbm1");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, createInScope.getStatus());
+
+        // 表级 DDL 不受影响，否则等于把 DDL 同步整个关掉
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.APPLIED,
+                service.applyDdl("CREATE TABLE ta (id INT PRIMARY KEY)", "CREATE_TABLE", "dbm1").getStatus());
+    }
+
+    @Test
+    @DisplayName("库级同步：DROP DATABASE 默认拦截，CREATE DATABASE 放行")
+    void dbLevelBlocksDestructiveDatabaseDdlByDefault() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("sync.db.level", "true");
+        props.setProperty("sync.db.level.databases", "dbm1");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult drop = service.applyDdl(
+                "DROP DATABASE IF EXISTS dbm1", "DROP_DATABASE", "dbm1");
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, drop.getStatus());
+        assertTrue(drop.getMessage().contains("破坏性"), "拦截原因要说得出是破坏性 DDL: " + drop.getMessage());
+
+        // 放行判据看的是"有没有被闸门拦下"，不是 H2 认不认 CREATE DATABASE——
+        // H2(MySQL 兼容模式) 不支持这条语句，执行会失败，但那与本用例要守的东西无关。
+        SchemaEvolutionService.ApplyResult create = service.applyDdl(
+                "CREATE DATABASE IF NOT EXISTS dbm1", "CREATE_DATABASE", "dbm1");
+        assertNotEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, create.getStatus(),
+                "CREATE DATABASE 在库级同步范围内应放行给执行层");
+    }
+
+    @Test
+    @DisplayName("库级同步：显式 ALLOW 才放行 DROP DATABASE")
+    void dbLevelAllowsDestructiveWhenExplicitlyConfigured() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("sync.db.level", "true");
+        props.setProperty("sync.db.level.databases", "dbm1");
+        props.setProperty("schema.ddl.destructive.policy", "ALLOW");
+        SchemaEvolutionService service = createService(props);
+
+        SchemaEvolutionService.ApplyResult drop = service.applyDdl(
+                "DROP DATABASE IF EXISTS dbm1", "DROP_DATABASE", "dbm1");
+        assertNotEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED, drop.getStatus(),
+                "显式 ALLOW 时闸门不该再拦");
+    }
+
+    @Test
+    @DisplayName("灾备任务：即使配了 ALLOW 也强制拦截——备库被清空是灾备的反义词")
+    void drTaskForcesBlockRegardlessOfPolicy() throws SQLException {
+        Properties props = baseProps();
+        props.setProperty("task.type", "DR");
+        props.setProperty("sync.db.level", "true");
+        props.setProperty("sync.db.level.databases", "dbm1");
+        props.setProperty("schema.ddl.destructive.policy", "ALLOW");
+        SchemaEvolutionService service = createService(props);
+
+        assertEquals(SchemaEvolutionService.ApplyResult.Status.SKIPPED,
+                service.applyDdl("DROP DATABASE dbm1", "DROP_DATABASE", "dbm1").getStatus());
     }
 
     @Test

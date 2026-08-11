@@ -39,6 +39,14 @@
             <artifactId>gson</artifactId>
         </dependency>
 
+        <!-- Avro 消息格式（subscribe.format=AVRO）。Schema Registry 只用它的 REST 接口，
+             不引 Confluent 的序列化器：那要额外挂一个 Confluent 私有 maven 仓库，
+             而我们需要的只是"注册 schema 拿 id + 按 Confluent wire format 写字节"这两件事。 -->
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
@@ -50,6 +58,12 @@
         <dependency>
             <groupId>net.logstash.logback</groupId>
             <artifactId>logstash-logback-encoder</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

@@ -208,7 +208,7 @@ public class MetadataService {
             String service = (conn.database != null && !conn.database.isEmpty()) ? conn.database : "ORCL";
             jdbcUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
         } else {
-            jdbcUrl = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&connectTimeout=15000&socketTimeout=15000&allowPublicKeyRetrieval=true",
+            jdbcUrl = String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&connectTimeout=15000&socketTimeout=15000&allowPublicKeyRetrieval=true",
                 conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "");
         }
 
@@ -573,9 +573,9 @@ public class MetadataService {
             return String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
         }
         if (database != null && !database.isEmpty()) {
-            return String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port, database);
+            return String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port, database);
         }
-        return String.format("jdbc:mysql://%s:%d/?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port);
+        return String.format("jdbc:mysql://%s:%d/?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port);
     }
     
     private String buildJdbcUrl(ParsedConnection conn) {
@@ -1128,6 +1128,8 @@ public class MetadataService {
                 checkBinlogEnabled(sourceDb, result);
                 checkBinlogFormat(sourceDb, result);
                 checkBinlogRowImage(sourceDb, result);
+                    checkBinlogRowValueOptions(sourceDb, result);
+                    checkBinlogRowMetadata(sourceDb, result);
                 String sourceVersion = getMySQLVersion(sourceDb);
                 checkSourceVersionSupported(sourceVersion, result);
                 checkServerId(sourceDb, sourceVersion, result);
@@ -1399,6 +1401,8 @@ public class MetadataService {
                     checkBinlogEnabled(sourceDb, result);
                     checkBinlogFormat(sourceDb, result);
                     checkBinlogRowImage(sourceDb, result);
+                    checkBinlogRowValueOptions(sourceDb, result);
+                    checkBinlogRowMetadata(sourceDb, result);
                     checkServerId(sourceDb, sourceVersion, result);
                 }
 
@@ -1439,6 +1443,8 @@ public class MetadataService {
                     checkBinlogEnabled(sourceDb, result);
                     checkBinlogFormat(sourceDb, result);
                     checkBinlogRowImage(sourceDb, result);
+                    checkBinlogRowValueOptions(sourceDb, result);
+                    checkBinlogRowMetadata(sourceDb, result);
                     checkServerId(sourceDb, sourceVersion, result);
                 }
                 checkStorageEngine(sourceDb, result);
@@ -1532,6 +1538,8 @@ public class MetadataService {
                 checkBinlogEnabled(sourceDb, result);
                 checkBinlogFormat(sourceDb, result);
                 checkBinlogRowImage(sourceDb, result);
+                    checkBinlogRowValueOptions(sourceDb, result);
+                    checkBinlogRowMetadata(sourceDb, result);
                 checkServerId(sourceDb, sourceVersion, result);
             }
             checkStorageEngine(sourceDb, result);
@@ -1930,6 +1938,8 @@ public class MetadataService {
                 checkBinlogEnabled(sourceDb, result);
                 checkBinlogFormat(sourceDb, result);
                 checkBinlogRowImage(sourceDb, result);
+                    checkBinlogRowValueOptions(sourceDb, result);
+                    checkBinlogRowMetadata(sourceDb, result);
                 checkServerId(sourceDb, sourceVersion, result);
             }
             
@@ -1992,6 +2002,60 @@ public class MetadataService {
             result.addItem("Binlog Row Image", "binlog_row_image需设置为FULL", passed, message, "error");
         } catch (SQLException e) {
             result.addItem("Binlog Row Image", "binlog_row_image需设置为FULL", false, "检查失败: " + e.getMessage(), "error");
+        }
+    }
+
+    /**
+     * {@code binlog_row_value_options} 必须为空。
+     *
+     * <p>设成 {@code PARTIAL_JSON} 后，用 JSON_SET/JSON_REPLACE/JSON_REMOVE 改 JSON 列时，
+     * MySQL 写的是<b>差量</b>——事件类型变成 {@code PARTIAL_UPDATE_ROWS_EVENT}，binlog 连接器
+     * 不认识这个编码。实测这类 UPDATE 会整条消失（连同同一语句里改的其它普通列），
+     * 现在抽取端会以 E3020 停下来上报，但更该做的是在任务开始前就拦住。
+     *
+     * <p>这和 Debezium / DTS / DMS 的口径一致：它们同样要求这个参数为空。
+     */
+    private void checkBinlogRowValueOptions(Connection conn, ValidationResult result) {
+        try {
+            String opts = getVariable(conn, "binlog_row_value_options");
+            boolean passed = opts == null || opts.trim().isEmpty();
+            String message = passed
+                    ? (opts == null ? "参数不存在（MySQL 5.7 及以下）或为空" : "binlog_row_value_options 为空")
+                    : "当前 binlog_row_value_options=" + opts + "，需要置空（SET GLOBAL binlog_row_value_options='')"
+                      + "：该参数会让 JSON 列的 UPDATE 以差量形式写入 binlog，增量链路无法解析，"
+                      + "这类 UPDATE 会整条丢失";
+            result.addItem("Binlog JSON 差量", "binlog_row_value_options 需为空", passed, message, "error");
+        } catch (SQLException e) {
+            // 5.7 及以下没有这个参数，查不到即视为通过
+            result.addItem("Binlog JSON 差量", "binlog_row_value_options 需为空", true,
+                    "参数不存在（MySQL 5.7 及以下），跳过检查", "warning");
+        }
+    }
+
+    /**
+     * 建议 {@code binlog_row_metadata=FULL}（不阻断）。
+     *
+     * <p>MySQL 8.0.1+ 的这个参数会把<b>列名</b>放进 TABLE_MAP 事件本身。抽取端拿到的就是与行值
+     * 同一时刻的列布局，不必再去查 {@code information_schema} 的<b>当前</b>定义——后者在链路有
+     * 延迟又恰好做了 ALTER TABLE 时会让整行的值与列错位，写进去的是合法值、看不出异常。
+     * 保持 MINIMAL 也能跑：抽取端会用事件里的列数兜底校验，对不上就停下来报 E3021，不会静默写坏。
+     */
+    private void checkBinlogRowMetadata(Connection conn, ValidationResult result) {
+        try {
+            String meta = getVariable(conn, "binlog_row_metadata");
+            if (meta == null) {
+                return;   // 5.7 及以下没这个参数，不提示
+            }
+            boolean full = "FULL".equalsIgnoreCase(meta.trim());
+            result.addItem("Binlog 列元数据", "建议 binlog_row_metadata=FULL", full,
+                    full ? "binlog_row_metadata=FULL，列名随事件下发"
+                         : "当前 binlog_row_metadata=" + meta + "。建议设为 FULL：列名会随 binlog 事件一起"
+                           + "下发，抽取端就不必依赖源库当前的表定义——同步有延迟时做 ALTER TABLE 加列/删列，"
+                           + "按当前定义解析会让整行的值与列错位。保持 MINIMAL 不影响正常同步，"
+                           + "但遇到这种情况任务会停下来报 E3021 而不是自动继续",
+                    "warning");
+        } catch (SQLException e) {
+            // 读不到就不提示：这只是一条建议项
         }
     }
 

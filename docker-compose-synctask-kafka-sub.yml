@@ -44,6 +44,27 @@ services:
       synctask-sub-net:
         ipv4_address: 192.168.151.12
 
+  # subscribe.format=AVRO 用的 Schema Registry。
+  #
+  # 用 Apicurio 而不是 Confluent 自家的镜像，是**有意的**：Apicurio 提供一套
+  # Confluent 兼容 API（/apis/ccompat/v7），拿它来验能同时回答两个问题——
+  # 我们产出的 wire format 对不对、以及"Confluent 兼容"是不是只对 Confluent 自己成立。
+  # 换一家实现照样跑通，才说明这个格式是通用的。（镜像也小得多。）
+  synctask-schema-registry:
+    image: docker.1ms.run/apicurio/apicurio-registry-mem:2.4.2.Final
+    container_name: synctask-schema-registry
+    depends_on:
+      - synctask-kafka-sub
+    ports:
+      - "38081:8080"
+    environment:
+      QUARKUS_PROFILE: prod
+      # 加列时自动注册新版本（我们的每个列字段都带 default:null，是向后兼容的加列）
+      REGISTRY_AUTO_REGISTER_ARTIFACT: "true"
+    networks:
+      synctask-sub-net:
+        ipv4_address: 192.168.151.13
+
 networks:
   synctask-sub-net:
     driver: bridge

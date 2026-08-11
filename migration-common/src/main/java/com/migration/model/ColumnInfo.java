@@ -12,6 +12,13 @@ public class ColumnInfo {
     private boolean primaryKey;
     private boolean autoIncrement;
     private int decimalDigits;
+    /**
+     * 生成列（MySQL 的 STORED / VIRTUAL GENERATED）。
+     *
+     * <p>这类列的值由目标库按表达式自己算，显式写入会被拒绝（MySQL 3105），
+     * 所以它们不参与数据搬运。
+     */
+    private boolean generated;
 
     public ColumnInfo() {
     }
@@ -83,6 +90,14 @@ public class ColumnInfo {
 
     public void setDecimalDigits(int decimalDigits) {
         this.decimalDigits = decimalDigits;
+    }
+
+    public boolean isGenerated() {
+        return generated;
+    }
+
+    public void setGenerated(boolean generated) {
+        this.generated = generated;
     }
 
     @Override

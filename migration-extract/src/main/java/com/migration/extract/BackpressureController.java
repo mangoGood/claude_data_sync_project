@@ -29,6 +29,8 @@ public class BackpressureController {
     public enum Signal { PAUSE, RESUME }
 
     private final String signalFilePath;
+    /** "全量正在跑"的带外标记，由 agent 维护；存在时不施加背压，见 {@link #fullRunning()}。 */
+    private final Path fullRunningMarker;
     private final int highWatermark;
     private final int lowWatermark;
     private volatile Signal lastSignal = Signal.RESUME;
@@ -40,8 +42,24 @@ public class BackpressureController {
      */
     public BackpressureController(String taskId, int highWatermark, int lowWatermark) {
         this.signalFilePath = "files/" + taskId + "/backpressure.signal";
+        this.fullRunningMarker = Paths.get("files", taskId, "full_running");
         this.highWatermark = highWatermark;
         this.lowWatermark = lowWatermark;
+    }
+
+    /**
+     * 全量是不是还在跑（agent 维护 {@code files/<taskId>/full_running}）。
+     *
+     * <p>全量期间 extract 与全量并行跑（把表结构漂移窗口从"全量耗时"压到"extract 落后量"），
+     * 但 increment 按设计要等 FULL_COMPLETED——也就是说 <b>THL 本来就该越堆越多，那不是积压</b>。
+     * 这时候施加背压是把"还没有消费者"误判成"消费不过来"。
+     */
+    private boolean fullRunning() {
+        try {
+            return Files.exists(fullRunningMarker);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
@@ -51,6 +69,16 @@ public class BackpressureController {
      * @return 当前生效的信号
      */
     public Signal checkAndApplyBackpressure(int pendingThlFileCount) {
+        if (fullRunning()) {
+            // 全量期间不背压。真暂停了 capture，源库 binlog 会继续前进而 capture 位点原地不动，
+            // 长全量下有被 purge 掉的风险（capture 启动时的 verifyBinlogFileRetained 拦的正是这个）。
+            // 已经处于 PAUSE 的话要先解除——否则全量一开始就把 capture 冻住了
+            if (lastSignal == Signal.PAUSE) {
+                writeSignal(Signal.RESUME);
+                logger.info("全量进行中，解除背压：此时 THL 堆积是设计使然（increment 尚未启动），不是消费不过来");
+            }
+            return lastSignal;
+        }
         if (lastSignal == Signal.RESUME && pendingThlFileCount > highWatermark) {
             writeSignal(Signal.PAUSE);
             logger.warn("背压触发：THL积压 {} 超过高水位 {}，暂停 capture", pendingThlFileCount, highWatermark);

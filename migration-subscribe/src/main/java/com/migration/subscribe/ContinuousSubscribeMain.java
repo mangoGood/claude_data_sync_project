@@ -41,7 +41,13 @@ public class ContinuousSubscribeMain {
     private String sourceType;
     private long scanInterval;
 
-    private KafkaProducer<String, String> kafkaProducer;
+    /**
+     * 值类型是 byte[] 而不是 String：AVRO 格式产出的是二进制。
+     * JSON 路径改用 UTF-8 编码后发送，线上字节与 StringSerializer 逐字节相同。
+     */
+    private KafkaProducer<String, byte[]> kafkaProducer;
+    /** subscribe.format=AVRO 时的序列化器（含 Schema Registry 注册）；其它格式为 null。 */
+    private com.migration.subscribe.avro.AvroCdcSerializer avroSerializer;
     /**
      * serializeNulls：值为 NULL 的列必须以 {@code "col": null} 出现在消息里。
      *
@@ -176,6 +182,7 @@ public class ContinuousSubscribeMain {
         }
 
         initKafkaProducer();
+        initAvro(props);
 
         // 订阅续传只认 .subscribe_progress（每个 THL 文件读到哪个 seqno）。
         // 曾经还有一个 checkpoint/subscribe_checkpoint 文件被读进 lastSentSeqno，但从未参与过跳过判断，
@@ -191,7 +198,8 @@ public class ContinuousSubscribeMain {
         Properties producerProps = new Properties();
         producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers);
         producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+                org.apache.kafka.common.serialization.ByteArraySerializer.class.getName());
         // acks=all + 幂等生产者：订阅位点一旦推进就再也不会重读这段 THL，因此"写进 Kafka"必须是
         // 真的落到全部 ISR。acks=1 时 leader 刚确认就崩溃会静默丢消息，而位点已经推进 —— 永久丢数据。
         producerProps.put(ProducerConfig.ACKS_CONFIG, "all");
@@ -203,6 +211,8 @@ public class ContinuousSubscribeMain {
         producerProps.put(ProducerConfig.LINGER_MS_CONFIG, 5);
         producerProps.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 33554432);
         producerProps.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "snappy");
+        // 订阅这条走的是**业务数据本身**，加密与否比控制面更要紧
+        com.migration.common.security.KafkaSecurity.apply(producerProps);
 
         this.kafkaProducer = new KafkaProducer<>(producerProps);
         logger.info("Kafka生产者初始化完成, bootstrapServers: {} (acks=all, 幂等)", kafkaBootstrapServers);
@@ -446,6 +456,13 @@ public class ContinuousSubscribeMain {
             case "DELETE":
                 cdcEvent.operation = "d";
                 break;
+            case "QUERY":
+                // DDL：此前 default 分支一句 return null 把它整个丢掉了。
+                // 下游按订阅流建镜像表的消费者因此完全不知道源端结构变了——
+                // ADD COLUMN 之后消息里突然多一个字段、DROP COLUMN 之后字段悄悄消失。
+                // Debezium 有专门的 schema change topic，这里对齐它。
+                sendSchemaChange(thlEvent, metadata);
+                return null;
             default:
                 return null;
         }
@@ -715,16 +732,28 @@ public class ContinuousSubscribeMain {
     private void sendToKafka(CdcEvent cdcEvent) {
         String topic = resolveTopic(cdcEvent);
         String messageKey = cdcEvent.key;
-        String messageValue;
+        byte[] messageValue;
 
-        if ("SIMPLE_JSON".equals(subscribeFormat)) {
-            messageValue = buildSimpleJson(cdcEvent);
+        if (avroSerializer != null) {
+            try {
+                messageValue = buildAvro(topic, cdcEvent);
+            } catch (Exception e) {
+                // schema 注册不上 / 序列化失败 = 下游拿到的字节没人能读。
+                // 与其投一堆读不出来的消息，不如计入 sendErrors 让位点停在这里
+                // （saveProgress 前会检查 sendErrors 增量，不推进位点）。
+                sendErrors.incrementAndGet();
+                logger.error("Avro 序列化失败 (seqno={}, topic={}): {}",
+                        cdcEvent.seqno, topic, e.getMessage());
+                return;
+            }
+        } else if ("SIMPLE_JSON".equals(subscribeFormat)) {
+            messageValue = utf8(buildSimpleJson(cdcEvent));
         } else {
-            messageValue = buildDebeziumJson(cdcEvent);
+            messageValue = utf8(buildDebeziumJson(cdcEvent));
         }
 
         try {
-            ProducerRecord<String, String> record = new ProducerRecord<>(topic, messageKey, messageValue);
+            ProducerRecord<String, byte[]> record = new ProducerRecord<>(topic, messageKey, messageValue);
             Future<RecordMetadata> future = kafkaProducer.send(record, (metadata, exception) -> {
                 if (exception != null) {
                     sendErrors.incrementAndGet();
@@ -735,7 +764,7 @@ public class ContinuousSubscribeMain {
             });
 
             totalEventsSent.incrementAndGet();
-            totalBytesSent.addAndGet(messageValue.length());
+            totalBytesSent.addAndGet(messageValue.length);
 
             if (totalEventsSent.get() % 1000 == 0) {
                 logger.info("Kafka发送统计: 总事件数={}, 字节数={}, 错误数={}",
@@ -783,6 +812,53 @@ public class ContinuousSubscribeMain {
     }
 
     /**
+     * schema 变更 topic（{@code <prefix>.<taskId>.schema-changes}）。
+     *
+     * <p>DDL 事件此前在 {@code convertToCdcEvent} 的 {@code default} 分支被整个丢掉：
+     * 下游按订阅流建镜像表的消费者，在源端 {@code ADD COLUMN} 之后收到的消息突然多一个字段，
+     * 而它完全不知道发生了什么；{@code DROP COLUMN} 则是字段悄悄消失。
+     * 第 2 批已经把<b>事务</b>元数据补齐到 Debezium 口径了，schema 这一半一直缺着。
+     *
+     * <p>投递失败与数据消息一样计入 {@code sendErrors}——位点推进的前提是"这一批全部落到 Kafka"，
+     * schema 变更丢了比数据丢了更难排查（下游要到很久以后才发现自己按错的结构在解析）。
+     */
+    private void sendSchemaChange(THLEvent thlEvent, Map<String, Object> metadata) {
+        Object sql = metadata.get("sql");
+        if (sql == null || sql.toString().trim().isEmpty()) {
+            return;
+        }
+        Map<String, Object> msg = new LinkedHashMap<>();
+        msg.put("taskId", taskId);
+        msg.put("seqno", thlEvent.getSeqno());
+        msg.put("database", metadata.getOrDefault("database_name", ""));
+        msg.put("table", metadata.getOrDefault("table_name", ""));
+        msg.put("ddl", sql.toString());
+        msg.put("ddlSubType", String.valueOf(metadata.getOrDefault("ddl_subtype", "")));
+        msg.put("txId", com.migration.common.txn.TxnMetadata.txIdOf(metadata));
+        msg.put("ts_ms", thlEvent.getSourceTstamp() != null
+                ? thlEvent.getSourceTstamp().getTime() : System.currentTimeMillis());
+        String topic = kafkaTopicPrefix + "." + taskId + ".schema-changes";
+        try {
+            // key 用库名：同一个库的 DDL 落同一分区，下游按分区顺序重放就是源端的 DDL 顺序
+            kafkaProducer.send(new ProducerRecord<>(topic, String.valueOf(msg.get("database")), utf8(gson.toJson(msg))),
+                    (md, ex) -> {
+                        if (ex != null) {
+                            sendErrors.incrementAndGet();
+                            logger.error("发送 schema 变更到 {} 失败: {}", topic, ex.getMessage());
+                        }
+                    });
+            logger.info("已投递 schema 变更事件 (seqno={}): {}", thlEvent.getSeqno(), truncateSql(sql.toString()));
+        } catch (Exception e) {
+            sendErrors.incrementAndGet();
+            logger.error("发送 schema 变更异常: {}", e.getMessage());
+        }
+    }
+
+    private static String truncateSql(String s) {
+        return s.length() <= 200 ? s : s.substring(0, 200) + "...";
+    }
+
+    /**
      * 事务标记 topic（{@code subscribe.transaction.topic.enabled}，默认关）：
      * 对齐 Debezium 的事务元数据 topic，下游据此知道一个事务从哪开始、到哪结束、共几条。
      */
@@ -797,7 +873,7 @@ public class ContinuousSubscribeMain {
         marker.put("ts_ms", System.currentTimeMillis());
         String topic = kafkaTopicPrefix + "." + taskId + ".transaction";
         try {
-            kafkaProducer.send(new ProducerRecord<>(topic, txId, gson.toJson(marker)), (md, ex) -> {
+            kafkaProducer.send(new ProducerRecord<>(topic, txId, utf8(gson.toJson(marker))), (md, ex) -> {
                 if (ex != null) {
                     sendErrors.incrementAndGet();
                     logger.error("发送事务标记到 {} 失败: {}", topic, ex.getMessage());
@@ -807,6 +883,52 @@ public class ContinuousSubscribeMain {
             sendErrors.incrementAndGet();
             logger.error("发送事务标记异常: {}", e.getMessage());
         }
+    }
+
+    private static byte[] utf8(String s) {
+        return s == null ? new byte[0] : s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Avro 初始化。{@code subscribe.format=AVRO} 时必须配 {@code subscribe.schema.registry.url}——
+     * 没有 registry 就没有 schema id，产出的字节下游读不了，所以这里直接抛而不是悄悄退回 JSON：
+     * "我以为在发 Avro，其实发的是 JSON" 是最难查的一类问题。
+     */
+    private void initAvro(Properties props) {
+        if (!"AVRO".equalsIgnoreCase(subscribeFormat)) {
+            return;
+        }
+        String url = props.getProperty("subscribe.schema.registry.url", "").trim();
+        if (url.isEmpty()) {
+            throw new IllegalStateException(
+                    "subscribe.format=AVRO 需要配置 subscribe.schema.registry.url（Schema Registry 地址）");
+        }
+        int timeout = Integer.parseInt(props.getProperty("subscribe.schema.registry.timeout.ms", "10000"));
+        com.migration.subscribe.avro.SchemaRegistryClient client =
+                new com.migration.subscribe.avro.SchemaRegistryClient(url,
+                        props.getProperty("subscribe.schema.registry.user", ""),
+                        props.getProperty("subscribe.schema.registry.password", ""),
+                        timeout);
+        this.avroSerializer = new com.migration.subscribe.avro.AvroCdcSerializer(client);
+        logger.info("订阅消息格式 = AVRO（Confluent wire format），Schema Registry: {}", url);
+    }
+
+    /** 组装 Avro 消息：前后镜像 + 信封元数据，脱敏与 JSON 路径共用同一套规则。 */
+    private byte[] buildAvro(String topic, CdcEvent cdcEvent) throws Exception {
+        Map<String, Object> before = parseDataToMap(cdcEvent.beforeData);
+        Map<String, Object> after = parseDataToMap(cdcEvent.afterData);
+        if (dataMaskingService != null && dataMaskingService.isEnabled()) {
+            before = dataMaskingService.mask(before);
+            after = dataMaskingService.mask(after);
+        }
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("op", cdcEvent.operation);
+        meta.put("ts_ms", cdcEvent.sourceTstamp);
+        meta.put("seqno", cdcEvent.seqno);
+        meta.put("db", cdcEvent.database);
+        meta.put("table", cdcEvent.table);
+        meta.put("txId", cdcEvent.txSourceId != null ? cdcEvent.txSourceId : cdcEvent.txId);
+        return avroSerializer.serialize(topic, before, after, meta);
     }
 
     private String resolveTopic(CdcEvent cdcEvent) {
@@ -980,6 +1102,9 @@ public class ContinuousSubscribeMain {
     /**
      * ENUM / SET 的取值表：{@code col=v1,v2,v3;col2=a,b}（各 extractor 统一格式）。
      * 增量应用侧一直按它把数值还原成标签，订阅侧此前没跟上，下游拿到的是 {@code 3} 而不是 {@code "c"}。
+     *
+     * <p>{@code split(",", -1)}：取值可以是空串（{@code enum('a','')} → {@code "col=a,"}），
+     * 默认的 split 会把末尾空串丢掉，取值表少一位，其后的序号全部对不上。
      */
     private Map<String, String[]> parseEnumSetValues(Object metaValue) {
         Map<String, String[]> out = new LinkedHashMap<>();
@@ -987,7 +1112,7 @@ public class ContinuousSubscribeMain {
         for (String entry : metaValue.toString().split(";")) {
             int eq = entry.indexOf('=');
             if (eq <= 0) continue;
-            out.put(entry.substring(0, eq).trim(), entry.substring(eq + 1).split(","));
+            out.put(entry.substring(0, eq).trim(), entry.substring(eq + 1).split(",", -1));
         }
         return out;
     }
@@ -1216,19 +1341,54 @@ public class ContinuousSubscribeMain {
         File target = new File(progressFile);
         File tmp = new File(progressFile + ".tmp");
         try {
+            StringBuilder text = new StringBuilder();
             try (BufferedWriter writer = new BufferedWriter(new FileWriter(tmp))) {
                 for (Map.Entry<String, Long> entry : fileSeqno.entrySet()) {
-                    writer.write(entry.getKey() + "=" + entry.getValue()
-                            + "|" + (completedFiles.contains(entry.getKey()) ? "1" : "0"));
+                    String line = entry.getKey() + "=" + entry.getValue()
+                            + "|" + (completedFiles.contains(entry.getKey()) ? "1" : "0");
+                    writer.write(line);
                     writer.newLine();
+                    text.append(line).append('\n');
                 }
             }
             if (!tmp.renameTo(target)) {
                 java.nio.file.Files.move(tmp.toPath(), target.toPath(),
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
+            saveUnifiedCheckpoint(text.toString());
         } catch (IOException e) {
             logger.warn("保存订阅进度失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 并行写一份统一位点（供 agent 上卷到元数据库、接管方回灌）。
+     *
+     * <p>订阅位点不是一个标量，而是"每个 THL 文件读到哪"的整张表，所以 payload 存进度文件<b>原文</b>，
+     * 回灌时原样写回。可比标量取其中最大的 seqno——seqno 只增不减，用它守住回退就够了。
+     */
+    private void saveUnifiedCheckpoint(String progressText) {
+        try {
+            long maxSeqno = -1L;
+            for (Long v : fileSeqno.values()) {
+                if (v != null && v > maxSeqno) {
+                    maxSeqno = v;
+                }
+            }
+            java.util.Properties payload = new java.util.Properties();
+            payload.setProperty("subscribe.progress.text", progressText);
+            com.migration.common.position.LocalCheckpointStore.saveThrottled(
+                    new com.migration.common.position.CheckpointRecord(
+                            taskId,
+                            com.migration.common.position.CheckpointRecord.Stage.SUBSCRIBE,
+                            "kafka",
+                            com.migration.common.position.CheckpointRecord.Kind.SEQNO,
+                            payload,
+                            com.migration.common.position.MonotonicKey.ofNumeric(maxSeqno),
+                            0L),
+                    1000L, false);
+        } catch (Exception e) {
+            logger.debug("统一位点（subscribe）落盘失败: {}", e.getMessage());
         }
     }
 

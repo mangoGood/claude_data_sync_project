@@ -42,6 +42,14 @@ public class TypedDmlConverter {
     private final boolean targetIsMysql;
     private final boolean guardWithBeforeImage;
     private final boolean sourceIsMysql;
+    /**
+     * 无主键表的 UPDATE/DELETE 是否限定成只影响一行（{@code increment.nopk.row.match}，默认 LIMIT_ONE）。
+     *
+     * <p>无主键表只能按<b>整行前镜像</b>定位，而无主键表天然允许完全重复的行——
+     * 源端删掉 3 条重复行中的 1 条，目标端那条 WHERE 会把 3 条全删掉（实测：源剩 2 / 目标剩 0）。
+     * 不报错、不进死信，只有对数时才发现。置 {@code ALL_MATCHING} 回到旧行为（不推荐）。
+     */
+    private final boolean limitNoPkToSingleRow;
     private final String targetDatabaseName;
     /** 表名映射（仅表级同步下发）："源库.源表" → 目标表名，来自 schema.mapping.table.* */
     private final Map<String, String> tableNameMapping = new java.util.HashMap<>();
@@ -103,14 +111,31 @@ public class TypedDmlConverter {
         final String targetDb;
         final String targetTable;
         final java.util.LinkedHashMap<String, String> tagValues;
+        /**
+         * 汇聚下需要逐行注值的附加列（列处理的 CUSTOM 附加列）→ 值。
+         *
+         * <p>与 {@code tagValues} 分开放：这些列只进 INSERT 的列表与参数，
+         * <b>不能</b>进 UPDATE/DELETE 的 WHERE、也不进冲突键——它们不是主键的一部分，
+         * 混进去会让 WHERE 命中不到行。
+         */
+        final java.util.LinkedHashMap<String, String> extraValues;
         final boolean compositePk;
 
         MergeCtx(String targetDb, String targetTable,
-                 java.util.LinkedHashMap<String, String> tagValues, boolean compositePk) {
+                 java.util.LinkedHashMap<String, String> tagValues,
+                 java.util.LinkedHashMap<String, String> extraValues, boolean compositePk) {
             this.targetDb = targetDb;
             this.targetTable = targetTable;
             this.tagValues = tagValues;
+            this.extraValues = extraValues;
             this.compositePk = compositePk;
+        }
+
+        /** INSERT 时补在源列之后的列（顺序：附加列 → 来源标识列，与全量侧严格一致）。 */
+        java.util.LinkedHashMap<String, String> insertOnlyColumns() {
+            java.util.LinkedHashMap<String, String> all = new java.util.LinkedHashMap<>(extraValues);
+            all.putAll(tagValues);
+            return all;
         }
     }
 
@@ -131,6 +156,8 @@ public class TypedDmlConverter {
         this.guardWithBeforeImage = Boolean.parseBoolean(
                 props.getProperty("sync.bidi.conflict.before.image.guard", "false"));
         this.sourceIsMysql = "mysql".equals(source);
+        this.limitNoPkToSingleRow = !"ALL_MATCHING".equalsIgnoreCase(
+                props.getProperty("increment.nopk.row.match", "LIMIT_ONE"));
         this.targetDatabaseName = props.getProperty("target.db.database", "");
 
         // 表名映射：schema.mapping.table.<源库>.<源表>=<目标库>.<目标表>，DML 只需要表名部分
@@ -198,7 +225,16 @@ public class TypedDmlConverter {
      * 其它来源的同主键行。调用方据此 fail-stop，而不是让它悄悄改坏别的来源的数据。
      */
     public boolean requiresTypedPipeline(THLEvent event) {
-        if ((!mergeActive && !splitActive) || event == null || event.getMetadata() == null) {
+        if (event == null || event.getMetadata() == null) {
+            return false;
+        }
+        // 带大字段引用的事件也必须走类型化路径：文本路径把值拼成 SQL 字面量，
+        // 而一个 1GB 的值根本没法出现在字面量里。真回退过去，写进目标 BLOB 列的会是
+        // "@lob:xxx" 这串字符——长度对得上、语法也合法，是最难查的那种静默数据损坏。
+        if (Boolean.TRUE.equals(event.getMetadata().get("has_lob"))) {
+            return true;
+        }
+        if (!mergeActive && !splitActive) {
             return false;
         }
         Map<String, Object> metadata = event.getMetadata();
@@ -245,11 +281,17 @@ public class TypedDmlConverter {
                 tags.put(col, value);
             }
         }
-        MergeCtx ctx = new MergeCtx(target.getDatabase(), target.getTable(), tags,
+        // 汇聚下 CUSTOM 附加列由 DML 逐行注值（建表不带 DEFAULT）——合并表只由第一个来源建出来，
+        // DEFAULT 里烤的是那一个来源的库表名。全量侧同理，两边的列序也必须一致
+        java.util.LinkedHashMap<String, String> extras = columnProcessingActive
+                ? columnProcessing.perRowExtraValues(srcDb, srcTable)
+                : new java.util.LinkedHashMap<>();
+        MergeCtx ctx = new MergeCtx(target.getDatabase(), target.getTable(), tags, extras,
                 rule.getPkStrategy() == com.migration.common.route.MergeRule.PkStrategy.COMPOSITE_SOURCE);
         mergeCtxCache.put(key, ctx);
-        logger.info("汇聚路由（增量）: {}.{} -> {}.{}，来源标识 {}",
-                srcDb, srcTable, ctx.targetDb, ctx.targetTable, tags);
+        logger.info("汇聚路由（增量）: {}.{} -> {}.{}，来源标识 {}{}",
+                srcDb, srcTable, ctx.targetDb, ctx.targetTable, tags,
+                extras.isEmpty() ? "" : "，逐行附加列 " + extras.keySet());
         return ctx;
     }
 
@@ -417,6 +459,75 @@ public class TypedDmlConverter {
         return (o instanceof List) ? (List<ArrayList<Object>>) o : null;
     }
 
+    /** 列名与行值成对剔除生成列之后的结果。 */
+    private static final class WritableColumns {
+        final String[] columns;
+        final List<ArrayList<Object>> rows;
+
+        WritableColumns(String[] columns, List<ArrayList<Object>> rows) {
+            this.columns = columns;
+            this.rows = rows;
+        }
+    }
+
+    /**
+     * 把生成列（STORED/VIRTUAL）从"要写的列"里剔掉，值同步剔除。
+     *
+     * <p>binlog 行事件<b>带着</b>生成列算好的值（实测 includedColumns 覆盖全部列），
+     * 但目标库拒绝显式写入：{@code ERROR 3105 The value specified for generated column ...
+     * is not allowed}，一条这样的 INSERT 就让增量 fail-stop、任务再也追不上。
+     *
+     * <p>只能在这里成对剔除，不能让 extract 直接不下发这些值——行值是按<b>全列顺序</b>排的，
+     * 少一个值后面所有列都会错位，那是比报错更糟的静默写坏。
+     *
+     * <p>剔的只是"写"的那一侧（INSERT 列清单、UPDATE 的 SET 列）；WHERE 用的前镜像保持完整，
+     * 生成列参与主键时（STORED 可以）仍定位得到行。
+     *
+     * @return null 表示无需过滤（没有生成列 / 列值数量对不上，后者交给原有的整事件回退逻辑）
+     */
+    private WritableColumns dropGeneratedColumns(Map<String, Object> metadata, String[] cols,
+                                                 List<ArrayList<Object>> rows) {
+        String generatedMeta = (String) metadata.get("generated_columns");
+        if (generatedMeta == null || generatedMeta.isEmpty() || cols == null || rows == null) {
+            return null;
+        }
+        java.util.Set<String> generated = new java.util.HashSet<>();
+        for (String name : generatedMeta.split("\\s*,\\s*")) {
+            if (!name.isEmpty()) {
+                generated.add(name.toLowerCase());
+            }
+        }
+        List<Integer> keep = new ArrayList<>(cols.length);
+        for (int i = 0; i < cols.length; i++) {
+            if (!generated.contains(cols[i].trim().toLowerCase())) {
+                keep.add(i);
+            }
+        }
+        if (keep.size() == cols.length) {
+            return null;
+        }
+        if (keep.isEmpty()) {
+            logger.warn("表的全部列都是生成列，无法生成写入语句");
+            return null;
+        }
+        String[] keptCols = new String[keep.size()];
+        for (int i = 0; i < keep.size(); i++) {
+            keptCols[i] = cols[keep.get(i)];
+        }
+        List<ArrayList<Object>> keptRows = new ArrayList<>(rows.size());
+        for (ArrayList<Object> row : rows) {
+            if (row.size() != cols.length) {
+                return null;
+            }
+            ArrayList<Object> kept = new ArrayList<>(keep.size());
+            for (int idx : keep) {
+                kept.add(row.get(idx));
+            }
+            keptRows.add(kept);
+        }
+        return new WritableColumns(keptCols, keptRows);
+    }
+
     private String[] columns(Map<String, Object> metadata, String preferredKey) {
         String preferred = preferredKey != null ? (String) metadata.get(preferredKey) : null;
         String s = (preferred != null && !preferred.isEmpty()) ? preferred : (String) metadata.get("column_names");
@@ -488,6 +599,12 @@ public class TypedDmlConverter {
         if (cols == null) {
             return null;
         }
+        // 生成列不能出现在 INSERT 的列清单里（MySQL 3105），列与值成对剔除
+        WritableColumns writable = dropGeneratedColumns(metadata, cols, rows);
+        if (writable != null) {
+            cols = writable.columns;
+            rows = writable.rows;
+        }
         if (isSplit(srcDb, srcTable)) {
             return convertInsertSplit(metadata, srcDb, srcTable, cols, rows);
         }
@@ -507,7 +624,7 @@ public class TypedDmlConverter {
             List<Object> params = row;
             if (ctx != null) {
                 params = new ArrayList<>(row);
-                params.addAll(ctx.tagValues.values());
+                params.addAll(ctx.insertOnlyColumns().values());
                 // 汇聚的"命中分布"记的是每个来源贡献了多少行（key 用来源，不是目标——
                 // 目标只有一张表，记目标看不出哪个分库偏斜）
                 routeHits.computeIfAbsent(srcDb + "." + srcTable,
@@ -688,11 +805,12 @@ public class TypedDmlConverter {
         MergeCtx ctx = mergeCtxOf(srcDb, srcTable);
         String[] sqlCols = mapColumns(srcDb, srcTable, cols);
         if (ctx != null) {
-            // 汇聚：来源标识列补在列尾，顺序与 convertInsert 的补值顺序一致
-            String[] withTags = java.util.Arrays.copyOf(sqlCols, sqlCols.length + ctx.tagValues.size());
+            // 汇聚：逐行附加列与来源标识列补在列尾，顺序与 convertInsert 的补值顺序一致
+            java.util.LinkedHashMap<String, String> appended = ctx.insertOnlyColumns();
+            String[] withTags = java.util.Arrays.copyOf(sqlCols, sqlCols.length + appended.size());
             int i = sqlCols.length;
-            for (String tag : ctx.tagValues.keySet()) {
-                withTags[i++] = tag;
+            for (String col : appended.keySet()) {
+                withTags[i++] = col;
             }
             sqlCols = withTags;
         }
@@ -753,6 +871,12 @@ public class TypedDmlConverter {
         if (setCols == null || whereCols == null) {
             return null;
         }
+        // 生成列只从 SET 侧剔除；WHERE 用的前镜像保持完整（生成列可以是主键的一部分）
+        WritableColumns writable = dropGeneratedColumns(metadata, setCols, afterRows);
+        if (writable != null) {
+            setCols = writable.columns;
+            afterRows = writable.rows;
+        }
         if (isSplit(srcDb, srcTable)) {
             return convertUpdateSplit(metadata, srcDb, srcTable, setCols, whereCols, afterRows, beforeRows);
         }
@@ -795,7 +919,7 @@ public class TypedDmlConverter {
                     List<Object> insParams = after;
                     if (ctx != null) {
                         insParams = new ArrayList<>(after);
-                        insParams.addAll(ctx.tagValues.values());
+                        insParams.addAll(ctx.insertOnlyColumns().values());
                     }
                     out.add(new ParameterizedDml(insertSql, insParams, table,
                             mergeRowKey(rowKeyOf(setCols, after, pks), ctx), "INSERT"));
@@ -804,7 +928,8 @@ public class TypedDmlConverter {
                 }
             }
 
-            StringBuilder sql = new StringBuilder("UPDATE ").append(tableRef(metadata, table, ctx)).append(" SET ");
+            String updRef = tableRef(metadata, table, ctx);
+            StringBuilder sql = new StringBuilder("UPDATE ").append(updRef).append(" SET ");
             List<Object> params = new ArrayList<>(after.size() + before.size());
             for (int i = 0; i < sqlSetCols.length; i++) {
                 if (i > 0) sql.append(", ");
@@ -814,16 +939,21 @@ public class TypedDmlConverter {
             // 主键定位版（冲突裁决判"来的一方赢"时用它强制覆盖）
             StringBuilder pkOnly = new StringBuilder(sql);
             List<Object> pkOnlyParams = new ArrayList<>(params);
+            int pkOnlyWhereStart = pkOnly.length();
             if (!appendWhere(pkOnly, pkOnlyParams, whereCols, sqlWhereCols, before, pks)) {
                 return null;
             }
             // 汇聚：源主键在合并表里不唯一，两种 WHERE 都必须补来源标识列
             appendMergeTagWhere(pkOnly, pkOnlyParams, ctx);
+            // 无主键表：WHERE 是整行前镜像，重复行会被一起改掉。必须在 WHERE 全部拼完之后再限量。
+            limitToSingleRow(pkOnly, updRef, pkOnlyWhereStart, pks);
             if (guardWithBeforeImage) {
+                int guardWhereStart = sql.length();
                 if (!appendBeforeImageWhere(sql, params, whereCols, sqlWhereCols, before, pks)) {
                     return null;
                 }
                 appendMergeTagWhere(sql, params, ctx);
+                limitToSingleRow(sql, updRef, guardWhereStart, pks);
             } else {
                 sql = pkOnly;
                 params = pkOnlyParams;
@@ -861,13 +991,17 @@ public class TypedDmlConverter {
                 logger.debug("列过滤跳过 DELETE 行: {}.{}", srcDb, srcTable);
                 continue;
             }
-            StringBuilder sql = new StringBuilder("DELETE FROM ").append(tableRef(metadata, table, ctx));
+            String delRef = tableRef(metadata, table, ctx);
+            StringBuilder sql = new StringBuilder("DELETE FROM ").append(delRef);
             List<Object> params = new ArrayList<>();
+            int delWhereStart = sql.length();
             if (!appendWhere(sql, params, cols, sqlCols, row, pks)) {
                 return null;
             }
             // 汇聚：不带来源标识的 DELETE 会连同其它来源的同主键行一起删掉
             appendMergeTagWhere(sql, params, ctx);
+            // 无主键表：整行 WHERE 会命中所有重复行，源端删一行目标端会删光
+            limitToSingleRow(sql, delRef, delWhereStart, pks);
             out.add(new ParameterizedDml(sql.toString(), params, table,
                     mergeRowKey(rowKeyOf(cols, row, pks), ctx), "DELETE"));
         }
@@ -944,6 +1078,34 @@ public class TypedDmlConverter {
      * @param cols    源列名（用于主键匹配——metadata 的 primary_keys 是源列名）
      * @param sqlCols SQL 输出用列名（列名映射后的目标列名；无映射时与 cols 相同）
      */
+    /**
+     * 无主键表：把"只影响一行"钉进 SQL 里。
+     *
+     * <p>有主键时 WHERE 天然只命中一行，什么都不做。无主键时 WHERE 是整行前镜像，
+     * 而完全重复的行在无主键表里是合法的——源端删一行，目标端会把所有重复行一起删掉。
+     *
+     * <p>两种方言的写法不一样，所以不能简单地"在末尾追加一句"：
+     * MySQL 的 UPDATE/DELETE 支持 {@code LIMIT 1}；PostgreSQL 不支持，得改写成
+     * {@code WHERE ctid IN (SELECT ctid FROM t WHERE ... LIMIT 1)}——子查询里的条件与参数
+     * 跟原 WHERE 完全一致，所以参数列表的顺序不用动。
+     *
+     * @param whereStart 调用 {@link #appendWhere} <b>之前</b> {@code sql.length()} 的值
+     */
+    private void limitToSingleRow(StringBuilder sql, String tableRef, int whereStart,
+                                  java.util.Set<String> pks) {
+        if (!limitNoPkToSingleRow || !pks.isEmpty()) {
+            return;
+        }
+        if (targetIsMysql) {
+            sql.append(" LIMIT 1");
+            return;
+        }
+        String where = sql.substring(whereStart);   // " WHERE a=? AND b IS NULL"
+        sql.setLength(whereStart);
+        sql.append(" WHERE ctid IN (SELECT ctid FROM ").append(tableRef)
+                .append(where).append(" LIMIT 1)");
+    }
+
     private boolean appendWhere(StringBuilder sql, List<Object> params,
                                 String[] cols, String[] sqlCols, List<Object> values, java.util.Set<String> pks) {
         sql.append(" WHERE ");

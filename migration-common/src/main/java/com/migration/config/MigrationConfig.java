@@ -26,6 +26,17 @@ public class MigrationConfig {
     private int bulkBatchRows;
     /** 批量装载的完整配置（档位/行阈值/字节阈值），与 Mongo/ES/Redis 各链路共用同一组键。 */
     private com.migration.common.bulk.BulkLoadOptions bulkLoadOptions;
+    /** 大字段旁路流式搬运开关与尺寸参数（见 migration.lob.*）。 */
+    private boolean lobStreamEnabled = true;
+    private com.migration.common.lob.LobWriteOptions lobWriteOptions =
+            com.migration.common.lob.LobWriteOptions.defaults();
+    /**
+     * 全量装载限速（行/秒），0/负数 = 不限速。
+     *
+     * <p>第 5 批把全量提到 38K 行/秒之后，"链路上一个阀门都没有"本身成了风险——
+     * 一个没人看着的全量任务可以把源库 IO 打满。增量早有限速，全量一直没有。
+     */
+    private long fullRateLimitRowsPerSec;
     /** 全量一致性快照模式（migration.full.snapshot.mode）：NONE / GTID_ONLY / CONSISTENT。 */
     private String snapshotMode;
     private Set<String> includedDatabases;
@@ -84,6 +95,9 @@ public class MigrationConfig {
         // flavor：TiDB 归一成 dbType=mysql，快照手法却完全不同（MVCC 无锁 vs FTWRL），
         // 故单独带一个 flavor 传给一致性快照
         sourceConfig.setFlavor(props.getProperty("source.db.flavor"));
+        // 传输层加密：默认 DISABLED，与历史行为完全一致；配了才走 TLS
+        sourceConfig.setSslMode(props.getProperty("source.db.ssl.mode"));
+        sourceConfig.setSslRootCert(props.getProperty("source.db.ssl.root.cert"));
 
         String sourceSchema = props.getProperty("source.db.schema");
         if (sourceSchema != null && !sourceSchema.isEmpty()) {
@@ -100,6 +114,8 @@ public class MigrationConfig {
         );
 
         targetConfig.setFlavor(props.getProperty("target.db.flavor"));
+        targetConfig.setSslMode(props.getProperty("target.db.ssl.mode"));
+        targetConfig.setSslRootCert(props.getProperty("target.db.ssl.root.cert"));
 
         String targetSchema = props.getProperty("target.db.schema");
         if (targetSchema != null && !targetSchema.isEmpty()) {
@@ -134,6 +150,8 @@ public class MigrationConfig {
         // COPY（PG 二进制）/ DIRECT_PATH（Oracle 直接路径）由 migration.full.bulk.mode 显式选中。
         // 只加驱动参数、不改协议（仍是 PreparedStatement 类型绑定），故默认开启。
         bulkLoadOptions = com.migration.common.bulk.BulkLoadOptions.from(props);
+        fullRateLimitRowsPerSec = Long.parseLong(
+                props.getProperty("migration.full.rate.limit.rows.per.sec", "0"));
         bulkLoadEnabled = bulkLoadOptions.isEnabled();
         // 未显式配置行阈值时按 batchSize 放大：重写后的多值 INSERT 每批越大往返越少，
         // 但单条语句过大会撞 max_allowed_packet，取 5 倍是实测的稳妥档位（另有字节阈值兜底）
@@ -141,6 +159,13 @@ public class MigrationConfig {
         if (bulkLoadEnabled) {
             applyBulkJdbcOptions(targetConfig, targetDbType);
         }
+
+        // 大字段旁路流式搬运（仅 mysql→mysql）：LONGBLOB/LONGTEXT/MEDIUM* 列不进 SELECT 列表，
+        // 改为"只取长度 + 分块拉取 + 流式写入"，让进程内存与字段大小脱钩。
+        // 默认开启：它只对上述类型的列改变行为，其它表一个字节都不碰；
+        // 关掉即回到"整行读进堆"的历史行为（也就是 1GB 字段必 OOM）。
+        lobStreamEnabled = Boolean.parseBoolean(props.getProperty("migration.lob.stream.enabled", "true"));
+        lobWriteOptions = com.migration.common.lob.LobWriteOptions.from(props);
 
         // 全量一致性快照（P2-3）：NONE / GTID_ONLY（默认，只记位点不加锁）/ CONSISTENT
         snapshotMode = props.getProperty("migration.full.snapshot.mode", "GTID_ONLY").trim().toUpperCase();
@@ -252,6 +277,16 @@ public class MigrationConfig {
         }
     }
 
+    /** 大字段旁路流式搬运是否启用（migration.lob.stream.enabled，默认 true）。 */
+    public boolean isLobStreamEnabled() {
+        return lobStreamEnabled;
+    }
+
+    /** 大字段搬运的尺寸参数（源端 chunk / 追加块 / 包余量）。 */
+    public com.migration.common.lob.LobWriteOptions getLobWriteOptions() {
+        return lobWriteOptions;
+    }
+
     /** 全量写侧批量装载是否启用。 */
     public boolean isBulkLoadEnabled() {
         return bulkLoadEnabled;
@@ -263,6 +298,10 @@ public class MigrationConfig {
     }
 
     /** 批量装载的完整配置（档位/行阈值/字节阈值）。 */
+    public long getFullRateLimitRowsPerSec() {
+        return fullRateLimitRowsPerSec;
+    }
+
     public com.migration.common.bulk.BulkLoadOptions getBulkLoadOptions() {
         return bulkLoadOptions != null
                 ? bulkLoadOptions

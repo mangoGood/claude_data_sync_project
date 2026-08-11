@@ -39,7 +39,7 @@ public class ValidationTaskController {
                 map.put("targetType", w.getTargetType() != null ? w.getTargetType() : "mysql");
                 // 列处理任务（列过滤/列名映射/附加列）不支持行数/内容对比，前端据此隐藏并提示
                 map.put("hasColumnProcessing", validationTaskService.hasColumnProcessing(w.getSyncObjects()));
-                // 路由任务（汇聚/拆分）支持行数对比（按落点统计），但不支持内容对比，前端据此过滤
+                // 路由模式（NONE/MERGE/SPLIT）：两种对比都已路由感知，这里给前端做展示与提示用
                 map.put("routeMode", com.synctask.service.RouteCompareSupport.modeOf(w.getRouteConfig()));
                 map.put("createdAt", w.getCreatedAt());
                 return map;
