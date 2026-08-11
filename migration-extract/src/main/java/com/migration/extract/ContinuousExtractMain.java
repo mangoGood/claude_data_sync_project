@@ -263,6 +263,19 @@ public class ContinuousExtractMain {
                     logger.info("Extract thread interrupted");
                     Thread.currentThread().interrupt();
                     break;
+                } catch (MySQLBinlogExtractor.ColumnLayoutMismatchException e) {
+                    // 事件的列布局与源库当前定义对不上：继续解析就是整行错位的静默写坏
+                    logger.error("列布局与源库当前定义不一致，停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3021", e.getMessage());
+                    running.set(false);
+                    break;
+                } catch (MySQLBinlogExtractor.UnsupportedBinlogEventException e) {
+                    // 不认识的事件类型：跳过去就是静默丢数据（源端开了压缩 binlog / PARTIAL_JSON
+                    // 这类参数时会命中）。停下来上报，让人先确认源端配置
+                    logger.error("遇到不支持的 binlog 事件类型，停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3020", e.getMessage());
+                    running.set(false);
+                    break;
                 } catch (XaTransactionBuffer.XaQuotaExceededException e) {
                     // XA 缓冲配额突破：继续跑下去要么把分支丢掉（源库已提交的数据永久不到目标库），
                     // 要么把磁盘撑爆。停下来上报，让人先处置源库的未决分支

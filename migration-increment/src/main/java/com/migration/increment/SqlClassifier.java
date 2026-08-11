@@ -91,6 +91,15 @@ public class SqlClassifier {
             "^\\s*XA\\s+(START|BEGIN|END|PREPARE|COMMIT|ROLLBACK)\\b",
             java.util.regex.Pattern.CASE_INSENSITIVE);
 
+    /**
+     * SAVEPOINT 相关语句。ROW 格式下 {@code SAVEPOINT `sp1`} 会<b>随事务一起进 binlog</b>
+     * （实测；{@code ROLLBACK TO} 不进，被回滚的行事件在写盘前就丢了）。这些语句在目标端
+     * 没有任何对应动作——目标事务是我们自己开的，源端的 savepoint 名字在那边不存在。
+     */
+    private static final java.util.regex.Pattern SAVEPOINT_STATEMENT = java.util.regex.Pattern.compile(
+            "^\\s*(SAVEPOINT\\s|ROLLBACK\\s+TO\\b|RELEASE\\s+SAVEPOINT\\b)",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+
     public static class ClassificationResult {
         private StatementType statementType;
         private DdlSubType ddlSubType;
@@ -156,6 +165,17 @@ public class SqlClassifier {
         if (sql == null || sql.trim().isEmpty()) {
             result.setStatementType(StatementType.OTHER);
             result.setParseSuccess(false);
+            return result;
+        }
+
+        // SAVEPOINT 三兄弟：ANTLR 只认裸 `SAVEPOINT x`，`ROLLBACK TO x` 和 `RELEASE SAVEPOINT x`
+        // 会落进 OTHER 的兜底执行路径被原样打到目标库——目标端那个 savepoint 根本不存在，
+        // 一执行就是 1305 SAVEPOINT does not exist，增量 fail-stop
+        if (SAVEPOINT_STATEMENT.matcher(sql).find()) {
+            result.setStatementType(StatementType.TRANSACTION);
+            result.setTransactionSubType(TransactionSubType.SAVEPOINT);
+            result.setNeedsDatabaseSelection(false);
+            result.setParseSuccess(true);
             return result;
         }
 

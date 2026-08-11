@@ -351,6 +351,9 @@ public class DiagnosticService {
             checks.add(checkLargeObjectSupport(src, srcConn, tgtConn, entries, needsIncrement));
             if (needsIncrement && "mysql".equalsIgnoreCase(workflow.getSourceType())) {
                 checks.add(checkPendingXaBranches(src));
+                if ("BIDIRECTIONAL".equalsIgnoreCase(workflow.getDrMode())) {
+                    checks.add(checkBidiAutoIncrement(src, tgtConn, entries));
+                }
             }
         } catch (Exception e) {
             checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
@@ -1165,6 +1168,95 @@ public class DiagnosticService {
         }
         return check("列处理引用列", "FAIL",
                 "列处理引用了不存在的源列（" + missing.size() + " 个）", String.join(", ", missing));
+    }
+
+    /**
+     * 双向同步的自增碰撞检查（仅 BIDIRECTIONAL + 有自增列的表）。
+     *
+     * <p>active-active 下两端各自分配自增 ID：A 端插到 id=5、B 端也插到 id=5，两条<b>内容不同</b>
+     * 的行复制到对端时撞主键。而应用侧对主键冲突的处理是 upsert 覆盖 / 当成"幂等重放"忽略——
+     * 两种都会让一侧的那行数据静默消失，没有任何冲突告警（冲突裁决管的是 UPDATE 的写写冲突，
+     * 不是这种"两端各自新增了不同的行却拿到同一个 ID"）。
+     *
+     * <p>解法是 MySQL 双主/组复制的老办法：两端 {@code auto_increment_increment} 都设成 ≥2，
+     * {@code auto_increment_offset} 互相错开，各自只用一个同余类的 ID，从源头上不可能撞。
+     *
+     * <p>只在同步对象里确实存在自增列时才拦——没有自增列就不存在这个问题。
+     */
+    private Map<String, Object> checkBidiAutoIncrement(Connection src, String tgtConn, List<DbEntry> entries) {
+        List<String> autoIncTables = new ArrayList<>();
+        try {
+            for (DbEntry de : entries) {
+                if (!schemaExists(src, de.sourceDb)) continue;
+                try (PreparedStatement ps = src.prepareStatement(
+                        "SELECT TABLE_NAME FROM information_schema.columns " +
+                        "WHERE TABLE_SCHEMA = ? AND EXTRA LIKE '%auto_increment%'")) {
+                    ps.setString(1, de.sourceDb);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            String t = rs.getString(1);
+                            if (de.dbLevel || de.tables.contains(t)) {
+                                autoIncTables.add(de.sourceDb + "." + t);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return check("双向自增错开", "WARNING", "无法读取源库自增列信息: " + e.getMessage(), null);
+        }
+        if (autoIncTables.isEmpty()) {
+            return check("双向自增错开", "PASS", "同步对象里没有自增列，不存在两端分配同一个 ID 的问题", null);
+        }
+
+        long srcInc, srcOff, tgtInc, tgtOff;
+        try (Connection tgt = openConn(tgtConn)) {
+            srcInc = longVariable(src, "auto_increment_increment");
+            srcOff = longVariable(src, "auto_increment_offset");
+            tgtInc = longVariable(tgt, "auto_increment_increment");
+            tgtOff = longVariable(tgt, "auto_increment_offset");
+        } catch (Exception e) {
+            return check("双向自增错开", "WARNING", "无法读取两端自增参数: " + e.getMessage(), null);
+        }
+
+        boolean staggered = autoIncrementStaggered(srcInc, srcOff, tgtInc, tgtOff);
+        String detail = String.format("源端 increment=%d offset=%d；目标端 increment=%d offset=%d；"
+                + "涉及自增列的表 %d 个（%s）", srcInc, srcOff, tgtInc, tgtOff, autoIncTables.size(),
+                String.join(", ", autoIncTables.subList(0, Math.min(10, autoIncTables.size()))));
+        if (staggered) {
+            return check("双向自增错开", "PASS", "两端自增步长与偏移已错开，不会分配到同一个 ID", detail);
+        }
+        return check("双向自增错开", "FAIL",
+                "双向同步下两端会分配到同一个自增 ID，复制到对端时撞主键，被当成幂等重放/upsert 覆盖掉——"
+                        + "一侧的数据会静默消失。请把两端设成错开的同余类，例如 "
+                        + "A 端 SET GLOBAL auto_increment_increment=2, auto_increment_offset=1；"
+                        + "B 端 SET GLOBAL auto_increment_increment=2, auto_increment_offset=2（并写进配置文件持久化）",
+                detail);
+    }
+
+    /**
+     * 两端的自增分配是否互不相交。
+     *
+     * <p>条件是"各自只用一个同余类"：步长都 ≥2、偏移互不相同、且偏移落在 [1, 步长] 内
+     * （MySQL 对 offset > increment 的配置是<b>直接忽略 offset</b> 的，写成 3/5 看着错开、
+     * 实际两端都从同一个序列取值，所以必须一起校验）。
+     */
+    static boolean autoIncrementStaggered(long srcInc, long srcOff, long tgtInc, long tgtOff) {
+        if (srcInc < 2 || tgtInc < 2) {
+            return false;
+        }
+        if (srcOff < 1 || tgtOff < 1 || srcOff > srcInc || tgtOff > tgtInc) {
+            return false;
+        }
+        // 步长不同的话同余类照样会相交（例如 2/1 与 3/1 都会产出 7），要求两端步长一致
+        return srcInc == tgtInc && srcOff != tgtOff;
+    }
+
+    private long longVariable(Connection conn, String name) throws Exception {
+        try (java.sql.Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT @@" + name)) {
+            return rs.next() ? rs.getLong(1) : 1L;
+        }
     }
 
     /**

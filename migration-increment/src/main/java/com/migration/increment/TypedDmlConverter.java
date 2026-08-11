@@ -459,6 +459,75 @@ public class TypedDmlConverter {
         return (o instanceof List) ? (List<ArrayList<Object>>) o : null;
     }
 
+    /** 列名与行值成对剔除生成列之后的结果。 */
+    private static final class WritableColumns {
+        final String[] columns;
+        final List<ArrayList<Object>> rows;
+
+        WritableColumns(String[] columns, List<ArrayList<Object>> rows) {
+            this.columns = columns;
+            this.rows = rows;
+        }
+    }
+
+    /**
+     * 把生成列（STORED/VIRTUAL）从"要写的列"里剔掉，值同步剔除。
+     *
+     * <p>binlog 行事件<b>带着</b>生成列算好的值（实测 includedColumns 覆盖全部列），
+     * 但目标库拒绝显式写入：{@code ERROR 3105 The value specified for generated column ...
+     * is not allowed}，一条这样的 INSERT 就让增量 fail-stop、任务再也追不上。
+     *
+     * <p>只能在这里成对剔除，不能让 extract 直接不下发这些值——行值是按<b>全列顺序</b>排的，
+     * 少一个值后面所有列都会错位，那是比报错更糟的静默写坏。
+     *
+     * <p>剔的只是"写"的那一侧（INSERT 列清单、UPDATE 的 SET 列）；WHERE 用的前镜像保持完整，
+     * 生成列参与主键时（STORED 可以）仍定位得到行。
+     *
+     * @return null 表示无需过滤（没有生成列 / 列值数量对不上，后者交给原有的整事件回退逻辑）
+     */
+    private WritableColumns dropGeneratedColumns(Map<String, Object> metadata, String[] cols,
+                                                 List<ArrayList<Object>> rows) {
+        String generatedMeta = (String) metadata.get("generated_columns");
+        if (generatedMeta == null || generatedMeta.isEmpty() || cols == null || rows == null) {
+            return null;
+        }
+        java.util.Set<String> generated = new java.util.HashSet<>();
+        for (String name : generatedMeta.split("\\s*,\\s*")) {
+            if (!name.isEmpty()) {
+                generated.add(name.toLowerCase());
+            }
+        }
+        List<Integer> keep = new ArrayList<>(cols.length);
+        for (int i = 0; i < cols.length; i++) {
+            if (!generated.contains(cols[i].trim().toLowerCase())) {
+                keep.add(i);
+            }
+        }
+        if (keep.size() == cols.length) {
+            return null;
+        }
+        if (keep.isEmpty()) {
+            logger.warn("表的全部列都是生成列，无法生成写入语句");
+            return null;
+        }
+        String[] keptCols = new String[keep.size()];
+        for (int i = 0; i < keep.size(); i++) {
+            keptCols[i] = cols[keep.get(i)];
+        }
+        List<ArrayList<Object>> keptRows = new ArrayList<>(rows.size());
+        for (ArrayList<Object> row : rows) {
+            if (row.size() != cols.length) {
+                return null;
+            }
+            ArrayList<Object> kept = new ArrayList<>(keep.size());
+            for (int idx : keep) {
+                kept.add(row.get(idx));
+            }
+            keptRows.add(kept);
+        }
+        return new WritableColumns(keptCols, keptRows);
+    }
+
     private String[] columns(Map<String, Object> metadata, String preferredKey) {
         String preferred = preferredKey != null ? (String) metadata.get(preferredKey) : null;
         String s = (preferred != null && !preferred.isEmpty()) ? preferred : (String) metadata.get("column_names");
@@ -529,6 +598,12 @@ public class TypedDmlConverter {
         String[] cols = columns(metadata, "insert_column_names");
         if (cols == null) {
             return null;
+        }
+        // 生成列不能出现在 INSERT 的列清单里（MySQL 3105），列与值成对剔除
+        WritableColumns writable = dropGeneratedColumns(metadata, cols, rows);
+        if (writable != null) {
+            cols = writable.columns;
+            rows = writable.rows;
         }
         if (isSplit(srcDb, srcTable)) {
             return convertInsertSplit(metadata, srcDb, srcTable, cols, rows);
@@ -795,6 +870,12 @@ public class TypedDmlConverter {
         String[] whereCols = columns(metadata, "update_before_column_names");
         if (setCols == null || whereCols == null) {
             return null;
+        }
+        // 生成列只从 SET 侧剔除；WHERE 用的前镜像保持完整（生成列可以是主键的一部分）
+        WritableColumns writable = dropGeneratedColumns(metadata, setCols, afterRows);
+        if (writable != null) {
+            setCols = writable.columns;
+            afterRows = writable.rows;
         }
         if (isSplit(srcDb, srcTable)) {
             return convertUpdateSplit(metadata, srcDb, srcTable, setCols, whereCols, afterRows, beforeRows);

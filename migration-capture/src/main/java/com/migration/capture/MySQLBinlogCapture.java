@@ -147,6 +147,8 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                 props.getProperty("capture.position.health.interval.ms", "60000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         serverId = Long.parseLong(props.getProperty("capture.server.id", "65535"));
+        deserializationFailureSkip = "SKIP".equalsIgnoreCase(
+                props.getProperty("capture.deserialization.failure.policy", "FAIL_STOP").trim());
         bidirectionalEnabled = com.migration.common.bidi.BidiConstants.isEnabled(props);
         loopGuard = new com.migration.common.bidi.BidiLoopGuard(bidirectionalEnabled);
         // 双向 DDL 单向传播：只有"方向开了 A_TO_B"且"本任务是正向通道"时才放行
@@ -307,6 +309,34 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         CapturePositionUnavailableException(String message) {
             super(message);
         }
+    }
+
+    /** 反序列化失败是否只跳过不停机（{@code capture.deserialization.failure.policy=SKIP}）。 */
+    private boolean deserializationFailureSkip = false;
+
+    /** 已经在停机流程里，避免多个失败事件重复触发。 */
+    private final java.util.concurrent.atomic.AtomicBoolean failStopped =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 不可继续的故障：上报 error_status 后退出进程。
+     *
+     * <p>必须另起线程做退出动作——本方法是在连接器的事件线程上被调用的，
+     * 而 {@code System.exit} 触发的关闭钩子里会 {@code client.disconnect()} 等这个线程收工，
+     * 在原线程上直接退出会死锁。
+     *
+     * <p>位点不用特意回退：{@code currentBinlogPosition} 只在事件<b>成功处理</b>时才更新，
+     * 失败事件根本没走到那一步，所以关闭钩子里存下的仍是故障事件之前的位点，重启会重读它。
+     */
+    private void failStop(String errorCode, String message) {
+        if (!failStopped.compareAndSet(false, true)) {
+            return;
+        }
+        logger.error("capture fail-stop [{}]: {}", errorCode, message);
+        writeCaptureErrorStatus(errorCode, message);
+        Thread exit = new Thread(() -> System.exit(1), "capture-fail-stop");
+        exit.setDaemon(false);
+        exit.start();
     }
 
     /**
@@ -543,7 +573,18 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
             @Override
             public void onEventDeserializationFailure(StreamingBinaryLogClient client, Exception ex) {
-                logger.error("事件反序列化失败: {}", ex.getMessage());
+                // 连接器在这个回调之后是 <b>continue</b>——该事件被永久跳过。只打一行日志的话，
+                // 一个解析不了的行事件就是一次静默丢数据：任务照常显示健康、位点照常前进、
+                // 下游少了几行没有任何人知道。实测源端开 binlog_row_value_options=PARTIAL_JSON
+                // 就会走到这里（PARTIAL_UPDATE_ROWS_EVENT），UPDATE 整条消失且 error_status 为空。
+                // 所以默认停下来上报，让人去处置源端；确实想放过时才配 SKIP。
+                if (deserializationFailureSkip) {
+                    logger.error("事件反序列化失败（按 capture.deserialization.failure.policy=SKIP 跳过，"
+                            + "该事件的数据将永久缺失）: {}", ex.getMessage());
+                    return;
+                }
+                failStop("E3019", "binlog 事件反序列化失败，该事件会被连接器跳过（等于静默丢数据），"
+                        + "已停止捕获: " + ex.getMessage());
             }
 
             @Override
@@ -665,7 +706,50 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         logger.info("背压监控线程已启动, taskId={}", taskId);
     }
 
+    /**
+     * 事件入口。压缩事务（{@code binlog_transaction_compression=ON}，MySQL 8.0.20+）在这里拆包。
+     *
+     * <p>开了压缩之后，<b>整个事务</b>在 binlog 里只有一个 {@code Transaction_payload} 事件
+     * （实测 8.0.44：ZSTD，内层的 BEGIN/Table_map/Write_rows/Xid 位点全等于外层）。而连接器
+     * 只把<b>外层</b>事件投给监听器，内层要调用方自己 {@code getUncompressedEvents()} 展开——
+     * 不展开的话整个事务连一行都到不了下游，而且不报错、位点照常前进，任务看着完全健康。
+     * 这是实测复现过的静默丢数据。
+     *
+     * <p>内层事件沿用外层的 binlog 位点（它们本来就在同一个位点上），所以位点语义、续传口径
+     * 都不变：重启从这个位点重来，整个事务原样重放一遍。
+     */
     private void processEvent(Event event) {
+        if (!running) {
+            return;
+        }
+        EventData data = event.getData();
+        if (data instanceof com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData) {
+            com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData payload =
+                    (com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData) data;
+            java.util.List<Event> inner = payload.getUncompressedEvents();
+            if (inner == null || inner.isEmpty()) {
+                failStop("E3019", "压缩事务 (TRANSACTION_PAYLOAD @ " + client.getBinlogFilename()
+                        + ":" + client.getBinlogPosition() + ") 解压后没有任何内层事件，"
+                        + "该事务的数据无法捕获");
+                return;
+            }
+            if (compressedTxLogged.compareAndSet(false, true)) {
+                logger.info("源端启用了压缩 binlog（binlog_transaction_compression），"
+                        + "已按内层事件逐个捕获（首个压缩事务含 {} 个内层事件）", inner.size());
+            }
+            for (Event e : inner) {
+                processSingleEvent(e);
+            }
+            return;
+        }
+        processSingleEvent(event);
+    }
+
+    /** 已经打过"源端开了压缩 binlog"这条提示（每进程一次，不刷屏）。 */
+    private final java.util.concurrent.atomic.AtomicBoolean compressedTxLogged =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private void processSingleEvent(Event event) {
         if (!running) {
             return;
         }

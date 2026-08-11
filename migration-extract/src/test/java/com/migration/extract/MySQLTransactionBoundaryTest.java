@@ -126,6 +126,36 @@ class MySQLTransactionBoundaryTest {
         assertTrue(TxnMetadata.isTxLast(x.getMetadata()));
     }
 
+    /**
+     * SAVEPOINT 是事务<b>内</b>的语句，不能当成隐式提交的 DDL。
+     *
+     * <p>ROW 格式下它照样进 binlog（实测 8.0.44：{@code BEGIN → 行事件 → SAVEPOINT `sp1` →
+     * 行事件 → XID}）。改造前它落进"DDL 隐式提交"分支把 currentTxId 清掉，于是 savepoint
+     * 之后的行事件全部没有 tx_id——事务一致模式下一个源事务被切成两个目标事务，正是该模式
+     * 要防的"半个事务"。Spring 的 PROPAGATION_NESTED、各类 ORM 的嵌套事务都会产生 savepoint。
+     */
+    @Test
+    @DisplayName("事务中间的 SAVEPOINT 不打断 tx_id，前后行事件仍属同一个源事务")
+    void savepointKeepsTransactionIntact() throws Exception {
+        begin(100);
+        THLEvent before = row(200);
+        THLEvent savepoint = extract("QUERY", 300,
+                "QueryEventData{threadId=1, database='db', sql='SAVEPOINT `sp1`'}");
+        THLEvent after1 = row(400);
+        THLEvent after2 = row(500);
+        THLEvent commit = xid(600, 77);
+
+        String txId = "mysql-bin.000001:100";
+        assertEquals(txId, TxnMetadata.txIdOf(before.getMetadata()));
+        assertEquals(txId, TxnMetadata.txIdOf(savepoint.getMetadata()),
+                "SAVEPOINT 事件本身也属于这个事务");
+        assertEquals(txId, TxnMetadata.txIdOf(after1.getMetadata()),
+                "savepoint 之后的行事件必须还挂在同一个 tx_id 上，否则源事务被切开");
+        assertEquals(txId, TxnMetadata.txIdOf(after2.getMetadata()));
+        assertEquals(txId, TxnMetadata.txIdOf(commit.getMetadata()));
+        assertTrue(TxnMetadata.isTxLast(commit.getMetadata()));
+    }
+
     @Test
     @DisplayName("非事务引擎用 QUERY 'COMMIT' 收尾，同样算事务末条")
     void queryCommitClosesTransaction() throws Exception {

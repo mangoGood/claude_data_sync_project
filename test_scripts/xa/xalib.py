@@ -54,8 +54,11 @@ def mysql(container, sql, db=None, want=False, timeout=120):
         args += ["-D", db]
     p = subprocess.run(args, input=sql, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
-        err = (p.stderr or "").strip()
-        if err and "Using a password" not in err:
+        # 必须<b>按行</b>剔掉密码警告再判：整段 stderr 里只要出现这句警告就放过的话，
+        # 「警告 + 真实报错」同时出现时报错会被一起吞掉，判据脚本就成了睁眼瞎
+        err = "\n".join(line for line in (p.stderr or "").splitlines()
+                        if line.strip() and "Using a password" not in line).strip()
+        if err:
             raise RuntimeError(f"[{container}] SQL 失败: {err}\nSQL: {sql[:300]}")
     return (p.stdout or "").strip()
 

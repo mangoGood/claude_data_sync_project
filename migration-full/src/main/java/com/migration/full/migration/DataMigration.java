@@ -246,6 +246,42 @@ public class DataMigration {
         nodeConnections.clear();
     }
 
+    /**
+     * 从列清单里剔掉生成列（STORED/VIRTUAL），仅同引擎 mysql→mysql。
+     *
+     * <p>目标表的建表语句是照搬源端的，所以源端的生成列在目标端<b>还是</b>生成列，
+     * 而 MySQL 拒绝显式写入生成列：{@code ERROR 3105 The value specified for generated column
+     * ... is not allowed}——一条这样的 INSERT 就让整表搬运失败。它们的值本来也不该搬，
+     * 目标库会按表达式自己算。
+     *
+     * <p>剔除动作放在<b>这一个地方</b>、且直接改 {@link TableInfo} 的列清单：SELECT 列表、
+     * 瘦扫描列表、INSERT 列表、主键下标、分片键下标、大字段计划全都按同一份列清单的
+     * <b>下标</b>互相对齐，任何一处单独过滤都会让行值整体错位——那是比报错更糟的静默写坏。
+     *
+     * <p>异构目标（mysql→pg 等）不动：那边的目标列是普通列，值照常搬过去才是对的。
+     */
+    private void stripGeneratedColumns(TableInfo table) {
+        if (targetIsPostgresql || !"mysql".equalsIgnoreCase(sourceConnection.getConfig().getDbType())
+                || !"mysql".equalsIgnoreCase(targetConnection.getConfig().getDbType())) {
+            return;
+        }
+        List<ColumnInfo> kept = new ArrayList<>();
+        List<String> dropped = new ArrayList<>();
+        for (ColumnInfo column : table.getColumns()) {
+            if (column.isGenerated()) {
+                dropped.add(column.getColumnName());
+            } else {
+                kept.add(column);
+            }
+        }
+        if (dropped.isEmpty()) {
+            return;
+        }
+        table.setColumns(kept);
+        logger.info("表 {} 的生成列 {} 不参与数据搬运（目标库按表达式自行计算，显式写入会报 3105）",
+                table.getTableName(), dropped);
+    }
+
     /** 分片键在行值数组里的下标（行值按 {@link #buildSourceQuotedColumnList} 的列序）。 */
     private int shardKeyIndexOf(TableInfo table) {
         List<ColumnInfo> columns = table.getColumns();
@@ -501,7 +537,9 @@ public class DataMigration {
 
     public int[] migrateTableData(TableInfo table) throws SQLException {
         String tableName = table.getTableName();
-        
+
+        stripGeneratedColumns(table);
+
         long totalRows = getTableRowCount(table);
         logger.info("开始迁移表 {} 的数据，总行数: {}", tableName, totalRows);
         

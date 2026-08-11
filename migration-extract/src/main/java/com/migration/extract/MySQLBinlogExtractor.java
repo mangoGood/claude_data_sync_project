@@ -44,6 +44,8 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
     protected Map<String, List<String>> tableColumnFullTypeCache = new HashMap<>();
     protected Map<String, Map<String, List<String>>> enumSetValuesCache = new HashMap<>();
     private Map<String, List<String>> primaryKeyCache = new HashMap<>();
+    /** 每张表的生成列（STORED/VIRTUAL）列名：随列类型一起查出来，与列类型缓存同生共死。 */
+    protected Map<String, List<String>> generatedColumnCache = new HashMap<>();
 
     protected Pipeline pipeline;
 
@@ -85,6 +87,9 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
         xaBuffer = new XaTransactionBuffer(props, outputDir);
         xaBuffer.recover();
+
+        unknownEventSkip = "SKIP".equalsIgnoreCase(
+                props.getProperty("extract.unknown.event.policy", "FAIL_STOP").trim());
 
         PipelineContext pipelineContext = new PipelineContextImpl(props);
         ((PipelineContextImpl) pipelineContext).setSourceConnection(sourceConnection);
@@ -189,6 +194,8 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             thlEvent.addMetadata("operation", "COMMIT");
         } else if ("ROTATE".equals(eventType)) {
             thlEvent.addMetadata("operation", "ROTATE");
+        } else {
+            checkIgnorableEventType(eventType, binlogFile, binlogPosition);
         }
 
         stampTransaction(thlEvent, eventType, binlogFile, binlogPosition, eventData);
@@ -212,6 +219,50 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         }
 
         return thlEvent;
+    }
+
+    /**
+     * 不带任何数据变更、丢掉也没有后果的 binlog 事件类型（<b>白名单</b>）。
+     *
+     * <p>剩下的一律当成"可能带数据"的未知类型处理。之所以是白名单而不是黑名单：
+     * MySQL 每个大版本都在加新事件类型，黑名单漏一个就是一次静默丢数据，而且不报错、
+     * 位点照常前进，只有对账时才看得出来。实测踩过两次——
+     * {@code TRANSACTION_PAYLOAD}（压缩 binlog，整个事务被打包成一个事件）和
+     * {@code PARTIAL_UPDATE_ROWS_EVENT}（binlog_row_value_options=PARTIAL_JSON 下的 JSON 差量
+     * 更新），两者都不在原来的分发链里，UPDATE/整事务直接消失且 {@code error_status} 是空的。
+     */
+    private static final java.util.Set<String> IGNORABLE_EVENT_TYPES =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "UNKNOWN", "START_V3", "STOP", "INTVAR", "SLAVE", "RAND", "USER_VAR",
+                    "FORMAT_DESCRIPTION", "INCIDENT", "HEARTBEAT", "IGNORABLE",
+                    // ROWS_QUERY 带的是原始 SQL 文本（binlog_rows_query_log_events=ON），不是数据
+                    "ROWS_QUERY", "GTID", "ANONYMOUS_GTID", "PREVIOUS_GTIDS",
+                    "TRANSACTION_CONTEXT", "VIEW_CHANGE",
+                    // MariaDB 专有：注解与检查点，同样不带数据
+                    "ANNOTATE_ROWS", "BINLOG_CHECKPOINT", "MARIADB_GTID", "MARIADB_GTID_LIST"));
+
+    /** 未知事件类型是否只告警不停机（{@code extract.unknown.event.policy=SKIP}）。 */
+    private boolean unknownEventSkip;
+
+    /** 遇到不认识、且可能带数据的 binlog 事件类型：默认停下来上报，不静默丢。 */
+    private void checkIgnorableEventType(String eventType, String binlogFile, long binlogPosition) {
+        if (IGNORABLE_EVENT_TYPES.contains(eventType)) {
+            return;
+        }
+        String detail = "不支持的 binlog 事件类型 " + eventType + " @ " + binlogFile + ":" + binlogPosition
+                + "。该类型不在已知的可忽略清单里，继续跑等于把它携带的数据静默丢掉";
+        if (unknownEventSkip) {
+            logger.error("{}（按 extract.unknown.event.policy=SKIP 放过）", detail);
+            return;
+        }
+        throw new UnsupportedBinlogEventException(detail);
+    }
+
+    /** 抽取遇到不认识的事件类型：由 ContinuousExtractMain 收口成 error_status + 停止抽取。 */
+    public static final class UnsupportedBinlogEventException extends RuntimeException {
+        public UnsupportedBinlogEventException(String message) {
+            super(message);
+        }
     }
 
     /**
@@ -249,6 +300,17 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                 closeTransaction(thlEvent, binlogFile, binlogPosition);
                 return;
             }
+            if (SAVEPOINT_STMT.matcher(sql).find()) {
+                // SAVEPOINT 是<b>事务内</b>的语句，不是隐式提交的 DDL——ROW 格式下它照样进 binlog
+                // （实测：BEGIN → 行事件 → `SAVEPOINT `sp2`` → 行事件 → XID）。
+                // 落进下面那条 DDL 分支会把 currentTxId 清掉，于是 savepoint 之后的行事件全部丢失
+                // tx_id，事务一致模式下一个源事务被切成两个目标事务——正是该模式要防的"半个事务"。
+                // Spring 的 PROPAGATION_NESTED、各类 ORM 的嵌套事务都会产生 savepoint，很常见。
+                if (currentTxId != null) {
+                    thlEvent.addMetadata(TxnMetadata.TX_ID, currentTxId);
+                }
+                return;
+            }
             currentTxId = null;   // DDL：隐式提交，自成一个事务
             return;
         }
@@ -275,6 +337,11 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
     private static final java.util.regex.Pattern XID_VALUE =
             java.util.regex.Pattern.compile("xid=(\\d+)");
+
+    /** 事务内的 SAVEPOINT 语句：{@code SAVEPOINT `sp1`} / {@code ROLLBACK TO SAVEPOINT sp1} / {@code RELEASE SAVEPOINT sp1}。 */
+    private static final java.util.regex.Pattern SAVEPOINT_STMT = java.util.regex.Pattern.compile(
+            "^\\s*(SAVEPOINT\\s|ROLLBACK\\s+TO\\b|RELEASE\\s+SAVEPOINT\\b)",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
 
     /** 重放 XA 分支时逐条接收事件的下游（由 extract 主循环负责落 THL、按大小轮转文件）。 */
     public interface XaReplaySink {
@@ -440,19 +507,34 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             tableInfo.put("table", table);
             tableMapCache.put(tableId, tableInfo);
 
-            List<String> columns = getTableColumns(database, table);
+            List<String> columns = resolveColumns(database, table, eventData);
             tableInfo.put("columns", String.join(",", columns));
 
             List<String> columnTypes = getTableColumnTypes(database, table);
-            tableInfo.put("column_types", String.join(",", columnTypes));
-
             List<String> columnFullTypes = tableColumnFullTypeCache.get(database + "." + table);
+
+            // 用的是事件自带的列布局（与当前表定义不一致）时，类型必须按<b>列名</b>重新对齐，
+            // 否则列名对了、类型还错位，等于换了一种写坏方式
+            List<String> schemaColumns = getTableColumns(database, table);
+            if (!columns.equals(schemaColumns)) {
+                columnTypes = columnMetaByName(columns, schemaColumns, columnTypes);
+                if (columnFullTypes != null) {
+                    columnFullTypes = columnMetaByName(columns, schemaColumns, columnFullTypes);
+                }
+            }
+            tableInfo.put("column_types", String.join(",", columnTypes));
             if (columnFullTypes != null) {
                 tableInfo.put("column_full_types", String.join(",", columnFullTypes));
             }
 
             List<String> pkColumns = getTablePrimaryKeys(database, table);
             tableInfo.put("primary_keys", String.join(",", pkColumns));
+
+            // 生成列随列类型一起查出来（getTableColumnTypes 里填的缓存），这里透传给下游
+            List<String> generatedColumns = generatedColumnCache.get(database + "." + table);
+            if (generatedColumns != null && !generatedColumns.isEmpty()) {
+                tableInfo.put("generated_columns", String.join(",", generatedColumns));
+            }
 
             String cacheKey = database + "." + table;
             Map<String, List<String>> enumSetValues = enumSetValuesCache.get(cacheKey);
@@ -514,6 +596,12 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                 String enumSetValuesStr = tableInfo.get("enum_set_values");
                 if (enumSetValuesStr != null) {
                     thlEvent.addMetadata("enum_set_values", enumSetValuesStr);
+                }
+
+                // 生成列：值照常按全列顺序下发（下标要对齐），由 apply 端在拼 DML 时跳过
+                String generatedColumnsStr = tableInfo.get("generated_columns");
+                if (generatedColumnsStr != null) {
+                    thlEvent.addMetadata("generated_columns", generatedColumnsStr);
                 }
 
                 int columnCount = columnsStr != null ? columnsStr.split(",").length : 0;
@@ -1324,10 +1412,131 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             removed |= tableColumnFullTypeCache.remove(cacheKey) != null;
             removed |= enumSetValuesCache.remove(cacheKey) != null;
             removed |= primaryKeyCache.remove(cacheKey) != null;
+            removed |= generatedColumnCache.remove(cacheKey) != null;
             if (removed) {
                 logger.info("DDL 变更表 {}, 失效列元数据缓存，下个数据事件将重新读取 information_schema", cacheKey);
             }
         }
+    }
+
+    /** {@code TableMapEventData{... columnTypes=3, 8, 17, columnMetadata=...}} 里的列类型串。 */
+    private static final java.util.regex.Pattern TABLE_MAP_COLUMN_TYPES =
+            java.util.regex.Pattern.compile("columnTypes=([^=]*?), columnMetadata=");
+
+    /** {@code TableMapEventMetadata{... columnNames=id, ts, updated_at, setStrValues=...}} 里的列名串。 */
+    private static final java.util.regex.Pattern TABLE_MAP_COLUMN_NAMES =
+            java.util.regex.Pattern.compile("columnNames=(.*?), setStrValues=");
+
+    /** 已经就"该表列布局与源库当前定义不一致"告过警的表（每表一次，不刷屏）。 */
+    private final java.util.Set<String> columnLayoutWarned = new java.util.HashSet<>();
+
+    /**
+     * 解析这条 TABLE_MAP 对应的列清单——<b>优先用事件自带的列名</b>。
+     *
+     * <p>为什么不能只信 {@code information_schema}：那查的是<b>此刻</b>的表定义，而事件是过去
+     * 某一刻的。链路有延迟时源库执行 {@code ALTER TABLE ... ADD COLUMN x AFTER a} 或
+     * {@code DROP COLUMN}，DDL 之前那些还没处理完的行事件就会按新布局对齐——整行左移/右移，
+     * 写进目标库的是合法值、看不出任何异常。这正是 Debezium 用 schema history、Canal 用表结构
+     * 时序（tsdb）在解决的问题。
+     *
+     * <p>MySQL 8.0.1+ 的 {@code binlog_row_metadata=FULL} 会把列名<b>放进 TABLE_MAP 事件本身</b>，
+     * 那是与行值同一时刻的权威信息，直接用它就没有漂移可言。拿不到（MINIMAL / 5.7）时退回
+     * information_schema，并用事件里的列<b>数</b>兜底校验：数量不符说明表结构在这中间变过，
+     * 此时无法把值正确对上列，只能停下来上报（E3021），而不是像以前那样"多的截断、少的补 null"
+     * 静默写坏。
+     */
+    private List<String> resolveColumns(String database, String table, String eventData) {
+        String cacheKey = database + "." + table;
+        List<String> current = getTableColumns(database, table);
+        List<String> eventColumns = parseEventColumnNames(eventData);
+
+        if (!eventColumns.isEmpty()) {
+            // 事件自带列名（binlog_row_metadata=FULL）：这是与行值同一时刻的权威信息，
+            // 表结构在这中间怎么变都不影响——值按事件的列名对齐，类型再按<b>列名</b>去查
+            // （见 columnMetaByName），加列/删列/改名都能自愈，不用停任务
+            if (!current.equals(eventColumns) && columnLayoutWarned.add(cacheKey)) {
+                logger.warn("表 {} 的事件列布局 {} 与源库当前定义 {} 不一致（表结构在抽取过程中变更过），"
+                        + "以事件自带的列名为准", cacheKey, eventColumns, current);
+            }
+            return eventColumns;
+        }
+
+        int eventCount = parseEventColumnCount(eventData);
+        if (eventCount > 0 && !current.isEmpty() && eventCount != current.size()) {
+            // 拿不到列名（binlog_row_metadata=MINIMAL）又列数对不上：没有任何办法把值正确对上列，
+            // 硬解就是整行错位的静默写坏，只能停下来
+            throw new ColumnLayoutMismatchException(String.format(
+                    "表 %s 的行事件有 %d 列，源库当前定义是 %d 列——表结构在抽取过程中变更过，"
+                            + "按当前定义解析会让整行的值与列错位（写进去的是合法值，看不出异常）。"
+                            + "请把源库 binlog_row_metadata 设为 FULL（列名随事件一起下发，"
+                            + "这种情况可以自愈），或等这段积压追平后再做 DDL",
+                    cacheKey, eventCount, current.size()));
+        }
+        return current;
+    }
+
+    /**
+     * 按<b>列名</b>取列元数据，而不是按下标。
+     *
+     * <p>用事件自带的列布局时，列的顺序和数量都可能与源库当前定义不同，
+     * 而类型/精度只能从 {@code information_schema} 拿——按下标取就会错位，必须按名字查。
+     * 查不到的列（DDL 之后已经删掉的列）给空串，下游按"无类型信息"处理。
+     */
+    private List<String> columnMetaByName(List<String> wantedColumns, List<String> schemaColumns,
+                                          List<String> schemaValues) {
+        Map<String, String> byName = new HashMap<>();
+        for (int i = 0; i < schemaColumns.size() && i < schemaValues.size(); i++) {
+            byName.put(schemaColumns.get(i), schemaValues.get(i));
+        }
+        List<String> out = new ArrayList<>(wantedColumns.size());
+        for (String column : wantedColumns) {
+            String v = byName.get(column);
+            out.add(v == null ? "" : v);
+        }
+        return out;
+    }
+
+    /** 抽取时发现事件的列布局与当前表定义对不上：由 ContinuousExtractMain 收口成 error_status。 */
+    public static final class ColumnLayoutMismatchException extends RuntimeException {
+        public ColumnLayoutMismatchException(String message) {
+            super(message);
+        }
+    }
+
+    private static List<String> parseEventColumnNames(String eventData) {
+        List<String> names = new ArrayList<>();
+        if (eventData == null) {
+            return names;
+        }
+        java.util.regex.Matcher m = TABLE_MAP_COLUMN_NAMES.matcher(eventData);
+        if (!m.find()) {
+            return names;
+        }
+        String raw = m.group(1).trim();
+        if (raw.isEmpty() || "null".equals(raw)) {
+            return names;
+        }
+        for (String name : raw.split("\\s*,\\s*")) {
+            if (!name.isEmpty()) {
+                names.add(name);
+            }
+        }
+        return names;
+    }
+
+    private static int parseEventColumnCount(String eventData) {
+        if (eventData == null) {
+            return 0;
+        }
+        java.util.regex.Matcher m = TABLE_MAP_COLUMN_TYPES.matcher(eventData);
+        if (!m.find()) {
+            return 0;
+        }
+        String raw = m.group(1).trim();
+        if (raw.isEmpty() || "null".equals(raw)) {
+            return 0;
+        }
+        return raw.split("\\s*,\\s*").length;
     }
 
     protected List<String> getTableColumns(String database, String table) {
@@ -1365,8 +1574,9 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         List<String> columnTypes = new ArrayList<>();
         List<String> columnFullTypes = new ArrayList<>();
         Map<String, List<String>> enumSetValues = new HashMap<>();
+        List<String> generated = new ArrayList<>();
         try {
-            String sql = "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS " +
+            String sql = "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, EXTRA FROM INFORMATION_SCHEMA.COLUMNS " +
                     "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
             try (PreparedStatement stmt = sourceConnection.prepareStatement(sql)) {
                 stmt.setString(1, database);
@@ -1381,13 +1591,25 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                             List<String> values = parseEnumSetValues(columnType);
                             enumSetValues.put(columnName, values);
                         }
+                        // 生成列（STORED / VIRTUAL）：binlog 行事件里<b>带着它们算好的值</b>，
+                        // 但目标库不接受显式写入（MySQL 3105）。列清单必须保留它们——行事件的值是
+                        // 按全列顺序排的，剔掉列名会让后面所有列错位——只能在生成 DML 时跳过。
+                        String extra = rs.getString("EXTRA");
+                        if (extra != null && extra.toUpperCase().contains("GENERATED")) {
+                            generated.add(columnName);
+                        }
                     }
                 }
             }
             tableColumnTypeCache.put(cacheKey, columnTypes);
             tableColumnFullTypeCache.put(cacheKey, columnFullTypes);
+            generatedColumnCache.put(cacheKey, generated);
             if (!enumSetValues.isEmpty()) {
                 enumSetValuesCache.put(cacheKey, enumSetValues);
+            }
+            if (!generated.isEmpty()) {
+                logger.info("表 {} 含生成列 {}，增量应用时会跳过这些列（由目标库按表达式自行计算）",
+                        cacheKey, generated);
             }
         } catch (SQLException e) {
             logger.error("Error fetching column types for {}.{}: {}", database, table, e.getMessage());
