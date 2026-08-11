@@ -81,9 +81,11 @@ public class ParallelDataMigration {
             Thread worker = new Thread(() -> {
                 DatabaseConnection src = new DatabaseConnection(sourceCfg);
                 DatabaseConnection tgt = new DatabaseConnection(targetCfg);
+                // finally 里要关大字段专用连接，所以声明放在 try 外
+                DataMigration dataMigration = null;
                 try {
                     prepareTargetSession(tgt);
-                    DataMigration dataMigration = new DataMigration(
+                    dataMigration = new DataMigration(
                             src, tgt, config.getBulkBatchRows(), config.isContinueOnError(), progressManager,
                             config.isShardEnabled(), config.getShardMinRows(), config.getShardCount());
                     dataMigration.setColumnProcessing(config.getColumnProcessingConfig());
@@ -92,6 +94,7 @@ public class ParallelDataMigration {
                     dataMigration.setRowRateLimiter(FullRateLimiter.get(config));
                     dataMigration.setTableRouter(config.getTableRouter());
                     dataMigration.setRoutingConfig(config.getRoutingConfig());
+                    dataMigration.setLobStreaming(config.isLobStreamEnabled(), config.getLobWriteOptions());
 
                     TableInfo table;
                     while ((table = queue.poll()) != null) {
@@ -123,6 +126,9 @@ public class ParallelDataMigration {
                         }
                     }
                 } finally {
+                    if (dataMigration != null) {
+                        dataMigration.closeLobConnections();
+                    }
                     src.close();
                     tgt.close();
                     done.countDown();

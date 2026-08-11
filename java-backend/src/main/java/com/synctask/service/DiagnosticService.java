@@ -348,6 +348,7 @@ public class DiagnosticService {
             }
             checks.add(checkColumnRefs(src, entries));
             checks.add(checkForeignKeyIntegrity(src, entries));
+            checks.add(checkLargeObjectSupport(src, srcConn, tgtConn, entries, needsIncrement));
         } catch (Exception e) {
             checks.add(check("源库 schema 检查", "FAIL", "连接源库失败: " + e.getMessage(), null));
         }
@@ -365,6 +366,182 @@ public class DiagnosticService {
         }
 
         return summarize(result, checks, workflow);
+    }
+
+    /**
+     * 大字段（LONGBLOB/LONGTEXT/MEDIUM*）能不能搬得动。
+     *
+     * <p>这一项拦的都是"跑到一半才炸、且炸得看不懂"的情况：
+     * <ul>
+     *   <li><b>max_allowed_packet 不够</b>：MySQL 的这个参数同时限制单值上限与
+     *       {@code CONCAT()} 结果上限，分块追加也绕不过去。撞上时服务端只回一句
+     *       "Result of concat() was larger than max_allowed_packet - truncated"，
+     *       既不说是哪张表哪一列，也不说该调多大。它的上限就是 1GB，
+     *       所以超过 1GB 的单值<b>根本无法通过 SQL 协议写入</b>；</li>
+     *   <li><b>大字段表没有主键</b>：增量靠主键定位行，没有主键就要拿 1GB 的值去做全列匹配，
+     *       既不可行也没有意义；</li>
+     *   <li><b>binlog 事务压缩开着</b>：压缩事务在连接器里是整块解压进堆的，
+     *       大字段的流式改造对这条路径完全无效；</li>
+     *   <li><b>binlog_row_image=FULL</b>：UPDATE 会把没改动的大字段前后镜像都写进 binlog，
+     *       网络与磁盘各多一倍。改 NOBLOB 能直接省掉，但不阻断。</li>
+     * </ul>
+     */
+    private Map<String, Object> checkLargeObjectSupport(Connection src, String srcConn, String tgtConn,
+                                                        List<DbEntry> entries, boolean needsIncrement) {
+        List<String> lobTables = new ArrayList<>();
+        List<String> noPkLobTables = new ArrayList<>();
+        long maxValueBytes = 0;
+        String maxValueWhere = null;
+        try {
+            for (DbEntry entry : entries) {
+                for (String table : entry.tables) {
+                    List<String> lobCols = new ArrayList<>();
+                    try (PreparedStatement ps = src.prepareStatement(
+                            "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
+                                    + "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? "
+                                    + "AND DATA_TYPE IN ('longblob','longtext','mediumblob','mediumtext')")) {
+                        ps.setString(1, entry.sourceDb);
+                        ps.setString(2, table);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                lobCols.add(rs.getString(1));
+                            }
+                        }
+                    }
+                    if (lobCols.isEmpty()) {
+                        continue;
+                    }
+                    lobTables.add(entry.sourceDb + "." + table);
+                    if (!hasPrimaryKey(src, entry.sourceDb, table)) {
+                        noPkLobTables.add(entry.sourceDb + "." + table + "(" + String.join(",", lobCols) + ")");
+                    }
+                    // 实际最大值：OCTET_LENGTH 会让服务端把 LOB 读一遍，所以只在
+                    // 确实存在大字段列的表上做，且一张表一条语句。
+                    for (String col : lobCols) {
+                        try (java.sql.Statement st = src.createStatement();
+                             ResultSet rs = st.executeQuery("SELECT IFNULL(MAX(OCTET_LENGTH(`"
+                                     + col.replace("`", "``") + "`)),0) FROM `"
+                                     + entry.sourceDb.replace("`", "``") + "`.`" + table.replace("`", "``") + "`")) {
+                            if (rs.next() && rs.getLong(1) > maxValueBytes) {
+                                maxValueBytes = rs.getLong(1);
+                                maxValueWhere = entry.sourceDb + "." + table + "." + col;
+                            }
+                        } catch (Exception ignored) {
+                            // 单列量不到不影响其余判据
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return check("大字段搬运能力", "WARNING", "大字段检查失败，已跳过: " + e.getMessage(), null);
+        }
+
+        if (lobTables.isEmpty()) {
+            return check("大字段搬运能力", "PASS", "所选对象里没有 LONGBLOB/LONGTEXT/MEDIUM* 列", null);
+        }
+
+        List<String> errors = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+        StringBuilder detail = new StringBuilder("含大字段的表: " + String.join(", ", lobTables));
+        if (maxValueWhere != null) {
+            detail.append("；实测最大单值 ").append(maxValueBytes).append(" 字节（").append(maxValueWhere).append("）");
+        }
+
+        long srcPacket = globalLong(src, "max_allowed_packet");
+        long tgtPacket = -1;
+        if (tgtConn != null && tgtConn.startsWith("mysql://")) {
+            try (Connection tgt = openConn(tgtConn)) {
+                tgtPacket = globalLong(tgt, "max_allowed_packet");
+            } catch (Exception e) {
+                warnings.add("读不到目标端 max_allowed_packet: " + e.getMessage());
+            }
+        }
+        detail.append("；max_allowed_packet 源=").append(srcPacket).append(" 目标=").append(tgtPacket);
+
+        if (maxValueBytes > 1073741824L) {
+            errors.add("存在超过 1GB 的单值（" + maxValueBytes + " 字节 @ " + maxValueWhere
+                    + "）。MySQL 的 max_allowed_packet 上限就是 1GB，这种值无法通过 SQL 协议写入目标端");
+        } else if (maxValueBytes > 0) {
+            if (srcPacket > 0 && srcPacket < maxValueBytes) {
+                errors.add("源端 max_allowed_packet=" + srcPacket + " 小于最大单值 " + maxValueBytes
+                        + "，读取会被截断，请调到 >= " + maxValueBytes);
+            }
+            if (tgtPacket > 0 && tgtPacket < maxValueBytes) {
+                errors.add("目标端 max_allowed_packet=" + tgtPacket + " 小于最大单值 " + maxValueBytes
+                        + "，写入必失败（该参数同时限制 CONCAT 结果上限，分块追加也绕不过），请调到 >= " + maxValueBytes);
+            }
+        }
+
+        if (needsIncrement && !noPkLobTables.isEmpty()) {
+            errors.add("下列表含大字段却没有主键，增量无法按行定位: " + String.join(", ", noPkLobTables));
+        }
+
+        if (needsIncrement && maxValueBytes > 0) {
+            // 复制协议的硬上限：单个 binlog 事件不能超过 replica_max_allowed_packet（最大 1GB）。
+            // 实测过：1GB 的 LONGBLOB 加上其余 9 列，行事件是 1073742110 字节——比 1GB 上限多 286 字节，
+            // 源端的 dump 线程直接断开连接，capture 侧表现为"读取线程无声无息地没了"。
+            // 注意这与全量无关：全量走的是普通 SQL，1GB 是搬得动的（已验证）。
+            long replicaLimit = globalLong(src, "replica_max_allowed_packet");
+            if (replicaLimit <= 0) {
+                replicaLimit = globalLong(src, "slave_max_allowed_packet");
+            }
+            String rowImage0 = globalString(src, "binlog_row_image");
+            boolean fullImage = rowImage0 == null || "FULL".equalsIgnoreCase(rowImage0);
+            // UPDATE 的前后镜像在<b>同一个事件</b>里；FULL 下未改动的大字段也会两份都写进去
+            long worstEvent = fullImage ? maxValueBytes * 2 : maxValueBytes;
+            detail.append("；replica_max_allowed_packet=").append(replicaLimit)
+                    .append("，最坏事件约 ").append(worstEvent).append(" 字节")
+                    .append(fullImage ? "（FULL 下 UPDATE 带前后两份镜像）" : "（NOBLOB）");
+            if (replicaLimit > 0 && worstEvent >= replicaLimit) {
+                errors.add("增量搬不动：单值 " + maxValueBytes + " 字节，在 binlog_row_image="
+                        + (rowImage0 == null ? "FULL" : rowImage0) + " 下一个 UPDATE 事件约 " + worstEvent
+                        + " 字节，超过 replica_max_allowed_packet=" + replicaLimit
+                        + "（MySQL 上限就是 1GB）。这是复制协议本身的限制，与同步工具无关——"
+                        + "源端 dump 线程会直接断开。可行的做法：把 binlog_row_image 改成 NOBLOB "
+                        + "（UPDATE 只带一份后镜像，上限翻倍）、把单值控制在 1GB 以内并留出行开销余量，"
+                        + "或该表只做全量不做增量（全量走普通 SQL，不受这条限制）");
+            }
+        }
+
+        if (needsIncrement) {
+            String compression = globalString(src, "binlog_transaction_compression");
+            if (compression != null && ("ON".equalsIgnoreCase(compression) || "1".equals(compression))) {
+                errors.add("源端 binlog_transaction_compression=ON：压缩事务在连接器里是整块解压进内存的，"
+                        + "大字段的流式读取对这条路径无效，请关闭");
+            }
+            String rowImage = globalString(src, "binlog_row_image");
+            if (rowImage != null && "FULL".equalsIgnoreCase(rowImage)) {
+                warnings.add("源端 binlog_row_image=FULL：UPDATE 会把未改动的大字段前后镜像都写进 binlog，"
+                        + "网络与磁盘各多一倍；改成 NOBLOB 可直接省掉（不影响正确性）");
+            }
+        }
+
+        if (!errors.isEmpty()) {
+            return check("大字段搬运能力", "FAIL", String.join("；", errors), detail.toString());
+        }
+        if (!warnings.isEmpty()) {
+            return check("大字段搬运能力", "WARNING", String.join("；", warnings), detail.toString());
+        }
+        return check("大字段搬运能力", "PASS", "大字段可搬运（单值未超过两端 max_allowed_packet，且均有主键）",
+                detail.toString());
+    }
+
+    private long globalLong(Connection conn, String var) {
+        String v = globalString(conn, var);
+        try {
+            return v == null ? -1 : Long.parseLong(v.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private String globalString(Connection conn, String var) {
+        try (java.sql.Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT @@GLOBAL." + var)) {
+            return rs.next() ? rs.getString(1) : null;
+        } catch (Exception e) {
+            return null;   // 变量不存在（版本差异）不算失败
+        }
     }
 
     /**

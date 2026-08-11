@@ -99,6 +99,22 @@ public class AgentConfig {
         props.setProperty("task.disk.check.interval.ms", "60000");
         // 任务进入终态后保留 files/<taskId> 的时长，到期由 agent 清理；0 表示不清理。
         props.setProperty("task.files.retention.hours", "72");
+
+        // 子进程 JVM 参数（见 ChildJvmOptions）。默认全空 = 保持历史行为（不传 -Xmx，
+        // 由 JVM 按物理内存 1/4 自决），要给某类进程设内存上界时在 agent.properties 里覆盖，
+        // 例如 proc.jvm.opts.full=-Xmx144m -XX:MaxMetaspaceSize=64m -XX:MaxDirectMemorySize=24m。
+        // 这些 key 必须在此登记默认值，loadFromEnv() 只遍历已存在的 key，不登记则环境变量覆盖失效。
+        props.setProperty("proc.jvm.opts.default", "");
+        props.setProperty("proc.jvm.opts.capture", "");
+        props.setProperty("proc.jvm.opts.full", "");
+        props.setProperty("proc.jvm.opts.extract", "");
+        props.setProperty("proc.jvm.opts.increment", "");
+        props.setProperty("proc.jvm.opts.subscribe", "");
+        props.setProperty("proc.jvm.opts.mongo", "");
+        props.setProperty("proc.jvm.opts.elastic", "");
+        props.setProperty("proc.jvm.opts.redis", "");
+        props.setProperty("proc.jvm.exit.on.oom", "true");
+        props.setProperty("proc.jvm.heapdump.dir", "");
     }
 
     private void loadFromFile() {

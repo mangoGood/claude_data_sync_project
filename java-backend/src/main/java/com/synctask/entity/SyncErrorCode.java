@@ -30,6 +30,7 @@ public enum SyncErrorCode {
     THL_FILE_UNREADABLE("E3010", "THL文件读取中断", "THL文件损坏或读取过程异常，已在断点处停止且未跳过剩余事件。请检查磁盘与 thl_output 目录，必要时重新初始化增量"),
     BIDI_WRITE_CONFLICT("E3011", "双向同步写写冲突", "两端同时修改了同一行，且冲突策略配置为 ERROR（不自动丢写）。请人工确认应保留哪一端的值，或改用 LWW_SOURCE_TS/NODE_PRIORITY 策略自动裁决"),
     // E3012 未分配（历史空位，新增错误码请顺延，不要复用）
+    LOB_TYPED_PIPELINE_UNAVAILABLE("E3012", "大字段事件缺少类型化值", "事件里带的是大字段引用（内容在磁盘上），但没有类型化值（rows_typed），只能走文本路径——文本路径把参数拼成 SQL 字面量，会把 \"@lob:...\" 这串引用本身当成内容写进目标 BLOB/TEXT 列，长度和语法都看不出问题，属于静默数据损坏，因此已停止应用。请确认源→目标是 mysql→mysql、increment.typed.pipeline.enabled 未被关掉、且源端 binlog_row_image 为 FULL/NOBLOB"),
     ROUTE_TYPED_PIPELINE_UNAVAILABLE("E3013", "汇聚/拆分事件缺少类型化值", "命中路由规则的表其事件没有类型化值（rows_typed），无法生成带来源标识列的 DML——文本路径的 UPDATE/DELETE 只按源主键定位，会改到同一张汇聚表里其它来源的同主键行，因此已停止应用。请检查该表的路由规则是否配错（不该汇聚的表被规则命中）、源端 binlog_row_image 是否为 FULL，以及该源→目标引擎对是否支持类型化管道（increment.typed.pipeline.enabled 是否被关掉）"),
     UNIQUE_KEY_CONFLICT("E3017", "唯一键冲突（非主键）", "目标端存在源端没有的唯一索引/约束，把这一行挡住了。主键冲突属于幂等重放可以忽略，但唯一键冲突忽略掉就是永久丢一行，因此默认停下等人处置。请核对两端的唯一索引差异；确认可以丢弃这类行时，将 increment.unique.conflict.policy 设为 IGNORE"),
 

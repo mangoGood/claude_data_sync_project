@@ -499,7 +499,12 @@ public class Main {
                     dataMigration.setRowRateLimiter(com.migration.full.migration.FullRateLimiter.get(config));
                     dataMigration.setTableRouter(config.getTableRouter());
                     dataMigration.setRoutingConfig(config.getRoutingConfig());
-                    dataMigration.migrateAllData(tables);
+                    dataMigration.setLobStreaming(config.isLobStreamEnabled(), config.getLobWriteOptions());
+                    try {
+                        dataMigration.migrateAllData(tables);
+                    } finally {
+                        dataMigration.closeLobConnections();
+                    }
                 }
             }
             logger.info("数据迁移完成");

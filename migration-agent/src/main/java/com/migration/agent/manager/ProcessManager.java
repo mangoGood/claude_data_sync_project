@@ -49,7 +49,29 @@ public class ProcessManager {
         if (!jarFile.exists()) {
             throw new RuntimeException("Jar file not found: " + jarPath);
         }
+
+        java.util.List<String> jvmOpts = ChildJvmOptions.resolve(processName);
+        java.util.List<String> command = buildCommand(jvmOpts);
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        pb.directory(new File(System.getProperty("user.dir")));
+
+        logger.info("Starting {} process: {} with task ID: {} (jvm opts: {})",
+                processName, jarPath, taskId, String.join(" ", jvmOpts));
+        process = pb.start();
+        running.set(true);
         
+        startMonitorThread();
+        logger.info("{} process started with PID: {}", processName, getPid());
+    }
+    
+    /**
+     * 拼装子进程启动命令。抽成独立方法是为了让单测能直接断言参数顺序——
+     * JVM 参数必须全部落在 {@code -jar} <b>之前</b>，掉到后面就成了 main 方法的入参，
+     * 静默失效（进程照常起来，只是 -Xmx 根本没生效），是这类问题里最难发现的一种。
+     */
+    java.util.List<String> buildCommand(java.util.List<String> jvmOpts) {
         java.util.List<String> command = new java.util.ArrayList<>();
         command.add("java");
 
@@ -71,27 +93,23 @@ public class ProcessManager {
             command.add("-Dlogback.configurationFile=files/" + taskId + "/logback.xml");
         }
 
+        // 用户配置的 JVM 参数放在最后、紧挨 -jar：同名参数（-Xmx 等）JVM 取最后一个，
+        // 这样配置值能覆盖上面的内置项，而不会被内置项反过来盖掉。
+        if (jvmOpts != null) {
+            command.addAll(jvmOpts);
+        }
+
         command.add("-jar");
         command.add(jarPath);
-        
+
         if (mainArgs != null) {
             for (String arg : mainArgs) {
                 command.add(arg);
             }
         }
-        
-        ProcessBuilder pb = new ProcessBuilder(command);
-        pb.redirectErrorStream(true);
-        pb.directory(new File(System.getProperty("user.dir")));
-        
-        logger.info("Starting {} process: {} with task ID: {}", processName, jarPath, taskId);
-        process = pb.start();
-        running.set(true);
-        
-        startMonitorThread();
-        logger.info("{} process started with PID: {}", processName, getPid());
+        return command;
     }
-    
+
     private void startMonitorThread() {
         monitorThread = new Thread(() -> {
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));

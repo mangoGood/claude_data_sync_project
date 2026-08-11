@@ -64,6 +64,18 @@ public class DataMigration {
             com.migration.common.bulk.BulkLoadOptions.of(true, com.migration.common.bulk.BulkLoadOptions.Mode.AUTO, 0, 0);
     /** 全量装载限速器；未注入 = 不限速（历史行为） */
     private com.migration.common.ratelimit.RowRateLimiter rowRateLimiter;
+    /**
+     * 大字段旁路流式搬运。关闭 = 完全走原路径（把 LOB 列跟其它列一起 SELECT 进堆），
+     * 也就是"1GB 字段必 OOM"的历史行为。仅 mysql→mysql 生效。
+     */
+    private boolean lobStreamEnabled;
+    private com.migration.common.lob.LobWriteOptions lobWriteOptions =
+            com.migration.common.lob.LobWriteOptions.defaults();
+    /** 目标端流式专用连接：必须带 useServerPrepStmts=true，否则驱动会把整个流读进内存组包。 */
+    private Connection lobTargetConn;
+    /** 源端分块读专用连接：与分页扫描连接分开，避免翻页游标与 SUBSTRING 查询互相打断。 */
+    private Connection lobSourceConn;
+    private long lobPacketLimit = -1;
 
     public DataMigration(DatabaseConnection sourceConnection, DatabaseConnection targetConnection,
                         int batchSize, boolean continueOnError, ProgressManager progressManager) {
@@ -92,6 +104,50 @@ public class DataMigration {
 
     private boolean sourceIsOracle() {
         return "oracle".equalsIgnoreCase(sourceConnection.getConfig().getDbType());
+    }
+
+    /**
+     * 开启大字段旁路流式搬运（仅 mysql→mysql）。
+     *
+     * <p>不开时行为与改造前逐字节一致：LOB 列照旧跟其它列一起 SELECT，
+     * 一行一个 1GB 的字段就会把堆撑爆。开启后这些列改走
+     * "瘦扫描（只取长度）+ 分块拉取 + 流式写入"，进程内存与字段大小脱钩。
+     */
+    public void setLobStreaming(boolean enabled, com.migration.common.lob.LobWriteOptions options) {
+        this.lobStreamEnabled = enabled;
+        if (options != null) {
+            this.lobWriteOptions = options;
+        }
+    }
+
+    /** 大字段流式是否对本链路可用：只在 mysql→mysql 上做，异构链路的值语义另说。 */
+    private boolean lobStreamApplicable() {
+        if (!lobStreamEnabled) {
+            return false;
+        }
+        String src = sourceConnection.getConfig().getDbType();
+        String tgt = targetConnection.getConfig().getDbType();
+        return isMysqlFamily(src) && isMysqlFamily(tgt);
+    }
+
+    private static boolean isMysqlFamily(String dbType) {
+        return "mysql".equalsIgnoreCase(dbType) || "tidb".equalsIgnoreCase(dbType);
+    }
+
+    /** 本表的大字段计划；不适用时返回空计划（调用方据此走原路径）。 */
+    private com.migration.common.lob.LobStreamPlan lobPlanFor(TableInfo table) {
+        if (!lobStreamApplicable()) {
+            return com.migration.common.lob.LobStreamPlan.EMPTY;
+        }
+        // 拆分/汇聚路由下一行可能落到多张目标表，大字段的目标位置不再唯一，暂不支持
+        if (table.isSplitRouted()) {
+            return com.migration.common.lob.LobStreamPlan.EMPTY;
+        }
+        boolean applyColumnMapping = columnProcessingApplicable();
+        String srcDb = applyColumnMapping ? columnProcessingDbOf(table) : null;
+        return com.migration.common.lob.LobStreamPlan.build(table, applyColumnMapping
+                ? name -> columnProcessing.mapColumn(srcDb, table.getTableName(), name)
+                : null);
     }
 
     /** 注入列处理配置（未注入 = 无列处理，行为与既有逻辑完全一致）。 */
@@ -454,16 +510,33 @@ public class DataMigration {
             return new int[]{0, 0};
         }
         
+        com.migration.common.lob.LobStreamPlan lobPlan = lobPlanFor(table);
+
         // 崩溃续传前的进度纠偏：上次未完成（分片或非分片）都清空目标表后从头重搬。
         // 全量 INSERT 非幂等，任何"从中断点增量续搬"都不安全：SIGKILL 可能使进度 lastMigratedId
         // 领先于实际已提交行（被杀批次未落库），续搬 WHERE id>lastId 会整段跳过这些行而漏数据
         // （实测 pg 目标续搬后目标缺失一整段 id）。唯一安全做法是清表 + 全新重搬。
-        resetIfIncompleteProgress(table);
+        //
+        // 大字段流式路径是例外：它按行 upsert、按目标端已有长度续写，整条路径幂等，
+        // 清表反而会把已经搬好的几个 GB 全部丢掉重来——那才是真正搬不完的原因。
+        if (lobPlan.isEmpty()) {
+            resetIfIncompleteProgress(table);
+        }
 
         List<String> columns = getColumnNames(table);
         String columnList = String.join(", ", columns);
 
         String primaryKeyColumn = getPrimaryKeyColumn(table);
+
+        if (!lobPlan.isEmpty()) {
+            if (primaryKeyColumn == null) {
+                // 无主键就没法按行定位大字段（把 1GB 的值放进 WHERE 里既不可行也无意义）
+                throw new SQLException("表 " + tableName + " 含大字段（" + lobPlan
+                        + "）但没有主键，无法做大字段旁路搬运。请为该表加主键，或关闭 "
+                        + "migration.lob.stream.enabled 后自行确保单值不会超出可用内存");
+            }
+            return migrateDataWithLobStreaming(table, totalRows, primaryKeyColumn, lobPlan);
+        }
 
         if (shardEnabled && shardCount > 1 && primaryKeyColumn != null && totalRows >= shardMinRows
                 && !hasUnresumableProgress(table.getProgressKey())) {
@@ -787,6 +860,338 @@ public class DataMigration {
         }
 
         return new int[]{(int) successCount, (int) failCount};
+    }
+
+    // ================================================================================
+    // 大字段旁路流式搬运
+    // ================================================================================
+
+    /**
+     * 含大字段表的搬运：<b>瘦扫描 + 旁路流式</b>。
+     *
+     * <p>与常规路径的根本区别在扫描 SQL：LOB 列<b>不出现在 SELECT 列表里</b>，只取
+     * {@code OCTET_LENGTH(col)}。这一点是整条链路能在受限内存下跑起来的前提——
+     * JDBC 驱动读一行时会把整行读进堆，只要 1GB 的列还在 SELECT 列表里，
+     * 后面做什么优化都没用。
+     *
+     * <p>每行两步：先 upsert 瘦行（LOB 列写 NULL），再逐个大字段流式补齐。
+     * 顺序不能反：{@code UPDATE ... SET col=?} 需要行已经存在。
+     *
+     * <p>整条路径幂等：瘦行是 upsert，大字段按目标端已有长度续写。所以崩溃续传不清表、
+     * 不重搬已完成的行——对 10 行 × 1GB 来说，"从头再来"和"搬不完"是一回事。
+     */
+    private int[] migrateDataWithLobStreaming(TableInfo table, long totalRows, String primaryKeyColumn,
+                                              com.migration.common.lob.LobStreamPlan plan) throws SQLException {
+        String tableName = table.getTableName();
+        String progressKey = table.getProgressKey();
+        long successCount = 0;
+        long failCount = 0;
+
+        Long lastMigratedId = null;
+        long processedRows = 0;
+        if (progressManager != null && progressManager.isEnabled()) {
+            try {
+                MigrationProgress progress = progressManager.startMigration(progressKey, totalRows);
+                if (progress != null && progress.getLastMigratedId() != 0
+                        && progress.getLastMigratedId() != SHARDED_LAST_ID_SENTINEL) {
+                    lastMigratedId = progress.getLastMigratedId();
+                    processedRows = progress.getMigratedRows();
+                    logger.info("表 {} 大字段续传：已搬 {} 行，从主键 {} 继续", tableName, processedRows, lastMigratedId);
+                }
+            } catch (SQLException e) {
+                logger.error("获取迁移进度失败", e);
+            }
+        }
+
+        String thinSelectList = buildThinSelectList(table, plan);
+        String insertSql = buildLobThinUpsertSql(table, plan);
+        List<String> targetColumns = getColumnNames(table);
+        String qualifiedSourceTable = sourceQuoteIdentifier(tableName);
+        String qualifiedTargetTable = targetQuoteIdentifier(table.getTargetTableName());
+
+        Connection targetConn = acquireTargetConnection(targetConnection);
+        Connection lobTarget = lobTargetConnection();
+        Connection lobSource = lobSourceConnection();
+        long packetLimit = lobPacketLimit(lobTarget);
+        logger.info("表 {} 走大字段旁路搬运：流式列 {}，目标端单语句上限 {} 字节",
+                tableName, plan, packetLimit);
+
+        final int pageSize = 100;   // 瘦行很小，页大小只影响翻页次数
+        boolean withLowerBound = (lastMigratedId != null);
+        Object currentLastId = lastMigratedId;
+
+        try (PreparedStatement insertStmt = targetConn.prepareStatement(insertSql)) {
+            while (true) {
+                String keepClause = filterKeepClause(table);
+                StringBuilder where = new StringBuilder();
+                if (withLowerBound) {
+                    // 续传用 >= 而不是 >：最后一行可能只搬了一半的大字段，必须重新处理它。
+                    // 整条路径幂等，重处理一行的代价远小于漏掉半个 1GB 的字段。
+                    where.append(" WHERE ").append(sourceQuoteIdentifier(primaryKeyColumn)).append(" >= ? ");
+                    if (keepClause != null) {
+                        where.append("AND ").append(keepClause).append(' ');
+                    }
+                } else if (keepClause != null) {
+                    where.append(" WHERE ").append(keepClause).append(' ');
+                }
+                String pageSql = "SELECT " + thinSelectList + " FROM " + snapshotTable(qualifiedSourceTable)
+                        + where + "ORDER BY " + sourceQuoteIdentifier(primaryKeyColumn) + " "
+                        + sourceDialect.limitClause(pageSize);
+
+                int pageFetched = 0;
+                List<Object[]> pageRows = new ArrayList<>();
+                List<long[]> pageLobLengths = new ArrayList<>();
+                List<Object> pagePks = new ArrayList<>();
+
+                Connection pageConn = acquirePageConnection(sourceConnection);
+                try (PreparedStatement selectStmt = pageConn.prepareStatement(pageSql)) {
+                    if (withLowerBound) {
+                        selectStmt.setObject(1, currentLastId);
+                    }
+                    try (ResultSet rs = selectStmt.executeQuery()) {
+                        ResultSetMetaData metaData = rs.getMetaData();
+                        int columnCount = metaData.getColumnCount();
+                        while (rs.next()) {
+                            pageFetched++;
+                            long[] lobLengths = new long[plan.columns().size()];
+                            Object[] values = readThinRowValues(rs, metaData, columnCount, table, plan, lobLengths);
+                            pageRows.add(values);
+                            pageLobLengths.add(lobLengths);
+                            pagePks.add(rs.getObject(primaryKeyIndex(table, primaryKeyColumn) + 1));
+                        }
+                    }
+                } finally {
+                    // 整页读完就放掉扫描连接：大字段的流式读走的是另一条连接，
+                    // 不能让翻页游标在整行搬运期间一直挂着
+                    releasePageConnection(pageConn);
+                }
+
+                for (int r = 0; r < pageRows.size(); r++) {
+                    Object pk = pagePks.get(r);
+                    try {
+                        long inserted = upsertThinRow(insertStmt, pageRows.get(r), targetColumns.size());
+                        // MySQL: 1 = 新插入的行（目标端大字段必然是 NULL，省掉一次昂贵的长度探测）；
+                        //        2 = 命中已存在行（续传场景，必须探测已写到哪）
+                        boolean freshRow = (inserted == 1);
+                        streamLobColumns(table, plan, pk, pageLobLengths.get(r), qualifiedSourceTable,
+                                qualifiedTargetTable, lobSource, lobTarget, packetLimit, freshRow);
+                        successCount++;
+                        processedRows++;
+                        currentLastId = pk;
+                        withLowerBound = true;
+                        if (progressManager != null && progressManager.isEnabled() && pk instanceof Number) {
+                            progressManager.updateProgress(progressKey, processedRows, ((Number) pk).longValue());
+                        }
+                        throttle(1);
+                    } catch (SQLException | java.io.IOException e) {
+                        failCount++;
+                        logger.error("大字段行搬运失败，表: {}, 主键: {}", tableName, pk, e);
+                        if (!continueOnError) {
+                            throw (e instanceof SQLException) ? (SQLException) e
+                                    : new SQLException("大字段搬运失败: " + tableName + " pk=" + pk, e);
+                        }
+                    }
+                }
+
+                logger.info("表 {} 大字段搬运一页完成，本页 {} 行，累计 {}/{}",
+                        tableName, pageRows.size(), processedRows, totalRows);
+                if (pageFetched < pageSize) {
+                    break;
+                }
+            }
+        }
+
+        logger.info("表 {} 大字段搬运完成，成功: {}, 失败: {}", tableName, successCount, failCount);
+        if (progressManager != null && progressManager.isEnabled()) {
+            try {
+                progressManager.completeMigration(progressKey);
+            } catch (SQLException e) {
+                logger.error("标记迁移完成失败", e);
+            }
+        }
+        return new int[]{(int) successCount, (int) failCount};
+    }
+
+    /** 逐个大字段流式搬运。 */
+    private void streamLobColumns(TableInfo table, com.migration.common.lob.LobStreamPlan plan,
+                                  Object pk, long[] lobLengths, String qualifiedSourceTable,
+                                  String qualifiedTargetTable, Connection lobSource, Connection lobTarget,
+                                  long packetLimit, boolean freshRow) throws SQLException, java.io.IOException {
+        String pkColumn = getPrimaryKeyColumn(table);
+        com.migration.common.lob.MySqlLobDialect dialect = com.migration.common.lob.MySqlLobDialect.INSTANCE;
+        List<com.migration.common.lob.LobStreamPlan.LobColumn> cols = plan.columns();
+        for (int i = 0; i < cols.size(); i++) {
+            com.migration.common.lob.LobStreamPlan.LobColumn col = cols.get(i);
+            long length = lobLengths[i];
+            if (length < 0) {
+                continue;   // 源端为 NULL：瘦行里已经写了 NULL，不用管
+            }
+            try (com.migration.common.lob.LobChunkSource source = new com.migration.common.lob.JdbcLobChunkSource(
+                    lobSource, dialect, qualifiedSourceTable, col.sourceName, pkColumn, pk,
+                    col.textColumn, length);
+                 com.migration.common.lob.StreamingBlobWriter writer = new com.migration.common.lob.StreamingBlobWriter(
+                         lobTarget, dialect, lobWriteOptions, qualifiedTargetTable, col.targetName,
+                         pkColumn, pk, packetLimit)) {
+                long known = freshRow
+                        ? com.migration.common.lob.StreamingBlobWriter.TARGET_NULL
+                        : writer.probeTargetLength();
+                com.migration.common.lob.StreamingBlobWriter.Result result = writer.write(source, known);
+                if (result.bytesWritten > 0 && logger.isDebugEnabled()) {
+                    logger.debug("大字段已搬: {}.{} pk={} {}", table.getTableName(), col.sourceName, pk, result);
+                }
+            }
+        }
+    }
+
+    /** 瘦扫描列表：大字段列换成 {@code OCTET_LENGTH(col)}，其余列原样。 */
+    private String buildThinSelectList(TableInfo table, com.migration.common.lob.LobStreamPlan plan) {
+        List<String> parts = new ArrayList<>();
+        List<ColumnInfo> columns = table.getColumns();
+        for (int i = 0; i < columns.size(); i++) {
+            String quoted = sourceQuoteIdentifier(columns.get(i).getColumnName());
+            if (plan.isLobIndex(i)) {
+                parts.add("OCTET_LENGTH(" + quoted + ")");
+            } else {
+                parts.add(quoted);
+            }
+        }
+        return String.join(", ", parts);
+    }
+
+    /**
+     * 瘦行写入 SQL：{@code INSERT ... ON DUPLICATE KEY UPDATE}。
+     *
+     * <p>更新列表里<b>必须排除大字段列</b>。否则续传时这条 upsert 会把 LOB 列
+     * 重新写成 VALUES(col)（也就是 NULL），把上一轮已经搬好的几百 MB 直接抹掉，
+     * 而且不报错——每次续传都从 0 开始，任务永远跑不完。
+     */
+    private String buildLobThinUpsertSql(TableInfo table, com.migration.common.lob.LobStreamPlan plan) {
+        List<String> targetColumns = getColumnNames(table);
+        String base = "INSERT INTO " + targetQuoteIdentifier(table.getTargetTableName())
+                + " (" + String.join(", ", targetColumns) + ") VALUES ("
+                + String.join(", ", createPlaceholders(targetColumns.size())) + ")";
+
+        java.util.Set<String> lobTargets = new java.util.HashSet<>();
+        for (com.migration.common.lob.LobStreamPlan.LobColumn c : plan.columns()) {
+            lobTargets.add(quoteIdentifier(c.targetName));
+        }
+        List<String> assignments = new ArrayList<>();
+        for (String col : targetColumns) {
+            if (!lobTargets.contains(col)) {
+                assignments.add(col + " = VALUES(" + col + ")");
+            }
+        }
+        if (assignments.isEmpty()) {
+            // 全是大字段列（理论上不会，主键至少不是）：退化成无副作用的自赋值，保住幂等
+            assignments.add(targetColumns.get(0) + " = " + targetColumns.get(0));
+        }
+        return base + " ON DUPLICATE KEY UPDATE " + String.join(", ", assignments);
+    }
+
+    /** 绑定并执行瘦行 upsert，返回受影响行数（MySQL: 1=新插入，2=更新已存在行）。 */
+    private long upsertThinRow(PreparedStatement stmt, Object[] values, int columnCount) throws SQLException {
+        for (int i = 0; i < columnCount; i++) {
+            stmt.setObject(i + 1, values[i]);
+        }
+        return stmt.executeUpdate();
+    }
+
+    /**
+     * 读瘦行：大字段位置放 null（瘦行先写 NULL），同时把该列的字节长度收进 lobLengths。
+     * 源端为 NULL 时长度记 -1，与"长度 0 的空值"区分开。
+     */
+    private Object[] readThinRowValues(ResultSet rs, ResultSetMetaData metaData, int columnCount,
+                                       TableInfo table, com.migration.common.lob.LobStreamPlan plan,
+                                       long[] lobLengths) throws SQLException {
+        java.util.Collection<String> extraValues = perRowExtras(table).values();
+        java.util.Collection<String> tagValues = table.getMergeTagValues().values();
+        Object[] values = new Object[columnCount + extraValues.size() + tagValues.size()];
+        int lobIdx = 0;
+        for (int i = 1; i <= columnCount; i++) {
+            if (plan.isLobIndex(i - 1)) {
+                long len = rs.getLong(i);
+                lobLengths[lobIdx++] = rs.wasNull() ? -1 : len;
+                values[i - 1] = null;
+                continue;
+            }
+            Object value = readColumnValue(rs, i, metaData, table);
+            values[i - 1] = translator.convertValue(value, metaData.getColumnTypeName(i), rs, i);
+        }
+        int idx = columnCount;
+        for (String extra : extraValues) {
+            values[idx++] = extra;
+        }
+        for (String tag : tagValues) {
+            values[idx++] = tag;
+        }
+        return values;
+    }
+
+    /** 主键列在源列序里的 0-based 下标。 */
+    private int primaryKeyIndex(TableInfo table, String primaryKeyColumn) throws SQLException {
+        List<ColumnInfo> columns = table.getColumns();
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).getColumnName().equalsIgnoreCase(primaryKeyColumn)) {
+                return i;
+            }
+        }
+        throw new SQLException("主键列 " + primaryKeyColumn + " 不在表 " + table.getTableName() + " 的列清单里");
+    }
+
+    /**
+     * 目标端流式专用连接。
+     *
+     * <p>必须带 {@code useServerPrepStmts=true}：客户端预编译下驱动会把整个
+     * {@code setBinaryStream} 读进内存再组包，1GB 照样 OOM（实测有对照）。
+     * 之所以单开一条连接而不是改全局 URL，是因为主写入连接开着
+     * {@code rewriteBatchedStatements}，两者的批量语义会互相影响——
+     * 常规表的批量装载路径一个字都不该被这次改造碰到。
+     */
+    private Connection lobTargetConnection() throws SQLException {
+        if (lobTargetConn == null || lobTargetConn.isClosed()) {
+            DatabaseConfig cfg = targetConnection.getConfig();
+            String url = com.migration.common.lob.LobJdbc.withStreamingParams(cfg.getJdbcUrl());
+            lobTargetConn = DriverManager.getConnection(url, cfg.getUsername(), cfg.getPassword());
+            try (Statement st = lobTargetConn.createStatement()) {
+                st.execute("SET FOREIGN_KEY_CHECKS=0");
+            } catch (SQLException e) {
+                logger.warn("大字段连接设置 FOREIGN_KEY_CHECKS=0 失败（继续）: {}", e.getMessage());
+            }
+            logger.info("已建立大字段流式写入连接（useServerPrepStmts=true）");
+        }
+        return lobTargetConn;
+    }
+
+    /** 源端分块读专用连接（与分页扫描分开，避免两个游标互相打断）。 */
+    private Connection lobSourceConnection() throws SQLException {
+        if (lobSourceConn == null || lobSourceConn.isClosed()) {
+            DatabaseConfig cfg = sourceConnection.getConfig();
+            lobSourceConn = DriverManager.getConnection(cfg.getJdbcUrl(), cfg.getUsername(), cfg.getPassword());
+        }
+        return lobSourceConn;
+    }
+
+    private long lobPacketLimit(Connection lobTarget) {
+        if (lobPacketLimit <= 0) {
+            lobPacketLimit = com.migration.common.lob.StreamingBlobWriter.probePacketLimit(
+                    lobTarget, com.migration.common.lob.MySqlLobDialect.INSTANCE);
+        }
+        return lobPacketLimit;
+    }
+
+    /** 关闭大字段专用连接（表迁移全部结束时调用）。 */
+    public void closeLobConnections() {
+        for (Connection c : new Connection[]{lobTargetConn, lobSourceConn}) {
+            if (c != null) {
+                try {
+                    c.close();
+                } catch (SQLException ignored) {
+                    // 收尾关连接失败不影响已完成的搬运结果
+                }
+            }
+        }
+        lobTargetConn = null;
+        lobSourceConn = null;
     }
 
     private int[] migrateDataBatch(TableInfo table, String columnList, long totalRows, String primaryKeyColumn) throws SQLException {

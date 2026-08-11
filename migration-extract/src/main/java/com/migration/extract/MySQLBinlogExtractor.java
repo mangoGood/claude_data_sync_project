@@ -391,8 +391,10 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                     if (!allRowValues.isEmpty()) {
                         List<String> formattedRows = new ArrayList<>();
                         ArrayList<ArrayList<Object>> typedRows = new ArrayList<>();
+                        boolean hasLob = false;
                         for (String rowValues : allRowValues) {
                             List<String> values = parseValueList(rowValues, columnCount);
+                            hasLob |= containsLobRef(values);
                             formattedRows.add(formatRowData(values, columnTypes, columnFullTypes, columnNames, enumValuesMap));
                             if (typedRows != null) {
                                 ArrayList<Object> typed = typeRowValues(values, columnTypes, columnFullTypes, columnNames, enumValuesMap);
@@ -401,6 +403,12 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                         }
                         thlEvent.addMetadata("rows_data", formattedRows);
                         thlEvent.addMetadata("row_data", formattedRows.get(0));
+                        if (hasLob) {
+                            // 带大字段的事件只能走类型化（参数绑定）路径。打上标记，
+                            // 让增量端在回退到文本路径之前就 fail-stop——文本路径写出来的是
+                            // "@lob:..." 这串字面量，目标列会被静默写坏。
+                            thlEvent.addMetadata("has_lob", true);
+                        }
                         if (typedRows != null) {
                             // 类型化值管道：供增量端 PreparedStatement 参数绑定，消除 SQL 字面量拼接
                             thlEvent.addMetadata("rows_typed", typedRows);
@@ -416,9 +424,11 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                         List<String> formattedBeforeRows = new ArrayList<>();
                         ArrayList<ArrayList<Object>> typedAfterRows = new ArrayList<>();
                         ArrayList<ArrayList<Object>> typedBeforeRows = new ArrayList<>();
+                        boolean hasLob = false;
                         for (String[] beforeAfter : allBeforeAfter) {
                             if (beforeAfter[1] != null) {
                                 List<String> afterValues = parseValueList(beforeAfter[1], columnCount);
+                                hasLob |= containsLobRef(afterValues);
                                 formattedAfterRows.add(formatRowData(afterValues, columnTypes, columnFullTypes, columnNames, enumValuesMap));
                                 if (typedAfterRows != null) {
                                     ArrayList<Object> typed = typeRowValues(afterValues, columnTypes, columnFullTypes, columnNames, enumValuesMap);
@@ -441,6 +451,11 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                         if (!formattedBeforeRows.isEmpty()) {
                             thlEvent.addMetadata("row_data_before", formattedBeforeRows.get(0));
                             thlEvent.addMetadata("rows_data_before", formattedBeforeRows);
+                        }
+                        if (hasLob) {
+                            // 见 INSERT 分支的说明：带大字段的事件禁止回退文本路径。
+                            // 前镜像里的大字段是"只留身份"的引用，同样不能当字面量拼进 SQL。
+                            thlEvent.addMetadata("has_lob", true);
                         }
                         // 类型化值：UPDATE 需 before/after 同时可类型化且行数配对，否则整体回退文本路径
                         if (typedAfterRows != null && typedBeforeRows != null
@@ -699,6 +714,24 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return map;
     }
 
+    /**
+     * 文本路径遇到大字段引用时放的毒丸。
+     *
+     * <p>取值刻意是<b>非法 SQL</b>：真要是漏到执行阶段，得到的是一个明确的语法错误，
+     * 而不是"把 @lob:xxx 这串字符当内容写进 BLOB 列"的静默损坏。
+     */
+    static final String LOB_TEXT_PATH_POISON = "<<LOB_REQUIRES_TYPED_PATH>>";
+
+    /** 该事件是否携带大字段引用（增量端据此禁止文本回退）。 */
+    static boolean containsLobRef(List<String> values) {
+        for (String v : values) {
+            if (v != null && v.startsWith(com.migration.common.lob.LobRef.MARKER)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private String formatRowData(List<String> values, String[] columnTypes, String[] columnFullTypes, String[] columnNames, Map<String, List<String>> enumValuesMap) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < values.size(); i++) {
@@ -710,6 +743,12 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
             if (value == null || "null".equalsIgnoreCase(value)) {
                 sb.append("null");
+            } else if (value.startsWith(com.migration.common.lob.LobRef.MARKER)) {
+                // 文本路径拼的是 SQL 字面量，而一个 1GB 的值根本没法出现在字面量里。
+                // 这里刻意放一个<b>语法上就非法</b>的毒丸而不是引号包起来的字符串：
+                // 后者会被当成正常内容写进目标列，是静默的数据损坏；
+                // 前者会在增量端被 has_lob 标记提前拦下（真漏到 SQL 也只会是明确的语法错误）。
+                sb.append(LOB_TEXT_PATH_POISON);
             } else if (isBinaryType(type) || isBlobType(type)) {
                 if (value.matches("\\[B@[0-9a-f]+")) {
                     sb.append("null");
@@ -824,6 +863,15 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
 
             if (value == null || "null".equalsIgnoreCase(value)) {
                 typed.add(null);
+            } else if (value.startsWith(com.migration.common.lob.LobRef.MARKER)) {
+                // 大字段引用：内容在磁盘上，这里只把引用原样带下去。
+                // 绝不能 return null 走文本回退——文本路径没法表达一个 1GB 的值，
+                // 回退过去只会把 "@lob:..." 这串字面量当成内容写进目标列（静默损坏数据）。
+                com.migration.common.lob.LobRef ref = com.migration.common.lob.LobRef.parse(value);
+                if (ref == null) {
+                    throw new IllegalStateException("无法解析大字段引用: " + value);
+                }
+                typed.add(ref);
             } else if (isBinaryType(type) || isBlobType(type)) {
                 if (value.matches("\\[B@[0-9a-f]+")) {
                     typed.add(null); // 与文本路径一致：无法还原的 byte[] toString 按 null 处理

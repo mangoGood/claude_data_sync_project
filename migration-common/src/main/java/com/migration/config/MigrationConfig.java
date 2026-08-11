@@ -26,6 +26,10 @@ public class MigrationConfig {
     private int bulkBatchRows;
     /** 批量装载的完整配置（档位/行阈值/字节阈值），与 Mongo/ES/Redis 各链路共用同一组键。 */
     private com.migration.common.bulk.BulkLoadOptions bulkLoadOptions;
+    /** 大字段旁路流式搬运开关与尺寸参数（见 migration.lob.*）。 */
+    private boolean lobStreamEnabled = true;
+    private com.migration.common.lob.LobWriteOptions lobWriteOptions =
+            com.migration.common.lob.LobWriteOptions.defaults();
     /**
      * 全量装载限速（行/秒），0/负数 = 不限速。
      *
@@ -156,6 +160,13 @@ public class MigrationConfig {
             applyBulkJdbcOptions(targetConfig, targetDbType);
         }
 
+        // 大字段旁路流式搬运（仅 mysql→mysql）：LONGBLOB/LONGTEXT/MEDIUM* 列不进 SELECT 列表，
+        // 改为"只取长度 + 分块拉取 + 流式写入"，让进程内存与字段大小脱钩。
+        // 默认开启：它只对上述类型的列改变行为，其它表一个字节都不碰；
+        // 关掉即回到"整行读进堆"的历史行为（也就是 1GB 字段必 OOM）。
+        lobStreamEnabled = Boolean.parseBoolean(props.getProperty("migration.lob.stream.enabled", "true"));
+        lobWriteOptions = com.migration.common.lob.LobWriteOptions.from(props);
+
         // 全量一致性快照（P2-3）：NONE / GTID_ONLY（默认，只记位点不加锁）/ CONSISTENT
         snapshotMode = props.getProperty("migration.full.snapshot.mode", "GTID_ONLY").trim().toUpperCase();
 
@@ -264,6 +275,16 @@ public class MigrationConfig {
         } else if ("postgresql".equalsIgnoreCase(targetDbType)) {
             target.setJdbcOption("reWriteBatchedInserts", "true");
         }
+    }
+
+    /** 大字段旁路流式搬运是否启用（migration.lob.stream.enabled，默认 true）。 */
+    public boolean isLobStreamEnabled() {
+        return lobStreamEnabled;
+    }
+
+    /** 大字段搬运的尺寸参数（源端 chunk / 追加块 / 包余量）。 */
+    public com.migration.common.lob.LobWriteOptions getLobWriteOptions() {
+        return lobWriteOptions;
     }
 
     /** 全量写侧批量装载是否启用。 */

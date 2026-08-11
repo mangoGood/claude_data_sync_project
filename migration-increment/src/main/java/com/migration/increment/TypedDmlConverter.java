@@ -225,7 +225,16 @@ public class TypedDmlConverter {
      * 其它来源的同主键行。调用方据此 fail-stop，而不是让它悄悄改坏别的来源的数据。
      */
     public boolean requiresTypedPipeline(THLEvent event) {
-        if ((!mergeActive && !splitActive) || event == null || event.getMetadata() == null) {
+        if (event == null || event.getMetadata() == null) {
+            return false;
+        }
+        // 带大字段引用的事件也必须走类型化路径：文本路径把值拼成 SQL 字面量，
+        // 而一个 1GB 的值根本没法出现在字面量里。真回退过去，写进目标 BLOB 列的会是
+        // "@lob:xxx" 这串字符——长度对得上、语法也合法，是最难查的那种静默数据损坏。
+        if (Boolean.TRUE.equals(event.getMetadata().get("has_lob"))) {
+            return true;
+        }
+        if (!mergeActive && !splitActive) {
             return false;
         }
         Map<String, Object> metadata = event.getMetadata();

@@ -26,6 +26,10 @@ public class ContinuousIncrementMain {
     private static final Logger logger = LoggerFactory.getLogger(ContinuousIncrementMain.class);
 
     private String thlDirectory;
+    /** 大字段落盘目录（见 migration.lob.spill.dir）。静态：类型化绑定入口是静态方法，并行 worker 共用。 */
+    private static String lobSpillDir = "files/unknown/lob";
+    /** 按已应用位点回收落盘文件。 */
+    private com.migration.common.lob.LobSpillJanitor lobSpillJanitor;
     private String targetHost;
     private int targetPort;
     private String targetDatabase;
@@ -263,6 +267,10 @@ public class ContinuousIncrementMain {
         taskId = props.getProperty("task.id", "unknown");
         thlDirectory = props.getProperty("increment.thl.dir",
                 "files/" + taskId + "/thl_output");
+        // 大字段落盘目录：与 capture 侧同一个目录，事件里的引用按它解析成本地文件。
+        // 静态字段是因为 executeTypedOn 是静态的（并行 worker 共用同一条绑定路径）。
+        lobSpillDir = props.getProperty("migration.lob.spill.dir", "files/" + taskId + "/lob");
+        lobSpillJanitor = new com.migration.common.lob.LobSpillJanitor(lobSpillDir);
         targetHost = props.getProperty("target.db.host", "localhost");
         targetPort = Integer.parseInt(props.getProperty("target.db.port", "3306"));
         targetDatabase = props.getProperty("target.db.database", "");
@@ -427,8 +435,11 @@ public class ContinuousIncrementMain {
             return "jdbc:postgresql://" + targetHost + ":" + targetPort + "/" + targetDatabase
                     + "?stringtype=unspecified&" + targetSslParams();
         }
-        return "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
-                "?" + targetSslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+        // useServerPrepStmts=true 是大字段流式写入的<b>前提</b>而非调优：客户端预编译下驱动会把
+        // setBinaryStream 的内容整个读进内存再组包，1GB 的值照样 OOM（有对照实测）。
+        return com.migration.common.lob.LobJdbc.withStreamingParams(
+                "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
+                "?" + targetSslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true");
     }
 
     private void connectToTargetDatabase() throws SQLException {
@@ -749,10 +760,13 @@ public class ContinuousIncrementMain {
                     // UPDATE/DELETE 只按源主键定位，会改到/删掉同一张汇聚表里其它来源的同主键行。
                     // 宁可停任务，也不能让它静默改坏别的来源的数据。
                     if (typedDmls == null && typedDmlConverter.requiresTypedPipeline(event)) {
-                        logger.error("汇聚表事件无法走类型化管道（seqno={}），停止应用以免写坏其它来源的数据",
-                                event.getSeqno());
-                        writeErrorStatus("E3013",
-                                "汇聚表事件缺少类型化值（rows_typed），无法安全生成带来源标识的 DML", event);
+                        boolean lobEvent = Boolean.TRUE.equals(event.getMetadata().get("has_lob"));
+                        logger.error("{}事件无法走类型化管道（seqno={}），停止应用以免写坏数据",
+                                lobEvent ? "大字段" : "汇聚表", event.getSeqno());
+                        writeErrorStatus(lobEvent ? "E3012" : "E3013",
+                                lobEvent
+                                        ? "大字段事件缺少类型化值（rows_typed），文本路径会把 @lob 引用当成内容写进目标列"
+                                        : "汇聚表事件缺少类型化值（rows_typed），无法安全生成带来源标识的 DML", event);
                         aborted = true;
                         running.set(false);
                         break;
@@ -1341,10 +1355,13 @@ public class ContinuousIncrementMain {
     }
 
     private static int executeTypedOn(Connection conn, String sql, List<Object> params) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            for (int i = 0; i < params.size(); i++) {
-                ps.setObject(i + 1, params.get(i));
-            }
+        try (PreparedStatement ps = conn.prepareStatement(sql);
+             com.migration.common.lob.LobParamBinder binder =
+                     new com.migration.common.lob.LobParamBinder(lobSpillDir)) {
+            // 大字段参数走 setBinaryStream：配合连接上的 useServerPrepStmts=true，
+            // 驱动按 COM_STMT_SEND_LONG_DATA 分片推送，1GB 的值也不会进堆。
+            // 其余参数照旧 setObject，行为不变。
+            binder.bindAll(ps, params);
             return ps.executeUpdate();
         }
     }
@@ -2473,6 +2490,11 @@ public class ContinuousIncrementMain {
                 event.getEventId() != null ? event.getEventId() : ""
         );
         saveUnifiedApplyCheckpoint(event);
+        // 位点推进之后，早于该位点的大字段落盘文件就再也用不到了。
+        // 回收判据只能是位点：删早了重放会取不到内容，不删则一个文件就是 1GB，很快吃光磁盘。
+        if (lobSpillJanitor != null && binlogFile != null && binlogPosition != null) {
+            lobSpillJanitor.cleanupUpTo(binlogFile, binlogPosition);
+        }
     }
 
     /**

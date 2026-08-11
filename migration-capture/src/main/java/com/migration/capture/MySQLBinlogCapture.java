@@ -1,6 +1,6 @@
 package com.migration.capture;
 
-import com.github.shyiko.mysql.binlog.BinaryLogClient;
+import com.github.shyiko.mysql.binlog.StreamingBinaryLogClient;
 import com.github.shyiko.mysql.binlog.event.Event;
 import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
 import com.github.shyiko.mysql.binlog.event.EventData;
@@ -58,7 +58,15 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     private long serverId;
     private String heartbeatDatabase;
 
-    private BinaryLogClient client;
+    private StreamingBinaryLogClient client;
+    /** 大字段落盘器；null = 关闭（完全走上游的"整值进堆"行为）。 */
+    private com.migration.capture.binlog.LobSpillWriter lobSpillWriter;
+    private int lobSpillThresholdBytes;
+    /** 当前事件内的大字段序号，用于生成按位点确定的落盘文件名。 */
+    private int lobCellSeq;
+    /** 孤儿临时文件清扫的节流。 */
+    private volatile long lastLobSweepMs = 0;
+    private static final long LOB_SWEEP_INTERVAL_MS = 30_000L;
     private BufferedWriter writer;
     private final AtomicLong eventCounter = new AtomicLong(0);
     private final AtomicLong fileCounter = new AtomicLong(0);
@@ -148,6 +156,26 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             logger.info("双向 DDL 传播: {}", bidiDdlForwardAllowed ? "本任务放行（A→B 正向）" : "不传播");
         }
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
+
+        // 大字段落盘：超过阈值的 BLOB/TEXT 边读边写到磁盘，事件里只留引用。
+        // 低于阈值的值按老路径走 byte[]（零回归），高于阈值的走落盘。
+        //
+        // 阈值默认 1MB，是<b>实测</b>定的而不是拍的：低于阈值的值要经过
+        // "0x 十六进制串 → .cap 整行 String → getBytes → 切分 → 还原 byte[] → 再拼一遍 SQL 字面量"
+        // 这一路，在 extract 里的峰值占用大约是值本身的 20~30 倍。
+        // 4MB 阈值配 -Xmx144m 时，一条 UPDATE（前后两个镜像各 4MB）就把 extract 顶到 273MB 并 OOM。
+        // 按 1MB 算，30 倍是 30MB，留得下。内存预算更小就把它再调小，代价只是更多小文件。
+        boolean lobSpillEnabled = Boolean.parseBoolean(props.getProperty("migration.lob.spill.enabled", "true"));
+        lobSpillThresholdBytes = Integer.parseInt(
+                props.getProperty("migration.lob.spill.threshold.bytes", "1048576"));
+        String lobSpillDir = props.getProperty("migration.lob.spill.dir", "files/" + taskId + "/lob");
+        lobSpillWriter = lobSpillEnabled
+                ? new com.migration.capture.binlog.LobSpillWriter(lobSpillDir) : null;
+        if (lobSpillWriter != null) {
+            int cleaned = lobSpillWriter.cleanupOrphanTemp(3600_000L);
+            logger.info("大字段落盘已启用: dir={} 阈值={}B，清理孤儿临时文件 {} 个",
+                    lobSpillDir, lobSpillThresholdBytes, cleaned);
+        }
 
         heartbeatDatabase = props.getProperty("source.db.database", "");
         if (heartbeatDatabase == null || heartbeatDatabase.isEmpty()) {
@@ -445,7 +473,10 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
         openNewOutputFile();
 
-        client = new BinaryLogClient(host, port, user, password);
+        // 用 vendored 的流式客户端：上游 BinaryLogClient 会把跨 16MB 包的事件
+        // 拼成一整块 byte[]，一个带 1GB 大字段的行事件在那里必 OOM。
+        // 差异只有一处（见 StreamingBinaryLogClient 类注释 [PATCH-1]）。
+        client = new StreamingBinaryLogClient(host, port, user, password);
         client.setServerId(serverId);
 
         // 反序列化模式改造：
@@ -456,24 +487,30 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         // 注意：兼容模式必须在注册自定义反序列化器之后设置，才能传播到它们。
         java.util.Map<Long, com.github.shyiko.mysql.binlog.event.TableMapEventData> tableMapShared =
                 new java.util.HashMap<>();
+        // 大字段落盘：超过阈值的 BLOB/TEXT 不进堆，边读边写到 files/<taskId>/lob/，
+        // 事件里只留引用。关掉即完全走上游行为（一个 1GB 的值分配 1GB byte[]）。
+        com.migration.capture.binlog.SignAwareRowsDeserializers.SpillPolicy spillPolicy =
+                lobSpillWriter == null ? null
+                        : new com.migration.capture.binlog.SignAwareRowsDeserializers.SpillPolicy(
+                                lobSpillWriter, lobSpillThresholdBytes);
         com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer eventDeserializer =
                 new com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer();
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.TABLE_MAP,
                 new com.migration.capture.binlog.SignAwareRowsDeserializers.SharedTableMapDeserializer(tableMapShared));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.WRITE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared));
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared, spillPolicy));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_WRITE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared)
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Write(tableMapShared, spillPolicy)
                         .setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.UPDATE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared));
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared, spillPolicy));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_UPDATE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared)
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Update(tableMapShared, spillPolicy)
                         .setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.DELETE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared));
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared, spillPolicy));
         eventDeserializer.setEventDataDeserializer(com.github.shyiko.mysql.binlog.event.EventType.EXT_DELETE_ROWS,
-                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared)
+                new com.migration.capture.binlog.SignAwareRowsDeserializers.Delete(tableMapShared, spillPolicy)
                         .setMayContainExtraInformation(true));
         eventDeserializer.setCompatibilityMode(
                 com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer.CompatibilityMode.CHAR_AND_BINARY_AS_BYTE_ARRAY);
@@ -493,24 +530,24 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
         client.registerEventListener(this::processEvent);
 
-        client.registerLifecycleListener(new BinaryLogClient.LifecycleListener() {
+        client.registerLifecycleListener(new StreamingBinaryLogClient.LifecycleListener() {
             @Override
-            public void onConnect(BinaryLogClient client) {
+            public void onConnect(StreamingBinaryLogClient client) {
                 logger.info("已连接到MySQL binlog流");
             }
 
             @Override
-            public void onCommunicationFailure(BinaryLogClient client, Exception ex) {
+            public void onCommunicationFailure(StreamingBinaryLogClient client, Exception ex) {
                 logger.error("MySQL通信失败: {}", ex.getMessage());
             }
 
             @Override
-            public void onEventDeserializationFailure(BinaryLogClient client, Exception ex) {
+            public void onEventDeserializationFailure(StreamingBinaryLogClient client, Exception ex) {
                 logger.error("事件反序列化失败: {}", ex.getMessage());
             }
 
             @Override
-            public void onDisconnect(BinaryLogClient client) {
+            public void onDisconnect(StreamingBinaryLogClient client) {
                 logger.info("已断开MySQL binlog流连接");
             }
         });
@@ -735,6 +772,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
             String eventDataStr;
             if (eventData != null) {
+                lobCellSeq = 0;   // 落盘文件名按 (位点, 事件内序号) 定，每个事件从 0 起
                 eventDataStr = serializeEventData(eventType, eventData);
             } else {
                 eventDataStr = "";
@@ -768,6 +806,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                 }
             }
             checkRetentionQuietly();
+            sweepOrphanLobTempQuietly();
         } catch (Exception e) {
             logger.error("处理binlog事件异常: {}", e.getMessage(), e);
         }
@@ -886,6 +925,16 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     private String serializeValue(Object value) {
         if (value == null) {
             return "null";
+        }
+        if (value instanceof com.migration.common.lob.LobRef) {
+            // 大字段：内容已在磁盘上，这里只写引用。
+            // 走到这一步才改名，是因为只有此刻才同时拿得到"这个值"和"它所属事件的位点"——
+            // 位点命名让 capture 重连重放时生成同名文件，覆盖即幂等，也让按位点批量清理成为一次范围扫描。
+            com.migration.common.lob.LobRef ref = (com.migration.common.lob.LobRef) value;
+            if (lobSpillWriter != null) {
+                ref = lobSpillWriter.finalizeName(ref, currentBinlogFile, currentBinlogPosition, lobCellSeq++);
+            }
+            return ref.toMarker();
         }
         if (value instanceof byte[]) {
             return "0x" + bytesToHex((byte[]) value);
@@ -1017,6 +1066,36 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
      *
      * <p>只预警不阻断：正在跑的任务被打成 FAILED 比告警晚一点更糟。真丢了由启动预检的 E3006 拦。
      */
+    /**
+     * 周期性清掉没被改名的大字段临时文件。
+     *
+     * <p>落盘发生在<b>反序列化</b>阶段，而"这张表要不要同步"是在那之后才判的
+     * （{@code shouldCaptureDataEvent}）。于是非同步表里的大字段也会先落一份盘，
+     * 却永远走不到序列化那一步、拿不到最终名——一张不同步的大对象表就能把磁盘吃光。
+     * 同理，事件序列化异常回退到 {@code toString()} 时也会留下孤儿。
+     *
+     * <p>阈值取 60 秒：正常路径上"落盘 → 改名"发生在同一个事件的处理过程里，
+     * 相隔毫秒级；活过一分钟的临时文件必然是孤儿。
+     */
+    private void sweepOrphanLobTempQuietly() {
+        if (lobSpillWriter == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastLobSweepMs < LOB_SWEEP_INTERVAL_MS) {
+            return;
+        }
+        lastLobSweepMs = now;
+        try {
+            int removed = lobSpillWriter.cleanupOrphanTemp(60_000L);
+            if (removed > 0) {
+                logger.info("已清理未改名的大字段临时文件 {} 个（多半来自未同步表的事件）", removed);
+            }
+        } catch (Exception e) {
+            logger.warn("清理大字段临时文件失败: {}", e.getMessage());
+        }
+    }
+
     private void checkRetentionQuietly() {
         if (!retentionCheckEnabled || currentBinlogFile == null) {
             return;
