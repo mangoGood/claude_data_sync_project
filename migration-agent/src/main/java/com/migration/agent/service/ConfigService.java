@@ -943,6 +943,14 @@ public class ConfigService {
             return;   // 不写任何键 = 引擎按 DISABLED 走，与历史行为逐字节相同
         }
         props.setProperty(prefix + ".db.ssl.mode", normalized);
+        // Oracle 专属两项（其余库用不到）：TLS 版本、期望的服务端证书 DN。
+        // 走 agent 级 env 而不是向导字段——它们是"这套 Oracle 怎么配的"的属性，
+        // 同一个部署环境里所有 Oracle 任务都一样，逐任务填反而容易填错。
+        String up = prefix.toUpperCase();
+        putIfPresent(props, prefix + ".db.ssl.oracle.version",
+                System.getenv(up + "_DB_SSL_ORACLE_VERSION"));
+        putIfPresent(props, prefix + ".db.ssl.oracle.server.dn",
+                System.getenv(up + "_DB_SSL_ORACLE_SERVER_DN"));
 
         CertificateStore store = CertificateStore.getInstance();
         if (certId == null || certId.trim().isEmpty()) {

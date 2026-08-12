@@ -273,7 +273,8 @@ public class MetadataService {
             // 信任材料走连接属性。见 OracleSslSupport。
             String service = (conn.database != null && !conn.database.isEmpty()) ? conn.database : "ORCL";
             jdbcUrl = taskSsl
-                    ? com.synctask.util.OracleSslSupport.tcpsUrl(conn.host, conn.port, service)
+                    ? com.synctask.util.OracleSslSupport.tcpsUrl(conn.host, conn.port, service,
+                            com.synctask.util.OracleSslSupport.serverDn())
                     : String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
             if (taskSsl) {
                 com.synctask.util.OracleSslSupport.applyProperties(connProps, ssl.mode, ssl.material);

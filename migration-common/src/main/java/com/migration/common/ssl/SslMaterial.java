@@ -64,9 +64,24 @@ public final class SslMaterial {
     private final String clientKeyStore;
     /** truststore / keystore 的口令（两者共用一个，由证书归一时随机生成）。 */
     private final String storePassword;
+    /**
+     * Oracle 专属：TLS 版本与期望的服务端证书 DN。
+     *
+     * <p>这两项 MySQL/PG 都不需要，是 Oracle 自己的两个坑（实测踩到，见类注释末尾）。
+     */
+    private final String oracleSslVersion;
+    private final String oracleServerDn;
 
     private SslMaterial(String mode, String rootCert, String rootCertPem, String clientCert,
                         String clientKey, String clientKeyStore, String storePassword) {
+        this(mode, rootCert, rootCertPem, clientCert, clientKey, clientKeyStore, storePassword, null, null);
+    }
+
+    private SslMaterial(String mode, String rootCert, String rootCertPem, String clientCert,
+                        String clientKey, String clientKeyStore, String storePassword,
+                        String oracleSslVersion, String oracleServerDn) {
+        this.oracleSslVersion = nullToEmpty(oracleSslVersion);
+        this.oracleServerDn = nullToEmpty(oracleServerDn);
         this.mode = mode;
         this.rootCert = nullToEmpty(rootCert);
         this.rootCertPem = nullToEmpty(rootCertPem);
@@ -103,7 +118,9 @@ public final class SslMaterial {
                   props.getProperty(p + "client.cert"),
                   props.getProperty(p + "client.key"),
                   props.getProperty(p + "client.keystore"),
-                  storePass);
+                  storePass,
+                  props.getProperty(p + "oracle.version"),
+                  props.getProperty(p + "oracle.server.dn"));
     }
 
     /** 只有档位与信任材料（控制面、以及尚未接入 mTLS 的链路）。 */
@@ -265,8 +282,38 @@ public final class SslMaterial {
      * {@link #applyOracleProperties(Properties)}。
      */
     public String oracleTcpsUrl(String host, int port, String service) {
-        return "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=" + host
-                + ")(PORT=" + port + "))(CONNECT_DATA=(SERVICE_NAME=" + service + ")))";
+        StringBuilder sb = new StringBuilder("jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=")
+                .append(host).append(")(PORT=").append(port).append("))(CONNECT_DATA=(SERVICE_NAME=")
+                .append(service).append("))");
+        // VERIFY_IDENTITY 时把期望的服务端 DN 写进描述串。
+        //
+        // Oracle 的"身份校验"与 MySQL/PG 完全不是一回事：后两者比的是**主机名 vs 证书 CN/SAN**，
+        // 而 Oracle 比的是**完整 DN**，且要由客户端在连接描述里显式给出期望值。
+        // 不给就只能拿主机名去撞 DN，实测报 "Mismatch with the server cert DN" ——
+        // 即便证书的 CN 就是所连主机名也照样失败。
+        if (verifyIdentity() && !oracleServerDn.isEmpty()) {
+            sb.append("(SECURITY=(SSL_SERVER_DN_MATCH=yes)(SSL_SERVER_CERT_DN=\"")
+              .append(oracleServerDn).append("\"))");
+        }
+        return sb.append(')').toString();
+    }
+
+    /**
+     * Oracle 的 TLS 版本。
+     *
+     * <p>默认 {@code 1.2}，这是实测的取舍而非保守：JDK 17+ 客户端默认先提 TLS 1.3，
+     * 而相当多的 Oracle 服务端（含本地 26ai Free 的默认 TCPS 监听）只做到 1.2，
+     * 握手会以 {@code TNS-00542 SSL Handshake failed} / {@code Connection closed} 告终——
+     * 报文里没有半个字提到"版本不匹配"，纯靠猜。
+     * 服务端确实支持 1.3 时用 {@code <prefix>.db.ssl.oracle.version=1.3} 覆盖。
+     */
+    public String oracleSslVersion() {
+        return oracleSslVersion.isEmpty() ? "1.2" : oracleSslVersion;
+    }
+
+    /** 期望的服务端证书 DN（VERIFY_IDENTITY 用）；未配置返回空串。 */
+    public String oracleServerDn() {
+        return oracleServerDn;
     }
 
     /** Oracle 的信任/密钥材料与主机名校验开关（走 {@code DriverManager} 的连接属性）。 */
@@ -289,6 +336,8 @@ public final class SslMaterial {
             }
         }
         p.setProperty("oracle.net.ssl_server_dn_match", String.valueOf(verifyIdentity()));
+        // 见 oracleSslVersion() 的说明：不钉版本时 JDK 会先提 TLS 1.3，多数 Oracle 服务端握不上手
+        p.setProperty("oracle.net.ssl_version", oracleSslVersion());
     }
 
     /** Kafka 客户端的安全参数（订阅目标 / 控制面共用）。 */

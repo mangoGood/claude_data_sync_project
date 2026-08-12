@@ -279,6 +279,115 @@ def criteria_task(token, cert_a, cert_b):
     return wf
 
 
+def criteria_oracle():
+    """Oracle TCPS：与 MySQL/PG 完全不同的两个坑，单独一组。
+
+    需要 oracle_db 容器已按 test_scripts/ssl/README.md 配好 TCPS(2484)。
+    没配就跳过，不算失败——Oracle 环境不是所有人都有。
+    """
+    print("\n[5] Oracle TCPS")
+    import socket
+    with socket.socket() as sk:
+        sk.settimeout(3)
+        if sk.connect_ex(("127.0.0.1", 2484)) != 0:
+            print("  - 2484 未监听，跳过（见 README「Oracle TCPS」一节）")
+            return
+
+    # 服务端证书（自签，CN=localhost）→ 取 DN 供 VERIFY_IDENTITY 用
+    pem = subprocess.run(
+        "openssl s_client -connect localhost:2484 -showcerts </dev/null 2>/dev/null "
+        "| openssl x509 -outform PEM", shell=True, capture_output=True, text=True).stdout
+    if "BEGIN CERTIFICATE" not in pem:
+        bad("Oracle 取服务端证书失败")
+        return
+    subj = subprocess.run(
+        "openssl s_client -connect localhost:2484 </dev/null 2>/dev/null "
+        "| openssl x509 -noout -subject -nameopt RFC2253", shell=True,
+        capture_output=True, text=True).stdout.strip()
+    dn = subj.split("=", 1)[1].strip() if "=" in subj else ""
+    ok("Oracle 服务端证书", dn or "(DN 未取到)")
+
+    import tempfile, os
+    d = tempfile.mkdtemp(prefix="ssl_ora_")
+    ca = os.path.join(d, "ca.pem")
+    open(ca, "w").write(pem)
+
+    jh = subprocess.run(["/usr/libexec/java_home", "-v", "21"],
+                        capture_output=True, text=True).stdout.strip()
+    ojdbc = subprocess.run(
+        "find ~/.m2/repository -name 'ojdbc8-12.2.0.1.jar' | head -1",
+        shell=True, capture_output=True, text=True).stdout.strip()
+    slf4j = subprocess.run("find ~/.m2/repository -name 'slf4j-api-*.jar' | head -1",
+                           shell=True, capture_output=True, text=True).stdout.strip()
+    common = "migration-common/target/migration-common-1.0.0.jar"
+    if not (jh and ojdbc and os.path.exists(common)):
+        print("  - 缺 JDK/ojdbc/migration-common jar，跳过")
+        return
+
+    src = os.path.join(d, "OraCheck.java")
+    open(src, "w").write(r"""
+import com.migration.common.ssl.*;
+import java.nio.file.*; import java.sql.*; import java.util.Properties;
+public class OraCheck {
+  public static void main(String[] a) throws Exception {
+    CertBundle b = CertBundle.materialize(Path.of(a[1]), Files.readString(Path.of(a[0])), null, null, "t");
+    String dn = a[2];
+    for (String mode : new String[]{"REQUIRED","VERIFY_CA","VERIFY_IDENTITY"}) {
+      Properties cfg = new Properties();
+      cfg.setProperty("source.db.ssl.mode", mode);
+      cfg.setProperty("source.db.ssl.root.cert", b.path(CertBundle.TRUSTSTORE_P12).toString());
+      cfg.setProperty("source.db.ssl.store.password", "t");
+      if (mode.equals("VERIFY_IDENTITY") && !dn.isEmpty())
+          cfg.setProperty("source.db.ssl.oracle.server.dn", dn);
+      SslMaterial ssl = SslMaterial.from(cfg, "source");
+      Properties p = new Properties();
+      p.setProperty("user","app_user"); p.setProperty("password","userpassword");
+      ssl.applyOracleProperties(p);
+      try (Connection c = DriverManager.getConnection(ssl.oracleTcpsUrl("localhost",2484,"FREEPDB1"), p);
+           Statement st = c.createStatement();
+           ResultSet rs = st.executeQuery("SELECT SYS_CONTEXT('USERENV','NETWORK_PROTOCOL') FROM dual")) {
+        rs.next(); System.out.println("OK|" + mode + "|" + rs.getString(1));
+      } catch (Exception e) {
+        System.out.println("FAIL|" + mode + "|"
+            + String.valueOf(e.getMessage()).lines().findFirst().orElse(""));
+      }
+    }
+    // 反向：错误 DN 必须被拒
+    Properties cfg = new Properties();
+    cfg.setProperty("source.db.ssl.mode","VERIFY_IDENTITY");
+    cfg.setProperty("source.db.ssl.root.cert", b.path(CertBundle.TRUSTSTORE_P12).toString());
+    cfg.setProperty("source.db.ssl.store.password","t");
+    cfg.setProperty("source.db.ssl.oracle.server.dn","CN=wrong,O=evil,C=CN");
+    SslMaterial ssl = SslMaterial.from(cfg,"source");
+    Properties p = new Properties();
+    p.setProperty("user","app_user"); p.setProperty("password","userpassword");
+    ssl.applyOracleProperties(p);
+    try (Connection c = DriverManager.getConnection(ssl.oracleTcpsUrl("localhost",2484,"FREEPDB1"), p)) {
+      System.out.println("FAIL|WRONG_DN|竟然连上了");
+    } catch (Exception e) { System.out.println("OK|WRONG_DN|已拒绝"); }
+  }
+}
+""")
+    cp = f"{common}:{ojdbc}:{slf4j}"
+    r = subprocess.run([f"{jh}/bin/java", "-cp", cp, src, ca, os.path.join(d, "bundle"), dn],
+                       capture_output=True, text=True, timeout=300)
+    # 子进程一句都没输出 = 它自己炸了。这里必须说出来——静默跳过正是本工程要根治的那类问题
+    if not any("|" in l for l in r.stdout.splitlines()):
+        bad("Oracle 判据子进程没有产出",
+            (r.stderr or r.stdout).strip().splitlines()[-1][:160] if (r.stderr or r.stdout).strip() else "无输出")
+        return
+    for line in r.stdout.splitlines():
+        if "|" not in line:
+            continue
+        st, mode, detail = line.split("|", 2)
+        if mode == "WRONG_DN":
+            (ok if st == "OK" else bad)("Oracle 反向：错误 DN 被拒绝", detail)
+        elif st == "OK" and detail.lower() == "tcps":
+            ok(f"Oracle {mode}", "服务端协议 = tcps")
+        else:
+            bad(f"Oracle {mode}", detail[:100])
+
+
 def criteria_server_side():
     """服务端取证：所有 ssluser 连接都必须有 Ssl_cipher，含 binlog 复制流。"""
     print("\n[4] 服务端取证（performance_schema）")
@@ -320,7 +429,8 @@ def cleanup(token, wf):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["accounts", "conn", "task", "server"], help="只跑某一组")
+    ap.add_argument("--only", choices=["accounts", "conn", "task", "server", "oracle"],
+                    help="只跑某一组")
     ap.add_argument("--keep", action="store_true", help="跑完不清理（便于手工排查）")
     args = ap.parse_args()
 
@@ -362,6 +472,8 @@ def main():
             wf = criteria_task(token, cert_a, cert_b)
         if args.only in (None, "server"):
             criteria_server_side()
+        if args.only in (None, "oracle"):
+            criteria_oracle()
     finally:
         if not args.keep:
             cleanup(token, wf)

@@ -80,4 +80,58 @@ docker exec dr-mysql-a cat /var/lib/mysql/ca.pem > /tmp/ca-a.pem
 | MongoDB | `--tlsMode requireTLS --tlsCertificateKeyFile` | 要 **cert+key 合并成一个 pem**（脚本已生成 `mongo-combined.pem`） |
 | Redis | `--tls-port 6380 --port 0 --tls-cert-file ...` | Redis 的 TLS 是**独立端口**，不是同端口协商——连接串里的端口要跟着改 |
 | Kafka | SSL listener + keystore | 控制面 29092 与订阅下游 39092 两套证书分开 |
-| Oracle | `listener.ora`/`sqlnet.ora` + wallet，TCPS 端口 2484 | URL 结构整个换成 DESCRIPTION，不是加参数 |
+| Oracle | 见下方「Oracle TCPS」 | URL 结构整个换成 DESCRIPTION，不是加参数 |
+
+## 五、Oracle TCPS
+
+Oracle 是唯一一个"开 TLS ≠ 加参数"的引擎，实测踩到三个各自独立的坑，按顺序处理：
+
+**1）钱包（服务端证书）。** `gvenzl/oracle-free` 精简镜像里 `orapki` 跑不起来——既没有 JRE，
+也没有 `oraclepki.jar` / `osdt_core.jar` / `osdt_cert.jar`。两样都要补进容器：
+
+```bash
+# JRE（容器是 aarch64 Linux，不能直接拷宿主 macOS 的 JDK）
+docker pull docker.1ms.run/eclipse-temurin:11-jre
+CID=$(docker create docker.1ms.run/eclipse-temurin:11-jre)
+docker cp "$CID:/opt/java/openjdk" /tmp/jre11 && docker rm -f "$CID"
+docker exec -u 0 oracle_db mkdir -p /opt/jre11 && docker cp /tmp/jre11/. oracle_db:/opt/jre11/
+docker exec -u 0 oracle_db chmod -R a+rx /opt/jre11
+
+# PKI jar（Maven Central 上就有，ojdbc 的同门）
+M=~/.m2/repository/com/oracle/database/security
+docker exec -u 0 oracle_db mkdir -p /opt/pki
+for j in oraclepki osdt_core osdt_cert; do
+  docker cp "$M/$j/21.1.0.0/$j-21.1.0.0.jar" oracle_db:/opt/pki/
+done
+docker exec -u 0 oracle_db chmod -R a+r /opt/pki
+
+# 建自签钱包。CN 必须是客户端连接用的主机名
+docker exec oracle_db bash -lc '
+CP=/opt/pki/oraclepki-21.1.0.0.jar:/opt/pki/osdt_core-21.1.0.0.jar:/opt/pki/osdt_cert-21.1.0.0.jar
+W=/opt/oracle/oradata/dbconfig/FREE/wallet
+mkdir -p $W
+/opt/jre11/bin/java -cp $CP oracle.security.pki.textui.OraclePKITextUI wallet create -wallet $W -auto_login_only
+/opt/jre11/bin/java -cp $CP oracle.security.pki.textui.OraclePKITextUI wallet add -wallet $W \
+  -dn "CN=localhost,O=synctask,C=CN" -keysize 2048 -self_signed -validity 3650 -auto_login_only'
+```
+
+钱包落在 `/opt/oracle/oradata/...`，那是**命名卷**，容器重建不丢。
+
+**2）监听器。** `listener.ora` 加 TCPS ADDRESS，`sqlnet.ora` 与 `listener.ora` 都要有
+`WALLET_LOCATION` 与 `SSL_CLIENT_AUTHENTICATION = FALSE`；改完必须 `lsnrctl stop && lsnrctl start`
+（`reload` **不会**加载新的 ADDRESS），再 `ALTER SYSTEM REGISTER` 让服务注册上去。
+compose 里还要把 2484 映射出来，否则宿主上的 agent/后端连不到。
+
+**3）客户端两个坑（已在 `SslMaterial` 里处理，这里说明为什么）。**
+
+- **TLS 版本**：JDK 17+ 默认先提 TLS 1.3，而这套 Oracle 只做到 1.2，握手以
+  `TNS-00542 SSL Handshake failed` / `Connection closed` 告终——报文里没有半个字提到版本。
+  所以 `oracle.net.ssl_version` 默认钉 `1.2`，服务端支持 1.3 时用
+  `SOURCE_DB_SSL_ORACLE_VERSION=1.3`（或 `TARGET_...`）覆盖。
+- **DN 匹配**：Oracle 的"身份校验"比的是**完整 DN**，不是主机名对 CN/SAN。
+  `VERIFY_IDENTITY` 必须把期望 DN 写进描述串，否则即便证书 CN 正是所连主机名，
+  也会报 `Mismatch with the server cert DN`。用
+  `SOURCE_DB_SSL_ORACLE_SERVER_DN="CN=localhost,O=synctask,C=CN"` 给出；
+  取值：`openssl s_client -connect host:2484 </dev/null | openssl x509 -noout -subject -nameopt RFC2253`。
+
+判据：`python3 test_scripts/ssl/ssl_e2e.py --only oracle`（2484 没监听则自动跳过）。

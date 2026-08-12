@@ -435,7 +435,7 @@ POST   /api/metadata/test-connection   请求加 sslMode/sslCertId，响应加 e
 |---|---|---|
 | MySQL 8（33306/3307/3308/3309） | 挂载 `ssl-ca/ssl-cert/ssl-key` | `ssluser REQUIRE SSL`；`mtlsuser REQUIRE X509` |
 | PostgreSQL（5432/5433） | `ssl=on` + `ssl_ca_file`；`pg_hba.conf` 用 `hostssl ... clientcert=verify-full` | `ssluser` |
-| Oracle Free（1521→2484） | 手配 `listener.ora`/`sqlnet.ora` + wallet（**这套最费时，单独排期**） | `SSLUSER` |
+| Oracle Free（1521→2484） | 手配 `listener.ora`/`sqlnet.ora` + wallet（**已完成，见 §6.4**） | `app_user` |
 | MongoDB（27117/27118） | `--tlsMode requireTLS --tlsCertificateKeyFile`（注意 Mongo 要 **cert+key 合并成一个 pem**） | `ssluser` |
 | Redis 7（6390/6391） | `--tls-port 6390 --port 0 --tls-cert-file ...`（官方 redis:7 镜像自带 TLS 支持） | `default`（requirepass） |
 | Kafka（29092/39092） | SSL listener + JKS | — |
@@ -465,7 +465,7 @@ POST   /api/metadata/test-connection   请求加 sslMode/sslCertId，响应加 e
 | 风险 | 处置 |
 |---|---|
 | 92 处连接点改漏一处 = 静默明文 | B1 先做统一出口；B3 完成后用 `grep -c "useSSL=false"` 归零作为门禁；判据从服务端取证而非看日志 |
-| Oracle TCPS 环境搭建耗时不可控 | 单独排期，不阻塞其余 11 条链路 |
+| ~~Oracle TCPS 环境搭建耗时不可控~~ | **已完成并实测通过**（§6.4） |
 | TLS 带来吞吐下降（全量场景敏感） | 判据里带一次全量吞吐对比；预期 5~15%，若超预期则评估 `TLS_AES_128` 套件优先 |
 | 证书过期导致长跑任务中断 | B4 加到期告警（提前 30 天）+ 任务详情展示有效期 |
 | 私钥泄露面扩大（落到每个 agent 主机） | 库内加密 + 落盘 0600 + 随任务清理；日志与 `toString()` 全链路脱敏（沿用连接串的既有做法） |
@@ -526,3 +526,46 @@ POST   /api/metadata/test-connection   请求加 sslMode/sslCertId，响应加 e
 **判据自身的一个修正**：反向判据原先断言"任务配 DISABLED 必须连不上"，但
 `CONTROL_PLANE_DB_SSL_MODE` 是一条**下限**——任务没配时会回落到它，于是连接照样加密、
 `REQUIRE SSL` 账号照样接受。真正的不变量是"**绝不允许连上且是明文**"，已按此改写。
+
+
+### 6.4 Oracle TCPS 交付记录（2026-08-12）
+
+Oracle 是唯一一个"开 TLS ≠ 加参数"的引擎。代码路径在 B3 就铺好了，但从未实测过；
+这次把服务端真配起来跑通，**逼出了两个只有实测才会暴露的客户端缺陷**。
+
+**服务端**（步骤与命令见 `test_scripts/ssl/README.md` §五）：自签钱包 + TCPS 监听 2484 +
+compose 映射端口。三个环境层面的坑：`gvenzl/oracle-free` 精简镜像里 `orapki` 完全跑不起来
+（既没有 JRE，也没有 `oraclepki.jar`/`osdt_*.jar`，两样都要补进容器；宿主的 macOS JDK 不能直接拷，
+容器是 aarch64 Linux）；改了 `listener.ora` 必须 `stop`+`start`，`reload` **不加载新的 ADDRESS**；
+钱包要落在 `/opt/oracle/oradata`（命名卷）才不会随容器重建丢失。
+
+**客户端两个缺陷（本轮修复）**
+
+1. **TLS 版本**。JDK 17+ 默认先提 TLS 1.3，而这套 Oracle 只做到 1.2
+   （`openssl s_client -tls1_3` 直接握手失败，`-tls1_2` 正常）。结果是
+   `TNS-00542 SSL Handshake failed` + 客户端 60 秒超时——**报文里没有半个字提到版本**。
+   现在 `oracle.net.ssl_version` 默认钉 `1.2`，可用 `SOURCE_DB_SSL_ORACLE_VERSION` 覆盖。
+2. **DN 匹配**。Oracle 的"身份校验"比的是**完整 DN**，不是 MySQL/PG 那种主机名对 CN/SAN，
+   而且期望值要由客户端写进连接描述串。不给就报 `Mismatch with the server cert DN`——
+   **即便证书的 CN 正是所连主机名**。现在 VERIFY_IDENTITY 会把
+   `(SECURITY=(SSL_SERVER_DN_MATCH=yes)(SSL_SERVER_CERT_DN="..."))` 拼进 DESCRIPTION，
+   DN 由 `SOURCE_DB_SSL_ORACLE_SERVER_DN` 给出。
+
+这两项都是 agent 级 env 而非向导字段：它们描述的是"这套 Oracle 怎么配的"，
+同一部署环境下所有 Oracle 任务一致，逐任务填反而更容易填错。
+
+**判据**：`python3 test_scripts/ssl/ssl_e2e.py --only oracle`，走的是平台真实代码路径
+（`SslMaterial.from(config.properties)` → `oracleTcpsUrl` + `applyOracleProperties`）：
+
+| 档位 | 结果 |
+|---|---|
+| REQUIRED | ✓ 服务端 `SYS_CONTEXT('USERENV','NETWORK_PROTOCOL')` = `tcps` |
+| VERIFY_CA | ✓ `tcps` |
+| VERIFY_IDENTITY（正确 DN） | ✓ `tcps` |
+| VERIFY_IDENTITY（错误 DN） | ✓ 被拒绝（校验确实生效，不是摆设） |
+
+全套判据 `ssl_e2e.py` **19/19 通过**；单测 1020/0。
+
+**判据脚本自身的一个教训**：Oracle 那组最初"通过 2 条、没有任何失败"——因为内嵌的 Java
+子进程编译失败、`stdout` 一片空白，而循环遍历空输出等于什么都不断言。
+判据必须显式检查"子进程到底有没有产出"，否则它会以最像成功的方式骗人。

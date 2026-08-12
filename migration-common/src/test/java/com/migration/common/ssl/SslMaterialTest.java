@@ -238,6 +238,43 @@ class SslMaterialTest {
     // ============ Oracle：TLS 下 URL 结构整个换掉 ============
 
     @Test
+    @DisplayName("Oracle 默认钉 TLS 1.2 —— 不钉则 JDK 先提 1.3，多数 Oracle 服务端握不上手")
+    void oracleTlsVersionDefaultsTo12() {
+        Properties p = new Properties();
+        SslMaterial.of("REQUIRED", "/c/ts.p12").applyOracleProperties(p);
+        assertEquals("1.2", p.getProperty("oracle.net.ssl_version"),
+                "实测：不钉版本时报 TNS-00542 SSL Handshake failed，报文里没有半个字提到版本");
+
+        Properties cfg = new Properties();
+        cfg.setProperty("source.db.ssl.mode", "REQUIRED");
+        cfg.setProperty("source.db.ssl.oracle.version", "1.3");
+        Properties p2 = new Properties();
+        SslMaterial.from(cfg, "source").applyOracleProperties(p2);
+        assertEquals("1.3", p2.getProperty("oracle.net.ssl_version"), "服务端支持时可覆盖");
+    }
+
+    @Test
+    @DisplayName("Oracle VERIFY_IDENTITY 需要在描述串里给出期望 DN（它比的是完整 DN，不是主机名）")
+    void oracleServerDnMatch() {
+        Properties cfg = new Properties();
+        cfg.setProperty("source.db.ssl.mode", "VERIFY_IDENTITY");
+        cfg.setProperty("source.db.ssl.oracle.server.dn", "CN=localhost,O=synctask,C=CN");
+        String url = SslMaterial.from(cfg, "source").oracleTcpsUrl("localhost", 2484, "FREEPDB1");
+        assertTrue(url.contains("(SSL_SERVER_DN_MATCH=yes)"), url);
+        assertTrue(url.contains("(SSL_SERVER_CERT_DN=\"CN=localhost,O=synctask,C=CN\")"), url);
+        // 括号必须配平，否则驱动直接报 "Invalid connection string format"
+        assertEquals(url.chars().filter(c -> c == '(').count(),
+                     url.chars().filter(c -> c == ')').count(), "描述串括号不配平: " + url);
+
+        // 低于 VERIFY_IDENTITY 的档位不写 DN —— 那是身份校验专属，写了会让 REQUIRED 也去比 DN
+        Properties cfg2 = new Properties();
+        cfg2.setProperty("source.db.ssl.mode", "VERIFY_CA");
+        cfg2.setProperty("source.db.ssl.oracle.server.dn", "CN=localhost,O=synctask,C=CN");
+        assertFalse(SslMaterial.from(cfg2, "source").oracleTcpsUrl("h", 2484, "S")
+                        .contains("SSL_SERVER_CERT_DN"));
+    }
+
+    @Test
     @DisplayName("Oracle 开启 TLS 后走 TCPS DESCRIPTION，且信任材料走连接属性")
     void oracleTcps() {
         SslMaterial m = SslMaterial.of("VERIFY_IDENTITY", "/c/truststore.p12");
