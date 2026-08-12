@@ -448,6 +448,10 @@
             'E5002': { desc: '目标数据库配置为空', solution: '请检查任务创建时目标数据库连接信息是否填写完整' },
             'E5003': { desc: '连接串解析失败', solution: '请检查连接串格式是否正确，正确格式: mysql://user:pass@host:port 或 postgresql://user:pass@host:port 或 oracle://user:pass@host:port/service 或 mongodb://user:pass@host:port 或 elastic://user:pass@host:port 或 redis://user:pass@host:port' },
             'E5004': { desc: '任务派发消息发送失败', solution: '任务的启动消息没能投进 Kafka，执行端从未收到它，因此任务不会开始跑。最常见的原因是 Kafka 未启动或地址不通（报文里通常是 "Broker may not be available" 或 "Topic ... not present in metadata"）。请确认 Kafka 已启动、spring.kafka.bootstrap-servers 指向正确的地址，然后重新启动该任务' },
+            'E5005': { desc: 'TLS 握手失败', solution: '请确认服务端已开启 SSL（MySQL: have_ssl=YES；PostgreSQL: postgresql.conf 设 ssl=on）、连接端口是 TLS 端口（Oracle 的 TCPS 通常是 2484 而非 1521），以及所选证书与该服务端匹配' },
+            'E5006': { desc: '证书校验失败', solution: '服务端证书不是所选 CA 签发的、证书链不完整、或证书已过期。若档位是 VERIFY_IDENTITY，还要求证书的 CN/SAN 与所填主机名完全一致——用 IP 连接而证书里写的是域名时会失败，可改用证书上的主机名、给证书补 SAN，或把档位降到 VERIFY_CA' },
+            'E5007': { desc: '要求加密但连接实际未加密', solution: '任务档位是 REQUIRED 及以上，但从服务端读到的加密状态是明文。通常是服务端未开启 SSL、或连的是非 TLS 端口。注意 PREFERRED 在服务端不支持时会静默退回明文，若必须加密请改用 REQUIRED 及以上' },
+            'E5008': { desc: '证书材料不可用', solution: '任务引用的证书已被删除、私钥格式不受支持（带口令的私钥需先解密：openssl pkcs8 -topk8 -nocrypt -in key.pem -out key-plain.pem），或证书库口令解密失败（检查 SYNCTASK_MASTER_KEY 与建证书时是否一致）' },
             'E9999': { desc: '未知错误', solution: '请查看Agent日志获取详细错误信息，或联系技术支持' }
         };
 

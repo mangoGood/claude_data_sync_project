@@ -13,3 +13,5 @@ certs/
 __pycache__/
 .venv_fi/
 .DS_Store
+# 判据生成的自签证书（含私钥），仅本地联调用
+test_scripts/ssl/out/

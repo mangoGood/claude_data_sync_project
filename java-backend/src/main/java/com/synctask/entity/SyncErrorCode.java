@@ -60,6 +60,27 @@ public enum SyncErrorCode {
     CONNECTION_STRING_PARSE_FAILED("E5003", "连接串解析失败", "请检查连接串格式是否正确，正确格式: mysql://user:pass@host:port 或 postgresql://user:pass@host:port"),
     TASK_DISPATCH_FAILED("E5004", "任务派发消息发送失败", "任务的启动消息没能投进 Kafka，执行端从未收到它，因此任务不会开始跑。最常见的原因是 Kafka 未启动或地址不通（报文里通常是 \"Broker may not be available\" 或 \"Topic ... not present in metadata\"）。请确认 Kafka 已启动、spring.kafka.bootstrap-servers 指向正确的地址，然后重新启动该任务"),
 
+    // ---- 传输加密（TLS）----
+    // 这四个的共同点：报文里若不点破是加密问题，人会往完全错误的方向查——
+    // 握手失败常被驱动包成"网络不可达"，主机名不符被当成"证书损坏"，
+    // 而"要求加密却实际明文"根本不报错，是最危险的一种"成功"。
+    SSL_HANDSHAKE_FAILED("E5005", "TLS 握手失败",
+            "请确认服务端已开启 SSL（MySQL: have_ssl=YES；PostgreSQL: postgresql.conf 设 ssl=on）、"
+            + "连接端口是 TLS 端口（Oracle 的 TCPS 通常是 2484 而非 1521），以及所选证书与该服务端匹配"),
+    SSL_CERT_INVALID("E5006", "证书校验失败",
+            "服务端证书不是所选 CA 签发的、证书链不完整、或证书已过期。"
+            + "若档位是 VERIFY_IDENTITY，还要求证书的 CN/SAN 与所填主机名完全一致——"
+            + "用 IP 连接而证书里写的是域名时会失败，这是预期行为，可改用证书上的主机名、"
+            + "给证书补 SAN，或把档位降到 VERIFY_CA（仍校验证书链，不校验主机名）"),
+    SSL_NOT_ENCRYPTED("E5007", "要求加密但连接实际未加密",
+            "任务档位是 REQUIRED 及以上，但从服务端读到的加密状态是明文。"
+            + "通常是服务端未开启 SSL、或连的是非 TLS 端口。注意 PREFERRED 档位在服务端不支持时"
+            + "会静默退回明文，若必须加密请改用 REQUIRED 及以上"),
+    SSL_MATERIAL_UNAVAILABLE("E5008", "证书材料不可用",
+            "任务引用的证书已被删除、私钥格式不受支持（带口令的私钥需先解密："
+            + "openssl pkcs8 -topk8 -nocrypt -in key.pem -out key-plain.pem），"
+            + "或证书库口令解密失败（检查 SYNCTASK_MASTER_KEY 与建证书时是否一致）"),
+
     UNKNOWN_ERROR("E9999", "未知错误", "请查看Agent日志获取详细错误信息，或联系技术支持");
 
     private final String code;

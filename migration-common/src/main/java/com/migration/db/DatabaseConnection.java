@@ -45,6 +45,9 @@ public class DatabaseConnection {
                 connection = DriverManager.getConnection(config.getJdbcUrl(), connectionProps());
                 logger.info("成功连接到数据库: {} (type: {}, ssl: {})",
                             config.getDatabase(), config.getDbType(), config.getSslMode());
+                // 运行期取证：配了 REQUIRED 及以上却实测明文，直接失败而不是继续明文搬数据
+                com.migration.common.ssl.TlsEvidence.verify(connection, config.getDbType(),
+                        config.getSsl(), "数据库[" + config.getDatabase() + "]");
             } catch (ClassNotFoundException e) {
                 logger.error("JDBC 驱动未找到: {}", config.getJdbcDriverClass(), e);
                 throw new SQLException("JDBC 驱动未找到: " + config.getJdbcDriverClass(), e);

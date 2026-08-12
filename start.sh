@@ -45,6 +45,30 @@ else
 fi
 export DB_URL="jdbc:mysql://localhost:33306/sync_task_db?${META_DB_SSL_PARAM}&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true"
 echo "[start] META_DB_SSL_MODE=$META_DB_SSL_MODE"
+
+# ---- 平台自身组件的 TLS（B5）：全部默认关闭，= 升级前行为 ----
+#   KAFKA_SECURITY_PROTOCOL / KAFKA_SSL_*   后端生产消费、agent 消费、订阅生产（KafkaSecurity）
+#   CONTROL_PLANE_DB_SSL_MODE               后端直连用户库（元数据探查/校验/内容对比）
+#   BACKEND_TLS_*                           后端 HTTPS（明文下 JWT 可嗅探）
+#   AGENT_TLS_*                             agent HTTP 接口（带 failover/switchover 等运维动作）
+# 一键打开：SYNCTASK_TLS_ALL=1 ./start.sh（证书由 test_scripts/ssl/gen_certs.sh 生成）
+if [ "${SYNCTASK_TLS_ALL:-0}" = "1" ]; then
+  CERTS_DIR="${SYNCTASK_TLS_CERTS_DIR:-$PROJECT_DIR/test_scripts/ssl/out}"
+  export CONTROL_PLANE_DB_SSL_MODE="${CONTROL_PLANE_DB_SSL_MODE:-REQUIRED}"
+  export BACKEND_TLS_ENABLED=true
+  export BACKEND_TLS_KEYSTORE="${BACKEND_TLS_KEYSTORE:-$CERTS_DIR/backend-keystore.p12}"
+  export BACKEND_TLS_KEYSTORE_PASSWORD="${BACKEND_TLS_KEYSTORE_PASSWORD:-synctask}"
+  export AGENT_TLS_KEYSTORE="${AGENT_TLS_KEYSTORE:-$CERTS_DIR/agent-keystore.p12}"
+  export AGENT_TLS_KEYSTORE_PASSWORD="${AGENT_TLS_KEYSTORE_PASSWORD:-synctask}"
+  # 后端要能信任 agent 的自签证书（监控页已改走后端代理，只有这一个客户端）
+  export AGENT_TLS_TRUSTSTORE="${AGENT_TLS_TRUSTSTORE:-$CERTS_DIR/truststore.p12}"
+  export AGENT_TLS_TRUSTSTORE_PASSWORD="${AGENT_TLS_TRUSTSTORE_PASSWORD:-synctask}"
+  echo "[start] SYNCTASK_TLS_ALL=1：后端 HTTPS / agent HTTPS / 控制面 TLS 已开启（证书目录 $CERTS_DIR）"
+fi
+# 其余 TLS 开关（KAFKA_SECURITY_PROTOCOL / KAFKA_SSL_* / KAFKA_SASL_* /
+# CONTROL_PLANE_DB_SSL_* / META_DB_SSL_ROOT_CERT / SYNCTASK_CERT_DIR）不在这里罗列：
+# 调用方以 `KAFKA_SECURITY_PROTOCOL=SSL ./start.sh` 形式给出时它们本就在环境里，
+# 子进程直接继承，再 export 一遍是空动作。
 export DB_USERNAME="root"
 export DB_PASSWORD="rootpassword"
 export KAFKA_BOOTSTRAP_SERVERS="localhost:29092"

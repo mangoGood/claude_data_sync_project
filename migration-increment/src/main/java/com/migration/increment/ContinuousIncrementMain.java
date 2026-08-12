@@ -437,6 +437,10 @@ public class ContinuousIncrementMain {
         targetConnection = ConnectionPoolManager.getConnection(url, targetUser, targetPassword);
         logger.info("已连接目标数据库: {}:{}/{} (类型: {})", targetHost, targetPort, targetDatabase,
                 isPostgresql ? "postgresql" : "mysql");
+        // 运行期取证：增量是长跑链路，一旦"以为加密其实明文"就是持续明文搬数据
+        com.migration.common.ssl.TlsEvidence.verify(targetConnection,
+                isPostgresql ? "postgresql" : "mysql",
+                com.migration.common.ssl.SslMaterial.from(props, "target"), "目标库");
         // MySQL 目标关闭本会话外键检查：增量按 binlog 顺序应用本身满足约束，但部分表同步/
         // 列过滤会破坏引用完整性（父行被过滤而子行保留），幂等重放（重试续传）也可能暂时乱序。
         // 与全量搬数会话保持一致语义；重连走同一入口，新会话自动重设。

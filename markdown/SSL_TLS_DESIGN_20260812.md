@@ -305,9 +305,9 @@ H2 在这里是**同一主机上的跨进程通道**，且已经因为 hostname 
 | **B1 ✅ 已完成** | `SslMaterial` 内核 + 证书归一（PEM→p12/pk8）+ 替换已有 3 份重复 switch + 修 §0.2 的①② | **零**（默认 DISABLED） | 见 §6.1 |
 | **B2 ✅ 已完成** | `V19` schema + 证书库 API + 上传 + 三个向导 UI + 测连回报协商结果 | 新增能力，旧任务不受影响 | 见 §6.2 |
 | **B3 ✅ 已完成** | 数据面链路接入 + §3.4 四处传播 | 按任务生效 | 见 §6.3 |
-| **B4** | 预检实连 + 运行期协商证据 + 4 个错误码 + 证书到期告警 | — | `REQUIRE SSL` 账号 + 任务配 DISABLED → 必须明确失败并给 E5007 |
-| **B5** | 平台组件：修死开关、元数据库/Kafka/后端/agent/SR/ES/TiCDC + start.sh/compose | 默认关，开关可控 | 全开一轮跑通完整 E2E |
-| **B6** | `test_scripts/ssl/` 判据套件 + 证书生成脚本 + SSL 账号 | — | 全绿 |
+| **B4 ✅ 已完成** | 预检实连 + 运行期协商证据 + 4 个错误码 + 证书到期告警 | — | 见 §6.4 |
+| **B5 ✅ 已完成** | 平台组件：修死开关、元数据库/Kafka/后端/agent + start.sh | 默认关，开关可控 | 见 §6.4 |
+| **B6 ✅ 已完成** | `test_scripts/ssl/` 判据套件 + 证书生成脚本 + SSL 账号 | — | 见 §6.4 |
 
 B2 与 B3 可并行（B3 先用手工写的 config.properties 验证引擎侧）。
 
@@ -477,3 +477,52 @@ POST   /api/metadata/test-connection   请求加 sslMode/sslCertId，响应加 e
 - **"以为加密了其实没有"** —— 与订阅链路"配了 AVRO 却退回 JSON 不报错"、"合成心跳把延迟刷成 0" 是同一类。因此本方案把**服务端视角取证**和 **≥REQUIRED 探到明文即 fail-stop** 定为必需项，不是加分项。
 - **判据必须跑 fat jar**，改了 `migration-common` 要 `clean install`，否则引擎子进程用的还是旧 `SslMaterial`。
 - **错误码三份目录**有 CI 门禁，E5005~E5008 要同步落三处。
+
+
+### 6.4 B4 / B5 / B6 交付记录（2026-08-12）
+
+#### B4 预检实连 + 运行期证据 + 错误码
+
+- **四个错误码**，三份目录同步（`SyncErrorCode` / `SyncErrorCodeMapper` / `admin-dashboard.js`，
+  已有 CI 门禁 `SyncErrorCodeCatalogTest` 守着）：
+  `E5005` TLS 握手失败 / `E5006` 证书校验失败 / `E5007` 要求加密但实际未加密 /
+  `E5008` 证书材料不可用。mapper 里这几条**排在最前**——驱动会把握手失败包成
+  "网络不可达/连接失败"，落到那些泛化规则上会把人指去查地址端口，而地址端口完全是对的。
+- **预检从"读 env"改成"按任务实配真连一次"**：`DiagnosticService.checkTransportEncryption`
+  现在给出的是服务端回报的协商结果，实测明文而档位要求加密时报 **FAIL 阻断**（此前只 WARNING）。
+- **运行期证据** `migration-common/.../ssl/TlsEvidence`：全量与增量连上目标库后立刻探一次，
+  ≥REQUIRED 却实测明文直接抛（E5007），PREFERRED 退回明文时告警但不阻断（那是驱动的既定语义）。
+
+#### B5 平台自身组件
+
+| 组件 | 开关 | 实测 |
+|---|---|---|
+| 元数据库（后端 + agent） | `META_DB_SSL_MODE` / `META_DB_SSL_ROOT_CERT` | `sync_task_db` 全部 5 条连接 `TLS_AES_256_GCM_SHA384`，明文 0 条 |
+| 后端 HTTPS | `BACKEND_TLS_ENABLED` / `BACKEND_TLS_KEYSTORE` | TLSv1.3；明文 HTTP 打到 38080 被拒（400） |
+| agent HTTPS | `AGENT_TLS_KEYSTORE` | TLSv1.3；后端代理位点/指标经 https 正常取到数据 |
+| 控制面到用户库 | `CONTROL_PLANE_DB_SSL_MODE` | 诊断里的 JDBC URL 实际带 `sslMode=REQUIRED` |
+| Kafka 四个客户端 | `KAFKA_SECURITY_PROTOCOL` / `KAFKA_SSL_*` | 代码路径就位（`KafkaSecurity` + 任务级覆盖），broker 侧 SSL listener 未在本轮实测 |
+
+一键打开：`SYNCTASK_TLS_ALL=1 ./start.sh`。默认全关 = 升级前行为。
+
+**新增 `AgentHttpSupport`**：agent 一旦走 HTTPS，后端那 5 处硬编码 `http://` 的代理调用会全部连不上。
+统一收口并加载 agent 的自签信任库。注意 TiCDC 的状态查询**不能**走它——那不是 agent，
+协议由 `sync.ticdc.api-url` 自己决定，误接会把 http 改写成 https。
+
+**H2 按既定取舍不上 TLS**（同主机 loopback + 已钉死 `h2.bindAddress=127.0.0.1`）。
+
+#### B6 判据套件
+
+- `test_scripts/ssl/gen_certs.sh`：自签 CA + 7 张服务端证书 + 客户端证书（含 PG 要的
+  PKCS8 DER）+ p12/truststore + Mongo 要的 cert-key 合并 pem。服务端证书 SAN 覆盖
+  `localhost` / `127.0.0.1` / 容器名——`VERIFY_IDENTITY` 下缺了就必挂，而报错会把人带偏。
+- `test_scripts/ssl/ssl_e2e.py`：4 组共 **14 条判据，全绿**（后端 http/https 自动探测）。
+- `test_scripts/ssl/README.md`：证书生成、平台组件开关、各引擎服务端开 SSL 的注意事项。
+
+**最终实测**（`SYNCTASK_TLS_ALL=1 META_DB_SSL_MODE=REQUIRED ./start.sh`，即数据面 + 控制面 +
+元数据库 + 后端/agent HTTPS 全开）：14/14 通过，含全量 3 行 + 增量 INSERT/UPDATE/DELETE
+后源目标 MD5 一致，以及 `Binlog Dump → ECDHE-RSA-AES256-GCM-SHA384`。
+
+**判据自身的一个修正**：反向判据原先断言"任务配 DISABLED 必须连不上"，但
+`CONTROL_PLANE_DB_SSL_MODE` 是一条**下限**——任务没配时会回落到它，于是连接照样加密、
+`REQUIRE SSL` 账号照样接受。真正的不变量是"**绝不允许连上且是明文**"，已按此改写。

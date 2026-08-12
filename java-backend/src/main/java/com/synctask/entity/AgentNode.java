@@ -40,8 +40,9 @@ public class AgentNode {
     @Column(name = "heartbeat_at")
     private LocalDateTime heartbeatAt;
 
+    /** agent 基址。协议随 agent 侧 TLS 开关走（见 AgentHttpSupport）。 */
     public String baseUrl() {
-        return "http://" + host + ":" + port;
+        return com.synctask.util.AgentHttpSupport.scheme() + "://" + host + ":" + port;
     }
 
     public String getAgentId() {

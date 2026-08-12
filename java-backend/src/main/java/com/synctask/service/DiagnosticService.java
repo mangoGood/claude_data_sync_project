@@ -28,6 +28,17 @@ public class DiagnosticService {
     private WorkflowRepository workflowRepository;
 
     /**
+     * 传输加密预检要<b>实连</b>取证，因此需要这两个依赖。
+     * {@code required = false}：诊断是只读能力，缺依赖时降级成"只报配置、不实连"，
+     * 不该因为它而让整个诊断接口起不来。
+     */
+    @Autowired(required = false)
+    private MetadataService metadataService;
+
+    @Autowired(required = false)
+    private CertificateService certificateService;
+
+    /**
      * 执行一键诊断
      */
     public Map<String, Object> diagnose(String workflowId, Long userId) {
@@ -561,8 +572,9 @@ public class DiagnosticService {
      * 但"当初知不知道自己没开"必须留下痕迹（预检结果现在会落 {@code task_precheck_results}）。
      */
     private Map<String, Object> checkTransportEncryption(Workflow workflow) {
-        String src = System.getenv("SOURCE_DB_SSL_MODE");
-        String tgt = System.getenv("TARGET_DB_SSL_MODE");
+        // 任务级档位（向导里选的）优先于部署级 env。两者都看：任务没配时 env 仍可能开着。
+        String src = firstNonDisabled(workflow.getSourceSslMode(), System.getenv("SOURCE_DB_SSL_MODE"));
+        String tgt = firstNonDisabled(workflow.getTargetSslMode(), System.getenv("TARGET_DB_SSL_MODE"));
         boolean srcOn = on(src);
         boolean tgtOn = on(tgt);
         // 控制面：后端自己也直连用户库（元数据探查、连接校验、数据校验、**内容对比逐行读业务数据**），
@@ -575,19 +587,81 @@ public class DiagnosticService {
         boolean metaOn = on(meta);
         boolean kafkaOn = com.synctask.util.KafkaSecurity.enabled();
 
+        // **实连取证**：只报"配了什么"是不够的——配置写着 REQUIRED 不等于连接真的加密了
+        // （驱动版本不对会静默忽略未知参数，PREFERRED 在服务端不支持时按定义就退回明文）。
+        // 这里按任务实配去真连一次，把服务端自己说的加密状态带回来。
+        String srcProbe = probeEndpoint(workflow, true, src);
+        String tgtProbe = probeEndpoint(workflow, false, tgt);
+
         String detail = String.format(
-                "数据面 源=%s 目标=%s；控制面 到用户库=%s 到元数据库=%s Kafka=%s",
-                srcOn ? src : "DISABLED", tgtOn ? tgt : "DISABLED",
+                "数据面 源=%s%s 目标=%s%s；控制面 到用户库=%s 到元数据库=%s Kafka=%s",
+                srcOn ? src : "DISABLED", srcProbe,
+                tgtOn ? tgt : "DISABLED", tgtProbe,
                 controlOn ? control : "DISABLED", metaOn ? meta : "DISABLED", kafka);
+
+        // 实测"要求加密却是明文"是硬错误，必须阻断：这是最危险的一种成功——
+        // 任务能跑、不报错，但数据在网上是明文，而配置页上明明写着 VERIFY_CA。
+        if (srcProbe.contains("实测明文") || tgtProbe.contains("实测明文")) {
+            return check("传输加密", "FAIL",
+                    "档位要求加密，但实测连接为明文（E5007）", detail
+                            + "。请确认服务端已开启 SSL，或把档位改回「不加密」");
+        }
 
         if (srcOn && tgtOn && controlOn && metaOn && kafkaOn) {
             return check("传输加密", "PASS", "数据面与控制面均已启用 TLS", detail);
         }
         return check("传输加密", "WARNING",
                 "以下链路未启用 TLS，数据在网络上是明文传输", detail
-                        + "。开关：SOURCE_DB_SSL_MODE / TARGET_DB_SSL_MODE（数据面）、"
-                        + "CONTROL_PLANE_DB_SSL_MODE（后端直连用户库）、META_DB_SSL_MODE（元数据库）、"
-                        + "KAFKA_SECURITY_PROTOCOL=SSL|SASL_SSL（Kafka）");
+                        + "。数据面开关在任务配置第 1 步（源/目标各自勾选「启用 SSL/TLS 加密连接」）；"
+                        + "控制面开关：CONTROL_PLANE_DB_SSL_MODE（后端直连用户库）、"
+                        + "META_DB_SSL_MODE（元数据库）、KAFKA_SECURITY_PROTOCOL=SSL|SASL_SSL（Kafka）");
+    }
+
+    /** 任务级档位优先；它没配（或 DISABLED）时看部署级 env。 */
+    private static String firstNonDisabled(String taskLevel, String envLevel) {
+        return on(taskLevel) ? taskLevel : envLevel;
+    }
+
+    /**
+     * 按任务实配去连一次，回报服务端视角的加密状态。
+     *
+     * @return 形如 {@code "(实测 TLSv1.3/TLS_AES_256_GCM_SHA384)"}；探不到就返回空串，不猜
+     */
+    private String probeEndpoint(Workflow workflow, boolean source, String mode) {
+        if (!on(mode)) {
+            return "";
+        }
+        String conn = source ? workflow.getSourceConnection() : workflow.getTargetConnection();
+        if (conn == null || conn.isEmpty()) {
+            return "";
+        }
+        String certId = source ? workflow.getSourceSslCertId() : workflow.getTargetSslCertId();
+        try {
+            com.synctask.util.CertMaterial material = certificateService == null ? null
+                    : certificateService.materialFor(certId, workflow.getUserId());
+            MetadataService.SslConfig ssl = new MetadataService.SslConfig(mode, material);
+            String dbType = source ? workflow.getSourceType() : workflow.getTargetType();
+            if (metadataService == null) {
+                return "";
+            }
+            MetadataService.ConnectionTestResult r =
+                    metadataService.testConnectionDetailed(conn, dbType, ssl);
+            if (Boolean.TRUE.equals(r.encrypted)) {
+                String d = java.util.stream.Stream.of(r.tlsVersion, r.tlsCipher)
+                        .filter(x -> x != null && !x.isEmpty())
+                        .collect(java.util.stream.Collectors.joining("/"));
+                return "(实测已加密" + (d.isEmpty() ? "" : " " + d) + ")";
+            }
+            if (Boolean.FALSE.equals(r.encrypted)) {
+                return "(实测明文)";
+            }
+            if (!r.connected && r.errorType != null && r.errorType.startsWith("SSL")) {
+                return "(实测明文: " + r.errorType + ")";
+            }
+        } catch (Exception e) {
+            logger.debug("传输加密预检实连失败: {}", e.getMessage());
+        }
+        return "";
     }
 
     private static boolean on(String v) {

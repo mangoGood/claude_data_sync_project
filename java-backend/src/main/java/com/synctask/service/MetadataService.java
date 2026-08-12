@@ -2456,6 +2456,8 @@ public class MetadataService {
         }
         java.net.HttpURLConnection conn = null;
         try {
+            // TiCDC 不是 agent：协议由 sync.ticdc.api-url 自己决定（https 时用户自己写 https://），
+            // 不能走 AgentHttpSupport —— 它会按 agent 的 TLS 开关把 http 改写成 https
             conn = (java.net.HttpURLConnection) new java.net.URL(apiUrl + "/api/v2/status").openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(5000);

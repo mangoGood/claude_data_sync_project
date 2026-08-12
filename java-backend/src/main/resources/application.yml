@@ -3,6 +3,18 @@
 # ============================================================
 server:
   port: 38080
+  # ============================================================
+  # 后端 HTTPS
+  #
+  # 明文 HTTP 下 JWT 是可嗅探的——拿到 token 即等同登录，这是整个平台最直接的一处暴露。
+  # 配了 BACKEND_TLS_KEYSTORE 就走 HTTPS；不配则保持明文（= 升级前行为）。
+  # keystore 用 PKCS12，与平台其它地方的证书形态一致（test_scripts/ssl/gen_certs.sh 会生成）。
+  # ============================================================
+  ssl:
+    enabled: ${BACKEND_TLS_ENABLED:false}
+    key-store: ${BACKEND_TLS_KEYSTORE:}
+    key-store-type: PKCS12
+    key-store-password: ${BACKEND_TLS_KEYSTORE_PASSWORD:}
   tomcat:
     threads:
       max: 200

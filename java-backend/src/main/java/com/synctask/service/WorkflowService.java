@@ -1500,7 +1500,7 @@ public class WorkflowService {
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/diagnostics/" + id);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("GET");
             if (agentToken != null && !agentToken.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + agentToken);
@@ -1552,7 +1552,8 @@ public class WorkflowService {
      * 单机部署行为不变。
      */
     private String agentBaseUrlFor(String taskId) {
-        String fallback = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String fallback = System.getenv().getOrDefault("AGENT_BASE_URL",
+                com.synctask.util.AgentHttpSupport.scheme() + "://localhost:8083");
         if (taskId == null) {
             return fallback;
         }
@@ -1578,7 +1579,7 @@ public class WorkflowService {
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + path);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("GET");
             if (agentToken != null && !agentToken.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + agentToken);
@@ -1606,7 +1607,7 @@ public class WorkflowService {
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/agent/deadletter/" + id);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("GET");
             if (agentToken != null && !agentToken.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + agentToken);
@@ -1864,7 +1865,7 @@ public class WorkflowService {
         Map<String, Object> out = new java.util.LinkedHashMap<>();
         try {
             java.net.HttpURLConnection conn =
-                    (java.net.HttpURLConnection) new java.net.URL(agentUrl).openConnection();
+                    com.synctask.util.AgentHttpSupport.open(agentUrl);
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
             if (agentToken != null && !agentToken.isEmpty()) {
@@ -1909,7 +1910,7 @@ public class WorkflowService {
         String agentUrl = agentBase + "/api/agent/failover";
         try {
             java.net.URL url = new java.net.URL(agentUrl);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
             if (agentToken != null && !agentToken.isEmpty()) {
