@@ -370,3 +370,60 @@ TiCDC 链路没跟上。
   新加的类"不存在"。同一条老规矩：改了 common 就要重新构建依赖。
 - 沿用 [[lob-test-suite]] 的老规矩：子进程 stdout 必须持续排空；判据跑 fat jar，
   只 `compile` 不 `package` 等于跑旧代码。
+
+---
+
+## 附二：增量延迟指标不可信（2026-08-12 修）
+
+上面 12 项修完后被问到一个好问题：Oracle/Mongo 没有数据面心跳，那它们的增量延迟准不准？
+把整条计算链读完，答案是**四条链路各有各的不准**，而且其中一条不准也波及 MySQL。
+
+延迟的算法是 `rtoMs = increment 本地 now − event.getSourceTstamp()`
+（`ContinuousIncrementMain`），所以准不准全看 `sourceTstamp` 是谁的时钟。
+
+| 源 | 改造前的 sourceTstamp | 问题 |
+|---|---|---|
+| MySQL / TiDB | 源库时钟（心跳表绕一圈回来），有 `clockOffsetMs` 校正 | 相对可信 |
+| PG | **capture 读到消息那一刻的本机时钟** | 「源库提交→capture 读到」整段不计入 |
+| Oracle | 源库时钟（`V$LOGMNR_CONTENTS.TIMESTAMP`），无偏移校正，列类型是 `DATE`=秒级 | 偏差 = 两机时钟差 |
+| Mongo 同步 | 无任何延迟指标 | 面板 RTO/RPO 是空的 |
+| Mongo 订阅 | `clusterTime`（源集群时钟） | 口径对，无偏移校正 |
+
+**最要命的一条对所有源都成立**：extract 空闲时注入的兜底心跳用**本机时钟**
+（`ContinuousExtractMain.writeHeartbeatIfNeeded`），而它的触发条件是"1 秒内没有事件流入" ——
+这个条件在"源库真的空闲"和"capture 卡死了"两种情况下都成立。于是 capture 一死，
+extract 每秒造一条心跳，increment 算出 `now − now ≈ 0` 写进 rto_metric，
+**面板显示延迟极低，实际一条数据都没在流动**。
+
+代码里其实意识到过一半：`AbstractTaskExecutor` 的注释写着"若只监控增量端 rto_metric，
+上游 capture 冻结后 rto_metric 仍在推进"，所以**看门狗**改用了每进程一个活性文件 ——
+但**面板上显示的那个延迟数字**没跟着改。
+
+### 修法
+
+1. **事件带源端时钟**：新增 `SourceClockOffset`（往返取中点测偏移，把源端时间戳折算到本机时钟域，
+   下游的减法就只剩真实链路耗时）。PG 改用 BEGIN 消息里的**提交时间戳**；Oracle 折算 LogMiner
+   TIMESTAMP；Mongo 同步用 `wallTime`/`clusterTime` 并**补写 rto_metric**（此前完全没有）。
+   偏移超过 5 秒打 WARN 点名 NTP。
+2. **合成心跳不冒充源端时钟**：打 `synthetic_heartbeat` 标记，increment 见到只推进位点与活性、
+   不刷 rto_metric；capture 在源库空闲时改由自己打一条**源端时钟**心跳（PG 用 `clock_timestamp()`，
+   Oracle 用 `SYSTIMESTAMP`），空闲期的延迟数字因此是真的在量链路耗时。
+   agent 侧对**过期**的 rto_metric 按无数据处理 —— "量不出来"和"延迟很低"必须能区分。
+3. **负延迟不再静默丢弃**：旧实现 `if (rtoMs >= 0)` 把负样本全扔掉，本机时钟偏快时
+   rto_metric 从此停在旧值上。改成限流 WARN 点名时钟未对齐 + 按 0 上报。
+
+### 判据额外揪出来的一个设计问题
+
+第一版判据跑出 rto=1038ms（期望 ≥9000ms），查 `.cap` 发现事件时间戳本身是对的，
+是**每 2 秒一次的空闲心跳把 12 秒的真实样本覆盖掉了**：心跳只覆盖 capture→apply 一段，
+数据事件覆盖全程，有数据流动时必须以数据事件为准。现在心跳在数据事件上报后的静默期内不抢话。
+
+判据 `test_scripts/pg_toast/pg_latency_e2e.py`：基线 8/11 → 11/11
+（关键两项：12 秒积压 969ms→13145ms；capture 死后指标从"每几秒刷成 ≈0"变成"停止刷新并陈旧"）。
+单测 `SourceClockOffsetTest` 7/7、`MetricStalenessTest` 5/5。
+
+### 仍未覆盖
+
+MySQL 的 `.cap` 事件时间戳仍是**未折算**的源库时钟（它的 RPO 有校正、RTO 没有），
+本轮没动它以免影响既有的 MySQL 判据；同机部署时偏移≈0，影响有限。
+Oracle 的秒级精度是 LogMiner 固有限制，量不出亚秒延迟。

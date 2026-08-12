@@ -18,6 +18,14 @@ public class ContinuousExtractMain {
 
     private static final Logger logger = LoggerFactory.getLogger(ContinuousExtractMain.class);
 
+    /**
+     * 合成心跳标记：该心跳的 {@code sourceTstamp} 取自**本机时钟**，不可用于计算延迟。
+     *
+     * <p>与之相对的是 capture 写的 {@code SYNC_HEARTBEAT} —— 那条的时间戳取自源库时钟
+     * （MySQL 走心跳表绕一圈回来，PG/Oracle 取源库当前时间），可以算延迟。
+     */
+    public static final String SYNTHETIC_HEARTBEAT = "synthetic_heartbeat";
+
     private static final long HEARTBEAT_IDLE_THRESHOLD_MS = 1000;
     private static final long HEARTBEAT_INTERVAL_MS = 1000;
     /** THL 文件最大大小（50MB），超过后轮转到新文件 */
@@ -542,6 +550,11 @@ public class ContinuousExtractMain {
             heartbeat.setSourceId(captureType);
             heartbeat.addMetadata("event_type", "HEARTBEAT");
             heartbeat.addMetadata("heartbeat_timestamp", now);
+            // 这条心跳的时间戳是**本机时钟**，不是源端时钟：它只能证明 extract 还活着，
+            // 不能用来算延迟。下游拿它做 `now - sourceTstamp` 恒得 ≈0 ——
+            // capture 死掉时 extract 空转、每秒造一条，面板就会显示"延迟极低"而实际一条数据都没动。
+            // 打上标记，increment 见到只推进位点与活性、不刷 rto_metric。
+            heartbeat.addMetadata(SYNTHETIC_HEARTBEAT, Boolean.TRUE);
 
             currentThlWriter.writeEvent(heartbeat);
 

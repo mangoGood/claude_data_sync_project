@@ -154,6 +154,15 @@ public class OracleRedoExtractor extends AbstractExtractor<byte[], THLEvent> {
             thlEvent.addMetadata(TxnMetadata.TX_SOURCE_ID, fields[4].trim());
         }
 
+        if ("SYNC_HEARTBEAT".equals(eventType)) {
+            // capture 在源库空闲时打的心跳，时间戳取自**源库时钟**（已折算到本机时钟域）。
+            // 没有它，空闲期只有 extract 那条本机时钟的兜底心跳，算出来的延迟恒为 0
+            thlEvent.setType(THLEvent.HEARTBEAT_EVENT);
+            thlEvent.addMetadata("operation", "HEARTBEAT");
+            thlEvent.addMetadata("source_db_timestamp", timestamp);
+            return thlEvent;
+        }
+
         if ("INSERT".equals(eventType)) {
             parseInsertEvent(thlEvent, eventData);
         } else if ("UPDATE".equals(eventType)) {

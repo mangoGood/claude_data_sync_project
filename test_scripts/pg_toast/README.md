@@ -51,3 +51,26 @@ python3 test_scripts/pg_toast/pg_schema_truncate_e2e.py
 判据里的辅助函数**别写死列名**：中途 `DROP COLUMN` 之后按老列名取值会 SQL 报错，
 而 `wait_until` 把异常当成"还没同步到"，一路等到超时 —— 判据永远失败且看不出原因。
 本目录用 `row_json()`（`row_to_json`）与表结构解耦。
+
+---
+
+## `pg_latency_e2e.py` —— 增量延迟指标是否可信
+
+```bash
+python3 test_scripts/pg_toast/pg_latency_e2e.py
+```
+
+| 场景 | 改造前 | 改造后 |
+|---|---|---|
+| capture 被暂停 12s 期间提交的变更 | rto **969ms**（只量 capture→apply） | rto **13145ms**（起点是源库提交时刻） |
+| capture 进程被杀掉 | rto_metric 每几秒仍被刷成 ≈0，陈旧度 1.8s | 指标停止刷新、随即陈旧，agent 按无数据处理 |
+| 源库空闲 | 靠 extract 的**本机时钟**心跳（恒 ≈0） | capture 打**源端时钟**心跳，量的是真实链路耗时 |
+
+基线 8/11 → 修复后 11/11。
+
+### 判据暴露出的一个设计问题
+
+第一版跑出来 rto 只有 1038ms，查 `.cap` 才发现事件时间戳本身是对的（提交时刻），
+是**每 2 秒一次的空闲心跳把 12 秒的真实样本覆盖掉了**。心跳只覆盖 capture→apply 一段，
+数据事件覆盖全程；有数据在流动时必须以数据事件为准，否则真实积压会被掩盖成一个漂亮的小数字。
+现在心跳在数据事件上报后的静默期内不抢话（`HEARTBEAT_YIELD_MS`）。

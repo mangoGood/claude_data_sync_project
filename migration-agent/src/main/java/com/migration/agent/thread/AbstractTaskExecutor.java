@@ -1419,6 +1419,24 @@ public abstract class AbstractTaskExecutor implements Runnable {
     // ==================== 工具方法 ====================
 
     protected Long readMetricFile(String filePath) {
+        return readMetricFile(filePath, metricStaleMs());
+    }
+
+    /**
+     * 读指标文件的值（格式 {@code 写入时刻|值|源端时间戳}）。
+     *
+     * <p><b>过期的样本按"没有数据"处理</b>，而不是返回那个旧值。链路停了之后指标文件不再更新，
+     * 若照旧返回最后一次的数字，面板上看到的是一个**过期但看着正常**的延迟 ——
+     * 与"量不出来"是两件完全不同的事，必须能区分。第一个字段就是写入时刻，判据现成。
+     *
+     * @param maxAgeMs 允许的最大年龄；≤0 表示不做新鲜度判断（兼容没有时间戳字段的老指标）
+     */
+    protected Long readMetricFile(String filePath, long maxAgeMs) {
+        return readFreshMetric(filePath, maxAgeMs);
+    }
+
+    /** 静态实现，便于单测直接验证新鲜度判断（构造一个 executor 需要一整套依赖）。 */
+    static Long readFreshMetric(String filePath, long maxAgeMs) {
         try {
             File file = new File(filePath);
             if (!file.exists()) return null;
@@ -1426,11 +1444,24 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 String line = reader.readLine();
                 if (line != null && !line.isEmpty()) {
                     String[] parts = line.split("\\|");
-                    if (parts.length >= 2) return Long.parseLong(parts[1].trim());
+                    if (parts.length >= 2) {
+                        if (maxAgeMs > 0) {
+                            long writtenAt = Long.parseLong(parts[0].trim());
+                            if (System.currentTimeMillis() - writtenAt > maxAgeMs) {
+                                return null;
+                            }
+                        }
+                        return Long.parseLong(parts[1].trim());
+                    }
                 }
             }
         } catch (Exception e) { }
         return null;
+    }
+
+    /** 指标最大年龄：超过即视为无数据。默认 60s（心跳侧最慢 5s 一次，留足余量）。 */
+    protected long metricStaleMs() {
+        return 60000;
     }
 
     protected Long readMetricTimestamp(String filePath) {

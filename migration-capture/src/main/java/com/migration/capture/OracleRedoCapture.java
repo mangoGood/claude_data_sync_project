@@ -96,6 +96,19 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
     private volatile boolean backpressurePaused = false;
     private String backpressureSignalPath;
 
+    /**
+     * 源库时钟与本机时钟的偏移。
+     *
+     * <p>LogMiner 的 {@code TIMESTAMP} 是**源库时钟**，而延迟是在 increment 端按
+     * {@code 本机 now − 事件时间戳} 算的 —— 不折算的话两台机器的时钟差会整体加进延迟里；
+     * 本机时钟偏快时还会算出负数，被下游的 {@code rtoMs >= 0} 直接丢掉，指标停在旧值上。
+     * MySQL 链路的 RPO 一直在做这个校正，Oracle 链路此前完全没做。
+     */
+    private final com.migration.common.clock.SourceClockOffset sourceClock =
+            new com.migration.common.clock.SourceClockOffset();
+    private long idleHeartbeatMs = 5000;
+    private volatile long lastIdleHeartbeatMs = 0;
+
     /** LogMiner 扫描间隔（毫秒） */
     private long scanIntervalMs = 1000;
     /** 每次查询 LogMiner 的最大行数 */
@@ -124,6 +137,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                 props.getProperty("capture.position.health.interval.ms", "60000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         scanIntervalMs = Long.parseLong(props.getProperty("capture.redo.scan.interval", "1000"));
+        idleHeartbeatMs = Long.parseLong(props.getProperty("capture.idle.heartbeat.ms", "5000"));
         queryBatchSize = Integer.parseInt(props.getProperty("capture.redo.batch.size", "1000"));
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
 
@@ -362,6 +376,9 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                     consecutiveErrors = 0;
 
                     if (events == 0) {
+                        // 源库空闲时也要有一个**源端时钟**的时间基准供下游算延迟
+                        // （extract 那条兜底心跳用本机时钟，算出来恒为 0）
+                        writeIdleHeartbeatIfNeeded();
                         Thread.sleep(scanIntervalMs);
                     }
 
@@ -677,7 +694,10 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                     eventData = buildEventData(segOwner, tableName, operation, sqlRedo);
                 }
 
-                long ts = timestamp != null ? timestamp.getTime() : System.currentTimeMillis();
+                // LogMiner 的 TIMESTAMP 是源库时钟，折算到本机时钟域再下发（见 sourceClock 注释）。
+                // 注意它的列类型是 DATE —— 只有秒级精度，亚秒延迟量不出来，这是 LogMiner 的固有限制
+                long ts = timestamp != null
+                        ? sourceClock.toLocal(timestamp.getTime()) : System.currentTimeMillis();
                 long xidNumeric = 0;
                 try {
                     xidNumeric = Long.parseLong(xid, 16);
@@ -1304,6 +1324,58 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
      * <p>在线 redo 被覆盖、归档被 RMAN 删掉之后，LogMiner 要么报 ORA-01291 要么干脆什么都不返回，
      * 外层看到的只是"任务在跑但没数据"。等重启才发现就已经晚了，只能重做全量。
      */
+    /**
+     * 源库空闲时往 {@code .cap} 写一条带**源端时钟**的心跳，顺带刷新时钟偏移。
+     *
+     * <p>口径：量的是"心跳穿过 capture→extract→apply"这一段，不含"redo 产生→LogMiner 挖到"
+     * （那一段的落后由 SCN 差与归档保留状态反映）。有真实变更时事件自带 LogMiner 时间戳，
+     * 那才是全程延迟。
+     */
+    private void writeIdleHeartbeatIfNeeded() {
+        if (idleHeartbeatMs <= 0 || conn == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastIdleHeartbeatMs < idleHeartbeatMs) {
+            return;
+        }
+        lastIdleHeartbeatMs = now;
+        long sourceNowMs;
+        try (Statement stmt = conn.createStatement()) {
+            long before = System.currentTimeMillis();
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT (CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE) - DATE '1970-01-01') "
+                            + "* 86400000 FROM DUAL")) {
+                if (!rs.next()) {
+                    return;
+                }
+                sourceNowMs = rs.getLong(1);
+            }
+            sourceClock.observe(sourceNowMs, before, System.currentTimeMillis());
+        } catch (Exception e) {
+            logger.debug("空闲心跳取源库时间失败: {}", e.getMessage());
+            return;
+        }
+        if (sourceClock.isSuspicious(5000)) {
+            logger.warn("源库与本机时钟相差 {} ms，延迟指标已按该偏移折算；请检查两端 NTP",
+                    sourceClock.offsetMs());
+        }
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("SYNC_HEARTBEAT").append(FIELD_SEP);
+            sb.append(currentScn != null ? currentScn : "0").append(FIELD_SEP);
+            sb.append(currentScnNumeric).append(FIELD_SEP);
+            sb.append(sourceClock.toLocal(sourceNowMs)).append(FIELD_SEP);
+            sb.append(0).append(FIELD_SEP);
+            sb.append("source_clock");
+            sb.append(RECORD_SEP);
+            writer.write(sb.toString());
+            writer.flush();
+        } catch (IOException e) {
+            logger.debug("写空闲心跳失败: {}", e.getMessage());
+        }
+    }
+
     private void checkRetentionQuietly() {
         if (!retentionCheckEnabled || currentScn == null) {
             return;

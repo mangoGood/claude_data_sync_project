@@ -67,6 +67,13 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
     /** 自己写进 error_status 的那条中断告警原文，恢复时按原文比对再撤销。 */
     private volatile String streamDownStatusLine;
 
+    /** 源库时钟与本机时钟的偏移；事件时间戳按它折算，否则延迟指标里混着两台机器的时钟差。 */
+    private final com.migration.common.clock.SourceClockOffset sourceClock =
+            new com.migration.common.clock.SourceClockOffset();
+    /** 空闲心跳间隔：源库没有变更时，也要有一个**源端时钟**的时间基准供下游算延迟。 */
+    private long idleHeartbeatMs = 5000;
+    private volatile long lastIdleHeartbeatMs = 0;
+
     // 背压控制：extract 通过信号文件通知 capture 暂停/恢复
     private volatile boolean backpressurePaused = false;
     private String backpressureSignalPath;
@@ -99,6 +106,8 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 props.getProperty("capture.position.health.interval.ms", "60000"));
         streamDownReportMs = Long.parseLong(
                 props.getProperty("capture.stream.down.report.ms", "300000"));
+        idleHeartbeatMs = Long.parseLong(
+                props.getProperty("capture.idle.heartbeat.ms", "5000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         slotName = props.getProperty("capture.wal.slot.name", "migration_slot_" + taskId.replaceAll("[^a-z0-9_]", "_"));
         publicationName = props.getProperty("capture.wal.publication.name", "migration_pub_" + taskId.replaceAll("[^a-z0-9_]", "_"));
@@ -157,6 +166,69 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             throw e;
         } catch (Exception e) {
             logger.warn("续传 LSN 可用性预检跳过（查询失败）: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 源库没有变更时，往 {@code .cap} 写一条带**源端时钟**的心跳。
+     *
+     * <p>为什么需要它：extract 也有一条兜底心跳，但那条用的是**本机时钟**，
+     * 下游拿它算出来的延迟恒等于 0 —— capture 卡死时反而显示"延迟极低"。
+     * 这里的心跳时间戳取自源库（{@code now()}），并按测得的偏移折算到本机时钟域，
+     * 因此空闲期的延迟数字是真的在量"心跳穿过 capture→extract→apply 要多久"。
+     *
+     * <p>口径要说清楚：它量的是**捕获端往下**这一段，不含"源库提交→capture 读到"
+     * （那一段的落后量由复制槽的 WAL 字节差反映，见 {@link #checkRetentionQuietly}）。
+     * 有真实变更时事件自带提交时刻，那才是全程延迟。
+     */
+    private void writeIdleHeartbeatIfNeeded() {
+        if (idleHeartbeatMs <= 0) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastIdleHeartbeatMs < idleHeartbeatMs) {
+            return;
+        }
+        lastIdleHeartbeatMs = now;
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        long sourceNowMs;
+        try (Connection probe = DriverManager.getConnection(url, user, password);
+             Statement stmt = probe.createStatement()) {
+            long before = System.currentTimeMillis();
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint")) {
+                if (!rs.next()) {
+                    return;
+                }
+                sourceNowMs = rs.getLong(1);
+            }
+            sourceClock.observe(sourceNowMs, before, System.currentTimeMillis());
+        } catch (Exception e) {
+            logger.debug("空闲心跳取源库时间失败: {}", e.getMessage());
+            return;
+        }
+        if (sourceClock.isSuspicious(5000)) {
+            logger.warn("源库与本机时钟相差 {} ms，延迟指标已按该偏移折算；请检查两端 NTP",
+                    sourceClock.offsetMs());
+        }
+        try {
+            synchronized (this) {
+                if (writer == null) {
+                    return;
+                }
+                StringBuilder sb = new StringBuilder();
+                sb.append("SYNC_HEARTBEAT").append(FIELD_SEP);
+                sb.append(currentLsn != null ? currentLsn : "0/0").append(FIELD_SEP);
+                sb.append(currentLsnNumeric).append(FIELD_SEP);
+                sb.append(sourceClock.toLocal(sourceNowMs)).append(FIELD_SEP);
+                sb.append(0).append(FIELD_SEP);
+                sb.append("source_clock");
+                sb.append(RECORD_SEP);
+                writer.write(sb.toString());
+                writer.flush();
+            }
+        } catch (IOException e) {
+            logger.debug("写空闲心跳失败: {}", e.getMessage());
         }
     }
 
@@ -365,6 +437,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                     // "槽没了 → 收不到数据"，那时 processWalMessage 一次都不会被调用，
                     // 巡检也就永远不跑，告警在最需要它的时候必然缺席。方法自身按间隔节流。
                     checkRetentionQuietly();
+                    writeIdleHeartbeatIfNeeded();
 
                     ByteBuffer msgBuffer = replicationStream.readPending();
                     if (msgBuffer != null) {
@@ -697,7 +770,11 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                 eventDataStr = walData.replace("\n", " ").replace("\r", " ");
             }
 
-            long timestamp = System.currentTimeMillis();
+            // 事件的源端时间 = 本事务的提交时刻，再按测得的时钟偏移折算到本机时钟域，
+            // 这样下游的 `本机 now − 事件时间戳` 就是真实的端到端延迟。
+            // 拿不到提交时刻（不在事务中、或解析失败）才退回本机时钟。
+            long timestamp = currentTxCommitMs > 0
+                    ? sourceClock.toLocal(currentTxCommitMs) : System.currentTimeMillis();
             long xid = 0;
 
             // 双向同步/环路防护：前向单遍事务标记状态机。与 MySQL 侧一致，但 PG 的
@@ -842,11 +919,30 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             long lsn = readInt64BE(data, offset); offset += 8;
             long commitTime = readInt64BE(data, offset); offset += 8;
             long xid = readInt32BE(data, offset);
+            // BEGIN 消息里的这个时间戳就是本事务的**提交时刻**（源库时钟）。
+            // 事务内的行事件本身不带时间戳，提交时刻正是它们该有的源端时间。
+            currentTxCommitMs = pgTimeToEpochMs(commitTime);
             return "BEGIN lsn=" + lsn + " transaction_id:" + xid;
         } catch (Exception e) {
             return "BEGIN";
         }
     }
+
+    /**
+     * PG 的时间戳是"2000-01-01 00:00:00 UTC 起的微秒数"，与 Unix 毫秒差 946684800000。
+     */
+    private static long pgTimeToEpochMs(long pgMicros) {
+        return pgMicros / 1000L + 946684800000L;
+    }
+
+    /**
+     * 本事务的提交时刻（源库时钟，毫秒）；不在事务中为 0。
+     *
+     * <p>旧实现给每个事件打的是"capture 读到这条消息的那一刻的本机时钟"，于是
+     * 「源库提交 → walsender 投递 → capture 读到」这一整段完全不计入延迟 ——
+     * capture 积压得再厉害，面板上的延迟也只反映下游。
+     */
+    private volatile long currentTxCommitMs = 0;
 
     private String parseCommitMessage(byte[] data, int offset) {
         try {
@@ -855,6 +951,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             long endLsn = readInt64BE(data, offset); offset += 8;
             long commitTime = readInt64BE(data, offset); offset += 8;
             long xid = readInt32BE(data, offset);
+            currentTxCommitMs = pgTimeToEpochMs(commitTime);
             return "COMMIT transaction_id:" + xid;
         } catch (Exception e) {
             return "COMMIT";

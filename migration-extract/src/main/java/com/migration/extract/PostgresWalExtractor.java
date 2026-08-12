@@ -140,6 +140,15 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         thlEvent.addMetadata("wal_lsn_numeric", lsnNumeric);
         thlEvent.addMetadata("xid", xid);
 
+        if ("SYNC_HEARTBEAT".equals(eventType)) {
+            // capture 在源库空闲时打的心跳，时间戳取自**源库时钟**（已折算到本机时钟域），
+            // 下游据此算出的空闲期延迟才是真的在量链路耗时，而不是 extract 自造的那个恒为 0 的数
+            thlEvent.setType(THLEvent.HEARTBEAT_EVENT);
+            thlEvent.addMetadata("operation", "HEARTBEAT");
+            thlEvent.addMetadata("source_db_timestamp", timestamp);
+            return thlEvent;
+        }
+
         if ("BEGIN".equals(eventType)) {
             parseBeginEvent(thlEvent, eventData);
         } else if ("COMMIT".equals(eventType)) {

@@ -720,15 +720,10 @@ public class ContinuousIncrementMain {
                     );
                     saveUnifiedApplyCheckpoint(event);
 
-                    if (event.getSourceTstamp() != null) {
-                        long rtoMs = System.currentTimeMillis() - event.getSourceTstamp().getTime();
-                        if (rtoMs >= 0) {
-                            lastRtoMs = rtoMs;
-                            lastRtoReportTime = System.currentTimeMillis();
-                            lastAppliedSourceTs = event.getSourceTstamp().getTime();
-                            writeRtoMetric(rtoMs);
-                            logger.debug("Heartbeat RTO: {}ms (seqno={})", rtoMs, event.getSeqno());
-                        }
+                    // 只有**源端时钟**的心跳才能用来算延迟。extract 空闲时合成的那条用的是本机时钟，
+                    // 拿它算恒得 ≈0 —— capture 死掉、extract 空转时面板会显示"延迟极低"而一条数据都没动。
+                    if (event.getSourceTstamp() != null && !isSyntheticHeartbeat(event)) {
+                        recordRto(event.getSourceTstamp().getTime(), event.getSeqno(), "心跳", false);
                     }
 
                     continue;
@@ -1007,15 +1002,10 @@ public class ContinuousIncrementMain {
                 String opType = determineOpTypeFromEvent(event, sqlStatements);
                 recordTableLatency(event, opType);
 
-                if (event.getSourceTstamp() != null) {
-                    long now = System.currentTimeMillis();
-                    long rtoMs = now - event.getSourceTstamp().getTime();
-                    lastAppliedSourceTs = event.getSourceTstamp().getTime();
-                    if (rtoMs >= 0 && (eventCount % RTO_REPORT_EVENT_INTERVAL == 0 || now - lastRtoReportTime > RTO_REPORT_INTERVAL_MS)) {
-                        lastRtoMs = rtoMs;
-                        lastRtoReportTime = now;
-                        writeRtoMetric(rtoMs);
-                    }
+                if (event.getSourceTstamp() != null
+                        && (eventCount % RTO_REPORT_EVENT_INTERVAL == 0
+                            || System.currentTimeMillis() - lastRtoReportTime > RTO_REPORT_INTERVAL_MS)) {
+                    recordRto(event.getSourceTstamp().getTime(), event.getSeqno(), "数据事件", true);
                 }
 
                 if (eventCount % 100 == 0) {
@@ -1815,6 +1805,60 @@ public class ContinuousIncrementMain {
         }
         return sb.append("}}").toString();
     }
+
+    /** 该心跳的时间戳是否来自本机时钟（extract 空闲时合成的），不能用来算延迟。 */
+    private static boolean isSyntheticHeartbeat(THLEvent event) {
+        return Boolean.TRUE.equals(event.getMetadata().get("synthetic_heartbeat"));
+    }
+
+    /**
+     * 记一次端到端延迟。
+     *
+     * <p><b>负值不再静默丢弃</b>：旧实现是 {@code if (rtoMs >= 0)}，本机时钟比源库快时
+     * 每个样本都是负的、一个都不记，rto_metric 从此停在旧值上不动 —— 面板显示的是过期数字，
+     * 而不是"量不出来"。负值的真正含义是两端时钟没对齐（捕获端已按测得偏移折算，
+     * 还是负说明偏移没测到或抖动很大），这是需要有人知道的事实，所以打日志并按 0 上报。
+     *
+     * <p><b>数据事件优先于心跳</b>：心跳的时间戳是捕获端向源库取的"当前时间"，只覆盖
+     * capture→apply 这一段；数据事件带的是源库<b>提交时刻</b>，覆盖全程。有数据在流动时
+     * 让心跳去刷指标，会把真实的积压掩盖成一个漂亮的小数字 —— 实测过：capture 积压 12 秒，
+     * 每 2 秒一次的心跳把 12 秒的样本覆盖成了 1 秒。
+     *
+     * @param fromDataEvent true 表示样本来自真实数据事件（权威），false 表示来自心跳
+     */
+    private void recordRto(long sourceTsMs, long seqno, String what, boolean fromDataEvent) {
+        long now = System.currentTimeMillis();
+        if (!fromDataEvent && now - lastDataEventRtoMs < HEARTBEAT_YIELD_MS) {
+            // 刚刚才有数据事件报过延迟：以它为准，心跳这一次不说话
+            return;
+        }
+        long rtoMs = now - sourceTsMs;
+        lastAppliedSourceTs = sourceTsMs;
+        if (rtoMs < 0) {
+            if (now - lastNegativeRtoWarnMs > NEGATIVE_RTO_WARN_INTERVAL_MS) {
+                lastNegativeRtoWarnMs = now;
+                logger.warn("{}算出负延迟 {} ms（源端时间戳 {} 晚于本机当前时间 {}，seqno={}）："
+                                + "源库与本机时钟未对齐，请检查两端 NTP；本次按 0 上报",
+                        what, rtoMs, sourceTsMs, now, seqno);
+            }
+            rtoMs = 0;
+        }
+        lastRtoMs = rtoMs;
+        if (fromDataEvent) {
+            lastDataEventRtoMs = now;
+            lastRtoReportTime = now;
+        }
+        writeRtoMetric(rtoMs);
+        logger.debug("{} RTO: {}ms (seqno={})", what, rtoMs, seqno);
+    }
+
+    /** 最后一次由**数据事件**上报延迟的时刻；心跳在这之后的静默期内不抢话。 */
+    private volatile long lastDataEventRtoMs = 0;
+    /** 数据事件上报之后，心跳让路多久（要盖住数据事件自身的上报间隔）。 */
+    private static final long HEARTBEAT_YIELD_MS = 15000;
+
+    private volatile long lastNegativeRtoWarnMs = 0;
+    private static final long NEGATIVE_RTO_WARN_INTERVAL_MS = 60000;
 
     private void writeRtoMetric(long rtoMs) {
         String metricsDir = "./files/" + taskId + "/binlog_output";
