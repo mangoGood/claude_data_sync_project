@@ -447,6 +447,7 @@
             'E5001': { desc: '源数据库配置为空', solution: '请检查任务创建时源数据库连接信息是否填写完整' },
             'E5002': { desc: '目标数据库配置为空', solution: '请检查任务创建时目标数据库连接信息是否填写完整' },
             'E5003': { desc: '连接串解析失败', solution: '请检查连接串格式是否正确，正确格式: mysql://user:pass@host:port 或 postgresql://user:pass@host:port 或 oracle://user:pass@host:port/service 或 mongodb://user:pass@host:port 或 elastic://user:pass@host:port 或 redis://user:pass@host:port' },
+            'E5004': { desc: '任务派发消息发送失败', solution: '任务的启动消息没能投进 Kafka，执行端从未收到它，因此任务不会开始跑。最常见的原因是 Kafka 未启动或地址不通（报文里通常是 "Broker may not be available" 或 "Topic ... not present in metadata"）。请确认 Kafka 已启动、spring.kafka.bootstrap-servers 指向正确的地址，然后重新启动该任务' },
             'E9999': { desc: '未知错误', solution: '请查看Agent日志获取详细错误信息，或联系技术支持' }
         };
 

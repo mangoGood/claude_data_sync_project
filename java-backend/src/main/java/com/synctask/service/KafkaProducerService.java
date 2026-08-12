@@ -29,6 +29,23 @@ public class KafkaProducerService {
     private String taskCreatedTopic;
 
     public void sendTaskCreatedMessage(Workflow workflow) {
+        sendTaskCreatedMessage(workflow, null);
+    }
+
+    /**
+     * 发送任务创建消息。
+     *
+     * @param onFailure 投递失败时的回调（可为 null）。**必须传**，否则失败只会留下一行日志：
+     *                  消息没投出去 = 执行端从未收到 = 任务永远不会开始跑，而任务状态还停在
+     *                  PENDING、HTTP 也照常返回成功，页面上只看到一个永远"启动中"的任务。
+     *                  失败有两条路径，都要接住：
+     *                  <ul>
+     *                    <li><b>同步抛出</b>：broker 不可达时 {@code send()} 自己会阻塞到
+     *                        {@code max.block.ms}（默认 60s）然后抛 TimeoutException；</li>
+     *                    <li><b>异步失败</b>：连上了但 ack 失败，走 future 的回调。</li>
+     *                  </ul>
+     */
+    public void sendTaskCreatedMessage(Workflow workflow, java.util.function.Consumer<Throwable> onFailure) {
         TaskCreatedMessage message = new TaskCreatedMessage();
         message.setTaskId(workflow.getId());
         message.setTaskName(workflow.getName());
@@ -78,10 +95,17 @@ public class KafkaProducerService {
 
         future.whenComplete((result, ex) -> {
             if (ex == null) {
-                logger.info("任务创建消息发送成功: taskId={}, partition={}, offset={}", 
+                logger.info("任务创建消息发送成功: taskId={}, partition={}, offset={}",
                     workflow.getId(), result.getRecordMetadata().partition(), result.getRecordMetadata().offset());
             } else {
                 logger.error("任务创建消息发送失败: taskId={}", workflow.getId(), ex);
+                if (onFailure != null) {
+                    try {
+                        onFailure.accept(ex);
+                    } catch (Exception cbEx) {
+                        logger.error("处理任务派发失败回调时又出错: taskId={}", workflow.getId(), cbEx);
+                    }
+                }
             }
         });
     }

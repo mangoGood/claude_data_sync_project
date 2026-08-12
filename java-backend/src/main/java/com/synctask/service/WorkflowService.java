@@ -3,6 +3,7 @@ package com.synctask.service;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.synctask.dto.TaskCreatedMessage;
+import com.synctask.entity.SyncErrorCode;
 import com.synctask.entity.Workflow;
 import com.synctask.entity.WorkflowLog;
 import com.synctask.entity.WorkflowStatus;
@@ -761,10 +762,10 @@ public class WorkflowService {
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务启动中，状态: 启动中");
 
         try {
-            kafkaProducerService.sendTaskCreatedMessage(workflow);
+            kafkaProducerService.sendTaskCreatedMessage(workflow, ex -> markDispatchFailed(workflowId, ex));
             addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务消息已发送到 Kafka topic: sync-task-created，等待任务执行服务处理");
         } catch (Exception e) {
-            addLog(workflowId, WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
+            markDispatchFailed(workflowId, e);
         }
 
         // 各条 leg 与父任务同时启动：它们是彼此独立的采集管线，没有先后依赖
@@ -773,11 +774,15 @@ public class WorkflowService {
             leg.setStatus(WorkflowStatus.PENDING);
             agentClusterService.assign(leg);
             workflowRepository.save(leg);
+            String legId = leg.getId();
             try {
-                kafkaProducerService.sendTaskCreatedMessage(leg);
+                kafkaProducerService.sendTaskCreatedMessage(leg, ex -> markDispatchFailed(legId, ex));
             } catch (Exception e) {
-                addLog(workflowId, WorkflowLog.LogLevel.WARNING,
-                        "来源通道 " + leg.getName() + " 的 Kafka 消息发送失败: " + e.getMessage());
+                // 这条 leg 自己置 FAILED（它是一个独立的采集管线）；父任务上也留一条，
+                // 否则只看父任务会以为一切正常
+                markDispatchFailed(legId, e);
+                addLog(workflowId, WorkflowLog.LogLevel.ERROR,
+                        "来源通道 " + leg.getName() + " 的派发消息发送失败: " + e.getMessage());
             }
         }
 
@@ -1162,11 +1167,12 @@ public class WorkflowService {
             // 消息体由 sendTaskCreatedMessage(workflow) 内部构建（与首次启动同一条路径），
             // 此处不再手工拼装 TaskCreatedMessage——曾有一份拼装后从未发送的死代码，
             // 改字段只改到死代码上不会生效，故删除。
+            String retryId = workflow.getId();
             try {
-                kafkaProducerService.sendTaskCreatedMessage(workflow);
-                addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务重试消息已发送到 Kafka，等待任务执行服务处理");
+                kafkaProducerService.sendTaskCreatedMessage(workflow, ex -> markDispatchFailed(retryId, ex));
+                addLog(retryId, WorkflowLog.LogLevel.INFO, "任务重试消息已发送到 Kafka，等待任务执行服务处理");
             } catch (Exception e) {
-                addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
+                markDispatchFailed(retryId, e);
             }
         }
 
@@ -1521,6 +1527,50 @@ public class WorkflowService {
             return gson.fromJson(syncObjects, type);
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    /**
+     * 派发消息没投出去 → 任务置 FAILED 并带上错误码。
+     *
+     * <p>改造前这里只 {@code addLog(WARNING, "Kafka 消息发送失败")}，任务状态留在 PENDING、
+     * HTTP 照常返回成功。而"消息没投出去"意味着执行端从未收到它，任务**永远不会开始跑** ——
+     * 页面上只看到一个永远"启动中"的任务，没人知道该重启它。实际发生过一次：
+     * Kafka 比后端晚起了一分钟，任务就此卡在 PENDING。
+     *
+     * <p><b>只在状态还是 PENDING 时才改</b>：异步失败回调可能来得很晚，那时任务也许已经被
+     * 执行端接走并跑起来了（比如重试成功、或另一条路径的消息投达），绝不能把一个正在跑的
+     * 任务打成 FAILED。
+     */
+    @Transactional
+    public void markDispatchFailed(String workflowId, Throwable ex) {
+        String reason = ex == null ? "未知原因"
+                : (ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName());
+        try {
+            Workflow current = workflowRepository.findById(workflowId).orElse(null);
+            if (current == null) {
+                logger.warn("派发失败但任务已不存在: taskId={}, 原因={}", workflowId, reason);
+                return;
+            }
+            if (current.getStatus() != WorkflowStatus.PENDING) {
+                // 已经被执行端接走了，说明消息其实投达（或另一条路径成功了），不动它
+                logger.warn("派发消息发送失败，但任务状态已是 {}，不改状态: taskId={}, 原因={}",
+                        current.getStatus(), workflowId, reason);
+                addLog(workflowId, WorkflowLog.LogLevel.WARNING,
+                        "派发消息发送失败（任务已在运行，未改状态）: " + reason);
+                return;
+            }
+            current.setStatus(WorkflowStatus.FAILED);
+            current.setErrorCode(SyncErrorCode.TASK_DISPATCH_FAILED.getCode());
+            current.setErrorMessage("任务派发消息发送失败: " + reason);
+            workflowRepository.save(current);
+            logger.error("任务派发消息发送失败，任务置为 FAILED: taskId={}, 原因={}", workflowId, reason);
+            addLog(workflowId, WorkflowLog.LogLevel.ERROR,
+                    "任务派发消息发送失败，执行端从未收到该任务，已置为失败（"
+                            + SyncErrorCode.TASK_DISPATCH_FAILED.getCode() + "）: " + reason);
+        } catch (Exception e) {
+            // 这里再抛就会把调用方（可能是 Kafka 生产者的回调线程）一起带走
+            logger.error("标记任务派发失败时出错: taskId={}", workflowId, e);
         }
     }
 
