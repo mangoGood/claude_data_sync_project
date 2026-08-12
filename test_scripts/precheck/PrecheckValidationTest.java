@@ -23,7 +23,8 @@ public class PrecheckValidationTest {
     static final String SRC = "mysql://root:rootpassword@localhost:33306";
     // 目标库仅需可连通 + 报告版本/权限；复用同一 host 可达实例(33306)，避免容器内网端口不可达。
     static final String TGT = "mysql://root:rootpassword@localhost:33306";
-    static final String SRC_JDBC = "jdbc:mysql://localhost:33306/?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
+    static final String SRC_JDBC = System.getenv().getOrDefault("PRECHECK_SRC_JDBC",
+            "jdbc:mysql://localhost:33306/?sslMode=DISABLED&allowPublicKeyRetrieval=true&serverTimezone=UTC");
 
     // PG / Mongo 源（host 可达）
     static final String PG_SRC = "postgresql://app_user:userpassword@localhost:5432/myapp_db";

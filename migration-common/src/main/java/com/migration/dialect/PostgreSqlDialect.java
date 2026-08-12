@@ -34,6 +34,12 @@ public class PostgreSqlDialect implements SqlDialect {
     }
 
     @Override
+    public String jdbcUrl(String host, String port, String database,
+                          com.migration.common.ssl.SslMaterial ssl) {
+        return jdbcUrl(host, port, database) + "&" + ssl.pgUrlParams();
+    }
+
+    @Override
     public String jdbcUrl(String host, String port, String database) {
         return "jdbc:postgresql://" + host + ":" + port + "/" + database
                 + "?currentSchema=public&stringtype=unspecified";

@@ -147,7 +147,11 @@ public class ContinuousSubscribeMain {
         }
     }
 
+    /** 任务配置。加密档位等在建生产者时才用得到，因此在 initialize 里留一份。 */
+    private Properties taskProps = new Properties();
+
     public void initialize(Properties props) throws Exception {
+        this.taskProps = props;
         this.taskId = props.getProperty("task.id", "unknown");
         this.thlDirectory = props.getProperty("subscribe.thl.dir",
                 "files/" + taskId + "/thl_output");
@@ -194,6 +198,25 @@ public class ContinuousSubscribeMain {
                 thlDirectory, kafkaBootstrapServers, kafkaTopicPrefix, kafkaTopicStrategy, subscribeFormat, fileSeqno.size());
     }
 
+    /**
+     * 下游 Kafka 的任务级传输加密。
+     *
+     * <p>订阅任务的"目标端"不是数据库而是 Kafka，档位在这里映射成
+     * {@code security.protocol=SSL} 与 truststore/keystore。用户在向导里看到的
+     * 也是 Kafka 的语汇（PLAINTEXT / SSL），不是数据库那五档。
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void applyTargetKafkaSsl(Properties producerProps) {
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(taskProps, "target");
+        if (!ssl.enabled()) {
+            return;
+        }
+        java.util.Map<String, Object> asMap = (java.util.Map) producerProps;
+        ssl.applyKafka(asMap);
+        logger.info("下游 Kafka 已启用传输加密: mode={}, mTLS={}", ssl.mode(), ssl.mutualTls());
+    }
+
     private void initKafkaProducer() {
         Properties producerProps = new Properties();
         producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers);
@@ -211,8 +234,11 @@ public class ContinuousSubscribeMain {
         producerProps.put(ProducerConfig.LINGER_MS_CONFIG, 5);
         producerProps.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 33554432);
         producerProps.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "snappy");
-        // 订阅这条走的是**业务数据本身**，加密与否比控制面更要紧
+        // 订阅这条走的是**业务数据本身**，加密与否比控制面更要紧。
+        // 先铺部署级 env（KAFKA_SECURITY_PROTOCOL 等），再让任务级配置覆盖它——
+        // 订阅任务的"目标端加密档位"配的就是这个下游 Kafka。
         com.migration.common.security.KafkaSecurity.apply(producerProps);
+        applyTargetKafkaSsl(producerProps);
 
         this.kafkaProducer = new KafkaProducer<>(producerProps);
         logger.info("Kafka生产者初始化完成, bootstrapServers: {} (acks=all, 幂等)", kafkaBootstrapServers);

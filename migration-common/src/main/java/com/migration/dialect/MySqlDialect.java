@@ -35,7 +35,13 @@ public class MySqlDialect implements SqlDialect {
 
     @Override
     public String jdbcUrl(String host, String port, String database) {
+        return jdbcUrl(host, port, database, com.migration.common.ssl.SslMaterial.disabled());
+    }
+
+    @Override
+    public String jdbcUrl(String host, String port, String database,
+                          com.migration.common.ssl.SslMaterial ssl) {
         return "jdbc:mysql://" + host + ":" + port + "/" + database
-                + "?useSSL=false&serverTimezone=UTC&characterEncoding=utf8";
+                + "?" + ssl.mysqlUrlParams() + "&serverTimezone=UTC&characterEncoding=utf8";
     }
 }

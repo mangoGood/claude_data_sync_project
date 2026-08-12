@@ -3884,7 +3884,14 @@
 
                 cfgUpdateDbNameRows();
                 cfgUpdateStepUI();
-                
+
+                // 传输加密面板：先渲染再回填已保存的档位/证书。
+                // 未配过的任务回填的是 DISABLED，面板保持折叠，第 1 步的外观与以前一致。
+                sslRenderPanel('cfgSource', '源数据库');
+                sslRenderPanel('cfgTarget', '目标数据库');
+                sslSetConfig('cfgSource', task.source_ssl_mode, task.source_ssl_cert_id);
+                sslSetConfig('cfgTarget', task.target_ssl_mode, task.target_ssl_cert_id);
+
                 document.getElementById('cfgValidationResult').innerHTML = '<div class="validation-empty">请点击"开始校验"按钮进行数据库同步条件检查</div>';
                 
                 cfgCompareDiffPage = 0;
@@ -4043,6 +4050,10 @@
                 }
             }
 
+            // VERIFY_CA / VERIFY_IDENTITY 必须有证书，否则连到建连时才报错
+            errors = errors.concat(
+                sslValidate(prefix, type === 'source' ? '源数据库' : '目标数据库'));
+
             return errors;
         }
 
@@ -4072,10 +4083,17 @@
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 20000);
             
+            // 测连必须带上加密配置：测的就得是任务将来真正会用的那套参数，
+            // 否则会出现"测连绿了、任务起不来"这种最没帮助的结果。
+            const sslCfg = sslGetConfig('cfg' + capitalize(type));
+
             fetchWithAuth(`${API_BASE_URL}/metadata/test-connection`, {
                 method: 'POST',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({ sourceConnection: connection, dbType: dbType }),
+                body: JSON.stringify({
+                    sourceConnection: connection, dbType: dbType,
+                    sslMode: sslCfg.mode, sslCertId: sslCfg.certId
+                }),
                 signal: controller.signal
             })
             .then(response => response.json())
@@ -4084,7 +4102,9 @@
                 testBtn.disabled = false;
                 if (result.success && result.data && result.data.connected) {
                     statusDiv.className = 'connection-status success';
-                    statusDiv.textContent = '✓ 连接成功';
+                    // 加密状态来自服务端（MySQL 的 Ssl_cipher / PG 的 pg_stat_ssl），
+                    // 不是我们自己的配置回显——这是"确实加密了"的唯一凭据
+                    statusDiv.innerHTML = '<div>✓ 连接成功</div>' + sslRenderTlsBadge(result.data);
                     cfgConnectionTestStatus[type] = true;
                 } else if (result.success && result.data && !result.data.connected) {
                     statusDiv.className = 'connection-status error';
@@ -4096,9 +4116,13 @@
                     else if (errorType === 'NETWORK_ERROR') displayMsg = '✗ 网络错误：无法连接到数据库服务器';
                     else if (errorType === 'DB_TYPE_MISMATCH') displayMsg = '✗ 类型不匹配：' + errorMsg;
                     else if (errorType === 'TIMEOUT') displayMsg = '✗ 连接超时：20秒内未连接到数据库服务器';
+                    else if (errorType === 'SSL_HANDSHAKE_FAILED') displayMsg = '✗ TLS 握手失败：' + errorMsg;
+                    else if (errorType === 'SSL_CERT_INVALID') displayMsg = '✗ 证书校验失败：' + errorMsg;
+                    else if (errorType === 'SSL_NOT_ENCRYPTED') displayMsg = '✗ ' + errorMsg;
+                    else if (errorType === 'SSL_NOT_SUPPORTED') displayMsg = '✗ ' + errorMsg;
                     // 后端 errorMsg 已是完整描述（如"连接失败：xxx"），直接展示，避免"✗ 连接失败：连接失败："重复前缀
                     else displayMsg = '✗ ' + errorMsg.substring(0, 100);
-                    statusDiv.innerHTML = `<div>${displayMsg}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
+                    statusDiv.innerHTML = `<div>${displayMsg}</div>${sslRenderTlsBadge(result.data)}${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     cfgConnectionTestStatus[type] = false;
                 } else {
                     statusDiv.className = 'connection-status error';
@@ -4354,7 +4378,12 @@
                         // 全量装载/快照档位：任务未启动前可改（后端只在 CONFIGURING 状态放行）
                         bulkLoadEnabled: cfgReadBulkLoadEnabled(),
                         bulkLoadMode: cfgReadSelect('cfgBulkLoadMode', 'AUTO'),
-                        snapshotMode: cfgReadSelect('cfgSnapshotMode', 'GTID_ONLY')
+                        snapshotMode: cfgReadSelect('cfgSnapshotMode', 'GTID_ONLY'),
+                        // 传输加密：源/目标各自的档位与证书；未启用时下发 DISABLED + 空证书
+                        sourceSslMode: sslGetConfig('cfgSource').mode,
+                        sourceSslCertId: sslGetConfig('cfgSource').certId,
+                        targetSslMode: sslGetConfig('cfgTarget').mode,
+                        targetSslCertId: sslGetConfig('cfgTarget').certId
                     })
                 });
             } catch (error) {

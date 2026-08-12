@@ -196,9 +196,13 @@ public class SwitchoverService {
         String pass = com.migration.common.crypto.CredentialCipher.decrypt(
                 cfg.getProperty("source.db.password"));
         String db = cfg.getProperty("source.db.database", "");
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(cfg, "source");
         String url = pg
                 ? "jdbc:postgresql://" + host + ":" + port + "/" + (db.isEmpty() ? "postgres" : db)
-                : "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
+                        + "?" + ssl.pgUrlParams()
+                : "jdbc:mysql://" + host + ":" + port + "/?" + ssl.mysqlUrlParams()
+                        + "&allowPublicKeyRetrieval=true&serverTimezone=UTC";
         return DriverManager.getConnection(url, user, pass);
     }
 

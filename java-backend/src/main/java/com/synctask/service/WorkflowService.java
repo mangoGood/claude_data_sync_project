@@ -386,6 +386,54 @@ public class WorkflowService {
         }
     }
 
+    /**
+     * 源/目标端各自的传输加密档位与证书。与全量装载档位一样，<b>任务启动前可改</b>——
+     * 它只影响连接怎么建，不改变数据语义。
+     *
+     * <p>做成一个对象而不是四个散参数：源与目标各一组，散参数在这条已经有 19 个参数的
+     * 调用链上极易接反，而"接反"的表现是目标端用了源端的证书——报错会指向证书本身，很难查。
+     */
+    public static class SslOptions {
+        private final String sourceMode;
+        private final String sourceCertId;
+        private final String targetMode;
+        private final String targetCertId;
+
+        public SslOptions(String sourceMode, String sourceCertId, String targetMode, String targetCertId) {
+            this.sourceMode = sourceMode;
+            this.sourceCertId = sourceCertId;
+            this.targetMode = targetMode;
+            this.targetCertId = targetCertId;
+        }
+
+        boolean isEmpty() {
+            return blank(sourceMode) && blank(sourceCertId) && blank(targetMode) && blank(targetCertId);
+        }
+
+        private static boolean blank(String s) {
+            return s == null || s.trim().isEmpty();
+        }
+    }
+
+    /** 档位归一。非法值当场拒绝——宽容处理的结果是明文，而用户以为自己开了加密。 */
+    static String resolveSslMode(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return "DISABLED";
+        }
+        String v = raw.trim().toUpperCase();
+        switch (v) {
+            case "DISABLED":
+            case "PREFERRED":
+            case "REQUIRED":
+            case "VERIFY_CA":
+            case "VERIFY_IDENTITY":
+                return v;
+            default:
+                throw new RuntimeException("非法的 SSL 档位: " + raw
+                        + "（可选 DISABLED / PREFERRED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY）");
+        }
+    }
+
     @Transactional
     public Workflow updateConfig(String workflowId, Long userId, String sourceConnection, String targetConnection,
                                   String migrationMode, String syncObjects, String sourceDbName,
@@ -410,6 +458,21 @@ public class WorkflowService {
                                   Boolean fanoutEnabled, String targetConnections,
                                   Boolean syncAccount, Boolean syncAccountSuperPrivilege,
                                   String consistencyMode, FullLoadOptions fullLoad) {
+        return updateConfig(workflowId, userId, sourceConnection, targetConnection, migrationMode, syncObjects,
+                sourceDbName, targetDbName, sourceType, targetType, kafkaBootstrapServers, kafkaTopicPrefix,
+                kafkaTopicStrategy, subscribeFormat, fanoutEnabled, targetConnections,
+                syncAccount, syncAccountSuperPrivilege, consistencyMode, fullLoad, null);
+    }
+
+    @Transactional
+    public Workflow updateConfig(String workflowId, Long userId, String sourceConnection, String targetConnection,
+                                  String migrationMode, String syncObjects, String sourceDbName,
+                                  String targetDbName, String sourceType, String targetType,
+                                  String kafkaBootstrapServers, String kafkaTopicPrefix,
+                                  String kafkaTopicStrategy, String subscribeFormat,
+                                  Boolean fanoutEnabled, String targetConnections,
+                                  Boolean syncAccount, Boolean syncAccountSuperPrivilege,
+                                  String consistencyMode, FullLoadOptions fullLoad, SslOptions ssl) {
         Workflow workflow = getWorkflowById(workflowId, userId);
 
         if (workflow.getStatus() != WorkflowStatus.CONFIGURING) {
@@ -469,6 +532,33 @@ public class WorkflowService {
                     workflow.getBulkLoadMode(),
                     Boolean.FALSE.equals(workflow.getBulkLoadEnabled()) ? "已关闭" : "启用",
                     workflow.getSnapshotMode()));
+        }
+
+        // 传输加密档位与证书：与装载档位同类，只在 CONFIGURING 放行（上面已挡）
+        if (ssl != null && !ssl.isEmpty()) {
+            if (ssl.sourceMode != null) {
+                workflow.setSourceSslMode(resolveSslMode(ssl.sourceMode));
+            }
+            if (ssl.targetMode != null) {
+                workflow.setTargetSslMode(resolveSslMode(ssl.targetMode));
+            }
+            // 证书 id 允许显式置空（用户把 SSL 关掉了）：传空串 = 清除，不传 = 不动。
+            if (ssl.sourceCertId != null) {
+                workflow.setSourceSslCertId(ssl.sourceCertId.trim().isEmpty() ? null : ssl.sourceCertId.trim());
+            }
+            if (ssl.targetCertId != null) {
+                workflow.setTargetSslCertId(ssl.targetCertId.trim().isEmpty() ? null : ssl.targetCertId.trim());
+            }
+            // 关掉加密时顺手把证书引用也清掉，避免"档位 DISABLED 但还挂着证书"这种
+            // 看起来配了、实际没生效的中间态误导人
+            if ("DISABLED".equals(workflow.getSourceSslMode())) {
+                workflow.setSourceSslCertId(null);
+            }
+            if ("DISABLED".equals(workflow.getTargetSslMode())) {
+                workflow.setTargetSslCertId(null);
+            }
+            addLog(workflowId, WorkflowLog.LogLevel.INFO, String.format(
+                    "传输加密档位: 源=%s，目标=%s", workflow.getSourceSslMode(), workflow.getTargetSslMode()));
         }
 
         // 路由与其余配置的兼容性要在<b>改完之后</b>再判一次：用户完全可能先存好路由配置，
@@ -565,6 +655,13 @@ public class WorkflowService {
             child.setBulkLoadEnabled(parent.getBulkLoadEnabled());
             child.setBulkLoadMode(parent.getBulkLoadMode());
             child.setSnapshotMode(parent.getSnapshotMode());
+            // 加密配置继承父任务：目标端本来就是同一个库，源端各 leg 是同构的多个实例
+            // （分库分表的分片），用同一套 CA 是常态。leg 的源实例若要用不同证书，
+            // 派生后单独改这条子任务即可——但默认继承好过默认明文。
+            child.setSourceSslMode(parent.getSourceSslMode());
+            child.setSourceSslCertId(parent.getSourceSslCertId());
+            child.setTargetSslMode(parent.getTargetSslMode());
+            child.setTargetSslCertId(parent.getTargetSslCertId());
             Object legSyncObjects = leg.get("syncObjects");
             child.setSyncObjects(legSyncObjects != null ? gson.toJson(legSyncObjects) : parent.getSyncObjects());
             // 子任务的路由配置不再带 legs（否则会递归派生），并钉上自己的 nodeId
@@ -730,6 +827,13 @@ public class WorkflowService {
             shadow.setTargetType(workflow.getSourceType());
             shadow.setSourceDbName(workflow.getTargetDbName());
             shadow.setTargetDbName(workflow.getSourceDbName());
+            // 加密配置同样要**对调**（影子通道是 B→A，正向的目标端就是它的源端）。
+            // 漏掉这四行的表现是：正向两端都加密、反向通道<b>整条明文</b>，而双向灾备的
+            // 反向通道搬的是同一批业务数据——任务全绿，没有任何报错。
+            shadow.setSourceSslMode(workflow.getTargetSslMode());
+            shadow.setTargetSslMode(workflow.getSourceSslMode());
+            shadow.setSourceSslCertId(workflow.getTargetSslCertId());
+            shadow.setTargetSslCertId(workflow.getSourceSslCertId());
             // 反向通道必须与正向同一套一致性语义：两个方向语义不同的双活，
             // 一边保事务、一边打散并发，冲突裁决的输入就不是同一个"事务视图"了
             shadow.setConsistencyMode(workflow.getConsistencyMode());
@@ -927,6 +1031,8 @@ public class WorkflowService {
         message.setTargetDbName(w.getTargetDbName());
         message.setTaskType(w.getTaskType());
         message.setConsistencyMode(w.getConsistencyMode());
+        message.applySsl(w.getSourceSslMode(), w.getSourceSslCertId(),
+                w.getTargetSslMode(), w.getTargetSslCertId(), false);
         message.setDrMode(w.getDrMode());
         message.setSyncObjects(parseSyncObjects(w.getSyncObjects()));
         // 控制消息（stop/resume/terminate/delete）同样定向：任务在哪台 agent 上跑，就只让那台处理
@@ -1034,6 +1140,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
 
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -1076,6 +1184,8 @@ public class WorkflowService {
         message.setTargetDbName(workflow.getTargetDbName());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -1104,6 +1214,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -1210,6 +1322,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         if (skipSeqnos != null && !skipSeqnos.isEmpty()) {
             message.setSkipSeqnos(skipSeqnos);
         }
@@ -1621,6 +1735,13 @@ public class WorkflowService {
         String originalTargetType = workflow.getTargetType();
         String originalSourceDbName = workflow.getSourceDbName();
         String originalTargetDbName = workflow.getTargetDbName();
+        // 加密配置必须跟着连接一起换：它描述的是"连某个库要用什么证书"，
+        // 换了源/目标却不换证书，倒换后新源会拿旧源的证书去连——
+        // 报错会指向证书本身（CN 不匹配 / 不是该 CA 签发），极难联想到是倒换导致的。
+        String originalSourceSslMode = workflow.getSourceSslMode();
+        String originalTargetSslMode = workflow.getTargetSslMode();
+        String originalSourceSslCertId = workflow.getSourceSslCertId();
+        String originalTargetSslCertId = workflow.getTargetSslCertId();
 
         workflow.setSourceConnection(originalTarget);
         workflow.setTargetConnection(originalSource);
@@ -1628,6 +1749,10 @@ public class WorkflowService {
         workflow.setTargetType(originalSourceType);
         workflow.setSourceDbName(originalTargetDbName);
         workflow.setTargetDbName(originalSourceDbName);
+        workflow.setSourceSslMode(originalTargetSslMode);
+        workflow.setTargetSslMode(originalSourceSslMode);
+        workflow.setSourceSslCertId(originalTargetSslCertId);
+        workflow.setTargetSslCertId(originalSourceSslCertId);
 
         workflow.setStatus(WorkflowStatus.SWITCHING);
         workflow.setDrStatus("SWITCHING");
@@ -1654,6 +1779,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
 
         final String logWorkflowId = workflowId;
         org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(

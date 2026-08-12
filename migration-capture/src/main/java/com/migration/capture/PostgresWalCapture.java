@@ -142,12 +142,26 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
      *
      * <p>只在"从已落盘位点续传"时检查：首次启动时槽还没建，startLsn 来自 checkpoint，属正常。
      */
+    /**
+     * 源库连接的 TLS 参数。
+     *
+     * <p>本类里连接分两类：普通查询连接、以及 {@code replication=database} 的<b>逻辑复制槽</b>连接。
+     * 后者才是搬业务数据的那条，两类都必须带上——只加密前者的话，任务看着"配了 TLS"，
+     * 真正的变更流仍然明文。
+     *
+     * <p>PG 的 {@code sslrootcert} 只吃 PEM，所以这里取的是 {@code pgUrlParams()}
+     * （它用 PEM 形态的 CA 与 PKCS8 DER 私钥），不是 MySQL 那套 p12。
+     */
+    private String sslParams() {
+        return com.migration.common.ssl.SslMaterial.from(props, "source").pgUrlParams();
+    }
+
     private void verifyResumePositionAvailable() {
         if (!resumedFromPersisted || startLsn == null
                 || !Boolean.parseBoolean(props.getProperty("capture.position.precheck.enabled", "true"))) {
             return;
         }
-        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
         try (Connection checkConn = DriverManager.getConnection(url, user, password);
              Statement stmt = checkConn.createStatement()) {
             ResultSet rs = stmt.executeQuery(
@@ -190,7 +204,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             return;
         }
         lastIdleHeartbeatMs = now;
-        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
         long sourceNowMs;
         try (Connection probe = DriverManager.getConnection(url, user, password);
              Statement stmt = probe.createStatement()) {
@@ -320,7 +334,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         ensureReplicationSlot();
         ensurePublication();
 
-        String url = String.format("jdbc:postgresql://%s:%d/%s?replication=database&stringtype=unspecified",
+        String url = String.format("jdbc:postgresql://%s:%d/%s?replication=database&stringtype=unspecified&" + sslParams(),
                 host, port, database);
         Properties connProps = new Properties();
         connProps.setProperty("user", user);
@@ -373,7 +387,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
                     }
                     Thread.sleep(2000);
                     ensureReplicationSlot();
-                    String retryUrl = String.format("jdbc:postgresql://%s:%d/%s?replication=database&stringtype=unspecified",
+                    String retryUrl = String.format("jdbc:postgresql://%s:%d/%s?replication=database&stringtype=unspecified&" + sslParams(),
                             host, port, database);
                     conn = DriverManager.getConnection(retryUrl, connProps);
                     conn.setAutoCommit(false);
@@ -549,7 +563,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
 
     private boolean isReplicationSlotActive() {
         try {
-            String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+            String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
             try (Connection checkConn = DriverManager.getConnection(url, user, password)) {
                 String connCatalog = checkConn.getCatalog();
                 logger.info("Liveness check connected to: host={}:{} db={} connCatalog={}", host, port, database, connCatalog);
@@ -600,7 +614,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
 
         ensureReplicationSlot();
 
-        String url = String.format("jdbc:postgresql://%s:%d/%s?replication=database&stringtype=unspecified",
+        String url = String.format("jdbc:postgresql://%s:%d/%s?replication=database&stringtype=unspecified&" + sslParams(),
                 host, port, database);
         Properties connProps = new Properties();
         connProps.setProperty("user", user);
@@ -637,7 +651,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
     }
 
     private void ensureReplicationSlot() throws Exception {
-        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
         try (Connection checkConn = DriverManager.getConnection(url, user, password);
              Statement stmt = checkConn.createStatement()) {
 
@@ -714,7 +728,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
     }
 
     private void ensurePublication() throws Exception {
-        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
         try (Connection checkConn = DriverManager.getConnection(url, user, password);
              Statement stmt = checkConn.createStatement()) {
 
@@ -1092,7 +1106,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             return builtin;
         }
         return resolvedTypeNames.computeIfAbsent(oid, id -> {
-            String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+            String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
             try (Connection qConn = DriverManager.getConnection(url, user, password);
                  Statement stmt = qConn.createStatement();
                  ResultSet rs = stmt.executeQuery("SELECT format_type(" + id + ", NULL)")) {
@@ -1433,7 +1447,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         return relationIdCache.computeIfAbsent(relationId, id -> {
             String[] result = new String[]{"public", "unknown_" + id};
             try {
-                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
                 try (Connection qConn = DriverManager.getConnection(url, user, password);
                      Statement stmt = qConn.createStatement();
                      ResultSet rs = stmt.executeQuery(
@@ -1456,7 +1470,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         return tableColumnsCache.computeIfAbsent(key, k -> {
             List<String> columns = new ArrayList<>();
             try {
-                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
                 try (Connection qConn = DriverManager.getConnection(url, user, password);
                      PreparedStatement stmt = qConn.prepareStatement(
                              "SELECT column_name FROM information_schema.columns " +
@@ -1481,7 +1495,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         return tableColumnTypesCache.computeIfAbsent(key, k -> {
             List<String> types = new ArrayList<>();
             try {
-                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
                 try (Connection qConn = DriverManager.getConnection(url, user, password);
                      PreparedStatement stmt = qConn.prepareStatement(
                              "SELECT data_type FROM information_schema.columns " +
@@ -1506,7 +1520,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         return tablePrimaryKeysCache.computeIfAbsent(key, k -> {
             List<String> pkColumns = new ArrayList<>();
             try {
-                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+                String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
                 try (Connection qConn = DriverManager.getConnection(url, user, password);
                      PreparedStatement stmt = qConn.prepareStatement(
                              "SELECT a.attname FROM pg_index i " +
@@ -1673,7 +1687,7 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
         }
         lastRetentionCheckMs = now;
 
-        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, database);
+        String url = String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified&" + sslParams(), host, port, database);
         try (Connection conn = DriverManager.getConnection(url, user, password);
              Statement stmt = conn.createStatement()) {
             String walStatus = null;

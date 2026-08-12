@@ -402,29 +402,16 @@ public class ContinuousIncrementMain {
     }
 
     /**
-     * 目标库连接的 TLS 参数（{@code target.db.ssl.mode}，默认 DISABLED = 历史行为）。
+     * 目标库连接的 TLS 参数（{@code target.db.ssl.*}，默认 DISABLED = 历史行为）。
      *
-     * <p>这条 URL 是增量自己拼的，不走 {@code DatabaseConfig}，所以加密档位得在这里也认一次——
+     * <p>这条 URL 是增量自己拼的，不走 {@code DatabaseConfig}，所以加密材料得在这里也取一次——
      * 否则"配了 TLS"只对全量生效、增量还是明文，比不支持更糟（以为加密了其实没有）。
+     * 档位映射本身收在 {@link com.migration.common.ssl.SslMaterial}，不再各拼各的。
      */
     private String targetSslParams() {
-        String mode = props.getProperty("target.db.ssl.mode", "DISABLED").trim().toUpperCase();
-        String cert = props.getProperty("target.db.ssl.root.cert", "");
-        if (isPostgresql) {
-            String pg;
-            switch (mode) {
-                case "PREFERRED":       pg = "prefer"; break;
-                case "REQUIRED":        pg = "require"; break;
-                case "VERIFY_CA":       pg = "verify-ca"; break;
-                case "VERIFY_IDENTITY": pg = "verify-full"; break;
-                default:                pg = "disable";
-            }
-            return "sslmode=" + pg + (cert.isEmpty() || "disable".equals(pg) ? "" : "&sslrootcert=" + cert);
-        }
-        if ("DISABLED".equals(mode)) {
-            return "useSSL=false";
-        }
-        return "sslMode=" + mode + (cert.isEmpty() ? "" : "&trustCertificateKeyStoreUrl=file:" + cert);
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(props, "target");
+        return isPostgresql ? ssl.pgUrlParams() : ssl.mysqlUrlParams();
     }
 
     /** 目标库 JDBC URL（串行主连接与并行 worker 连接共用，避免 URL 口径漂移）。 */
@@ -1305,11 +1292,12 @@ public class ContinuousIncrementMain {
         String url = isPostgresql
                 ? "jdbc:postgresql://" + node.getHost() + ":" + node.getPort() + "/"
                     + (node.getDatabase() == null || node.getDatabase().isEmpty()
-                        ? targetDatabase : node.getDatabase()) + "?stringtype=unspecified"
+                        ? targetDatabase : node.getDatabase()) + "?stringtype=unspecified&" + targetSslParams()
                 : "jdbc:mysql://" + node.getHost() + ":" + node.getPort() + "/"
                     + (node.getDatabase() == null || node.getDatabase().isEmpty()
                         ? targetDatabase : node.getDatabase())
-                    + "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+                    + "?" + targetSslParams()
+                    + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
         conn = ConnectionPoolManager.getConnection(url,
                 node.getUsername() != null ? node.getUsername() : targetUser,
                 node.getPassword() != null ? node.getPassword() : targetPassword);

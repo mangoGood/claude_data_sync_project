@@ -34,8 +34,35 @@ public class MetadataController {
     @Autowired
     private ContentCompareService contentCompareService;
 
+    @Autowired
+    private com.synctask.service.CertificateService certificateService;
+
+    /**
+     * 从请求里解出任务级加密配置。{@code sslMode} 缺省 / DISABLED → 返回 null
+     * （回落到部署级 env 那套，与历史行为一致）。
+     *
+     * <p>证书按<b>当前登录用户</b>取，不接受请求里直接带证书内容——否则任何人都能让
+     * 后端拿任意 PEM 去连任意地址。
+     */
+    private com.synctask.service.MetadataService.SslConfig resolveSsl(
+            Map<String, String> request,
+            org.springframework.security.core.Authentication authentication) {
+        String mode = request.get("sslMode");
+        if (mode == null || mode.trim().isEmpty() || "DISABLED".equalsIgnoreCase(mode.trim())) {
+            return null;
+        }
+        String certId = request.get("sslCertId");
+        com.synctask.util.CertMaterial material = null;
+        if (certId != null && !certId.trim().isEmpty()) {
+            Long userId = ((com.synctask.security.UserPrincipal) authentication.getPrincipal()).getId();
+            material = certificateService.materialFor(certId.trim(), userId);
+        }
+        return new com.synctask.service.MetadataService.SslConfig(mode.trim().toUpperCase(), material);
+    }
+
     @PostMapping("/test-connection")
-    public ResponseEntity<?> testConnection(@RequestBody Map<String, String> request) {
+    public ResponseEntity<?> testConnection(@RequestBody Map<String, String> request,
+                                            org.springframework.security.core.Authentication authentication) {
         try {
             String connectionStr = request.get("sourceConnection");
             String expectedType = request.get("dbType");
@@ -59,22 +86,33 @@ public class MetadataController {
                 }
             }
 
-            logger.info("测试数据库连接: expectedType={}", expectedType);
+            // 任务级加密：测连必须用**将来任务真正会用的那套参数**，否则"测连绿了、任务起不来"
+            MetadataService.SslConfig ssl = resolveSsl(request, authentication);
+            logger.info("测试数据库连接: expectedType={}, sslMode={}", expectedType,
+                    ssl == null ? "DISABLED" : ssl.mode);
 
-            MetadataService.ConnectionTestResult result = metadataService.testConnectionDetailed(connectionStr, expectedType);
-            
+            MetadataService.ConnectionTestResult result =
+                    metadataService.testConnectionDetailed(connectionStr, expectedType, ssl);
+
             Map<String, Object> data = new HashMap<>();
             data.put("connected", result.connected);
-            if (!result.connected) {
+            // 加密状态无论成败都回：连上了要让人看见协商到的协议与套件（这是"确实加密了"的
+            // 唯一凭据，来自服务端而不是我们自己的配置），失败时也要让人看见当时是什么状态
+            data.put("encrypted", result.encrypted);
+            data.put("tlsVersion", result.tlsVersion);
+            data.put("tlsCipher", result.tlsCipher);
+            if (result.connected) {
+                data.put("message", result.errorMessage);
+            } else {
                 data.put("errorType", result.errorType);
                 data.put("errorMessage", result.errorMessage);
                 data.put("suggestion", result.suggestion);
             }
-            
+
             Map<String, Object> response = new HashMap<>();
             response.put("success", true);
             response.put("data", data);
-            
+
             return ResponseEntity.ok(response);
         } catch (Exception e) {
             logger.error("测试连接失败: {}", e.getMessage());

@@ -95,7 +95,12 @@ public class WorkflowController {
                     new WorkflowService.FullLoadOptions(
                             request.getBulkLoadEnabled(),
                             request.getBulkLoadMode(),
-                            request.getSnapshotMode())
+                            request.getSnapshotMode()),
+                    new WorkflowService.SslOptions(
+                            request.getSourceSslMode(),
+                            request.getSourceSslCertId(),
+                            request.getTargetSslMode(),
+                            request.getTargetSslCertId())
             );
             auditLogService.logSuccess(userPrincipal.getId(), AuditLog.Action.UPDATE_CONFIG,
                     id, AuditLogService.buildDetails(workflow.getName(),
@@ -661,6 +666,10 @@ public class WorkflowController {
         map.put("bulk_load_enabled", workflow.getBulkLoadEnabled());
         map.put("bulk_load_mode", workflow.getBulkLoadMode());
         map.put("snapshot_mode", workflow.getSnapshotMode());
+        map.put("source_ssl_mode", workflow.getSourceSslMode());
+        map.put("source_ssl_cert_id", workflow.getSourceSslCertId());
+        map.put("target_ssl_mode", workflow.getTargetSslMode());
+        map.put("target_ssl_cert_id", workflow.getTargetSslCertId());
         map.put("dr_status", workflow.getDrStatus());
         map.put("dr_mode", workflow.getDrMode());
         map.put("dr_peer_workflow_id", workflow.getDrPeerWorkflowId());
@@ -720,6 +729,22 @@ public class WorkflowController {
         private String bulkLoadMode;
         /** 全量快照档位 NONE/GTID_ONLY/CONSISTENT；不传 = 不改动。任务启动后整个接口都不可用。 */
         private String snapshotMode;
+        /** 源端传输加密档位；不传 = 不改动，传 DISABLED = 关闭（并清掉证书引用）。 */
+        private String sourceSslMode;
+        /** 源端证书 id；传空串 = 清除引用。 */
+        private String sourceSslCertId;
+        /** 目标端传输加密档位（订阅任务=下游 Kafka）。 */
+        private String targetSslMode;
+        private String targetSslCertId;
+
+        public String getSourceSslMode() { return sourceSslMode; }
+        public void setSourceSslMode(String sourceSslMode) { this.sourceSslMode = sourceSslMode; }
+        public String getSourceSslCertId() { return sourceSslCertId; }
+        public void setSourceSslCertId(String sourceSslCertId) { this.sourceSslCertId = sourceSslCertId; }
+        public String getTargetSslMode() { return targetSslMode; }
+        public void setTargetSslMode(String targetSslMode) { this.targetSslMode = targetSslMode; }
+        public String getTargetSslCertId() { return targetSslCertId; }
+        public void setTargetSslCertId(String targetSslCertId) { this.targetSslCertId = targetSslCertId; }
 
         public String getConsistencyMode() { return consistencyMode; }
         public void setConsistencyMode(String consistencyMode) { this.consistencyMode = consistencyMode; }

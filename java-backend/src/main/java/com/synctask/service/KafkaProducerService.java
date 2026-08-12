@@ -64,6 +64,9 @@ public class KafkaProducerService {
         message.setBulkLoadEnabled(workflow.getBulkLoadEnabled());
         message.setBulkLoadMode(workflow.getBulkLoadMode());
         message.setSnapshotMode(workflow.getSnapshotMode());
+        // 传输加密：源/目标各自的档位与证书 id（不下发证书内容，agent 按 id 从元数据库取）
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         message.setDrMode(workflow.getDrMode());
         message.setKafkaBootstrapServers(workflow.getKafkaBootstrapServers());
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());
@@ -129,6 +132,9 @@ public class KafkaProducerService {
         message.setBulkLoadEnabled(workflow.getBulkLoadEnabled());
         message.setBulkLoadMode(workflow.getBulkLoadMode());
         message.setSnapshotMode(workflow.getSnapshotMode());
+        // 传输加密：源/目标各自的档位与证书 id（不下发证书内容，agent 按 id 从元数据库取）
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         message.setDrMode(workflow.getDrMode());
         message.setKafkaBootstrapServers(workflow.getKafkaBootstrapServers());
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());

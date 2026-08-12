@@ -147,6 +147,26 @@ public class Workflow {
     @Column(name = "snapshot_mode", length = 20)
     private String snapshotMode = "GTID_ONLY";
 
+    /**
+     * 源端传输加密档位：DISABLED（默认，明文）/ PREFERRED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY。
+     *
+     * <p>源与目标各自独立配置——两端常常不是同一个团队运维的，强制同档会让人为了跑通
+     * 把两端一起降级。启动前可改（updateConfig 只在 CONFIGURING 状态放行）。
+     */
+    @Column(name = "source_ssl_mode", length = 20)
+    private String sourceSslMode = "DISABLED";
+
+    /** 源端证书（{@code db_certificates.id}）。REQUIRED 及以下可为空（加密但不校验）。 */
+    @Column(name = "source_ssl_cert_id", length = 36)
+    private String sourceSslCertId;
+
+    /** 目标端传输加密档位。订阅任务的"目标端"是下游 Kafka，语义由引擎侧按 targetType 分派。 */
+    @Column(name = "target_ssl_mode", length = 20)
+    private String targetSslMode = "DISABLED";
+
+    @Column(name = "target_ssl_cert_id", length = 36)
+    private String targetSslCertId;
+
     @Column(name = "dr_status", length = 20)
     private String drStatus;
 
@@ -537,6 +557,38 @@ public class Workflow {
 
     public void setSnapshotMode(String snapshotMode) {
         this.snapshotMode = snapshotMode;
+    }
+
+    public String getSourceSslMode() {
+        return sourceSslMode;
+    }
+
+    public void setSourceSslMode(String sourceSslMode) {
+        this.sourceSslMode = sourceSslMode;
+    }
+
+    public String getSourceSslCertId() {
+        return sourceSslCertId;
+    }
+
+    public void setSourceSslCertId(String sourceSslCertId) {
+        this.sourceSslCertId = sourceSslCertId;
+    }
+
+    public String getTargetSslMode() {
+        return targetSslMode;
+    }
+
+    public void setTargetSslMode(String targetSslMode) {
+        this.targetSslMode = targetSslMode;
+    }
+
+    public String getTargetSslCertId() {
+        return targetSslCertId;
+    }
+
+    public void setTargetSslCertId(String targetSslCertId) {
+        this.targetSslCertId = targetSslCertId;
     }
 
     public String getDrStatus() {

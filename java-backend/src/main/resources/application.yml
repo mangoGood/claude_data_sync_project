@@ -21,7 +21,9 @@ spring:
   datasource:
     # 元数据库连接。META_DB_SSL_MODE 缺省 DISABLED（= useSSL=false，历史行为）；
     # 设成 REQUIRED/VERIFY_CA/VERIFY_IDENTITY 即让后端到元数据库这一跳也走 TLS。
-    # 直接给 DB_URL 时以 DB_URL 为准（运维可以自己写全参数）。
+    # 直接给 DB_URL 时以 DB_URL 为准（运维可以自己写全参数）——注意 start.sh 会导出 DB_URL，
+    # 所以实际部署路径下生效的是 start.sh 里那段按 META_DB_SSL_MODE 拼的逻辑（含信任库路径），
+    # 下面这个默认值只在裸跑 java -jar 且没设 DB_URL 时才用得上。
     url: ${DB_URL:jdbc:mysql://localhost:33306/sync_task_db?sslMode=${META_DB_SSL_MODE:DISABLED}&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true}
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD:rootpassword}
@@ -61,6 +63,19 @@ spring:
           batch_size: 50
         order_inserts: true
         order_updates: true
+
+  # ============================================================
+  # 文件上传（目前只有 TLS 证书这一处用到）
+  #
+  # 上限压得很低是刻意的：这个端点只接 PEM 文本，正常证书都是几 KB。放宽到几十 MB
+  # 等于给一个已认证但越权的调用者一条免费的磁盘填充通道。单份文件的精确上限由
+  # CertMaterial.MAX_PEM_BYTES(64KB) 在业务侧再判一次，报错能指出是哪一份。
+  # ============================================================
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 256KB
+      max-request-size: 1MB
 
   # ============================================================
   # Kafka（任务状态回传 + 任务创建事件）
@@ -138,6 +153,17 @@ app:
   alert:
     webhook-timeout-seconds: 5
     retry-notify-times: 3
+
+# ============================================================
+# TLS 证书物化目录
+#
+# 库里存的是 PEM 文本，而 JDBC 驱动要的是**文件路径**（MySQL 要 p12、PG 要 PEM+pk8），
+# 所以按需转换一次并缓存在这里。目录与其中的文件权限都收到 0700/0600。
+# 与 agent 侧各自物化各自的一份：两者可能根本不在同一台机器上。
+# ============================================================
+synctask:
+  cert:
+    dir: ${SYNCTASK_CERT_DIR:${user.dir}/certs}
 
 # ============================================================
 # 日志级别

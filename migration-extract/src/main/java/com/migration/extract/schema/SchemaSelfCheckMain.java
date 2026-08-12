@@ -58,7 +58,8 @@ public final class SchemaSelfCheckMain {
 
         String url = "jdbc:mysql://" + props.getProperty("source.db.host", "localhost") + ":"
                 + props.getProperty("source.db.port", "3306")
-                + "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+                + "/?" + com.migration.common.ssl.SslMaterial.from(props, "source").mysqlUrlParams()
+                + "&serverTimezone=UTC&characterEncoding=UTF-8";
 
         try (Connection conn = DriverManager.getConnection(url,
                 props.getProperty("source.db.username", "root"),

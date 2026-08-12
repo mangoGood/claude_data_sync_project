@@ -23,6 +23,27 @@ public class AgentConfig {
         loadFromEnv();
     }
 
+    /**
+     * 元数据库（位点中心库、agent 注册、配额）的默认连接 URL。
+     *
+     * <p>{@code META_DB_SSL_MODE} 缺省 DISABLED（= 历史行为的明文），设成
+     * REQUIRED/VERIFY_CA/VERIFY_IDENTITY 即让这一跳走 TLS；VERIFY_* 还需要
+     * {@code META_DB_SSL_ROOT_CERT} 指向信任库。显式给 {@code DB_URL} /
+     * {@code MIGRATION_AGENT_MYSQL_DB_URL} 时以它为准。
+     *
+     * <p>做成 static 是为了让 {@link com.migration.agent.AgentMain} 用同一份——
+     * 此前 AgentMain 自己硬编码了一个 {@code useSSL=false} 的默认值，同一个进程里
+     * 两条路对"元数据库要不要加密"给出两个答案。
+     */
+    public static String defaultMetaDbUrl() {
+        String mode = com.migration.common.ssl.SslMaterial.normalizeMode(
+                System.getenv("META_DB_SSL_MODE"));
+        String cert = System.getenv("META_DB_SSL_ROOT_CERT");
+        return "jdbc:mysql://localhost:33306/sync_task_db?"
+                + com.migration.common.ssl.SslMaterial.of(mode, cert).mysqlUrlParams()
+                + "&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true";
+    }
+
     private void loadDefaults() {
         // 默认值统一为本机地址（可被 agent.properties 或 MIGRATION_AGENT_* 环境变量覆盖）；不再硬编码内网 IP。
         props.setProperty("kafka.bootstrap.servers", "localhost:29092");
@@ -30,12 +51,7 @@ public class AgentConfig {
         props.setProperty("kafka.topic.task-created", "sync-task-created");
         props.setProperty("kafka.topic.task-status", "sync-task-status");
 
-        // 元数据库连接（位点中心库、agent 注册、配额）。META_DB_SSL_MODE 缺省 DISABLED
-        // （= 历史行为的明文），设成 REQUIRED/VERIFY_CA/VERIFY_IDENTITY 即让这一跳走 TLS。
-        // 显式给 MIGRATION_AGENT_MYSQL_DB_URL 时以它为准。
-        props.setProperty("mysql.db.url", "jdbc:mysql://localhost:33306/sync_task_db?sslMode="
-                + System.getenv().getOrDefault("META_DB_SSL_MODE", "DISABLED")
-                + "&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
+        props.setProperty("mysql.db.url", defaultMetaDbUrl());
         props.setProperty("mysql.db.user", "root");
         props.setProperty("mysql.db.password", "rootpassword");
 

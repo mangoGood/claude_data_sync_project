@@ -962,6 +962,7 @@
                             <input type="text" class="form-input" id="cfgSourceDbNameInput" placeholder="数据库名称（PG必填，如 test_db1）" oninput="cfgOnConnectionFieldChange('source')" style="max-width: 400px;">
                             <div style="font-size: 11px; color: #999; margin-top: 4px;">PostgreSQL 为三层结构(db-schema-table)，请指定要同步的数据库</div>
                         </div>
+                        <div id="cfgSourceSslPanel"></div>
                         <div style="margin-top: 8px; display: flex; gap: 8px;">
                             <button type="button" class="btn-test" id="cfgTestSourceBtn" onclick="cfgTestConnection('source')">测试连接</button>
                         </div>
@@ -979,6 +980,7 @@
                             <input type="text" class="form-input" id="cfgTargetDbNameInput" placeholder="数据库名称（PG必填，如 test_db1）" oninput="cfgOnConnectionFieldChange('target')" style="max-width: 400px;">
                             <div style="font-size: 11px; color: #999; margin-top: 4px;">PostgreSQL 为三层结构(db-schema-table)，请指定目标数据库</div>
                         </div>
+                        <div id="cfgTargetSslPanel"></div>
                         <div style="margin-top: 8px; display: flex; gap: 8px;">
                             <button type="button" class="btn-test" id="cfgTestTargetBtn" onclick="cfgTestConnection('target')">测试连接</button>
                         </div>
@@ -1363,6 +1365,7 @@
                             <input type="text" class="form-input" id="subSourceDbNameInput" placeholder="数据库名称（PG必填，如 test_db1）" oninput="subOnConnectionFieldChange()" style="max-width: 400px;">
                             <div style="font-size: 11px; color: #999; margin-top: 4px;">PostgreSQL 为三层结构(db-schema-table)，请指定要订阅的数据库</div>
                         </div>
+                        <div id="subSourceSslPanel"></div>
                         <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center;">
                             <button type="button" class="btn-test" id="subTestSourceBtn" onclick="subTestSourceConnection()">测试连接</button>
                         </div>
@@ -1388,6 +1391,7 @@
                             </select>
                             <button type="button" class="btn-test" id="subTestKafkaBtn" onclick="subTestKafkaConnection()">测试连接</button>
                         </div>
+                        <div id="subTargetSslPanel"></div>
                         <div id="subKafkaConnectionStatus" class="connection-status"></div>
                     </div>
                 </div>
@@ -1655,6 +1659,7 @@
                             <input type="password" id="drSourcePassword" placeholder="请输入密码" style="width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; box-sizing: border-box;">
                         </div>
                     </div>
+                    <div id="drSourceSslPanel"></div>
                     <div style="margin-top: 8px; text-align: right;">
                         <button class="btn btn-default" id="drTestSourceBtn" style="font-size: 12px;">测试连接</button>
                         <span id="drSourceTestResult" style="margin-left: 8px; font-size: 12px;"></span>
@@ -1681,6 +1686,7 @@
                             <input type="password" id="drTargetPassword" placeholder="请输入密码" style="width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; box-sizing: border-box;">
                         </div>
                     </div>
+                    <div id="drTargetSslPanel"></div>
                     <div style="margin-top: 8px; text-align: right;">
                         <button class="btn btn-default" id="drTestTargetBtn" style="font-size: 12px;">测试连接</button>
                         <span id="drTargetTestResult" style="margin-left: 8px; font-size: 12px;"></span>
@@ -1882,6 +1888,8 @@
         </div>
     </div>
 
+    <!-- 传输加密面板：三个向导（同步/灾备/订阅）共用，须在各向导脚本之前加载 -->
+    <script src="dashboard-ssl.js"></script>
     <script src="admin-dashboard.js"></script>
     <!-- 高级功能独立 ES module：主脚本(经典,parse 时执行)先设 window.__dash，
          本 module(defer,解析后执行)再读取，顺序有保证 -->

@@ -327,7 +327,8 @@ public class THLToSqlConverter {
             }
         } else {
             if (!url.contains("serverTimezone") && !url.contains("?")) {
-                url = url + "?serverTimezone=UTC&useSSL=false";
+                // 同 ConcurrentSqlExecutor：兜底补参数时不再写死明文
+                url = url + "?serverTimezone=UTC";
             } else if (!url.contains("serverTimezone")) {
                 url = url + "&serverTimezone=UTC";
             }

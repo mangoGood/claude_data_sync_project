@@ -843,7 +843,9 @@ public final class ElasticSyncMain {
         // tinyInt1isBit=false：TINYINT(1) 按数字交付（与 binlog 增量侧一致）。驱动默认把
         // TINYINT(1) 猜成 Boolean，会让全量建出 boolean mapping，而增量 binlog 给 1/0 数字，
         // 两侧口径不一致会导致增量写入被 ES 以类型冲突拒绝。
-        String url = String.format("jdbc:mysql://%s:%s/?useSSL=false&serverTimezone=UTC&characterEncoding=utf8"
+        String url = String.format("jdbc:mysql://%s:%s/?"
+                + com.migration.common.ssl.SslMaterial.from(props, "source").mysqlUrlParams()
+                + "&serverTimezone=UTC&characterEncoding=utf8"
                 + "&allowPublicKeyRetrieval=true&connectTimeout=15000&tinyInt1isBit=false", host, port);
         return DriverManager.getConnection(url, user, password);
     }

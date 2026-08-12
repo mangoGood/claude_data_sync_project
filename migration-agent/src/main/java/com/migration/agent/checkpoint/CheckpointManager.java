@@ -150,13 +150,28 @@ public class CheckpointManager {
         }
     }
     
-    public BinlogPositionInfo getCurrentPositionFromSource(String sourceHost, int sourcePort, 
+    public BinlogPositionInfo getCurrentPositionFromSource(String sourceHost, int sourcePort,
                                                            String sourceUser, String sourcePassword) {
+        return getCurrentPositionFromSource(sourceHost, sourcePort, sourceUser, sourcePassword,
+                com.migration.common.ssl.SslMaterial.disabled());
+    }
+
+    /**
+     * 取源库当前位点，作为增量的起点。
+     *
+     * <p>这条连接必须跟着任务的加密档位走：它是<b>任务启动路径上第一条打到源库的连接</b>，
+     * 源端账号若是 {@code REQUIRE SSL}，明文连接会被服务端直接拒绝，任务在
+     * "初始化 checkpoint 失败: 无法获取 binlog position" 处就失败——而报错完全看不出是加密问题。
+     */
+    public BinlogPositionInfo getCurrentPositionFromSource(String sourceHost, int sourcePort,
+                                                           String sourceUser, String sourcePassword,
+                                                           com.migration.common.ssl.SslMaterial ssl) {
         String filename = null;
         long position = -1;
         String gtid = null;
         
-        String url = "jdbc:mysql://" + sourceHost + ":" + sourcePort + "?useSSL=false&serverTimezone=UTC&characterEncoding=utf8";
+        String url = "jdbc:mysql://" + sourceHost + ":" + sourcePort + "?"
+                + ssl.mysqlUrlParams() + "&serverTimezone=UTC&characterEncoding=utf8";
         
         try (Connection conn = DriverManager.getConnection(url, sourceUser, sourcePassword)) {
             try (Statement stmt = conn.createStatement();
@@ -209,10 +224,19 @@ public class CheckpointManager {
 
     public BinlogPositionInfo getCurrentPositionFromPostgres(String sourceHost, int sourcePort,
                                                               String sourceUser, String sourcePassword) {
+        return getCurrentPositionFromPostgres(sourceHost, sourcePort, sourceUser, sourcePassword,
+                com.migration.common.ssl.SslMaterial.disabled());
+    }
+
+    /** 同上，PostgreSQL 版：位点连接同样要跟着任务的加密档位走。 */
+    public BinlogPositionInfo getCurrentPositionFromPostgres(String sourceHost, int sourcePort,
+                                                              String sourceUser, String sourcePassword,
+                                                              com.migration.common.ssl.SslMaterial ssl) {
         String lsn = null;
         long position = 0;
 
-        String url = "jdbc:postgresql://" + sourceHost + ":" + sourcePort + "/postgres?stringtype=unspecified";
+        String url = "jdbc:postgresql://" + sourceHost + ":" + sourcePort
+                + "/postgres?stringtype=unspecified&" + ssl.pgUrlParams();
 
         try {
             Class.forName("org.postgresql.Driver");
@@ -265,10 +289,21 @@ public class CheckpointManager {
     public BinlogPositionInfo getCurrentPositionFromOracle(String sourceHost, int sourcePort,
                                                             String sourceDatabase,
                                                             String sourceUser, String sourcePassword) {
+        return getCurrentPositionFromOracle(sourceHost, sourcePort, sourceDatabase, sourceUser,
+                sourcePassword, com.migration.common.ssl.SslMaterial.disabled());
+    }
+
+    /** 同上，Oracle 版。开启 TLS 时 URL 换成 TCPS 描述串，信任材料走连接属性。 */
+    public BinlogPositionInfo getCurrentPositionFromOracle(String sourceHost, int sourcePort,
+                                                            String sourceDatabase,
+                                                            String sourceUser, String sourcePassword,
+                                                            com.migration.common.ssl.SslMaterial ssl) {
         String scn = null;
         long position = 0;
 
-        String url = String.format("jdbc:oracle:thin:@%s:%d/%s", sourceHost, sourcePort, sourceDatabase);
+        String url = ssl.enabled()
+                ? ssl.oracleTcpsUrl(sourceHost, sourcePort, sourceDatabase)
+                : String.format("jdbc:oracle:thin:@%s:%d/%s", sourceHost, sourcePort, sourceDatabase);
 
         // 加载并显式注册 Oracle 驱动。
         // 在 fat jar (java -jar) 模式下，DriverManager 的 ServiceLoader 机制可能因

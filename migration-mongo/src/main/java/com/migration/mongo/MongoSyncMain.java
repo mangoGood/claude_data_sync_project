@@ -1064,9 +1064,26 @@ public final class MongoSyncMain {
         // directConnection：只连指定节点，不按副本集配置里的内部主机名（容器 hostname 等）
         // 重路由；Change Streams 与写入在直连 Primary 下均正常工作
         uri.append(host).append(':').append(port).append("/?authSource=admin&directConnection=true");
-        return MongoClientSettings.builder()
-                .applyConnectionString(new ConnectionString(uri.toString()))
-                .build();
+
+        // 传输加密：Mongo 驱动只认 SSLContext 对象，不认 URI 上的证书参数。
+        // invalidHostNameAllowed 与档位对齐：VERIFY_IDENTITY 才校验主机名，
+        // 其余档位（含 VERIFY_CA）只校验证书链——与 MySQL/PG 的档位语义保持一致。
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(props, prefix);
+        MongoClientSettings.Builder builder = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(uri.toString()));
+        if (ssl.enabled()) {
+            try {
+                final javax.net.ssl.SSLContext ctx = ssl.sslContext();
+                builder.applyToSslSettings(b -> b.enabled(true)
+                        .invalidHostNameAllowed(!ssl.verifyIdentity())
+                        .context(ctx));
+            } catch (Exception e) {
+                // 拿不到证书材料就连不上；绝不能"降级明文继续"
+                throw new IllegalStateException("MongoDB 传输加密材料装配失败: " + e.getMessage(), e);
+            }
+        }
+        return builder.build();
     }
 
     private static String urlEncode(String s) {

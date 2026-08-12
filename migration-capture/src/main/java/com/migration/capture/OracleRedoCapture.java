@@ -179,7 +179,8 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         } catch (NumberFormatException e) {
             return;
         }
-        String pdbUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, database);
+        // Oracle 开 TLS 要换 TCPS 描述串；信任材料走连接属性（见 applyOracleSsl）
+        String pdbUrl = oracleUrl(database);
         try {
             Class.forName("oracle.jdbc.OracleDriver");
         } catch (ClassNotFoundException ignored) {
@@ -298,8 +299,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         Class.forName("oracle.jdbc.OracleDriver");
 
         // 先连接 PDB（源库），用于探测 CDB 名称和起始 SCN
-        String pdbUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, database);
-        pdbConn = DriverManager.getConnection(pdbUrl, user, password);
+        pdbConn = DriverManager.getConnection(oracleUrl(database), oracleProps());
         pdbConn.setAutoCommit(false);
         logger.info("Connected to Oracle PDB for metadata probe: {}", database);
 
@@ -336,7 +336,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         cdbConnected = false;
         if (cdbEnabled && cdbName != null && !cdbName.isEmpty()) {
             String effectiveCdbService = (cdbService != null && !cdbService.isEmpty()) ? cdbService : cdbName;
-            String cdbUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, effectiveCdbService);
+            String cdbUrl = oracleUrl(effectiveCdbService);
             // Oracle JDBC 中 sys as sysdba 通过 username 携带角色实现
             String cdbUserWithRole = cdbUsername + " as " + cdbRole;
             try {
@@ -1460,5 +1460,31 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
 
     public long getEventCount() {
         return eventCounter.get();
+    }
+
+    /** 源库加密材料。Oracle 的 thin URL 没有查询串，信任材料只能走连接属性。 */
+    private com.migration.common.ssl.SslMaterial sourceSsl() {
+        return com.migration.common.ssl.SslMaterial.from(props, "source");
+    }
+
+    /** Oracle 连接串：开 TLS 时换成 TCPS 描述串（端口通常也要改成 2484）。 */
+    private String oracleUrl(String service) {
+        com.migration.common.ssl.SslMaterial ssl = sourceSsl();
+        return ssl.enabled()
+                ? ssl.oracleTcpsUrl(host, port, service)
+                : String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, service);
+    }
+
+    /** 连接属性：用户名口令 + （开启 TLS 时的）信任库与主机名校验开关。 */
+    private java.util.Properties oracleProps() {
+        java.util.Properties p = new java.util.Properties();
+        if (user != null) {
+            p.setProperty("user", user);
+        }
+        if (password != null) {
+            p.setProperty("password", password);
+        }
+        sourceSsl().applyOracleProperties(p);
+        return p;
     }
 }

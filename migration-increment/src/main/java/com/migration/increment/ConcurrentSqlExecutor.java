@@ -36,7 +36,9 @@ public class ConcurrentSqlExecutor {
         String password = props.getProperty("target.mysql.password");
 
         if (!url.contains("serverTimezone") && !url.contains("?")) {
-            url = url + "?serverTimezone=UTC&useSSL=false";
+            // 兜底补参数：只在 URL 完全没有查询串时才走到这里。加密档位由调用方拼在 URL 上，
+            // 这里不再写死 useSSL=false —— 那会把已经配好的 TLS 覆盖成明文。
+            url = url + "?serverTimezone=UTC";
         } else if (!url.contains("serverTimezone")) {
             url = url + "&serverTimezone=UTC";
         }

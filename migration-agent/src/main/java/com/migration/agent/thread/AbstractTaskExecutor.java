@@ -605,7 +605,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 }
 
                 BinlogPositionInfo currentPosition = checkpointManager.getCurrentPositionFromSource(
-                        sourceHost, sourcePort, sourceUser, sourcePassword);
+                        sourceHost, sourcePort, sourceUser, sourcePassword,
+                        com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前位点作为 checkpoint: {}", threadName, currentPosition);
@@ -654,7 +655,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 }
 
                 BinlogPositionInfo currentPosition = checkpointManager.getCurrentPositionFromPostgres(
-                        sourceHost, sourcePort, sourceUser, sourcePassword);
+                        sourceHost, sourcePort, sourceUser, sourcePassword,
+                        com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前 PostgreSQL WAL LSN 作为 checkpoint: {}", threadName, currentPosition);
@@ -704,7 +706,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 }
 
                 BinlogPositionInfo currentPosition = checkpointManager.getCurrentPositionFromOracle(
-                        sourceHost, sourcePort, sourceDatabase, sourceUser, sourcePassword);
+                        sourceHost, sourcePort, sourceDatabase, sourceUser, sourcePassword,
+                        com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前 Oracle SCN 作为 checkpoint: {}", threadName, currentPosition);
@@ -1324,10 +1327,26 @@ public abstract class AbstractTaskExecutor implements Runnable {
         }
     }
 
+    /** 读本任务的 config.properties（读不到就返回空 Properties，调用方按默认值走）。 */
+    private java.util.Properties readTaskConfigProps() {
+        java.util.Properties props = new java.util.Properties();
+        java.io.File configFile = new java.io.File("./files/" + taskId + "/config.properties");
+        if (!configFile.exists()) {
+            return props;
+        }
+        try (java.io.InputStream input = new java.io.FileInputStream(configFile)) {
+            props.load(input);
+        } catch (Exception e) {
+            logger.debug("[{}] 读取 config.properties 失败: {}", taskId, e.getMessage());
+        }
+        return props;
+    }
+
     private SlaMetricsCollector slaCollector() {
         SlaMetricsCollector local = slaCollector;
         if (local == null) {
-            local = new SlaMetricsCollector(taskId, taskMessage.getSourceConnection());
+            local = new SlaMetricsCollector(taskId, taskMessage.getSourceConnection(),
+                    com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
             slaCollector = local;
         }
         return local;

@@ -30,7 +30,21 @@ export PATH="$JAVA_HOME/bin:$PATH"
 echo "[start] JAVA_HOME=$JAVA_HOME"
 
 # ---- 连接信息（agent 与 backend 共用）----
-export DB_URL="jdbc:mysql://localhost:33306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true"
+# 元数据库这一跳的传输加密档位。此前这里无条件写死 useSSL=false，而 application.yml 与
+# AgentConfig 的默认值都是 ${DB_URL:...sslMode=${META_DB_SSL_MODE}...} 形式——DB_URL 一旦导出，
+# 那两处默认值就永远轮不到生效，META_DB_SSL_MODE 设成什么都没用（设了以为开了，实际明文）。
+# 现在按 META_DB_SSL_MODE 拼；缺省 DISABLED，与之前逐字节等价。
+export META_DB_SSL_MODE="${META_DB_SSL_MODE:-DISABLED}"
+if [ "$META_DB_SSL_MODE" = "DISABLED" ]; then
+  META_DB_SSL_PARAM="useSSL=false"
+else
+  META_DB_SSL_PARAM="sslMode=${META_DB_SSL_MODE}"
+  # VERIFY_CA / VERIFY_IDENTITY 需要信任库；给了才追加，避免空路径拼进 URL
+  [ -n "${META_DB_SSL_ROOT_CERT:-}" ] && \
+    META_DB_SSL_PARAM="${META_DB_SSL_PARAM}&trustCertificateKeyStoreUrl=file:${META_DB_SSL_ROOT_CERT}"
+fi
+export DB_URL="jdbc:mysql://localhost:33306/sync_task_db?${META_DB_SSL_PARAM}&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true"
+echo "[start] META_DB_SSL_MODE=$META_DB_SSL_MODE"
 export DB_USERNAME="root"
 export DB_PASSWORD="rootpassword"
 export KAFKA_BOOTSTRAP_SERVERS="localhost:29092"

@@ -7,6 +7,9 @@ files/
 .synctask_master_key
 .synctask_jwt_secret
 .synctask_agent_token
+# TLS 证书的本地物化目录（含客户端私钥；权限 0700/0600）。
+# 库里才是正本，这里只是给驱动用的一份本地缓存，绝不入库到 git。
+certs/
 __pycache__/
 .venv_fi/
 .DS_Store
