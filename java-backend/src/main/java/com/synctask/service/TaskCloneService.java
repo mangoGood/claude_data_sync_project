@@ -64,6 +64,12 @@ public class TaskCloneService {
         cloned.setFanoutEnabled(source.getFanoutEnabled());
         cloned.setTargetConnections(source.getTargetConnections());
         cloned.setFanoutTargetCount(source.getFanoutTargetCount());
+        // 传输加密同样复制：克隆的语义是"和原任务一样地跑"，
+        // 落回默认 DISABLED 会让副本悄悄走明文，而用户以为它和原任务一致
+        cloned.setSourceSslMode(source.getSourceSslMode());
+        cloned.setSourceSslCertId(source.getSourceSslCertId());
+        cloned.setTargetSslMode(source.getTargetSslMode());
+        cloned.setTargetSslCertId(source.getTargetSslCertId());
 
         workflowRepository.save(cloned);
 

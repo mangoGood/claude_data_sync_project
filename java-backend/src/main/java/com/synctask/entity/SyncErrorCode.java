@@ -41,6 +41,9 @@ public enum SyncErrorCode {
     SCHEMA_TIMELINE_VERSION_MISSING("E3022", "表结构时序库缺少该位点的版本", "表结构时序库里没有这条事件所在位点的表结构版本，无法按\"事件当时\"的结构解析。常见原因：任务是在时序库启用之前建的（缺基线）、该表的基线因 CREATE TABLE ... AS SELECT 之类推不出结构而被标记不可用、或跨机接管时时序库没有随位点一起回灌。降级回查源库当前定义会退回到\"用现在的结构解释过去的事件\"，因此在 extract.schema.timeline.fallback=FAIL_STOP 下停止抽取。请确认时序库文件存在且已回灌；允许降级时将该参数设为 RESNAPSHOT"),
     SCHEMA_TIMELINE_DDL_PARSE_FAILED("E3023", "DDL 解析失败（表结构时序库）", "时序库解析不了这条 DDL，无法把它施加到表结构模型上，该表之后的版本都会失准。这通常意味着遇到了语法覆盖之外的 DDL 形态。错误信息里带有原始语句，请据此补语法；在补齐之前，该表会按 extract.schema.timeline.fallback 的设置降级回查源库当前定义（RESNAPSHOT）或停止抽取（FAIL_STOP）"),
     SCHEMA_TIMELINE_COLUMN_MISMATCH("E3024", "表结构版本与事件列名不一致", "时序库算出的列布局与 binlog 事件自带的列名（binlog_row_metadata=FULL）对不上，说明时序库跟丢了源库的真实结构——多半是某条 DDL 被漏施加或施加错了。事件列名是与行值同一时刻的权威信息，两者矛盾时硬解就是整行错位的静默数据损坏，因此已停止抽取。请把错误信息里的两份列清单与该表的 DDL 历史对照，并把漏掉的 DDL 形态补进语法"),
+    WAL_VALUE_NOT_SENT("E3025", "WAL 事件缺少必需的列值", "PostgreSQL 逻辑复制对行外存储（TOAST）里本次未被修改的列不会发送值，只发一个\"未变更\"标记。这类列会被整列从 UPDATE 的 SET 里摘掉（写 NULL 会把目标端已有的大字段抹掉），但当它落在主键上、或该表没有主键而 WHERE 需要整行前镜像时，就定位不出目标行了，只能停止抽取。请给该表建主键，或将 REPLICA IDENTITY 设为 FULL 后重启任务"),
+    CAPTURE_STREAM_DOWN("E3027", "捕获流长时间中断", "捕获进程还活着，但与源库的复制流已经断开很久且没能恢复，这段时间一条变更都没抓到。进程级的活性心跳在这种状态下照常刷新，看门狗看不出异常，所以这里单独上报。常见原因：源库重启/网络中断、复制槽被占用或删除、账号权限被回收。请检查源库与网络后重启任务；调整判定时长用 capture.stream.down.report.ms"),
+    APPLY_NO_STATEMENT("E3026", "数据变更事件未生成任何 SQL", "一条 INSERT/UPDATE/DELETE 事件转换后一条 SQL 都没生成，说明事件里缺库表名或行数据——上游解析退化了。照常提交并推进位点等于把这条变更静默丢掉，因此停下等人处置。请看日志里同一 seqno 前后的 extract 告警定位上游原因；确认这类事件可以丢弃时，将 increment.empty.statement.policy 设为 SKIP"),
 
     CHECKPOINT_HYDRATE_FAILED("E3014", "位点回灌失败", "本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管。此时若按首次启动去取源库当前位点，会静默跳过崩溃到接管之间的全部变更，因此任务停在这里等人处置。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务；确认这确实是一个全新任务时，可临时将 checkpoint.hydrate.fail.stop 设为 false"),
 
@@ -55,6 +58,28 @@ public enum SyncErrorCode {
     SOURCE_DB_CONFIG_EMPTY("E5001", "源数据库配置为空", "请检查任务创建时源数据库连接信息是否填写完整"),
     TARGET_DB_CONFIG_EMPTY("E5002", "目标数据库配置为空", "请检查任务创建时目标数据库连接信息是否填写完整"),
     CONNECTION_STRING_PARSE_FAILED("E5003", "连接串解析失败", "请检查连接串格式是否正确，正确格式: mysql://user:pass@host:port 或 postgresql://user:pass@host:port"),
+    TASK_DISPATCH_FAILED("E5004", "任务派发消息发送失败", "任务的启动消息没能投进 Kafka，执行端从未收到它，因此任务不会开始跑。最常见的原因是 Kafka 未启动或地址不通（报文里通常是 \"Broker may not be available\" 或 \"Topic ... not present in metadata\"）。请确认 Kafka 已启动、spring.kafka.bootstrap-servers 指向正确的地址，然后重新启动该任务"),
+
+    // ---- 传输加密（TLS）----
+    // 这四个的共同点：报文里若不点破是加密问题，人会往完全错误的方向查——
+    // 握手失败常被驱动包成"网络不可达"，主机名不符被当成"证书损坏"，
+    // 而"要求加密却实际明文"根本不报错，是最危险的一种"成功"。
+    SSL_HANDSHAKE_FAILED("E5005", "TLS 握手失败",
+            "请确认服务端已开启 SSL（MySQL: have_ssl=YES；PostgreSQL: postgresql.conf 设 ssl=on）、"
+            + "连接端口是 TLS 端口（Oracle 的 TCPS 通常是 2484 而非 1521），以及所选证书与该服务端匹配"),
+    SSL_CERT_INVALID("E5006", "证书校验失败",
+            "服务端证书不是所选 CA 签发的、证书链不完整、或证书已过期。"
+            + "若档位是 VERIFY_IDENTITY，还要求证书的 CN/SAN 与所填主机名完全一致——"
+            + "用 IP 连接而证书里写的是域名时会失败，这是预期行为，可改用证书上的主机名、"
+            + "给证书补 SAN，或把档位降到 VERIFY_CA（仍校验证书链，不校验主机名）"),
+    SSL_NOT_ENCRYPTED("E5007", "要求加密但连接实际未加密",
+            "任务档位是 REQUIRED 及以上，但从服务端读到的加密状态是明文。"
+            + "通常是服务端未开启 SSL、或连的是非 TLS 端口。注意 PREFERRED 档位在服务端不支持时"
+            + "会静默退回明文，若必须加密请改用 REQUIRED 及以上"),
+    SSL_MATERIAL_UNAVAILABLE("E5008", "证书材料不可用",
+            "任务引用的证书已被删除、私钥格式不受支持（带口令的私钥需先解密："
+            + "openssl pkcs8 -topk8 -nocrypt -in key.pem -out key-plain.pem），"
+            + "或证书库口令解密失败（检查 SYNCTASK_MASTER_KEY 与建证书时是否一致）"),
 
     UNKNOWN_ERROR("E9999", "未知错误", "请查看Agent日志获取详细错误信息，或联系技术支持");
 

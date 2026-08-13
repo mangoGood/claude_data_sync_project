@@ -131,8 +131,9 @@ public class DbObjectsSyncService {
         String port = props.getProperty(prefix + ".db.port", "3306");
         String user = props.getProperty(prefix + ".db.username", "root");
         String password = CredentialCipher.decrypt(props.getProperty(prefix + ".db.password", ""));
-        String url = "jdbc:mysql://" + host + ":" + port +
-                "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+        String url = "jdbc:mysql://" + host + ":" + port + "/?"
+                + com.migration.common.ssl.SslMaterial.from(props, prefix).mysqlUrlParams()
+                + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
         return DriverManager.getConnection(url, user, password);
     }
 }

@@ -327,7 +327,8 @@ public class THLToSqlConverter {
             }
         } else {
             if (!url.contains("serverTimezone") && !url.contains("?")) {
-                url = url + "?serverTimezone=UTC&useSSL=false";
+                // 同 ConcurrentSqlExecutor：兜底补参数时不再写死明文
+                url = url + "?serverTimezone=UTC";
             } else if (!url.contains("serverTimezone")) {
                 url = url + "&serverTimezone=UTC";
             }
@@ -806,6 +807,34 @@ public class THLToSqlConverter {
     // 与全量对象路径 convertValue 同处维护；增量端经 translator.convertLiteral 调用，杜绝行为漂移。
 
     /** 带宽度的完整 MySQL 列类型（COLUMN_TYPE，如 tinyint(1)/bit(8)）；缺失时回退到 DATA_TYPE。 */
+    /**
+     * 把全宽的列类型数组重排成与给定列名清单一一对应。
+     *
+     * <p>UPDATE 的 SET 与 WHERE 两侧列清单可以窄于全表（PG 摘掉未变更的 TOAST 列、
+     * Oracle 只下发变更列），而类型是按全表顺序给的。按<b>列名</b>取类型才对得上；
+     * 沿用全宽数组按下标取，第 i 个值会配到第 i 列的类型上——转出来的是合法字面量、
+     * 看不出异常，属于静默转错值。
+     *
+     * <p>列清单与全表一致（同一个数组，或逐个同名）时原样返回，不产生额外开销。
+     */
+    private static String[] typesAlignedTo(String[] cols, String[] allCols, String[] allTypes) {
+        if (cols == null || allCols == null || allTypes == null || cols == allCols) {
+            return allTypes;
+        }
+        java.util.Map<String, String> byName = new java.util.HashMap<>();
+        for (int i = 0; i < allCols.length && i < allTypes.length; i++) {
+            byName.put(allCols[i].trim(), allTypes[i]);
+        }
+        String[] out = new String[cols.length];
+        for (int i = 0; i < cols.length; i++) {
+            String type = byName.get(cols[i].trim());
+            // 查不到就退回按下标取（列名映射等场景），至少不比改动前差
+            out[i] = type != null ? type
+                    : (i < allTypes.length ? allTypes[i] : "");
+        }
+        return out;
+    }
+
     private String[] getColumnFullTypes(Map<String, Object> metadata) {
         String s = (String) metadata.get("mysql_column_full_types");
         if (s == null || s.isEmpty()) {
@@ -1089,6 +1118,13 @@ public class THLToSqlConverter {
         String[] whereColNames = (beforeColNamesStr != null && !beforeColNamesStr.isEmpty())
                 ? beforeColNamesStr.split("\\s*,\\s*") : columnNames;
 
+        // 类型数组必须各自对齐到自己那一侧的列名：SET 与 WHERE 的列清单可以不同宽
+        // （PG 的未变更 TOAST 只从后镜像里摘列；Oracle 只下发变更列），
+        // 两边共用一份全宽 columnTypes 会让 convertLiteral 拿错类型 —— 静默转错值。
+        String[] setColumnTypes = typesAlignedTo(setColNames, columnNames, columnTypes);
+        String[] whereColumnTypes = typesAlignedTo(whereColNames, columnNames, columnTypes);
+        columnTypes = setColumnTypes;
+
         // 生成列：只从 SET 一侧剔除（列名与后镜像值成对），WHERE 用的前镜像保持完整——
         // 生成列可以是主键的一部分（STORED），前镜像少一列就定位不到行了
         int[] writableSet = writableColumnIndexes(metadata, setColNames);
@@ -1121,7 +1157,8 @@ public class THLToSqlConverter {
                 values[i] = translator.convertLiteral(values[i], type);
             }
             for (int i = 0; i < beforeValues.length; i++) {
-                String type = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : "";
+                String type = (whereColumnTypes != null && i < whereColumnTypes.length)
+                        ? whereColumnTypes[i] : "";
                 beforeValues[i] = translator.convertLiteral(beforeValues[i], type);
             }
         }

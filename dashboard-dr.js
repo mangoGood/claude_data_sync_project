@@ -326,6 +326,11 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             document.getElementById('drTargetTestResult').textContent = '';
             drConnectionTestStatus = { source: false, target: false };
             drResetFullLoadOptions();
+            // 传输加密面板（主库/备库各一套）。倒换后两端角色互换，后端会把加密配置一起换，
+            // 因此这里按"当前的源/目标"配即可。
+            window.sslRenderPanel('drSource', '主库（源库）');
+            window.sslRenderPanel('drTarget', '备库（目标库）');
+            drLoadSslConfig(currentDrTaskId);
             document.getElementById('drConfigModal').classList.add('show');
         }
 
@@ -333,6 +338,48 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             const el = document.getElementById(id);
             return (el && el.value) ? el.value : fallback;
         }
+
+        /** 回填已保存的加密配置（编辑已有灾备任务时）。 */
+        async function drLoadSslConfig(taskId) {
+            if (!taskId) return;
+            try {
+                const resp = await fetchWithAuth(`${API_BASE_URL}/workflows/${taskId}`);
+                const result = await resp.json();
+                if (!result.success || !result.data) return;
+                window.sslSetConfig('drSource', result.data.source_ssl_mode, result.data.source_ssl_cert_id);
+                window.sslSetConfig('drTarget', result.data.target_ssl_mode, result.data.target_ssl_cert_id);
+            } catch (e) { /* 新建任务时取不到，保持默认关闭 */ }
+        }
+
+        /** 测连结果是否算成功。后端 success 只表示"接口没炸"，连没连上看 data.connected。 */
+        function drTestOk(result) {
+            return !!(result && result.success && result.data && result.data.connected);
+        }
+
+        /**
+         * 渲染测连结果。加密状态取自服务端（Ssl_cipher / pg_stat_ssl），
+         * 不是我们自己的配置回显——配置写了 REQUIRED 不等于连接真的加密了。
+         */
+        function drRenderTestResult(elementId, result) {
+            const el = document.getElementById(elementId);
+            const data = (result && result.data) || {};
+            if (drTestOk(result)) {
+                el.style.color = '#52c41a';
+                el.innerHTML = '✓ 连接成功' + window.sslRenderTlsBadge(data);
+            } else {
+                el.style.color = '#f5222d';
+                const msg = data.errorMessage || (result && result.message) || '连接失败';
+                el.innerHTML = '✕ ' + String(msg).substring(0, 120) + window.sslRenderTlsBadge(data);
+            }
+        }
+
+        /** 加密配置变了，之前那次"测试连接成功"就不作数了——它测的是另一套参数。 */
+        function drOnConnectionFieldChange(type) {
+            drConnectionTestStatus[type] = false;
+            const el = document.getElementById(type === 'source' ? 'drSourceTestResult' : 'drTargetTestResult');
+            if (el) el.innerHTML = '';
+        }
+        window.drOnConnectionFieldChange = drOnConnectionFieldChange;
 
         /**
          * 装载/快照档位复位到该源端的默认值，并写清楚代价。
@@ -458,18 +505,13 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 const response = await fetchWithAuth(`${API_BASE_URL}/metadata/test-connection`, {
                     method: 'POST',
                     headers: getAuthHeaders(),
-                    body: JSON.stringify({ host, port: parseInt(port), username: user, password, type: currentDrDbType })
+                    body: JSON.stringify({ host, port: parseInt(port), username: user, password, type: currentDrDbType,
+                                           sslMode: window.sslGetConfig('drSource').mode,
+                                           sslCertId: window.sslGetConfig('drSource').certId })
                 });
                 const result = await response.json();
-                if (result.success) {
-                    document.getElementById('drSourceTestResult').textContent = '✓ 连接成功';
-                    document.getElementById('drSourceTestResult').style.color = '#52c41a';
-                    drConnectionTestStatus.source = true;
-                } else {
-                    document.getElementById('drSourceTestResult').textContent = '✕ 连接失败';
-                    document.getElementById('drSourceTestResult').style.color = '#f5222d';
-                    drConnectionTestStatus.source = false;
-                }
+                drRenderTestResult('drSourceTestResult', result);
+                drConnectionTestStatus.source = drTestOk(result);
             } catch (e) {
                 document.getElementById('drSourceTestResult').textContent = '✕ 连接失败';
                 document.getElementById('drSourceTestResult').style.color = '#f5222d';
@@ -490,18 +532,13 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 const response = await fetchWithAuth(`${API_BASE_URL}/metadata/test-connection`, {
                     method: 'POST',
                     headers: getAuthHeaders(),
-                    body: JSON.stringify({ host, port: parseInt(port), username: user, password, type: currentDrDbType })
+                    body: JSON.stringify({ host, port: parseInt(port), username: user, password, type: currentDrDbType,
+                                           sslMode: window.sslGetConfig('drTarget').mode,
+                                           sslCertId: window.sslGetConfig('drTarget').certId })
                 });
                 const result = await response.json();
-                if (result.success) {
-                    document.getElementById('drTargetTestResult').textContent = '✓ 连接成功';
-                    document.getElementById('drTargetTestResult').style.color = '#52c41a';
-                    drConnectionTestStatus.target = true;
-                } else {
-                    document.getElementById('drTargetTestResult').textContent = '✕ 连接失败';
-                    document.getElementById('drTargetTestResult').style.color = '#f5222d';
-                    drConnectionTestStatus.target = false;
-                }
+                drRenderTestResult('drTargetTestResult', result);
+                drConnectionTestStatus.target = drTestOk(result);
             } catch (e) {
                 document.getElementById('drTargetTestResult').textContent = '✕ 连接失败';
                 document.getElementById('drTargetTestResult').style.color = '#f5222d';
@@ -523,6 +560,11 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             if (!targetHost || !targetPort || !targetUser) { showNotification('请填写完整的备库连接信息', 'error'); return; }
             if (!drConnectionTestStatus.source) { showNotification('请先测试主库连接并确保连接成功', 'error'); return; }
             if (!drConnectionTestStatus.target) { showNotification('请先测试备库连接并确保连接成功', 'error'); return; }
+
+            // VERIFY_CA / VERIFY_IDENTITY 必须有证书，否则要到建连时才报错
+            const sslErrors = window.sslValidate('drSource', '主库')
+                    .concat(window.sslValidate('drTarget', '备库'));
+            if (sslErrors.length > 0) { showNotification(sslErrors.join('；'), 'error'); return; }
             
             const drProto = drProtocol(currentDrDbType);
             const sourceConnection = `${drProto}://${sourceUser}:${sourcePassword}@${sourceHost}:${sourcePort}`;
@@ -541,7 +583,12 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                         targetType: currentDrDbType,
                         // 灾备的全量走的就是同步那几条链路，装载/快照档位同样可选（任务未启动前）
                         bulkLoadMode: drSelectValue('drBulkLoadMode', 'AUTO'),
-                        snapshotMode: drSelectValue('drSnapshotMode', 'GTID_ONLY')
+                        snapshotMode: drSelectValue('drSnapshotMode', 'GTID_ONLY'),
+                        // 传输加密：双向灾备的反向影子任务由后端按"源/目标对调"继承这份配置
+                        sourceSslMode: window.sslGetConfig('drSource').mode,
+                        sourceSslCertId: window.sslGetConfig('drSource').certId,
+                        targetSslMode: window.sslGetConfig('drTarget').mode,
+                        targetSslCertId: window.sslGetConfig('drTarget').certId
                     })
                 });
                 const result = await response.json();

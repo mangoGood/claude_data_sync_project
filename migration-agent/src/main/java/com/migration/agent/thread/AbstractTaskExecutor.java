@@ -605,7 +605,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 }
 
                 BinlogPositionInfo currentPosition = checkpointManager.getCurrentPositionFromSource(
-                        sourceHost, sourcePort, sourceUser, sourcePassword);
+                        sourceHost, sourcePort, sourceUser, sourcePassword,
+                        com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前位点作为 checkpoint: {}", threadName, currentPosition);
@@ -654,7 +655,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 }
 
                 BinlogPositionInfo currentPosition = checkpointManager.getCurrentPositionFromPostgres(
-                        sourceHost, sourcePort, sourceUser, sourcePassword);
+                        sourceHost, sourcePort, sourceUser, sourcePassword,
+                        com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前 PostgreSQL WAL LSN 作为 checkpoint: {}", threadName, currentPosition);
@@ -704,7 +706,8 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 }
 
                 BinlogPositionInfo currentPosition = checkpointManager.getCurrentPositionFromOracle(
-                        sourceHost, sourcePort, sourceDatabase, sourceUser, sourcePassword);
+                        sourceHost, sourcePort, sourceDatabase, sourceUser, sourcePassword,
+                        com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
                 checkpointManager.saveCheckpoint(currentPosition);
                 checkpointToUse = currentPosition;
                 logger.info("[{}] 已记录当前 Oracle SCN 作为 checkpoint: {}", threadName, currentPosition);
@@ -1324,10 +1327,26 @@ public abstract class AbstractTaskExecutor implements Runnable {
         }
     }
 
+    /** 读本任务的 config.properties（读不到就返回空 Properties，调用方按默认值走）。 */
+    private java.util.Properties readTaskConfigProps() {
+        java.util.Properties props = new java.util.Properties();
+        java.io.File configFile = new java.io.File("./files/" + taskId + "/config.properties");
+        if (!configFile.exists()) {
+            return props;
+        }
+        try (java.io.InputStream input = new java.io.FileInputStream(configFile)) {
+            props.load(input);
+        } catch (Exception e) {
+            logger.debug("[{}] 读取 config.properties 失败: {}", taskId, e.getMessage());
+        }
+        return props;
+    }
+
     private SlaMetricsCollector slaCollector() {
         SlaMetricsCollector local = slaCollector;
         if (local == null) {
-            local = new SlaMetricsCollector(taskId, taskMessage.getSourceConnection());
+            local = new SlaMetricsCollector(taskId, taskMessage.getSourceConnection(),
+                    com.migration.common.ssl.SslMaterial.from(readTaskConfigProps(), "source"));
             slaCollector = local;
         }
         return local;
@@ -1419,6 +1438,24 @@ public abstract class AbstractTaskExecutor implements Runnable {
     // ==================== 工具方法 ====================
 
     protected Long readMetricFile(String filePath) {
+        return readMetricFile(filePath, metricStaleMs());
+    }
+
+    /**
+     * 读指标文件的值（格式 {@code 写入时刻|值|源端时间戳}）。
+     *
+     * <p><b>过期的样本按"没有数据"处理</b>，而不是返回那个旧值。链路停了之后指标文件不再更新，
+     * 若照旧返回最后一次的数字，面板上看到的是一个**过期但看着正常**的延迟 ——
+     * 与"量不出来"是两件完全不同的事，必须能区分。第一个字段就是写入时刻，判据现成。
+     *
+     * @param maxAgeMs 允许的最大年龄；≤0 表示不做新鲜度判断（兼容没有时间戳字段的老指标）
+     */
+    protected Long readMetricFile(String filePath, long maxAgeMs) {
+        return readFreshMetric(filePath, maxAgeMs);
+    }
+
+    /** 静态实现，便于单测直接验证新鲜度判断（构造一个 executor 需要一整套依赖）。 */
+    static Long readFreshMetric(String filePath, long maxAgeMs) {
         try {
             File file = new File(filePath);
             if (!file.exists()) return null;
@@ -1426,11 +1463,24 @@ public abstract class AbstractTaskExecutor implements Runnable {
                 String line = reader.readLine();
                 if (line != null && !line.isEmpty()) {
                     String[] parts = line.split("\\|");
-                    if (parts.length >= 2) return Long.parseLong(parts[1].trim());
+                    if (parts.length >= 2) {
+                        if (maxAgeMs > 0) {
+                            long writtenAt = Long.parseLong(parts[0].trim());
+                            if (System.currentTimeMillis() - writtenAt > maxAgeMs) {
+                                return null;
+                            }
+                        }
+                        return Long.parseLong(parts[1].trim());
+                    }
                 }
             }
         } catch (Exception e) { }
         return null;
+    }
+
+    /** 指标最大年龄：超过即视为无数据。默认 60s（心跳侧最慢 5s 一次，留足余量）。 */
+    protected long metricStaleMs() {
+        return 60000;
     }
 
     protected Long readMetricTimestamp(String filePath) {

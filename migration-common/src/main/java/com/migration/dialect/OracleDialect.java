@@ -34,6 +34,16 @@ public class OracleDialect implements SqlDialect {
     }
 
     @Override
+    public String jdbcUrl(String host, String port, String database,
+                          com.migration.common.ssl.SslMaterial ssl) {
+        // Oracle 开 TLS 不是加参数：协议换成 TCPS、URL 结构整个变，端口通常也从 1521 改成 2484。
+        // 信任材料走连接属性（SslMaterial#applyOracleProperties），thin URL 里没有查询串。
+        return ssl.enabled()
+                ? ssl.oracleTcpsUrl(host, Integer.parseInt(port), database)
+                : jdbcUrl(host, port, database);
+    }
+
+    @Override
     public String jdbcUrl(String host, String port, String database) {
         return "jdbc:oracle:thin:@" + host + ":" + port + "/" + database;
     }

@@ -129,12 +129,13 @@ public class SqlSyncEndToEndTest {
     }
 
     private void connect() throws SQLException {
+        // 兜底补参数：加密档位由调用方拼在 targetUrl 上（ConfigService 生成），
+        // 这里不再写死 useSSL=false —— 那会把已经配好的 TLS 覆盖成明文。
         String url = targetUrl;
         if (!url.contains("?")) {
-            url += "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
-        } else {
-            if (!url.contains("useSSL")) url += "&useSSL=false";
-            if (!url.contains("allowPublicKeyRetrieval")) url += "&allowPublicKeyRetrieval=true";
+            url += "?allowPublicKeyRetrieval=true&serverTimezone=UTC";
+        } else if (!url.contains("allowPublicKeyRetrieval")) {
+            url += "&allowPublicKeyRetrieval=true";
         }
         conn = DriverManager.getConnection(url, targetUser, targetPass);
         conn.setAutoCommit(true);

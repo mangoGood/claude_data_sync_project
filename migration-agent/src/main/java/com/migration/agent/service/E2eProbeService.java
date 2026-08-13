@@ -44,6 +44,12 @@ public class E2eProbeService implements AutoCloseable {
     private final long intervalMs;
     private final long timeoutMs;
     private final MetricsService.TaskMetrics metrics;
+    /** 探针连的是用户库，同样要跟任务的加密档位走。默认 DISABLED（历史行为）。 */
+    private volatile com.migration.common.ssl.SslMaterial ssl = com.migration.common.ssl.SslMaterial.disabled();
+
+    public void setSsl(com.migration.common.ssl.SslMaterial ssl) {
+        this.ssl = ssl != null ? ssl : com.migration.common.ssl.SslMaterial.disabled();
+    }
 
     private volatile boolean running;
     private Thread worker;
@@ -207,9 +213,10 @@ public class E2eProbeService implements AutoCloseable {
         String url;
         if ("postgresql".equalsIgnoreCase(info.getType())) {
             url = "jdbc:postgresql://" + info.getHost() + ":" + info.getPort() + "/" + info.getDatabase();
+            url = url + "?" + ssl.pgUrlParams();
         } else {
             url = "jdbc:mysql://" + info.getHost() + ":" + info.getPort() + "/" + info.getDatabase()
-                    + "?useSSL=false&serverTimezone=UTC&connectTimeout=5000&socketTimeout=10000";
+                    + "?" + ssl.mysqlUrlParams() + "&serverTimezone=UTC&connectTimeout=5000&socketTimeout=10000";
         }
         return DriverManager.getConnection(url, info.getUsername(), info.getPassword());
     }

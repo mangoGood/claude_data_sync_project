@@ -109,6 +109,10 @@ public class MetadataService {
         public String errorType;
         public String errorMessage;
         public String suggestion;
+        /** 服务端视角的加密状态。null = 没探测（非 JDBC 链路）或问不出来。 */
+        public Boolean encrypted;
+        public String tlsVersion;
+        public String tlsCipher;
 
         public ConnectionTestResult(boolean connected, String errorType, String errorMessage, String suggestion) {
             this.connected = connected;
@@ -116,9 +120,57 @@ public class MetadataService {
             this.errorMessage = errorMessage;
             this.suggestion = suggestion;
         }
+
+        ConnectionTestResult withTls(com.synctask.util.TlsStateProbe.TlsState state) {
+            if (state != null) {
+                this.encrypted = state.encrypted;
+                this.tlsVersion = state.version;
+                this.tlsCipher = state.cipher;
+            }
+            return this;
+        }
+    }
+
+    /**
+     * 任务级加密配置。null / DISABLED = 与历史行为完全一致（明文，走部署级 env 那套）。
+     *
+     * <p>做成一个小对象而不是两个散参数：源与目标各有一份，散参数在调用链上极易接反，
+     * 而"接反"的表现是目标端用了源端的证书——报错信息会指向证书本身，非常难查。
+     */
+    public static class SslConfig {
+        public final String mode;
+        public final com.synctask.util.CertMaterial material;
+
+        public SslConfig(String mode, com.synctask.util.CertMaterial material) {
+            this.mode = mode;
+            this.material = material;
+        }
+
+        boolean enabled() {
+            return mode != null && !mode.trim().isEmpty()
+                    && !"DISABLED".equalsIgnoreCase(mode.trim());
+        }
+
+        /**
+         * 是否<b>必须</b>加密（REQUIRED 及以上）。
+         *
+         * <p>PREFERRED 不在其中——按驱动的既定语义，它在服务端不支持时会退回明文。
+         * 拿它当"必须加密"来判会把正常的降级误报成失败。
+         */
+        boolean mustEncrypt() {
+            if (!enabled()) {
+                return false;
+            }
+            String m = mode.trim().toUpperCase();
+            return "REQUIRED".equals(m) || "VERIFY_CA".equals(m) || "VERIFY_IDENTITY".equals(m);
+        }
     }
 
     public ConnectionTestResult testConnectionDetailed(String connectionStr, String expectedType) {
+        return testConnectionDetailed(connectionStr, expectedType, null);
+    }
+
+    public ConnectionTestResult testConnectionDetailed(String connectionStr, String expectedType, SslConfig ssl) {
         ParsedConnection conn = parseConnection(connectionStr);
         boolean isPg = conn.isPostgresql();
         boolean isOracle = conn.isOracle();
@@ -200,38 +252,92 @@ public class MetadataService {
                 "期望MySQL/PostgreSQL数据库，但连接串格式为Oracle", "请检查数据库类型是否正确");
         }
 
+        // 任务级加密优先；没配（或配 DISABLED）时回落到部署级 env 那套，行为与之前一致
+        boolean taskSsl = ssl != null && ssl.enabled();
         String jdbcUrl;
+        java.util.Properties connProps = new java.util.Properties();
+        if (conn.username != null) {
+            connProps.setProperty("user", conn.username);
+        }
+        if (conn.password != null) {
+            connProps.setProperty("password", conn.password);
+        }
         if (isPg) {
-            jdbcUrl = String.format("jdbc:postgresql://%s:%d/%s?connectTimeout=15&socketTimeout=15&stringtype=unspecified",
-                conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "postgres");
+            String pgSsl = taskSsl
+                    ? com.synctask.util.JdbcSslOptions.postgres(ssl.mode, ssl.material)
+                    : com.synctask.util.JdbcSslOptions.postgres();
+            jdbcUrl = String.format("jdbc:postgresql://%s:%d/%s?connectTimeout=15&socketTimeout=15&stringtype=unspecified&%s",
+                conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "postgres", pgSsl);
         } else if (isOracle) {
+            // Oracle 的 thin URL 不带查询串：开启 TLS 要换协议（TCPS）与端口（通常 2484），
+            // 信任材料走连接属性。见 OracleSslSupport。
             String service = (conn.database != null && !conn.database.isEmpty()) ? conn.database : "ORCL";
-            jdbcUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
+            jdbcUrl = taskSsl
+                    ? com.synctask.util.OracleSslSupport.tcpsUrl(conn.host, conn.port, service,
+                            com.synctask.util.OracleSslSupport.serverDn())
+                    : String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
+            if (taskSsl) {
+                com.synctask.util.OracleSslSupport.applyProperties(connProps, ssl.mode, ssl.material);
+            }
         } else {
-            jdbcUrl = String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&connectTimeout=15000&socketTimeout=15000&allowPublicKeyRetrieval=true",
+            String mysqlSsl = taskSsl
+                    ? com.synctask.util.JdbcSslOptions.mysql(ssl.mode, ssl.material)
+                    : com.synctask.util.JdbcSslOptions.mysql();
+            jdbcUrl = String.format("jdbc:mysql://%s:%d/%s?" + mysqlSsl + "&serverTimezone=UTC&characterEncoding=utf8&connectTimeout=15000&socketTimeout=15000&allowPublicKeyRetrieval=true",
                 conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "");
         }
 
         // 测试连接必须用一次性直连（DriverManager），不能走连接池：
         // 测试语义是"验证当前输入的凭证"，复用池中既有连接会掩盖凭证错误，
         // 且一次性测试不应催生常驻池。
-        try (Connection connection = java.sql.DriverManager.getConnection(jdbcUrl, conn.username, conn.password)) {
+        try (Connection connection = java.sql.DriverManager.getConnection(jdbcUrl, connProps)) {
             if (connection.isValid(5)) {
                 // TiDB 用 mysql:// 连接串走 MySQL 驱动，连接串无从区分，按所选类型给出提示
                 String dbTypeName = isPg ? "PostgreSQL"
                         : (isOracle ? "Oracle" : ("tidb".equalsIgnoreCase(expectedType) ? "TiDB" : "MySQL"));
-                return new ConnectionTestResult(true, null, dbTypeName + "连接成功", null);
+                String probeType = isPg ? "postgresql" : (isOracle ? "oracle" : "mysql");
+                com.synctask.util.TlsStateProbe.TlsState tls =
+                        com.synctask.util.TlsStateProbe.probe(connection, probeType);
+
+                // 要求加密却探到明文 = 最危险的那种"成功"：连上了、也没报错，但数据在网上是明文。
+                // 这里必须判失败，不能只在提示里写一句。
+                if (ssl != null && ssl.mustEncrypt() && Boolean.FALSE.equals(tls.encrypted)) {
+                    return new ConnectionTestResult(false, "SSL_NOT_ENCRYPTED",
+                            "已选择 " + ssl.mode + " 但连接实际未加密",
+                            "服务端可能未开启 SSL。请确认数据库已配置证书（MySQL: have_ssl=YES；"
+                                    + "PostgreSQL: ssl=on），且账号未被限制在非加密端口")
+                            .withTls(tls);
+                }
+                String msg = dbTypeName + "连接成功";
+                if (tls.encrypted != null) {
+                    msg += "（" + tls.describe() + "）";
+                }
+                return new ConnectionTestResult(true, null, msg, null).withTls(tls);
             } else {
                 return new ConnectionTestResult(false, "CONNECTION_FAILED", "连接验证失败", "请检查数据库服务器状态");
             }
+        // 注：这里没有单独 catch SSLHandshakeException——它是 IOException 分支的受检异常，
+        // JDBC 驱动一律把它包进自己的 SQLException 再抛，直接 catch 反而编译不过。
+        // TLS 失败的识别统一由 sslFailureResult() 沿 cause 链完成。
         } catch (java.sql.SQLInvalidAuthorizationSpecException e) {
             return new ConnectionTestResult(false, "AUTH_FAILED",
                 "认证失败：用户名或密码错误", "请检查用户名和密码是否正确");
         } catch (java.sql.SQLNonTransientConnectionException e) {
+            // SSL 失败要先判：驱动会把它包成普通的连接异常，报文里常常还带着
+            // "authentication" 之类的词，落到下面的分支就会被误报成"用户名密码错误"，
+            // 让人对着一个根本没错的口令查半天。
+            ConnectionTestResult sslResult = sslFailureResult(e);
+            if (sslResult != null) {
+                return sslResult;
+            }
             String msg = e.getMessage();
             if (msg != null && (msg.contains("Access denied") || msg.contains("authentication"))) {
                 return new ConnectionTestResult(false, "AUTH_FAILED",
                     "认证失败：用户名或密码错误", "请检查用户名和密码是否正确");
+            }
+            ConnectionTestResult sslFallback = sslNotSupportedFallback(ssl, msg);
+            if (sslFallback != null) {
+                return sslFallback;
             }
             return new ConnectionTestResult(false, "NETWORK_ERROR",
                 "网络连接失败：" + e.getMessage(), "请检查数据库服务器地址和端口是否正确，以及网络是否可达");
@@ -239,6 +345,10 @@ public class MetadataService {
             return new ConnectionTestResult(false, "AUTH_FAILED",
                 "认证失败：用户名或密码错误", "请检查用户名和密码是否正确");
         } catch (java.sql.SQLException e) {
+            ConnectionTestResult sslResult = sslFailureResult(e);
+            if (sslResult != null) {
+                return sslResult;
+            }
             String msg = e.getMessage();
             if (msg != null && (msg.contains("Access denied") || msg.contains("authentication") || msg.contains("password") || msg.contains("ORA-01017"))) {
                 return new ConnectionTestResult(false, "AUTH_FAILED",
@@ -254,6 +364,10 @@ public class MetadataService {
                 return new ConnectionTestResult(false, "NETWORK_ERROR",
                     "网络不可达：无法建立到数据库的连接", "请检查主机地址和端口是否正确、数据库服务是否已启动且可从本机访问");
             }
+            ConnectionTestResult sslFallback = sslNotSupportedFallback(ssl, msg);
+            if (sslFallback != null) {
+                return sslFallback;
+            }
             return new ConnectionTestResult(false, "CONNECTION_FAILED",
                 "连接失败：" + e.getMessage(), "请检查连接参数是否正确");
         } catch (Exception e) {
@@ -265,6 +379,100 @@ public class MetadataService {
             return new ConnectionTestResult(false, "CONNECTION_FAILED",
                 "连接失败：" + e.getMessage(), "请检查连接参数是否正确");
         }
+    }
+
+    /**
+     * 沿 cause 链找 TLS 相关失败，找到就给出可操作的结论；不是 TLS 问题返回 null。
+     *
+     * <p>必须走 cause 链而不是只看顶层报文：JDBC 驱动一律把 {@code SSLHandshakeException}
+     * 包进自己的 {@code SQLException}，顶层那句话往往只是"Communications link failure"
+     * 或干脆带上 "authentication"——按顶层报文归类会把证书问题报成网络或口令问题。
+     */
+    private ConnectionTestResult sslFailureResult(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof java.security.cert.CertificateExpiredException) {
+                return new ConnectionTestResult(false, "SSL_CERT_INVALID",
+                        "证书校验失败：证书已过期（" + t.getMessage() + "）",
+                        "请更换未过期的证书，或让数据库侧续期服务端证书");
+            }
+            if (t instanceof java.security.cert.CertPathValidatorException
+                    || t instanceof java.security.cert.CertificateException) {
+                return new ConnectionTestResult(false, "SSL_CERT_INVALID",
+                        "证书校验失败：" + t.getMessage(),
+                        "服务端证书不是所选 CA 签发的，或证书链不完整。"
+                                + "若档位是 VERIFY_IDENTITY，还需要证书的 CN/SAN 与所填主机名一致");
+            }
+            if (t instanceof javax.net.ssl.SSLHandshakeException) {
+                // 握手失败里最常见的两类要分开给建议，否则提示词等于没说：
+                //   ·主机名不符——档位选了 VERIFY_IDENTITY，但用 IP 连、证书里写的是域名
+                //   ·证书链不通——选错 CA 或压根没选
+                String m = t.getMessage() == null ? "" : t.getMessage();
+                if (m.contains("identity verification") || m.contains("does not match")
+                        || m.contains("No subject alternative")) {
+                    return new ConnectionTestResult(false, "SSL_CERT_INVALID",
+                            "证书主机名校验失败：" + m,
+                            "VERIFY_IDENTITY 要求证书的 CN/SAN 与所填主机名完全一致。"
+                                    + "请改用证书上的主机名连接、给证书补上对应的 SAN，"
+                                    + "或把档位降到 VERIFY_CA（仍校验证书链，不校验主机名）");
+                }
+                if (m.contains("CertPathValidatorException") || m.contains("trust anchors")
+                        || m.contains("unable to find valid certification path")) {
+                    return new ConnectionTestResult(false, "SSL_CERT_INVALID",
+                            "证书链校验失败：" + m,
+                            "服务端证书不是所选 CA 签发的。请确认选的是该实例对应的 CA 证书"
+                                    + "（VERIFY_CA 及以上必须选证书，留空会回落到 JVM 默认信任库，自签 CA 不在其中）");
+                }
+                return new ConnectionTestResult(false, "SSL_HANDSHAKE_FAILED",
+                        "TLS 握手失败：" + m,
+                        "请确认服务端已开启 SSL、端口是 TLS 端口（Oracle 通常是 2484 而非 1521），"
+                                + "以及所选证书与该服务端匹配");
+            }
+            if (t instanceof javax.net.ssl.SSLException) {
+                return new ConnectionTestResult(false, "SSL_HANDSHAKE_FAILED",
+                        "TLS 连接失败：" + t.getMessage(),
+                        "请确认服务端 SSL 配置，以及所选档位与证书是否匹配");
+            }
+        }
+        // 还有一类根本不抛 SSLException：驱动自己发现"服务端不支持 SSL"就直接拒绝建连
+        // （Connector/J: "SSL Connection required, but not provided by server."）。
+        // 这类报文落到下面会被归成 NETWORK_ERROR，把人指去查地址和端口——而地址端口完全是对的。
+        //
+        // 注意 pgjdbc 的同一句话是**按 JVM locale 本地化**的（中文环境下是"服务器不支援 SSL 连线"），
+        // 所以英文子串匹配靠不住。这里只做尽力而为的文本识别，真正兜底的是
+        // sslNotSupportedFallback()——它不看报文，只看"要求了加密却没连上"这个上下文。
+        String msg = e == null ? null : e.getMessage();
+        if (msg != null) {
+            String lower = msg.toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("ssl connection required")
+                    || lower.contains("does not support ssl")
+                    || lower.contains("ssl is required")
+                    || msg.contains("不支援 SSL") || msg.contains("不支持 SSL")) {
+                return sslNotSupported(msg);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 最后兜底：要求了加密、连接又失败、且前面所有分支都没能归类。
+     *
+     * <p>必须排在认证/网络判定<b>之后</b>——否则一个口令打错也会被说成 SSL 问题。
+     * 排在最后时，剩下的可能性里"服务端不支持 SSL"占绝大多数，而给出一个能动手的方向
+     * 远好过把驱动的原始报文（很可能还是本地化过的）直接甩给用户。原始报文仍然带上。
+     */
+    private ConnectionTestResult sslNotSupportedFallback(SslConfig ssl, String rawMessage) {
+        if (ssl == null || !ssl.mustEncrypt()) {
+            return null;
+        }
+        return sslNotSupported(rawMessage);
+    }
+
+    private ConnectionTestResult sslNotSupported(String rawMessage) {
+        return new ConnectionTestResult(false, "SSL_NOT_SUPPORTED",
+                "服务端可能未开启 SSL：" + rawMessage,
+                "请确认该数据库实例已开启 SSL（MySQL: 配好 ssl_cert/ssl_key 后 have_ssl=YES；"
+                        + "PostgreSQL: postgresql.conf 设 ssl=on 并在 pg_hba.conf 放行 hostssl），"
+                        + "或把加密档位改回「不加密」");
     }
 
     /**
@@ -2249,6 +2457,8 @@ public class MetadataService {
         }
         java.net.HttpURLConnection conn = null;
         try {
+            // TiCDC 不是 agent：协议由 sync.ticdc.api-url 自己决定（https 时用户自己写 https://），
+            // 不能走 AgentHttpSupport —— 它会按 agent 的 TLS 开关把 http 改写成 https
             conn = (java.net.HttpURLConnection) new java.net.URL(apiUrl + "/api/v2/status").openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(5000);

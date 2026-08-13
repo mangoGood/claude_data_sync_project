@@ -43,7 +43,13 @@ public class AgentMain {
     private static final String METADATA_DB_USER = "sa";
     private static final String METADATA_DB_PASSWORD = "";
 
-    private static final String MYSQL_DB_URL = System.getenv().getOrDefault("DB_URL", "jdbc:mysql://localhost:33306/sync_task_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true");
+    /**
+     * 元数据库 URL。默认值必须与 {@link com.migration.agent.service.AgentConfig} 的那份口径一致——
+     * 此前这里硬编码 {@code useSSL=false} 而 AgentConfig 认 {@code META_DB_SSL_MODE}，
+     * 同一个 agent 进程里两条路对"元数据库要不要加密"给出两个答案。
+     */
+    private static final String MYSQL_DB_URL =
+        System.getenv().getOrDefault("DB_URL", AgentConfig.defaultMetaDbUrl());
     private static final String MYSQL_DB_USER = System.getenv().getOrDefault("DB_USERNAME", "root");
     private static final String MYSQL_DB_PASSWORD = System.getenv().getOrDefault("DB_PASSWORD", "rootpassword");
     
@@ -162,6 +168,11 @@ public class AgentMain {
         // 位点中心持久化：位点不能只活在这台机器的磁盘上——V8 的故障转移假设"接管方从各自
         // checkpoint 续传"，而那个 checkpoint 在 files/<taskId>/ 里，换台机器就是空的，
         // 接管方于是去取"源库此刻的位点"，把崩溃到接管之间的变更整段跳过（不报错、不告警）。
+        // 任务级 TLS 证书：按 certId 从元数据库取（证书内容不随 Kafka 消息下发）。
+        // 与位点中心库同一条连接配置。
+        com.migration.agent.service.CertificateStore.initialize(
+                agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(), agentConfig.getMysqlDbPassword());
+
         if (Boolean.parseBoolean(agentConfig.getRawProperty("checkpoint.central.enabled", "true"))) {
             com.migration.agent.checkpoint.CentralCheckpointStore checkpointStore =
                     com.migration.agent.checkpoint.CentralCheckpointStore.initialize(

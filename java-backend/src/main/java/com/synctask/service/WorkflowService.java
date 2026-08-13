@@ -3,6 +3,7 @@ package com.synctask.service;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.synctask.dto.TaskCreatedMessage;
+import com.synctask.entity.SyncErrorCode;
 import com.synctask.entity.Workflow;
 import com.synctask.entity.WorkflowLog;
 import com.synctask.entity.WorkflowStatus;
@@ -385,6 +386,54 @@ public class WorkflowService {
         }
     }
 
+    /**
+     * 源/目标端各自的传输加密档位与证书。与全量装载档位一样，<b>任务启动前可改</b>——
+     * 它只影响连接怎么建，不改变数据语义。
+     *
+     * <p>做成一个对象而不是四个散参数：源与目标各一组，散参数在这条已经有 19 个参数的
+     * 调用链上极易接反，而"接反"的表现是目标端用了源端的证书——报错会指向证书本身，很难查。
+     */
+    public static class SslOptions {
+        private final String sourceMode;
+        private final String sourceCertId;
+        private final String targetMode;
+        private final String targetCertId;
+
+        public SslOptions(String sourceMode, String sourceCertId, String targetMode, String targetCertId) {
+            this.sourceMode = sourceMode;
+            this.sourceCertId = sourceCertId;
+            this.targetMode = targetMode;
+            this.targetCertId = targetCertId;
+        }
+
+        boolean isEmpty() {
+            return blank(sourceMode) && blank(sourceCertId) && blank(targetMode) && blank(targetCertId);
+        }
+
+        private static boolean blank(String s) {
+            return s == null || s.trim().isEmpty();
+        }
+    }
+
+    /** 档位归一。非法值当场拒绝——宽容处理的结果是明文，而用户以为自己开了加密。 */
+    static String resolveSslMode(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return "DISABLED";
+        }
+        String v = raw.trim().toUpperCase();
+        switch (v) {
+            case "DISABLED":
+            case "PREFERRED":
+            case "REQUIRED":
+            case "VERIFY_CA":
+            case "VERIFY_IDENTITY":
+                return v;
+            default:
+                throw new RuntimeException("非法的 SSL 档位: " + raw
+                        + "（可选 DISABLED / PREFERRED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY）");
+        }
+    }
+
     @Transactional
     public Workflow updateConfig(String workflowId, Long userId, String sourceConnection, String targetConnection,
                                   String migrationMode, String syncObjects, String sourceDbName,
@@ -409,6 +458,21 @@ public class WorkflowService {
                                   Boolean fanoutEnabled, String targetConnections,
                                   Boolean syncAccount, Boolean syncAccountSuperPrivilege,
                                   String consistencyMode, FullLoadOptions fullLoad) {
+        return updateConfig(workflowId, userId, sourceConnection, targetConnection, migrationMode, syncObjects,
+                sourceDbName, targetDbName, sourceType, targetType, kafkaBootstrapServers, kafkaTopicPrefix,
+                kafkaTopicStrategy, subscribeFormat, fanoutEnabled, targetConnections,
+                syncAccount, syncAccountSuperPrivilege, consistencyMode, fullLoad, null);
+    }
+
+    @Transactional
+    public Workflow updateConfig(String workflowId, Long userId, String sourceConnection, String targetConnection,
+                                  String migrationMode, String syncObjects, String sourceDbName,
+                                  String targetDbName, String sourceType, String targetType,
+                                  String kafkaBootstrapServers, String kafkaTopicPrefix,
+                                  String kafkaTopicStrategy, String subscribeFormat,
+                                  Boolean fanoutEnabled, String targetConnections,
+                                  Boolean syncAccount, Boolean syncAccountSuperPrivilege,
+                                  String consistencyMode, FullLoadOptions fullLoad, SslOptions ssl) {
         Workflow workflow = getWorkflowById(workflowId, userId);
 
         if (workflow.getStatus() != WorkflowStatus.CONFIGURING) {
@@ -468,6 +532,33 @@ public class WorkflowService {
                     workflow.getBulkLoadMode(),
                     Boolean.FALSE.equals(workflow.getBulkLoadEnabled()) ? "已关闭" : "启用",
                     workflow.getSnapshotMode()));
+        }
+
+        // 传输加密档位与证书：与装载档位同类，只在 CONFIGURING 放行（上面已挡）
+        if (ssl != null && !ssl.isEmpty()) {
+            if (ssl.sourceMode != null) {
+                workflow.setSourceSslMode(resolveSslMode(ssl.sourceMode));
+            }
+            if (ssl.targetMode != null) {
+                workflow.setTargetSslMode(resolveSslMode(ssl.targetMode));
+            }
+            // 证书 id 允许显式置空（用户把 SSL 关掉了）：传空串 = 清除，不传 = 不动。
+            if (ssl.sourceCertId != null) {
+                workflow.setSourceSslCertId(ssl.sourceCertId.trim().isEmpty() ? null : ssl.sourceCertId.trim());
+            }
+            if (ssl.targetCertId != null) {
+                workflow.setTargetSslCertId(ssl.targetCertId.trim().isEmpty() ? null : ssl.targetCertId.trim());
+            }
+            // 关掉加密时顺手把证书引用也清掉，避免"档位 DISABLED 但还挂着证书"这种
+            // 看起来配了、实际没生效的中间态误导人
+            if ("DISABLED".equals(workflow.getSourceSslMode())) {
+                workflow.setSourceSslCertId(null);
+            }
+            if ("DISABLED".equals(workflow.getTargetSslMode())) {
+                workflow.setTargetSslCertId(null);
+            }
+            addLog(workflowId, WorkflowLog.LogLevel.INFO, String.format(
+                    "传输加密档位: 源=%s，目标=%s", workflow.getSourceSslMode(), workflow.getTargetSslMode()));
         }
 
         // 路由与其余配置的兼容性要在<b>改完之后</b>再判一次：用户完全可能先存好路由配置，
@@ -564,6 +655,13 @@ public class WorkflowService {
             child.setBulkLoadEnabled(parent.getBulkLoadEnabled());
             child.setBulkLoadMode(parent.getBulkLoadMode());
             child.setSnapshotMode(parent.getSnapshotMode());
+            // 加密配置继承父任务：目标端本来就是同一个库，源端各 leg 是同构的多个实例
+            // （分库分表的分片），用同一套 CA 是常态。leg 的源实例若要用不同证书，
+            // 派生后单独改这条子任务即可——但默认继承好过默认明文。
+            child.setSourceSslMode(parent.getSourceSslMode());
+            child.setSourceSslCertId(parent.getSourceSslCertId());
+            child.setTargetSslMode(parent.getTargetSslMode());
+            child.setTargetSslCertId(parent.getTargetSslCertId());
             Object legSyncObjects = leg.get("syncObjects");
             child.setSyncObjects(legSyncObjects != null ? gson.toJson(legSyncObjects) : parent.getSyncObjects());
             // 子任务的路由配置不再带 legs（否则会递归派生），并钉上自己的 nodeId
@@ -729,6 +827,13 @@ public class WorkflowService {
             shadow.setTargetType(workflow.getSourceType());
             shadow.setSourceDbName(workflow.getTargetDbName());
             shadow.setTargetDbName(workflow.getSourceDbName());
+            // 加密配置同样要**对调**（影子通道是 B→A，正向的目标端就是它的源端）。
+            // 漏掉这四行的表现是：正向两端都加密、反向通道<b>整条明文</b>，而双向灾备的
+            // 反向通道搬的是同一批业务数据——任务全绿，没有任何报错。
+            shadow.setSourceSslMode(workflow.getTargetSslMode());
+            shadow.setTargetSslMode(workflow.getSourceSslMode());
+            shadow.setSourceSslCertId(workflow.getTargetSslCertId());
+            shadow.setTargetSslCertId(workflow.getSourceSslCertId());
             // 反向通道必须与正向同一套一致性语义：两个方向语义不同的双活，
             // 一边保事务、一边打散并发，冲突裁决的输入就不是同一个"事务视图"了
             shadow.setConsistencyMode(workflow.getConsistencyMode());
@@ -761,10 +866,10 @@ public class WorkflowService {
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务启动中，状态: 启动中");
 
         try {
-            kafkaProducerService.sendTaskCreatedMessage(workflow);
+            kafkaProducerService.sendTaskCreatedMessage(workflow, ex -> markDispatchFailed(workflowId, ex));
             addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务消息已发送到 Kafka topic: sync-task-created，等待任务执行服务处理");
         } catch (Exception e) {
-            addLog(workflowId, WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
+            markDispatchFailed(workflowId, e);
         }
 
         // 各条 leg 与父任务同时启动：它们是彼此独立的采集管线，没有先后依赖
@@ -773,11 +878,15 @@ public class WorkflowService {
             leg.setStatus(WorkflowStatus.PENDING);
             agentClusterService.assign(leg);
             workflowRepository.save(leg);
+            String legId = leg.getId();
             try {
-                kafkaProducerService.sendTaskCreatedMessage(leg);
+                kafkaProducerService.sendTaskCreatedMessage(leg, ex -> markDispatchFailed(legId, ex));
             } catch (Exception e) {
-                addLog(workflowId, WorkflowLog.LogLevel.WARNING,
-                        "来源通道 " + leg.getName() + " 的 Kafka 消息发送失败: " + e.getMessage());
+                // 这条 leg 自己置 FAILED（它是一个独立的采集管线）；父任务上也留一条，
+                // 否则只看父任务会以为一切正常
+                markDispatchFailed(legId, e);
+                addLog(workflowId, WorkflowLog.LogLevel.ERROR,
+                        "来源通道 " + leg.getName() + " 的派发消息发送失败: " + e.getMessage());
             }
         }
 
@@ -922,6 +1031,8 @@ public class WorkflowService {
         message.setTargetDbName(w.getTargetDbName());
         message.setTaskType(w.getTaskType());
         message.setConsistencyMode(w.getConsistencyMode());
+        message.applySsl(w.getSourceSslMode(), w.getSourceSslCertId(),
+                w.getTargetSslMode(), w.getTargetSslCertId(), false);
         message.setDrMode(w.getDrMode());
         message.setSyncObjects(parseSyncObjects(w.getSyncObjects()));
         // 控制消息（stop/resume/terminate/delete）同样定向：任务在哪台 agent 上跑，就只让那台处理
@@ -1029,6 +1140,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
 
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -1071,6 +1184,8 @@ public class WorkflowService {
         message.setTargetDbName(workflow.getTargetDbName());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -1099,6 +1214,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         
         try {
             kafkaProducerService.sendControlMessage(message);
@@ -1162,11 +1279,12 @@ public class WorkflowService {
             // 消息体由 sendTaskCreatedMessage(workflow) 内部构建（与首次启动同一条路径），
             // 此处不再手工拼装 TaskCreatedMessage——曾有一份拼装后从未发送的死代码，
             // 改字段只改到死代码上不会生效，故删除。
+            String retryId = workflow.getId();
             try {
-                kafkaProducerService.sendTaskCreatedMessage(workflow);
-                addLog(workflow.getId(), WorkflowLog.LogLevel.INFO, "任务重试消息已发送到 Kafka，等待任务执行服务处理");
+                kafkaProducerService.sendTaskCreatedMessage(workflow, ex -> markDispatchFailed(retryId, ex));
+                addLog(retryId, WorkflowLog.LogLevel.INFO, "任务重试消息已发送到 Kafka，等待任务执行服务处理");
             } catch (Exception e) {
-                addLog(workflow.getId(), WorkflowLog.LogLevel.WARNING, "Kafka 消息发送失败: " + e.getMessage());
+                markDispatchFailed(retryId, e);
             }
         }
 
@@ -1204,6 +1322,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
         if (skipSeqnos != null && !skipSeqnos.isEmpty()) {
             message.setSkipSeqnos(skipSeqnos);
         }
@@ -1380,7 +1500,7 @@ public class WorkflowService {
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/diagnostics/" + id);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("GET");
             if (agentToken != null && !agentToken.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + agentToken);
@@ -1432,7 +1552,8 @@ public class WorkflowService {
      * 单机部署行为不变。
      */
     private String agentBaseUrlFor(String taskId) {
-        String fallback = System.getenv().getOrDefault("AGENT_BASE_URL", "http://localhost:8083");
+        String fallback = System.getenv().getOrDefault("AGENT_BASE_URL",
+                com.synctask.util.AgentHttpSupport.scheme() + "://localhost:8083");
         if (taskId == null) {
             return fallback;
         }
@@ -1458,7 +1579,7 @@ public class WorkflowService {
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + path);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("GET");
             if (agentToken != null && !agentToken.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + agentToken);
@@ -1486,7 +1607,7 @@ public class WorkflowService {
         String agentToken = System.getenv("AGENT_API_TOKEN");
         try {
             java.net.URL url = new java.net.URL(agentBase + "/api/agent/deadletter/" + id);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("GET");
             if (agentToken != null && !agentToken.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + agentToken);
@@ -1521,6 +1642,50 @@ public class WorkflowService {
             return gson.fromJson(syncObjects, type);
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    /**
+     * 派发消息没投出去 → 任务置 FAILED 并带上错误码。
+     *
+     * <p>改造前这里只 {@code addLog(WARNING, "Kafka 消息发送失败")}，任务状态留在 PENDING、
+     * HTTP 照常返回成功。而"消息没投出去"意味着执行端从未收到它，任务**永远不会开始跑** ——
+     * 页面上只看到一个永远"启动中"的任务，没人知道该重启它。实际发生过一次：
+     * Kafka 比后端晚起了一分钟，任务就此卡在 PENDING。
+     *
+     * <p><b>只在状态还是 PENDING 时才改</b>：异步失败回调可能来得很晚，那时任务也许已经被
+     * 执行端接走并跑起来了（比如重试成功、或另一条路径的消息投达），绝不能把一个正在跑的
+     * 任务打成 FAILED。
+     */
+    @Transactional
+    public void markDispatchFailed(String workflowId, Throwable ex) {
+        String reason = ex == null ? "未知原因"
+                : (ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName());
+        try {
+            Workflow current = workflowRepository.findById(workflowId).orElse(null);
+            if (current == null) {
+                logger.warn("派发失败但任务已不存在: taskId={}, 原因={}", workflowId, reason);
+                return;
+            }
+            if (current.getStatus() != WorkflowStatus.PENDING) {
+                // 已经被执行端接走了，说明消息其实投达（或另一条路径成功了），不动它
+                logger.warn("派发消息发送失败，但任务状态已是 {}，不改状态: taskId={}, 原因={}",
+                        current.getStatus(), workflowId, reason);
+                addLog(workflowId, WorkflowLog.LogLevel.WARNING,
+                        "派发消息发送失败（任务已在运行，未改状态）: " + reason);
+                return;
+            }
+            current.setStatus(WorkflowStatus.FAILED);
+            current.setErrorCode(SyncErrorCode.TASK_DISPATCH_FAILED.getCode());
+            current.setErrorMessage("任务派发消息发送失败: " + reason);
+            workflowRepository.save(current);
+            logger.error("任务派发消息发送失败，任务置为 FAILED: taskId={}, 原因={}", workflowId, reason);
+            addLog(workflowId, WorkflowLog.LogLevel.ERROR,
+                    "任务派发消息发送失败，执行端从未收到该任务，已置为失败（"
+                            + SyncErrorCode.TASK_DISPATCH_FAILED.getCode() + "）: " + reason);
+        } catch (Exception e) {
+            // 这里再抛就会把调用方（可能是 Kafka 生产者的回调线程）一起带走
+            logger.error("标记任务派发失败时出错: taskId={}", workflowId, e);
         }
     }
 
@@ -1571,6 +1736,13 @@ public class WorkflowService {
         String originalTargetType = workflow.getTargetType();
         String originalSourceDbName = workflow.getSourceDbName();
         String originalTargetDbName = workflow.getTargetDbName();
+        // 加密配置必须跟着连接一起换：它描述的是"连某个库要用什么证书"，
+        // 换了源/目标却不换证书，倒换后新源会拿旧源的证书去连——
+        // 报错会指向证书本身（CN 不匹配 / 不是该 CA 签发），极难联想到是倒换导致的。
+        String originalSourceSslMode = workflow.getSourceSslMode();
+        String originalTargetSslMode = workflow.getTargetSslMode();
+        String originalSourceSslCertId = workflow.getSourceSslCertId();
+        String originalTargetSslCertId = workflow.getTargetSslCertId();
 
         workflow.setSourceConnection(originalTarget);
         workflow.setTargetConnection(originalSource);
@@ -1578,6 +1750,10 @@ public class WorkflowService {
         workflow.setTargetType(originalSourceType);
         workflow.setSourceDbName(originalTargetDbName);
         workflow.setTargetDbName(originalSourceDbName);
+        workflow.setSourceSslMode(originalTargetSslMode);
+        workflow.setTargetSslMode(originalSourceSslMode);
+        workflow.setSourceSslCertId(originalTargetSslCertId);
+        workflow.setTargetSslCertId(originalSourceSslCertId);
 
         workflow.setStatus(WorkflowStatus.SWITCHING);
         workflow.setDrStatus("SWITCHING");
@@ -1604,6 +1780,8 @@ public class WorkflowService {
         message.setTargetType(workflow.getTargetType());
         message.setTaskType(workflow.getTaskType());
         message.setConsistencyMode(workflow.getConsistencyMode());
+        message.applySsl(workflow.getSourceSslMode(), workflow.getSourceSslCertId(),
+                workflow.getTargetSslMode(), workflow.getTargetSslCertId(), false);
 
         final String logWorkflowId = workflowId;
         org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
@@ -1687,7 +1865,7 @@ public class WorkflowService {
         Map<String, Object> out = new java.util.LinkedHashMap<>();
         try {
             java.net.HttpURLConnection conn =
-                    (java.net.HttpURLConnection) new java.net.URL(agentUrl).openConnection();
+                    com.synctask.util.AgentHttpSupport.open(agentUrl);
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
             if (agentToken != null && !agentToken.isEmpty()) {
@@ -1732,7 +1910,7 @@ public class WorkflowService {
         String agentUrl = agentBase + "/api/agent/failover";
         try {
             java.net.URL url = new java.net.URL(agentUrl);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            java.net.HttpURLConnection conn = com.synctask.util.AgentHttpSupport.open(url.toString());
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
             if (agentToken != null && !agentToken.isEmpty()) {

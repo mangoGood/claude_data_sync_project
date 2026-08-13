@@ -15,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -235,11 +236,19 @@ class TiCDCExtractorTest {
         assertNotNull(extract(record("TICDC_INSERT", 1001, 1700000000000L, 7, later)), "晚于位点应保留");
     }
 
+    /**
+     * 契约已变更（2026-08-11）：这两种记录以前是"安全跳过"，现在是停机。
+     *
+     * <p>跳过看着安全，实则是静默丢数据 —— 记录用不了但位点照常前进，它承载的那条变更
+     * 永久消失且任务全绿。与 MySQL 链路的 {@code extract.unknown.event.policy} 对齐后，
+     * 默认停下来让人处置。细分场景见 {@link TiCDCUnknownEventTest}。
+     */
     @Test
-    @DisplayName("字段数不足或 JSON 非法的记录被安全跳过，不影响后续事件")
-    void malformedRecords() throws Exception {
-        assertNull(extract("TICDC_INSERT" + FS + "tidb-binlog" + FS + "1"));
-        assertNull(extract(record("TICDC_INSERT", 1, 1L, 1, "{not json")));
-        assertTrue(true);
+    @DisplayName("字段数不足或 JSON 非法的记录：停机上报，不再静默跳过")
+    void malformedRecordsFailStop() {
+        assertThrows(MySQLBinlogExtractor.UnsupportedBinlogEventException.class,
+                () -> extract("TICDC_INSERT" + FS + "tidb-binlog" + FS + "1"));
+        assertThrows(MySQLBinlogExtractor.UnsupportedBinlogEventException.class,
+                () -> extract(record("TICDC_INSERT", 1, 1L, 1, "{not json")));
     }
 }

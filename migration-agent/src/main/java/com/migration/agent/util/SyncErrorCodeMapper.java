@@ -42,6 +42,19 @@ public class SyncErrorCodeMapper {
         }
         String msg = failureMessage.toLowerCase();
 
+        // TLS 相关必须排在最前：驱动会把握手失败包成"网络不可达/连接失败"，
+        // 落到那些泛化规则上会把人指去查地址端口——而地址端口完全是对的。
+        if (msg.contains("要求加密") || msg.contains("实际未加密") || msg.contains("ssl_not_encrypted")) return "E5007";
+        if (msg.contains("证书") && (msg.contains("已被删除") || msg.contains("材料")
+                || msg.contains("物化失败") || msg.contains("不受支持") || msg.contains("无法解析"))) return "E5008";
+        if (msg.contains("证书") && (msg.contains("校验失败") || msg.contains("主机名")
+                || msg.contains("过期") || msg.contains("链"))) return "E5006";
+        if (msg.contains("certpathvalidator") || msg.contains("trust anchors")
+                || msg.contains("unable to find valid certification path")) return "E5006";
+        if (msg.contains("tls") && (msg.contains("握手") || msg.contains("handshake"))) return "E5005";
+        if (msg.contains("sslhandshakeexception") || msg.contains("ssl connection required")
+                || msg.contains("不支援 ssl") || msg.contains("不支持 ssl")) return "E5005";
+
         if (msg.contains("源数据库配置为空")) return "E5001";
         if (msg.contains("目标数据库配置为空")) return "E5002";
         if (msg.contains("连接串") && msg.contains("解析")) return "E5003";

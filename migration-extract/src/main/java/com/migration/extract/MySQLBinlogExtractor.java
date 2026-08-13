@@ -174,8 +174,9 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
     }
 
     private void connectToSourceDatabase() throws SQLException {
-        String url = "jdbc:mysql://" + sourceHost + ":" + sourcePort +
-                "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+        String url = "jdbc:mysql://" + sourceHost + ":" + sourcePort + "/?"
+                + com.migration.common.ssl.SslMaterial.from(props, "source").mysqlUrlParams()
+                + "&serverTimezone=UTC&characterEncoding=UTF-8";
         sourceConnection = ConnectionPoolManager.getConnection(url, sourceUser, sourcePassword);
         logger.info("Connected to source database: {}:{}", sourceHost, sourcePort);
     }

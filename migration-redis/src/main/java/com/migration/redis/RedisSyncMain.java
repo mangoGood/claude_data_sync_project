@@ -186,6 +186,7 @@ public final class RedisSyncMain {
                 // 这里禁用 replicator 内部无限重试，让致命错误快速冒泡为任务失败。
                 .setRetries(1);
         applyAuth(conf, "source");
+        applyReplicatorSsl(conf, "source");
         replConfiguration = conf;
         tryResumeFromPersistedOffset(conf);
 
@@ -483,7 +484,56 @@ public final class RedisSyncMain {
         if (password != null && !password.isEmpty()) {
             cfg.password(password);
         }
+        applySsl(cfg, prefix);
         return new Jedis(new HostAndPort(host, port), cfg.build());
+    }
+
+    /**
+     * Jedis 命令通道的传输加密。
+     *
+     * <p><b>注意 Redis 这条链路有两条独立连接</b>：这里的命令通道（读写键值、FLUSH、RESTORE），
+     * 以及 redis-replicator 的 PSYNC 复制通道（{@link #applyReplicatorSsl}）。
+     * 后者才是搬全量 RDB 与增量命令流的那条——只加密其中一条的结果是
+     * "控制命令加密、业务数据明文"，而两处看起来都配好了。
+     */
+    private void applySsl(DefaultJedisClientConfig.Builder cfg, String prefix) {
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(props, prefix);
+        if (!ssl.enabled()) {
+            return;
+        }
+        try {
+            cfg.ssl(true).sslSocketFactory(ssl.sslContext().getSocketFactory());
+            if (!ssl.verifyIdentity()) {
+                // 档位低于 VERIFY_IDENTITY 时不校验主机名，与 MySQL/PG 的语义一致
+                cfg.hostnameVerifier((hostname, session) -> true);
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Redis 命令通道传输加密材料装配失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * PSYNC 复制通道的传输加密——真正搬数据的那条。
+     *
+     * <p>Redis 的 TLS 是<b>独立端口</b>（{@code --tls-port}），不是同端口协商。
+     * 因此源端开了 TLS 就要把连接串里的端口改成 TLS 端口，这里只负责把加密材料装上去。
+     */
+    private void applyReplicatorSsl(Configuration conf, String prefix) {
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(props, prefix);
+        if (!ssl.enabled()) {
+            return;
+        }
+        try {
+            conf.setSsl(true).setSslSocketFactory(ssl.sslContext().getSocketFactory());
+            if (!ssl.verifyIdentity()) {
+                conf.setHostnameVerifier((hostname, session) -> true);
+            }
+            logger.info("Redis 复制通道(PSYNC)已启用传输加密: mode={}", ssl.mode());
+        } catch (Exception e) {
+            throw new IllegalStateException("Redis 复制通道传输加密材料装配失败: " + e.getMessage(), e);
+        }
     }
 
     /** 源端认证注入 redis-replicator：单参/双参 AUTH 语义与 {@link #buildJedis} 保持一致。 */

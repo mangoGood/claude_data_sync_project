@@ -434,6 +434,9 @@
             'E3022': { desc: '表结构时序库缺少该位点的版本', solution: '时序库里没有这条事件所在位点的表结构版本，无法按"事件当时"的结构解析。常见原因：任务建于时序库启用之前（缺基线）、该表基线推不出结构被标记不可用（如 CREATE TABLE ... AS SELECT）、跨机接管时时序库没随位点一起回灌。降级回查源库当前定义等于退回"用现在的结构解释过去的事件"，因此在 extract.schema.timeline.fallback=FAIL_STOP 下停止抽取；允许降级时改为 RESNAPSHOT' },
             'E3023': { desc: 'DDL 解析失败（表结构时序库）', solution: '时序库解析不了这条 DDL，无法把它施加到表结构模型上，该表之后的版本都会失准，通常意味着遇到了语法覆盖之外的 DDL 形态。错误信息里带原始语句，请据此补语法；补齐之前该表按 extract.schema.timeline.fallback 降级回查源库当前定义（RESNAPSHOT）或停止抽取（FAIL_STOP）' },
             'E3024': { desc: '表结构版本与事件列名不一致', solution: '时序库算出的列布局与 binlog 事件自带的列名（binlog_row_metadata=FULL）对不上，说明时序库跟丢了源库真实结构，多半是某条 DDL 被漏施加或施加错了。事件列名是与行值同一时刻的权威信息，两者矛盾时硬解就是整行错位的静默数据损坏，因此已停止抽取。请对照错误信息里的两份列清单与该表 DDL 历史，把漏掉的形态补进语法' },
+            'E3025': { desc: 'WAL 事件缺少必需的列值', solution: 'PostgreSQL 逻辑复制对行外存储（TOAST）里本次未修改的列不发送值，只发一个"未变更"标记。这类列会被整列从 UPDATE 的 SET 里摘掉（写 NULL 会抹掉目标端已有的大字段），但它落在主键上、或该表无主键而 WHERE 需要整行前镜像时就定位不出目标行。请给该表建主键，或把 REPLICA IDENTITY 设为 FULL 后重启任务' },
+            'E3027': { desc: '捕获流长时间中断', solution: '捕获进程还活着，但与源库的复制流断开很久且没能恢复，这段时间一条变更都没抓到。进程级活性心跳在这种状态下照常刷新、看门狗看不出异常，所以单独上报。常见原因：源库重启/网络中断、复制槽被占用或删除、账号权限被回收。请检查源库与网络后重启任务；判定时长用 capture.stream.down.report.ms 调整' },
+            'E3026': { desc: '数据变更事件未生成任何 SQL', solution: '一条 INSERT/UPDATE/DELETE 事件转换后一条 SQL 都没生成，说明事件里缺库表名或行数据，上游解析退化了。照常提交并推进位点等于把这条变更静默丢掉，因此停下等人处置。请看日志里同一 seqno 前后的 extract 告警定位上游原因；确认可丢弃时把 increment.empty.statement.policy 设为 SKIP' },
             'E3014': { desc: '位点回灌失败', solution: '本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管；按首次启动去取源库当前位点会静默跳过崩溃到接管之间的全部变更，因此任务停在这里。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务' },
             'E3101': { desc: 'Elastic同步进程启动失败', solution: '请检查Agent日志，确认elastic模块JAR包存在且配置正确' },
             'E3102': { desc: 'Elastic同步失败', solution: '请检查Agent日志，确认Elasticsearch连接正常、索引可写且源库binlog可访问' },
@@ -444,6 +447,11 @@
             'E5001': { desc: '源数据库配置为空', solution: '请检查任务创建时源数据库连接信息是否填写完整' },
             'E5002': { desc: '目标数据库配置为空', solution: '请检查任务创建时目标数据库连接信息是否填写完整' },
             'E5003': { desc: '连接串解析失败', solution: '请检查连接串格式是否正确，正确格式: mysql://user:pass@host:port 或 postgresql://user:pass@host:port 或 oracle://user:pass@host:port/service 或 mongodb://user:pass@host:port 或 elastic://user:pass@host:port 或 redis://user:pass@host:port' },
+            'E5004': { desc: '任务派发消息发送失败', solution: '任务的启动消息没能投进 Kafka，执行端从未收到它，因此任务不会开始跑。最常见的原因是 Kafka 未启动或地址不通（报文里通常是 "Broker may not be available" 或 "Topic ... not present in metadata"）。请确认 Kafka 已启动、spring.kafka.bootstrap-servers 指向正确的地址，然后重新启动该任务' },
+            'E5005': { desc: 'TLS 握手失败', solution: '请确认服务端已开启 SSL（MySQL: have_ssl=YES；PostgreSQL: postgresql.conf 设 ssl=on）、连接端口是 TLS 端口（Oracle 的 TCPS 通常是 2484 而非 1521），以及所选证书与该服务端匹配' },
+            'E5006': { desc: '证书校验失败', solution: '服务端证书不是所选 CA 签发的、证书链不完整、或证书已过期。若档位是 VERIFY_IDENTITY，还要求证书的 CN/SAN 与所填主机名完全一致——用 IP 连接而证书里写的是域名时会失败，可改用证书上的主机名、给证书补 SAN，或把档位降到 VERIFY_CA' },
+            'E5007': { desc: '要求加密但连接实际未加密', solution: '任务档位是 REQUIRED 及以上，但从服务端读到的加密状态是明文。通常是服务端未开启 SSL、或连的是非 TLS 端口。注意 PREFERRED 在服务端不支持时会静默退回明文，若必须加密请改用 REQUIRED 及以上' },
+            'E5008': { desc: '证书材料不可用', solution: '任务引用的证书已被删除、私钥格式不受支持（带口令的私钥需先解密：openssl pkcs8 -topk8 -nocrypt -in key.pem -out key-plain.pem），或证书库口令解密失败（检查 SYNCTASK_MASTER_KEY 与建证书时是否一致）' },
             'E9999': { desc: '未知错误', solution: '请查看Agent日志获取详细错误信息，或联系技术支持' }
         };
 
@@ -3880,7 +3888,14 @@
 
                 cfgUpdateDbNameRows();
                 cfgUpdateStepUI();
-                
+
+                // 传输加密面板：先渲染再回填已保存的档位/证书。
+                // 未配过的任务回填的是 DISABLED，面板保持折叠，第 1 步的外观与以前一致。
+                sslRenderPanel('cfgSource', '源数据库');
+                sslRenderPanel('cfgTarget', '目标数据库');
+                sslSetConfig('cfgSource', task.source_ssl_mode, task.source_ssl_cert_id);
+                sslSetConfig('cfgTarget', task.target_ssl_mode, task.target_ssl_cert_id);
+
                 document.getElementById('cfgValidationResult').innerHTML = '<div class="validation-empty">请点击"开始校验"按钮进行数据库同步条件检查</div>';
                 
                 cfgCompareDiffPage = 0;
@@ -4039,6 +4054,10 @@
                 }
             }
 
+            // VERIFY_CA / VERIFY_IDENTITY 必须有证书，否则连到建连时才报错
+            errors = errors.concat(
+                sslValidate(prefix, type === 'source' ? '源数据库' : '目标数据库'));
+
             return errors;
         }
 
@@ -4068,10 +4087,17 @@
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 20000);
             
+            // 测连必须带上加密配置：测的就得是任务将来真正会用的那套参数，
+            // 否则会出现"测连绿了、任务起不来"这种最没帮助的结果。
+            const sslCfg = sslGetConfig('cfg' + capitalize(type));
+
             fetchWithAuth(`${API_BASE_URL}/metadata/test-connection`, {
                 method: 'POST',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({ sourceConnection: connection, dbType: dbType }),
+                body: JSON.stringify({
+                    sourceConnection: connection, dbType: dbType,
+                    sslMode: sslCfg.mode, sslCertId: sslCfg.certId
+                }),
                 signal: controller.signal
             })
             .then(response => response.json())
@@ -4080,7 +4106,9 @@
                 testBtn.disabled = false;
                 if (result.success && result.data && result.data.connected) {
                     statusDiv.className = 'connection-status success';
-                    statusDiv.textContent = '✓ 连接成功';
+                    // 加密状态来自服务端（MySQL 的 Ssl_cipher / PG 的 pg_stat_ssl），
+                    // 不是我们自己的配置回显——这是"确实加密了"的唯一凭据
+                    statusDiv.innerHTML = '<div>✓ 连接成功</div>' + sslRenderTlsBadge(result.data);
                     cfgConnectionTestStatus[type] = true;
                 } else if (result.success && result.data && !result.data.connected) {
                     statusDiv.className = 'connection-status error';
@@ -4092,9 +4120,13 @@
                     else if (errorType === 'NETWORK_ERROR') displayMsg = '✗ 网络错误：无法连接到数据库服务器';
                     else if (errorType === 'DB_TYPE_MISMATCH') displayMsg = '✗ 类型不匹配：' + errorMsg;
                     else if (errorType === 'TIMEOUT') displayMsg = '✗ 连接超时：20秒内未连接到数据库服务器';
+                    else if (errorType === 'SSL_HANDSHAKE_FAILED') displayMsg = '✗ TLS 握手失败：' + errorMsg;
+                    else if (errorType === 'SSL_CERT_INVALID') displayMsg = '✗ 证书校验失败：' + errorMsg;
+                    else if (errorType === 'SSL_NOT_ENCRYPTED') displayMsg = '✗ ' + errorMsg;
+                    else if (errorType === 'SSL_NOT_SUPPORTED') displayMsg = '✗ ' + errorMsg;
                     // 后端 errorMsg 已是完整描述（如"连接失败：xxx"），直接展示，避免"✗ 连接失败：连接失败："重复前缀
                     else displayMsg = '✗ ' + errorMsg.substring(0, 100);
-                    statusDiv.innerHTML = `<div>${displayMsg}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
+                    statusDiv.innerHTML = `<div>${displayMsg}</div>${sslRenderTlsBadge(result.data)}${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     cfgConnectionTestStatus[type] = false;
                 } else {
                     statusDiv.className = 'connection-status error';
@@ -4350,7 +4382,12 @@
                         // 全量装载/快照档位：任务未启动前可改（后端只在 CONFIGURING 状态放行）
                         bulkLoadEnabled: cfgReadBulkLoadEnabled(),
                         bulkLoadMode: cfgReadSelect('cfgBulkLoadMode', 'AUTO'),
-                        snapshotMode: cfgReadSelect('cfgSnapshotMode', 'GTID_ONLY')
+                        snapshotMode: cfgReadSelect('cfgSnapshotMode', 'GTID_ONLY'),
+                        // 传输加密：源/目标各自的档位与证书；未启用时下发 DISABLED + 空证书
+                        sourceSslMode: sslGetConfig('cfgSource').mode,
+                        sourceSslCertId: sslGetConfig('cfgSource').certId,
+                        targetSslMode: sslGetConfig('cfgTarget').mode,
+                        targetSslCertId: sslGetConfig('cfgTarget').certId
                     })
                 });
             } catch (error) {

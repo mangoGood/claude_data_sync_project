@@ -40,6 +40,8 @@ public class ContinuousIncrementMain {
     private RowRateLimiter rowRateLimiter;
     /** {@code increment.unique.conflict.policy} = FAIL_STOP（默认）| IGNORE */
     private String uniqueConflictPolicy = "FAIL_STOP";
+    /** 数据变更事件在文本路径下没生成任何 SQL 时的处置：FAIL_STOP（默认）/ SKIP。 */
+    private String emptyStatementPolicy = "FAIL_STOP";
 
     /**
      * 这条重复键错误是不是<b>主键</b>冲突。
@@ -283,6 +285,7 @@ public class ContinuousIncrementMain {
         // 旧行为把主键冲突（幂等重放，忽略正确）和唯一键冲突（目标端多了一条源端没有的约束，
         // 忽略即永久丢一行）混成了一类。
         uniqueConflictPolicy = props.getProperty("increment.unique.conflict.policy", "FAIL_STOP");
+        emptyStatementPolicy = props.getProperty("increment.empty.statement.policy", "FAIL_STOP");
         if (!rowRateLimiter.isUnlimited()) {
             logger.info("增量限速已启用: {} 行/秒（配额落到执行层，避免应用过快打挂源库）", maxRowsPerSec);
         }
@@ -399,29 +402,16 @@ public class ContinuousIncrementMain {
     }
 
     /**
-     * 目标库连接的 TLS 参数（{@code target.db.ssl.mode}，默认 DISABLED = 历史行为）。
+     * 目标库连接的 TLS 参数（{@code target.db.ssl.*}，默认 DISABLED = 历史行为）。
      *
-     * <p>这条 URL 是增量自己拼的，不走 {@code DatabaseConfig}，所以加密档位得在这里也认一次——
+     * <p>这条 URL 是增量自己拼的，不走 {@code DatabaseConfig}，所以加密材料得在这里也取一次——
      * 否则"配了 TLS"只对全量生效、增量还是明文，比不支持更糟（以为加密了其实没有）。
+     * 档位映射本身收在 {@link com.migration.common.ssl.SslMaterial}，不再各拼各的。
      */
     private String targetSslParams() {
-        String mode = props.getProperty("target.db.ssl.mode", "DISABLED").trim().toUpperCase();
-        String cert = props.getProperty("target.db.ssl.root.cert", "");
-        if (isPostgresql) {
-            String pg;
-            switch (mode) {
-                case "PREFERRED":       pg = "prefer"; break;
-                case "REQUIRED":        pg = "require"; break;
-                case "VERIFY_CA":       pg = "verify-ca"; break;
-                case "VERIFY_IDENTITY": pg = "verify-full"; break;
-                default:                pg = "disable";
-            }
-            return "sslmode=" + pg + (cert.isEmpty() || "disable".equals(pg) ? "" : "&sslrootcert=" + cert);
-        }
-        if ("DISABLED".equals(mode)) {
-            return "useSSL=false";
-        }
-        return "sslMode=" + mode + (cert.isEmpty() ? "" : "&trustCertificateKeyStoreUrl=file:" + cert);
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(props, "target");
+        return isPostgresql ? ssl.pgUrlParams() : ssl.mysqlUrlParams();
     }
 
     /** 目标库 JDBC URL（串行主连接与并行 worker 连接共用，避免 URL 口径漂移）。 */
@@ -447,6 +437,10 @@ public class ContinuousIncrementMain {
         targetConnection = ConnectionPoolManager.getConnection(url, targetUser, targetPassword);
         logger.info("已连接目标数据库: {}:{}/{} (类型: {})", targetHost, targetPort, targetDatabase,
                 isPostgresql ? "postgresql" : "mysql");
+        // 运行期取证：增量是长跑链路，一旦"以为加密其实明文"就是持续明文搬数据
+        com.migration.common.ssl.TlsEvidence.verify(targetConnection,
+                isPostgresql ? "postgresql" : "mysql",
+                com.migration.common.ssl.SslMaterial.from(props, "target"), "目标库");
         // MySQL 目标关闭本会话外键检查：增量按 binlog 顺序应用本身满足约束，但部分表同步/
         // 列过滤会破坏引用完整性（父行被过滤而子行保留），幂等重放（重试续传）也可能暂时乱序。
         // 与全量搬数会话保持一致语义；重连走同一入口，新会话自动重设。
@@ -717,15 +711,10 @@ public class ContinuousIncrementMain {
                     );
                     saveUnifiedApplyCheckpoint(event);
 
-                    if (event.getSourceTstamp() != null) {
-                        long rtoMs = System.currentTimeMillis() - event.getSourceTstamp().getTime();
-                        if (rtoMs >= 0) {
-                            lastRtoMs = rtoMs;
-                            lastRtoReportTime = System.currentTimeMillis();
-                            lastAppliedSourceTs = event.getSourceTstamp().getTime();
-                            writeRtoMetric(rtoMs);
-                            logger.debug("Heartbeat RTO: {}ms (seqno={})", rtoMs, event.getSeqno());
-                        }
+                    // 只有**源端时钟**的心跳才能用来算延迟。extract 空闲时合成的那条用的是本机时钟，
+                    // 拿它算恒得 ≈0 —— capture 死掉、extract 空转时面板会显示"延迟极低"而一条数据都没动。
+                    if (event.getSourceTstamp() != null && !isSyntheticHeartbeat(event)) {
+                        recordRto(event.getSourceTstamp().getTime(), event.getSeqno(), "心跳", false);
                     }
 
                     continue;
@@ -781,6 +770,16 @@ public class ContinuousIncrementMain {
                         break;
                     }
                     continue;
+                }
+
+                // 转换出 0 条 SQL 的数据变更事件绝不能照常提交推进位点
+                if (isSilentlyDropped(event, typedDmls, sqlStatements)) {
+                    aborted = true;
+                    running.set(false);
+                    break;
+                }
+                if (sqlStatements == null) {
+                    sqlStatements = java.util.Collections.emptyList();
                 }
 
                 // 逐事件一条同样是长跑的日志膨胀源（BEGIN/COMMIT 也各占一条），降到 DEBUG；
@@ -896,9 +895,26 @@ public class ContinuousIncrementMain {
                             String errorMsg = e.getMessage();
                             boolean isRecoverable = false;
 
-                            if (errorMsg != null && (errorMsg.contains("Duplicate entry") || errorMsg.contains("1062"))) {
-                                isRecoverable = true;
-                                logger.warn("重复键忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                            if (errorMsg != null && (errorMsg.contains("Duplicate entry")
+                                    || errorMsg.contains("duplicate key") || errorMsg.contains("1062"))) {
+                                // 与类型化路径同一套判定：主键冲突 = 幂等重放，忽略是对的；
+                                // **非主键唯一键**冲突不是——那是目标端有一条源端没有的约束把这一行挡住了，
+                                // 忽略掉就是永久丢一行。这条判定原先只加在类型化路径上，
+                                // 没走类型化管道的源→目标组合全从这个分支过，洞是活的
+                                if (isPrimaryKeyConflict(errorMsg)) {
+                                    isRecoverable = true;
+                                    logger.warn("主键重复忽略（幂等重放）(seqno={}): {}", event.getSeqno(), errorMsg);
+                                } else if ("IGNORE".equalsIgnoreCase(uniqueConflictPolicy)) {
+                                    isRecoverable = true;
+                                    logger.warn("唯一键冲突按策略忽略 (seqno={}): {}", event.getSeqno(), errorMsg);
+                                } else {
+                                    txFailed = true;
+                                    logger.error("唯一键冲突（非主键）(seqno={}): {}。"
+                                            + "目标端存在源端没有的唯一约束，忽略它会永久丢掉这一行",
+                                            event.getSeqno(), errorMsg);
+                                    writeErrorStatus("E3017", "唯一键冲突（非主键）: " + errorMsg, event);
+                                    break;
+                                }
                             } else if ((sqlUpper.startsWith("UPDATE") || sqlUpper.startsWith("DELETE"))
                                     && errorMsg != null
                                     && (errorMsg.contains("0 rows affected") || errorMsg.contains("not found"))) {
@@ -977,15 +993,10 @@ public class ContinuousIncrementMain {
                 String opType = determineOpTypeFromEvent(event, sqlStatements);
                 recordTableLatency(event, opType);
 
-                if (event.getSourceTstamp() != null) {
-                    long now = System.currentTimeMillis();
-                    long rtoMs = now - event.getSourceTstamp().getTime();
-                    lastAppliedSourceTs = event.getSourceTstamp().getTime();
-                    if (rtoMs >= 0 && (eventCount % RTO_REPORT_EVENT_INTERVAL == 0 || now - lastRtoReportTime > RTO_REPORT_INTERVAL_MS)) {
-                        lastRtoMs = rtoMs;
-                        lastRtoReportTime = now;
-                        writeRtoMetric(rtoMs);
-                    }
+                if (event.getSourceTstamp() != null
+                        && (eventCount % RTO_REPORT_EVENT_INTERVAL == 0
+                            || System.currentTimeMillis() - lastRtoReportTime > RTO_REPORT_INTERVAL_MS)) {
+                    recordRto(event.getSourceTstamp().getTime(), event.getSeqno(), "数据事件", true);
                 }
 
                 if (eventCount % 100 == 0) {
@@ -1285,11 +1296,12 @@ public class ContinuousIncrementMain {
         String url = isPostgresql
                 ? "jdbc:postgresql://" + node.getHost() + ":" + node.getPort() + "/"
                     + (node.getDatabase() == null || node.getDatabase().isEmpty()
-                        ? targetDatabase : node.getDatabase()) + "?stringtype=unspecified"
+                        ? targetDatabase : node.getDatabase()) + "?stringtype=unspecified&" + targetSslParams()
                 : "jdbc:mysql://" + node.getHost() + ":" + node.getPort() + "/"
                     + (node.getDatabase() == null || node.getDatabase().isEmpty()
                         ? targetDatabase : node.getDatabase())
-                    + "?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
+                    + "?" + targetSslParams()
+                    + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true";
         conn = ConnectionPoolManager.getConnection(url,
                 node.getUsername() != null ? node.getUsername() : targetUser,
                 node.getPassword() != null ? node.getPassword() : targetPassword);
@@ -1466,6 +1478,40 @@ public class ContinuousIncrementMain {
      * 会把所有类型化路径的事件误标为 UNKNOWN；这里优先看事件自身的类型，仅在缺失/不识别时才回退文本判断。
      */
     /** 是否为数据变更（INSERT/UPDATE/DELETE）事件——仅这类事件写 origin 标记；DDL/心跳等不写。 */
+    /**
+     * 一条数据变更事件走文本路径却一条 SQL 都没生成 —— 这是静默丢数的公共出口，必须停下。
+     *
+     * <p>{@link THLToSqlConverter} 的 INSERT/UPDATE/DELETE 三个入口各有"缺库表名"和"无行数据"
+     * 两条 {@code logger.warn} 完就返回空列表的路径。返回空列表之后这里的执行循环一次都不进，
+     * {@code txFailed} 保持 false，事务照常提交、位点照常推进 —— 上游任何一次解析退化
+     * （半行 .cap、TOAST 值缺失、列元数据查不到）都会在这里变成"一条 warn + 一行数据永久消失"。
+     *
+     * <p>只判**文本路径**（{@code typedDmls == null}）：类型化路径返回空列表是合法的，
+     * 列过滤把整行排除掉时本来就不该产生 SQL。
+     *
+     * @return true 表示应当停机
+     */
+    private boolean isSilentlyDropped(THLEvent event, List<ParameterizedDml> typedDmls,
+                                      List<String> sqlStatements) {
+        if (typedDmls != null || !isDataChangeEvent(event)) {
+            return false;
+        }
+        if (sqlStatements != null && !sqlStatements.isEmpty()) {
+            return false;
+        }
+        String detail = String.format("%s 事件未生成任何 SQL（seqno=%d, %s.%s），"
+                        + "继续提交会把这条变更静默丢掉",
+                event.getMetadata("event_type"), event.getSeqno(),
+                event.getMetadata("database_name"), event.getMetadata("table_name"));
+        if ("SKIP".equalsIgnoreCase(emptyStatementPolicy)) {
+            logger.error("{}（按 increment.empty.statement.policy=SKIP 放过）", detail);
+            return false;
+        }
+        logger.error("{}，停止应用", detail);
+        writeErrorStatus("E3026", detail, event);
+        return true;
+    }
+
     private boolean isDataChangeEvent(THLEvent event) {
         String t = (String) event.getMetadata("event_type");
         if (t == null) return false;
@@ -1752,6 +1798,60 @@ public class ContinuousIncrementMain {
         return sb.append("}}").toString();
     }
 
+    /** 该心跳的时间戳是否来自本机时钟（extract 空闲时合成的），不能用来算延迟。 */
+    private static boolean isSyntheticHeartbeat(THLEvent event) {
+        return Boolean.TRUE.equals(event.getMetadata().get("synthetic_heartbeat"));
+    }
+
+    /**
+     * 记一次端到端延迟。
+     *
+     * <p><b>负值不再静默丢弃</b>：旧实现是 {@code if (rtoMs >= 0)}，本机时钟比源库快时
+     * 每个样本都是负的、一个都不记，rto_metric 从此停在旧值上不动 —— 面板显示的是过期数字，
+     * 而不是"量不出来"。负值的真正含义是两端时钟没对齐（捕获端已按测得偏移折算，
+     * 还是负说明偏移没测到或抖动很大），这是需要有人知道的事实，所以打日志并按 0 上报。
+     *
+     * <p><b>数据事件优先于心跳</b>：心跳的时间戳是捕获端向源库取的"当前时间"，只覆盖
+     * capture→apply 这一段；数据事件带的是源库<b>提交时刻</b>，覆盖全程。有数据在流动时
+     * 让心跳去刷指标，会把真实的积压掩盖成一个漂亮的小数字 —— 实测过：capture 积压 12 秒，
+     * 每 2 秒一次的心跳把 12 秒的样本覆盖成了 1 秒。
+     *
+     * @param fromDataEvent true 表示样本来自真实数据事件（权威），false 表示来自心跳
+     */
+    private void recordRto(long sourceTsMs, long seqno, String what, boolean fromDataEvent) {
+        long now = System.currentTimeMillis();
+        if (!fromDataEvent && now - lastDataEventRtoMs < HEARTBEAT_YIELD_MS) {
+            // 刚刚才有数据事件报过延迟：以它为准，心跳这一次不说话
+            return;
+        }
+        long rtoMs = now - sourceTsMs;
+        lastAppliedSourceTs = sourceTsMs;
+        if (rtoMs < 0) {
+            if (now - lastNegativeRtoWarnMs > NEGATIVE_RTO_WARN_INTERVAL_MS) {
+                lastNegativeRtoWarnMs = now;
+                logger.warn("{}算出负延迟 {} ms（源端时间戳 {} 晚于本机当前时间 {}，seqno={}）："
+                                + "源库与本机时钟未对齐，请检查两端 NTP；本次按 0 上报",
+                        what, rtoMs, sourceTsMs, now, seqno);
+            }
+            rtoMs = 0;
+        }
+        lastRtoMs = rtoMs;
+        if (fromDataEvent) {
+            lastDataEventRtoMs = now;
+            lastRtoReportTime = now;
+        }
+        writeRtoMetric(rtoMs);
+        logger.debug("{} RTO: {}ms (seqno={})", what, rtoMs, seqno);
+    }
+
+    /** 最后一次由**数据事件**上报延迟的时刻；心跳在这之后的静默期内不抢话。 */
+    private volatile long lastDataEventRtoMs = 0;
+    /** 数据事件上报之后，心跳让路多久（要盖住数据事件自身的上报间隔）。 */
+    private static final long HEARTBEAT_YIELD_MS = 15000;
+
+    private volatile long lastNegativeRtoWarnMs = 0;
+    private static final long NEGATIVE_RTO_WARN_INTERVAL_MS = 60000;
+
     private void writeRtoMetric(long rtoMs) {
         String metricsDir = "./files/" + taskId + "/binlog_output";
         File dir = new File(metricsDir);
@@ -2031,6 +2131,14 @@ public class ContinuousIncrementMain {
                     if (!handleConvertFailure(event, convEx)) { aborted = true; break; }
                     continue;
                 }
+                // 与串行路径同：转换出 0 条 SQL 的数据变更事件停机，不能让它随批提交推进位点。
+                // 先把批里已转换的落库，位点才停在这条事件之前而不是把前面的一起丢掉
+                if (isSilentlyDropped(event, typedDmls, sqlStatements)) {
+                    flushBatch(batch);
+                    batch.clear();
+                    aborted = true;
+                    break;
+                }
                 batch.add(new WorkItem(event, typedDmls, sqlStatements));
             }
             if (!aborted) {
@@ -2074,6 +2182,11 @@ public class ContinuousIncrementMain {
         // 其余（DDL / 无表名的数据事件）：主线程转换 + 在 worker[0] 连接上串行应用
         List<ParameterizedDml> typedDmls = typedDmlConverter.convert(event);
         List<String> sqlStatements = (typedDmls == null) ? sqlConverter.convertToSql(event) : null;
+        // 无表名的数据事件正是从这儿过的：转不出 SQL 还 advanceCheckpoint 就是静默丢一行
+        if (isSilentlyDropped(event, typedDmls, sqlStatements)) {
+            running.set(false);
+            return false;
+        }
         Connection conn = parallelExecutor.conns[0];
         try {
             applyEventTx(event, conn, typedDmls, sqlStatements);

@@ -314,6 +314,11 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             document.getElementById('subSelectedObjectsList').innerHTML = '<div class="empty-selection">暂未选择任何对象</div>';
             document.getElementById('subValidationResult').innerHTML = '<div class="validation-empty">请点击"开始校验"按钮进行数据订阅条件检查</div>';
 
+            // 传输加密面板：源库一套（库的语汇），下游 Kafka 一套（Kafka 的语汇）。
+            // 两者不是一回事，共用一套"数据库档位"的说法会让人配错。
+            window.sslRenderPanel('subSource', '源数据库');
+            window.sslRenderPanel('subTarget', '下游 Kafka', { kafka: true });
+
             subUpdateStepUI();
             document.getElementById('createSubscribeTaskModal').classList.add('show');
 
@@ -342,6 +347,8 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 if (task.subscribe_format) {
                     document.getElementById('subscribeFormat').value = task.subscribe_format;
                 }
+                window.sslSetConfig('subSource', task.source_ssl_mode, task.source_ssl_cert_id);
+                window.sslSetConfig('subTarget', task.target_ssl_mode, task.target_ssl_cert_id);
                 if (task.sync_objects) {
                     try {
                         const syncObjects = JSON.parse(task.sync_objects);
@@ -478,10 +485,16 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 20000);
 
+            // 带上加密配置：测的必须是任务将来真正会用的那套参数
+            const sslCfg = window.sslGetConfig('subSource');
+
             fetchWithAuth(`${API_BASE_URL}/metadata/test-connection`, {
                 method: 'POST',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({ sourceConnection: connection, dbType: sourceType }),
+                body: JSON.stringify({
+                    sourceConnection: connection, dbType: sourceType,
+                    sslMode: sslCfg.mode, sslCertId: sslCfg.certId
+                }),
                 signal: controller.signal
             })
             .then(response => response.json())
@@ -490,13 +503,14 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 testBtn.disabled = false;
                 if (result.success && result.data && result.data.connected) {
                     statusDiv.className = 'connection-status success';
-                    statusDiv.textContent = '✓ 连接成功';
+                    // 加密状态取自服务端，不是配置回显
+                    statusDiv.innerHTML = '<div>✓ 连接成功</div>' + window.sslRenderTlsBadge(result.data);
                     subSourceTested = true;
                 } else {
                     statusDiv.className = 'connection-status error';
                     const errMsg = (result.data && result.data.errorMessage) ? result.data.errorMessage : (result.message || '无法连接到数据库');
                     const suggestion = (result.data && result.data.suggestion) ? result.data.suggestion : '';
-                    statusDiv.innerHTML = `<div>✗ 连接失败：${errMsg.substring(0, 80)}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
+                    statusDiv.innerHTML = `<div>✗ 连接失败：${errMsg.substring(0, 120)}</div>${window.sslRenderTlsBadge(result.data)}${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     subSourceTested = false;
                 }
             })
@@ -967,7 +981,13 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                         kafkaBootstrapServers: kafkaServers,
                         kafkaTopicPrefix: topicPrefix,
                         kafkaTopicStrategy: topicStrategy,
-                        subscribeFormat: format
+                        subscribeFormat: format,
+                        // 源库加密 + 下游 Kafka 加密（订阅任务的"目标端"就是 Kafka，
+                        // 档位在引擎侧映射成 security.protocol=SSL / PLAINTEXT）
+                        sourceSslMode: window.sslGetConfig('subSource').mode,
+                        sourceSslCertId: window.sslGetConfig('subSource').certId,
+                        targetSslMode: window.sslGetConfig('subTarget').mode,
+                        targetSslCertId: window.sslGetConfig('subTarget').certId
                     })
                 });
                 const data = await response.json();

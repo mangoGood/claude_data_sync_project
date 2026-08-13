@@ -247,7 +247,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         if (!Boolean.parseBoolean(props.getProperty("capture.position.precheck.enabled", "true"))) {
             return;
         }
-        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        String url = "jdbc:mysql://" + host + ":" + port + "/?" + sslParams() + "&serverTimezone=UTC&allowPublicKeyRetrieval=true";
         try (Connection conn = DriverManager.getConnection(url, user, password)) {
             if (gtidEnabled && gtidSet != null && !gtidSet.isEmpty()) {
                 verifyGtidNotPurged(conn);
@@ -511,6 +511,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         // 差异只有一处（见 StreamingBinaryLogClient 类注释 [PATCH-1]）。
         client = new StreamingBinaryLogClient(host, port, user, password);
         client.setServerId(serverId);
+        applySslToClient(client);
 
         // 反序列化模式改造：
         // 1) 符号感知 TIME2：连接器默认实现丢负号（-100:00:00 → +924:00:00），用自定义行反序列化器修正；
@@ -943,7 +944,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
 
         String url = "jdbc:mysql://" + host + ":" + port
-                + "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+                + "/?" + sslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8";
         int ok = 0;
         int failed = 0;
         try (Connection conn = DriverManager.getConnection(url, user, password)) {
@@ -990,7 +991,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
             return out;   // 全库捕获：范围未知，不打基线，由 CREATE TABLE / 降级路径兜底
         }
         String url = "jdbc:mysql://" + host + ":" + port
-                + "/?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8";
+                + "/?" + sslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8";
         try (Connection conn = DriverManager.getConnection(url, user, password)) {
             for (String db : syncedDatabases) {
                 try (java.sql.PreparedStatement ps = conn.prepareStatement(
@@ -1341,7 +1342,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         }
         lastRetentionCheckMs = now;
 
-        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        String url = "jdbc:mysql://" + host + ":" + port + "/?" + sslParams() + "&serverTimezone=UTC&allowPublicKeyRetrieval=true";
         try (Connection conn = DriverManager.getConnection(url, user, password);
              Statement stmt = conn.createStatement();
              java.sql.ResultSet rs = stmt.executeQuery("SHOW BINARY LOGS")) {
@@ -1412,7 +1413,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
 
     /** 源库 gtid_mode 是否为 ON / ON_PERMISSIVE（AUTO_POSITION 前提）。查询失败保守返回 false 走 file+pos。 */
     private boolean sourceGtidModeOn() {
-        String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        String url = "jdbc:mysql://" + host + ":" + port + "/?" + sslParams() + "&serverTimezone=UTC&allowPublicKeyRetrieval=true";
         try (Connection conn = DriverManager.getConnection(url, user, password);
              Statement stmt = conn.createStatement();
              java.sql.ResultSet rs = stmt.executeQuery("SELECT @@global.gtid_mode")) {
@@ -1426,9 +1427,50 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         return false;
     }
 
+    /** 源库连接的 TLS 参数（本类里所有辅助 JDBC 连接共用，避免口径漂移）。 */
+    private String sslParams() {
+        return com.migration.common.ssl.SslMaterial.from(props, "source").mysqlUrlParams();
+    }
+
+    /**
+     * 给 binlog 复制流本身加密。
+     *
+     * <p><b>这是本类最要紧的一处</b>：上面那些 JDBC 辅助连接（查 GTID、查保留策略、心跳）
+     * 加不加密都只影响元信息，而 binlog 复制流搬的是<b>业务数据本身</b>。
+     * vendored 的客户端一直支持 {@code setSSLMode}，只是从来没人调过——
+     * 于是"任务配了 VERIFY_CA"的效果仅止于那几条辅助连接，真正的数据仍然全程明文。
+     *
+     * <p>注意 {@link StreamingBinaryLogClient} 的默认工厂只在 REQUIRED/PREFERRED 下是
+     * "信任所有证书"，VERIFY_CA 及以上会走 JVM 默认信任库——自签 CA 不在其中。
+     * 因此配了证书就必须换成按任务证书构造的工厂。
+     */
+    private void applySslToClient(StreamingBinaryLogClient c) {
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(props, "source");
+        if (!ssl.enabled()) {
+            return;   // 不调用 = 客户端保持 SSLMode.DISABLED，与历史行为完全一致
+        }
+        c.setSSLMode(com.github.shyiko.mysql.binlog.network.SSLMode.valueOf(ssl.mode()));
+        try {
+            final javax.net.ssl.KeyManager[] km = ssl.keyManagers();
+            final javax.net.ssl.TrustManager[] tm = ssl.effectiveTrustManagers();
+            c.setSslSocketFactory(new com.github.shyiko.mysql.binlog.network.DefaultSSLSocketFactory() {
+                @Override
+                protected void initSSLContext(javax.net.ssl.SSLContext sc)
+                        throws java.security.GeneralSecurityException {
+                    sc.init(km, tm, null);
+                }
+            });
+        } catch (Exception e) {
+            // 拿不到证书材料就连不上，绝不能"降级为明文继续"——那正是本轮要根治的那类问题
+            throw new IllegalStateException("binlog 复制流的 TLS 材料装配失败: " + e.getMessage(), e);
+        }
+        logger.info("binlog 复制流已启用传输加密: mode={}, mTLS={}", ssl.mode(), ssl.mutualTls());
+    }
+
     private void initClockOffset() {
         try {
-            String url = "jdbc:mysql://" + host + ":" + port + "/?useSSL=false&serverTimezone=UTC";
+            String url = "jdbc:mysql://" + host + ":" + port + "/?" + sslParams() + "&serverTimezone=UTC";
             try (Connection conn = DriverManager.getConnection(url, user, password);
                  Statement stmt = conn.createStatement();
                  java.sql.ResultSet rs = stmt.executeQuery("SELECT UNIX_TIMESTAMP(NOW(3))*1000")) {
@@ -1448,7 +1490,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
     private void startHeartbeat() {
         try {
             String db = (heartbeatDatabase != null && !heartbeatDatabase.isEmpty()) ? heartbeatDatabase : "mysql";
-            String url = "jdbc:mysql://" + host + ":" + port + "/" + db + "?useSSL=false&serverTimezone=UTC";
+            String url = "jdbc:mysql://" + host + ":" + port + "/" + db + "?" + sslParams() + "&serverTimezone=UTC";
             heartbeatConnection = DriverManager.getConnection(url, user, password);
 
             try (Statement stmt = heartbeatConnection.createStatement()) {
@@ -1479,7 +1521,7 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
                     try {
                         if (heartbeatConnection != null && !heartbeatConnection.isValid(2)) {
                             String db = (heartbeatDatabase != null && !heartbeatDatabase.isEmpty()) ? heartbeatDatabase : "mysql";
-                            String url = "jdbc:mysql://" + host + ":" + port + "/" + db + "?useSSL=false&serverTimezone=UTC";
+                            String url = "jdbc:mysql://" + host + ":" + port + "/" + db + "?" + sslParams() + "&serverTimezone=UTC";
                             heartbeatConnection = DriverManager.getConnection(url, user, password);
                             logger.info("心跳连接已重新建立");
                         }

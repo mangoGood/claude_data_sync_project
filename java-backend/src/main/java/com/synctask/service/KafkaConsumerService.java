@@ -331,14 +331,19 @@ public class KafkaConsumerService {
             shadow.setStatus(WorkflowStatus.PENDING);
             shadow.setIsBilling(true);
             workflowRepository.save(shadow);
-            kafkaProducerService.sendTaskCreatedMessage(shadow);
+            String shadowId = shadow.getId();
+            // 派发失败要把影子通道自己置 FAILED：留在 PENDING 的话双向同步实际只剩单边，
+            // 而两个任务看上去都正常
+            kafkaProducerService.sendTaskCreatedMessage(shadow,
+                    ex -> workflowService.markDispatchFailed(shadowId, ex));
             addLog(primary.getId(), WorkflowLog.LogLevel.INFO,
                     "双向灾备：正向已进入增量同步，反向同步通道（" + shadow.getId() + "）已自动启动");
             logger.info("双向灾备反向通道已启动: primary={}, shadow={}", primary.getId(), shadow.getId());
         } catch (Exception e) {
             logger.error("双向灾备反向通道启动失败: primary={}", primary.getId(), e);
-            addLog(primary.getId(), WorkflowLog.LogLevel.WARNING,
-                    "双向灾备：反向同步通道启动失败: " + e.getMessage());
+            workflowService.markDispatchFailed(primary.getDrPeerWorkflowId(), e);
+            addLog(primary.getId(), WorkflowLog.LogLevel.ERROR,
+                    "双向灾备：反向同步通道启动失败（双向同步已退化为单边）: " + e.getMessage());
         }
     }
 

@@ -71,7 +71,7 @@ public class AgentHttpServer {
 
     public void start(int port) {
         try {
-            server = HttpServer.create(new InetSocketAddress(port), 0);
+            server = createServer(port);
             server.setExecutor(Executors.newFixedThreadPool(4));
 
             server.createContext("/api/agent/failover", this::handleFailover);
@@ -690,5 +690,45 @@ public class AgentHttpServer {
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(responseBytes);
         }
+    }
+
+    /**
+     * 建 HTTP 或 HTTPS 服务。
+     *
+     * <p>agent 的这些接口带的是运维动作（failover / switchover-drain / start-increment）与
+     * 位点、指标等诊断信息，且用 {@code AGENT_API_TOKEN} 做鉴权——明文 HTTP 下 token 可被嗅探，
+     * 拿到即可对任意任务发起倒换。配了 {@code AGENT_TLS_KEYSTORE} 就走 HTTPS。
+     *
+     * <p>只认 PKCS12（{@code .p12}）：与平台其它地方的证书形态保持一致，
+     * 由 {@code test_scripts/ssl/gen_certs.sh} 一并生成。
+     */
+    private HttpServer createServer(int port) throws java.io.IOException {
+        String keystore = System.getenv("AGENT_TLS_KEYSTORE");
+        if (keystore == null || keystore.trim().isEmpty()) {
+            return HttpServer.create(new InetSocketAddress(port), 0);
+        }
+        String storePass = System.getenv().getOrDefault("AGENT_TLS_KEYSTORE_PASSWORD", "");
+        javax.net.ssl.SSLContext ctx;
+        try {
+            java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
+            try (java.io.InputStream in = java.nio.file.Files.newInputStream(
+                    java.nio.file.Path.of(keystore.trim()))) {
+                ks.load(in, storePass.toCharArray());
+            }
+            javax.net.ssl.KeyManagerFactory kmf = javax.net.ssl.KeyManagerFactory.getInstance(
+                    javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
+            kmf.init(ks, storePass.toCharArray());
+            ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+            ctx.init(kmf.getKeyManagers(), null, null);
+        } catch (java.security.GeneralSecurityException e) {
+            // 配了 keystore 却装不起来，绝不能退回明文 HTTP —— 那正是"以为加密了其实没有"
+            throw new java.io.IOException("Agent TLS keystore 装配失败: " + keystore + " —— " + e.getMessage(), e);
+        }
+
+        com.sun.net.httpserver.HttpsServer https =
+                com.sun.net.httpserver.HttpsServer.create(new InetSocketAddress(port), 0);
+        https.setHttpsConfigurator(new com.sun.net.httpserver.HttpsConfigurator(ctx));
+        logger.info("Agent HTTP 服务已启用 TLS（keystore={}）", keystore);
+        return https;
     }
 }

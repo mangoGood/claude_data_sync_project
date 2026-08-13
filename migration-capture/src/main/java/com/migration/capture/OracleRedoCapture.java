@@ -96,6 +96,19 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
     private volatile boolean backpressurePaused = false;
     private String backpressureSignalPath;
 
+    /**
+     * 源库时钟与本机时钟的偏移。
+     *
+     * <p>LogMiner 的 {@code TIMESTAMP} 是**源库时钟**，而延迟是在 increment 端按
+     * {@code 本机 now − 事件时间戳} 算的 —— 不折算的话两台机器的时钟差会整体加进延迟里；
+     * 本机时钟偏快时还会算出负数，被下游的 {@code rtoMs >= 0} 直接丢掉，指标停在旧值上。
+     * MySQL 链路的 RPO 一直在做这个校正，Oracle 链路此前完全没做。
+     */
+    private final com.migration.common.clock.SourceClockOffset sourceClock =
+            new com.migration.common.clock.SourceClockOffset();
+    private long idleHeartbeatMs = 5000;
+    private volatile long lastIdleHeartbeatMs = 0;
+
     /** LogMiner 扫描间隔（毫秒） */
     private long scanIntervalMs = 1000;
     /** 每次查询 LogMiner 的最大行数 */
@@ -124,6 +137,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                 props.getProperty("capture.position.health.interval.ms", "60000"));
         maxEventsPerFile = Long.parseLong(props.getProperty("capture.max.events.per.file", "10000"));
         scanIntervalMs = Long.parseLong(props.getProperty("capture.redo.scan.interval", "1000"));
+        idleHeartbeatMs = Long.parseLong(props.getProperty("capture.idle.heartbeat.ms", "5000"));
         queryBatchSize = Integer.parseInt(props.getProperty("capture.redo.batch.size", "1000"));
         backpressureSignalPath = "files/" + taskId + "/backpressure.signal";
 
@@ -165,7 +179,8 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         } catch (NumberFormatException e) {
             return;
         }
-        String pdbUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, database);
+        // Oracle 开 TLS 要换 TCPS 描述串；信任材料走连接属性（见 applyOracleSsl）
+        String pdbUrl = oracleUrl(database);
         try {
             Class.forName("oracle.jdbc.OracleDriver");
         } catch (ClassNotFoundException ignored) {
@@ -284,8 +299,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         Class.forName("oracle.jdbc.OracleDriver");
 
         // 先连接 PDB（源库），用于探测 CDB 名称和起始 SCN
-        String pdbUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, database);
-        pdbConn = DriverManager.getConnection(pdbUrl, user, password);
+        pdbConn = DriverManager.getConnection(oracleUrl(database), oracleProps());
         pdbConn.setAutoCommit(false);
         logger.info("Connected to Oracle PDB for metadata probe: {}", database);
 
@@ -322,7 +336,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         cdbConnected = false;
         if (cdbEnabled && cdbName != null && !cdbName.isEmpty()) {
             String effectiveCdbService = (cdbService != null && !cdbService.isEmpty()) ? cdbService : cdbName;
-            String cdbUrl = String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, effectiveCdbService);
+            String cdbUrl = oracleUrl(effectiveCdbService);
             // Oracle JDBC 中 sys as sysdba 通过 username 携带角色实现
             String cdbUserWithRole = cdbUsername + " as " + cdbRole;
             try {
@@ -362,6 +376,9 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                     consecutiveErrors = 0;
 
                     if (events == 0) {
+                        // 源库空闲时也要有一个**源端时钟**的时间基准供下游算延迟
+                        // （extract 那条兜底心跳用本机时钟，算出来恒为 0）
+                        writeIdleHeartbeatIfNeeded();
                         Thread.sleep(scanIntervalMs);
                     }
 
@@ -587,7 +604,9 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
 
         int eventCount = 0;
         StringBuilder queryBuilder = new StringBuilder(
-                "SELECT SCN, OPERATION, XID, SEG_OWNER, TABLE_NAME, SQL_REDO, TIMESTAMP, ROW_ID " +
+                // CSF 必须取：SQL_REDO 单行上限 4000 字节，超了 Oracle 把一条语句拆成多行、
+                // 除末行外 CSF=1。不拼接就是按残缺列集写目标端 + 续行被当独立事件，且全程不报错
+                "SELECT SCN, OPERATION, XID, SEG_OWNER, TABLE_NAME, SQL_REDO, CSF, TIMESTAMP, ROW_ID " +
                 "FROM V$LOGMNR_CONTENTS WHERE OPERATION IN ('INSERT', 'UPDATE', 'DELETE', 'UNSUPPORTED')");
 
         // 添加 SCN 过滤（只查大于当前 SCN 的记录）
@@ -623,6 +642,10 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
 
         queryBuilder.append(" ORDER BY SCN ASC");
 
+        // 每批查询用一个新的拼接器：CSF=1 的末行若落在本批边界之外，下一批会从同一 SCN
+        // 重新读到它，残句留着只会与新一批拼串
+        com.migration.capture.oracle.CsfAssembler csf = new com.migration.capture.oracle.CsfAssembler();
+
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         try {
@@ -636,9 +659,14 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                 String xid = rs.getString("XID");
                 String segOwner = rs.getString("SEG_OWNER");
                 String tableName = rs.getString("TABLE_NAME");
-                String sqlRedo = rs.getString("SQL_REDO");
                 Timestamp timestamp = rs.getTimestamp("TIMESTAMP");
                 String rowId = rs.getString("ROW_ID");
+
+                // 续行拼接：CSF=1 说明这条语句还没完，收下继续读下一行
+                String sqlRedo = csf.accept(rs.getString("SQL_REDO"), rs.getInt("CSF"));
+                if (sqlRedo == null) {
+                    continue;
+                }
 
                 if (segOwner == null || tableName == null) {
                     continue;
@@ -666,7 +694,10 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                     eventData = buildEventData(segOwner, tableName, operation, sqlRedo);
                 }
 
-                long ts = timestamp != null ? timestamp.getTime() : System.currentTimeMillis();
+                // LogMiner 的 TIMESTAMP 是源库时钟，折算到本机时钟域再下发（见 sourceClock 注释）。
+                // 注意它的列类型是 DATE —— 只有秒级精度，亚秒延迟量不出来，这是 LogMiner 的固有限制
+                long ts = timestamp != null
+                        ? sourceClock.toLocal(timestamp.getTime()) : System.currentTimeMillis();
                 long xidNumeric = 0;
                 try {
                     xidNumeric = Long.parseLong(xid, 16);
@@ -702,6 +733,13 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
                     savePosition();
                 }
                 checkRetentionQuietly();
+            }
+            if (csf.hasPending()) {
+                // 半条语句挂在批边界上：本批不下发它，位点也没越过（currentScn 只在写出事件后前进），
+                // 下一批会从同一个 SCN 重新读到完整的一串
+                logger.warn("本批结束时仍有未拼完的 SQL_REDO（已累计 {} 个续行），"
+                        + "该语句留待下一批重新读取", csf.pendingRows());
+                csf.reset();
             }
         } finally {
             if (rs != null) try { rs.close(); } catch (SQLException e) { /* ignore */ }
@@ -1103,7 +1141,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         for (Map.Entry<String, String> entry : values.entrySet()) {
             if (!first) sb.append(",");
             sb.append(entry.getKey()).append(":")
-              .append(entry.getValue() != null ? entry.getValue() : "[null]");
+              .append(entry.getValue() != null ? entry.getValue() : com.migration.common.wire.CapTupleMarkers.NULL);
             first = false;
         }
         return sb.toString();
@@ -1286,6 +1324,58 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
      * <p>在线 redo 被覆盖、归档被 RMAN 删掉之后，LogMiner 要么报 ORA-01291 要么干脆什么都不返回，
      * 外层看到的只是"任务在跑但没数据"。等重启才发现就已经晚了，只能重做全量。
      */
+    /**
+     * 源库空闲时往 {@code .cap} 写一条带**源端时钟**的心跳，顺带刷新时钟偏移。
+     *
+     * <p>口径：量的是"心跳穿过 capture→extract→apply"这一段，不含"redo 产生→LogMiner 挖到"
+     * （那一段的落后由 SCN 差与归档保留状态反映）。有真实变更时事件自带 LogMiner 时间戳，
+     * 那才是全程延迟。
+     */
+    private void writeIdleHeartbeatIfNeeded() {
+        if (idleHeartbeatMs <= 0 || conn == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastIdleHeartbeatMs < idleHeartbeatMs) {
+            return;
+        }
+        lastIdleHeartbeatMs = now;
+        long sourceNowMs;
+        try (Statement stmt = conn.createStatement()) {
+            long before = System.currentTimeMillis();
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT (CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE) - DATE '1970-01-01') "
+                            + "* 86400000 FROM DUAL")) {
+                if (!rs.next()) {
+                    return;
+                }
+                sourceNowMs = rs.getLong(1);
+            }
+            sourceClock.observe(sourceNowMs, before, System.currentTimeMillis());
+        } catch (Exception e) {
+            logger.debug("空闲心跳取源库时间失败: {}", e.getMessage());
+            return;
+        }
+        if (sourceClock.isSuspicious(5000)) {
+            logger.warn("源库与本机时钟相差 {} ms，延迟指标已按该偏移折算；请检查两端 NTP",
+                    sourceClock.offsetMs());
+        }
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("SYNC_HEARTBEAT").append(FIELD_SEP);
+            sb.append(currentScn != null ? currentScn : "0").append(FIELD_SEP);
+            sb.append(currentScnNumeric).append(FIELD_SEP);
+            sb.append(sourceClock.toLocal(sourceNowMs)).append(FIELD_SEP);
+            sb.append(0).append(FIELD_SEP);
+            sb.append("source_clock");
+            sb.append(RECORD_SEP);
+            writer.write(sb.toString());
+            writer.flush();
+        } catch (IOException e) {
+            logger.debug("写空闲心跳失败: {}", e.getMessage());
+        }
+    }
+
     private void checkRetentionQuietly() {
         if (!retentionCheckEnabled || currentScn == null) {
             return;
@@ -1370,5 +1460,31 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
 
     public long getEventCount() {
         return eventCounter.get();
+    }
+
+    /** 源库加密材料。Oracle 的 thin URL 没有查询串，信任材料只能走连接属性。 */
+    private com.migration.common.ssl.SslMaterial sourceSsl() {
+        return com.migration.common.ssl.SslMaterial.from(props, "source");
+    }
+
+    /** Oracle 连接串：开 TLS 时换成 TCPS 描述串（端口通常也要改成 2484）。 */
+    private String oracleUrl(String service) {
+        com.migration.common.ssl.SslMaterial ssl = sourceSsl();
+        return ssl.enabled()
+                ? ssl.oracleTcpsUrl(host, port, service)
+                : String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, service);
+    }
+
+    /** 连接属性：用户名口令 + （开启 TLS 时的）信任库与主机名校验开关。 */
+    private java.util.Properties oracleProps() {
+        java.util.Properties p = new java.util.Properties();
+        if (user != null) {
+            p.setProperty("user", user);
+        }
+        if (password != null) {
+            p.setProperty("password", password);
+        }
+        sourceSsl().applyOracleProperties(p);
+        return p;
     }
 }

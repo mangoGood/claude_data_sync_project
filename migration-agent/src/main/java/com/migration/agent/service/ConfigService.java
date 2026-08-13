@@ -387,6 +387,11 @@ public class ConfigService {
         logger.info("Source database type: {} (flavor={}), Target database type: {}",
                 sourceType, props.getProperty("source.db.flavor"), targetType);
 
+        // 传输层加密：必须排在库类型之后、方言生成 JDBC URL 之前——
+        // 下面 source/target.db.jdbc.url 是照着这些键拼的，晚一步写就拼不进去，
+        // 表现是"config 里 ssl.mode 写着 VERIFY_CA，但 jdbc.url 里没有任何加密参数"。
+        applyTaskSslConfig(props, taskMessage, taskDir);
+
         // 聚合路由（分库分表汇聚/拆分）：JSON 展开成 route.*，并用引擎的解析器当场校验。
         // 配置非法直接抛——路由错了就是数据写错地方，不能让任务带着坏规则起来。
         // 必须排在库类型与列处理之后：引擎的 RoutingConfig 要靠 source.db.type/target.db.type
@@ -426,7 +431,8 @@ public class ConfigService {
         SqlDialect sourceDialect = SqlDialect.forType(sourceType);
         props.setProperty("source.db.jdbc.driver", sourceDialect.jdbcDriverClass());
         props.setProperty("source.db.jdbc.url", sourceDialect.jdbcUrl(
-            props.getProperty("source.db.host"), props.getProperty("source.db.port"), props.getProperty("source.db.database")));
+            props.getProperty("source.db.host"), props.getProperty("source.db.port"), props.getProperty("source.db.database"),
+            com.migration.common.ssl.SslMaterial.from(props, "source")));
         if ("postgresql".equals(sourceType)) {
             props.setProperty("capture.type", "wal");
             logger.info("PostgreSQL source config: using WAL capture, JDBC driver: {}", sourceDialect.jdbcDriverClass());
@@ -474,12 +480,16 @@ public class ConfigService {
                     }
                 }
                 props.setProperty("target.db.schema", targetPgSchema);
-                props.setProperty("target.db.jdbc.url", String.format("jdbc:postgresql://%s:%s/%s?currentSchema=%s&stringtype=unspecified",
-                    props.getProperty("target.db.host"), props.getProperty("target.db.port"), props.getProperty("target.db.database"), targetPgSchema));
+                props.setProperty("target.db.jdbc.url", String.format(
+                    "jdbc:postgresql://%s:%s/%s?currentSchema=%s&stringtype=unspecified&%s",
+                    props.getProperty("target.db.host"), props.getProperty("target.db.port"),
+                    props.getProperty("target.db.database"), targetPgSchema,
+                    com.migration.common.ssl.SslMaterial.from(props, "target").pgUrlParams()));
                 logger.info("PostgreSQL target config: JDBC driver: {}, quote char: double-quote, schema: {}", targetDialect.jdbcDriverClass(), targetPgSchema);
             } else {
                 props.setProperty("target.db.jdbc.url", targetDialect.jdbcUrl(
-                    props.getProperty("target.db.host"), props.getProperty("target.db.port"), props.getProperty("target.db.database")));
+                    props.getProperty("target.db.host"), props.getProperty("target.db.port"), props.getProperty("target.db.database"),
+                    com.migration.common.ssl.SslMaterial.from(props, "target")));
                 logger.info("MySQL target config: JDBC driver: {}, quote char: backtick", targetDialect.jdbcDriverClass());
             }
         }
@@ -654,12 +664,12 @@ public class ConfigService {
         writeEnumPropFromEnv(props, "subscribe.transaction.topic.enabled",
                 "SUBSCRIBE_TRANSACTION_TOPIC_ENABLED", "true", "false");
 
-        // 传输层加密（agent 级开关，随任务 config 下发）。默认不写 = DISABLED（历史行为，明文）。
-        // 全仓此前 34 处硬编码 useSSL=false 且没有任何 SSL 配置项——凭证与 THL 都能加密，
-        // 唯独真正流动的业务数据在网络上是明文的。
-        writeEnumPropFromEnv(props, "source.db.ssl.mode", "SOURCE_DB_SSL_MODE",
+        // 传输层加密的 agent 级 env 兜底/灰度（任务级配置已在前面写好，见 applyTaskSslConfig）。
+        // 只在任务没配时才生效：env 覆盖任务级会让"页面上写着 VERIFY_CA、实际按 env 跑"这种
+        // 没人能推理的状态出现。
+        writeEnumPropIfAbsent(props, "source.db.ssl.mode", "SOURCE_DB_SSL_MODE",
                 "DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY");
-        writeEnumPropFromEnv(props, "target.db.ssl.mode", "TARGET_DB_SSL_MODE",
+        writeEnumPropIfAbsent(props, "target.db.ssl.mode", "TARGET_DB_SSL_MODE",
                 "DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY");
         // 非主键唯一键冲突的处置（默认 FAIL_STOP：忽略它就是永久丢一行）
         writeEnumPropFromEnv(props, "increment.unique.conflict.policy",
@@ -908,6 +918,89 @@ public class ConfigService {
     }
 
     /** 枚举型引擎调优参数：只接受白名单取值（大小写不敏感），非法值忽略并告警。 */
+    /**
+     * 任务级传输加密：把向导里选的档位与证书落成引擎能读的 {@code <prefix>.db.ssl.*}。
+     *
+     * <p>证书在这里就<b>物化到本机</b>（而不是等引擎自己去取）：引擎子进程是短命的、
+     * 可能并发拉起多个，让它们各自去连元数据库取证书既慢又会在失败时报出一堆
+     * 与业务无关的错。这里取一次、落一份，子进程只看到几个文件路径。
+     *
+     * <p>取不到证书直接抛：调用方的意图是"用 TLS 连库"，拿不到证书就连不上。
+     * 静默跳过的结果是引擎退回明文——任务照样跑、数据照样搬，只是全程明文，
+     * 而配置页上明明写着 VERIFY_CA。
+     */
+    private void applyTaskSslConfig(java.util.Properties props, TaskMessage taskMessage, File taskDir) {
+        applyOneSideSsl(props, "source", taskMessage.getSourceSslMode(),
+                taskMessage.getSourceSslCertId(), taskMessage.getTaskId(), taskDir);
+        applyOneSideSsl(props, "target", taskMessage.getTargetSslMode(),
+                taskMessage.getTargetSslCertId(), taskMessage.getTaskId(), taskDir);
+    }
+
+    private void applyOneSideSsl(java.util.Properties props, String prefix, String mode, String certId,
+                                 String taskId, File taskDir) {
+        String normalized = com.migration.common.ssl.SslMaterial.normalizeMode(mode);
+        if ("DISABLED".equals(normalized)) {
+            return;   // 不写任何键 = 引擎按 DISABLED 走，与历史行为逐字节相同
+        }
+        props.setProperty(prefix + ".db.ssl.mode", normalized);
+        // Oracle 专属两项（其余库用不到）：TLS 版本、期望的服务端证书 DN。
+        // 走 agent 级 env 而不是向导字段——它们是"这套 Oracle 怎么配的"的属性，
+        // 同一个部署环境里所有 Oracle 任务都一样，逐任务填反而容易填错。
+        String up = prefix.toUpperCase();
+        putIfPresent(props, prefix + ".db.ssl.oracle.version",
+                System.getenv(up + "_DB_SSL_ORACLE_VERSION"));
+        putIfPresent(props, prefix + ".db.ssl.oracle.server.dn",
+                System.getenv(up + "_DB_SSL_ORACLE_SERVER_DN"));
+
+        CertificateStore store = CertificateStore.getInstance();
+        if (certId == null || certId.trim().isEmpty()) {
+            return;   // REQUIRED 及以下不需要证书（加密但不校验）
+        }
+        if (store == null) {
+            throw new IllegalStateException("任务配置了 TLS 证书但证书库未初始化（certId=" + certId + "）");
+        }
+        com.migration.common.ssl.CertBundle bundle =
+                store.materialize(certId, taskId, taskDir.toPath());
+        if (bundle == null) {
+            return;
+        }
+        // MySQL / Oracle / Kafka 认 p12 信任库；PostgreSQL 认 PEM + PKCS8 DER 私钥。
+        // 两套路径都写下去，由引擎按库类型各取所需——在这里按类型分叉的话，
+        // 一个任务里源是 PG、目标是 MySQL 的情形就会取错。
+        putIfPresent(props, prefix + ".db.ssl.root.cert",
+                pathOf(bundle, com.migration.common.ssl.CertBundle.TRUSTSTORE_P12));
+        putIfPresent(props, prefix + ".db.ssl.root.cert.pem",
+                pathOf(bundle, com.migration.common.ssl.CertBundle.CA_PEM));
+        putIfPresent(props, prefix + ".db.ssl.client.cert",
+                pathOf(bundle, com.migration.common.ssl.CertBundle.CLIENT_CERT_PEM));
+        putIfPresent(props, prefix + ".db.ssl.client.key",
+                pathOf(bundle, com.migration.common.ssl.CertBundle.CLIENT_KEY_PK8));
+        putIfPresent(props, prefix + ".db.ssl.client.keystore",
+                pathOf(bundle, com.migration.common.ssl.CertBundle.KEYSTORE_P12));
+        // 库口令随 config 落盘，encryptSensitiveProps() 会把它加密成 ENC:
+        props.setProperty(prefix + ".db.ssl.store.password", bundle.storePassword());
+        logger.info("任务 {} 的 {} 端传输加密已配置: mode={}, certId={}", taskId, prefix, normalized, certId);
+    }
+
+    private static String pathOf(com.migration.common.ssl.CertBundle bundle, String name) {
+        java.nio.file.Path p = bundle.path(name);
+        return java.nio.file.Files.isRegularFile(p) ? p.toAbsolutePath().toString() : null;
+    }
+
+    private static void putIfPresent(java.util.Properties props, String key, String value) {
+        if (value != null && !value.isEmpty()) {
+            props.setProperty(key, value);
+        }
+    }
+
+    /** 同 {@link #writeEnumPropFromEnv}，但已有任务级取值时不覆盖。 */
+    private void writeEnumPropIfAbsent(java.util.Properties props, String key, String envName, String... allowed) {
+        if (props.getProperty(key) != null) {
+            return;
+        }
+        writeEnumPropFromEnv(props, key, envName, allowed);
+    }
+
     private void writeEnumPropFromEnv(java.util.Properties props, String key, String envName, String... allowed) {
         String v = System.getenv(envName);
         if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);

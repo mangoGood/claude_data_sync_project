@@ -18,6 +18,14 @@ public class ContinuousExtractMain {
 
     private static final Logger logger = LoggerFactory.getLogger(ContinuousExtractMain.class);
 
+    /**
+     * 合成心跳标记：该心跳的 {@code sourceTstamp} 取自**本机时钟**，不可用于计算延迟。
+     *
+     * <p>与之相对的是 capture 写的 {@code SYNC_HEARTBEAT} —— 那条的时间戳取自源库时钟
+     * （MySQL 走心跳表绕一圈回来，PG/Oracle 取源库当前时间），可以算延迟。
+     */
+    public static final String SYNTHETIC_HEARTBEAT = "synthetic_heartbeat";
+
     private static final long HEARTBEAT_IDLE_THRESHOLD_MS = 1000;
     private static final long HEARTBEAT_INTERVAL_MS = 1000;
     /** THL 文件最大大小（50MB），超过后轮转到新文件 */
@@ -58,6 +66,9 @@ public class ContinuousExtractMain {
 
     /** 已处理cap文件保留数量（安全余量），超过此数量的已处理文件将被清理 */
     private int capRetentionCount = 2;
+
+    /** .cap 多久没被写过才认为"capture 已经不写它了"（判错就是永久丢那段事件，宁可晚一点）。 */
+    private long capSettleMs = 30000;
 
     /** THL 加密服务 */
     private ThlEncryptionService thlEncryptionService;
@@ -139,6 +150,7 @@ public class ContinuousExtractMain {
         this.watchEnabled = Boolean.parseBoolean(props.getProperty("extract.watch.enabled", "true"));
         this.watchFallbackMs = Long.parseLong(props.getProperty("extract.watch.fallback.ms", "1000"));
         this.progressRecordFile = outputDir + "/.extract_progress";
+        this.capSettleMs = Long.parseLong(props.getProperty("extract.cap.settle.ms", "30000"));
         this.captureType = props.getProperty("capture.type", "binlog").toLowerCase();
 
         // 初始化背压控制器：高水位/低水位可配置
@@ -288,6 +300,13 @@ public class ContinuousExtractMain {
                     // 该表之后的每个版本都是错的
                     logger.error("DDL 解析失败（表结构时序库），停止抽取: {}", e.getMessage());
                     writeExtractErrorStatus("E3023", e.getMessage());
+                    running.set(false);
+                    break;
+                } catch (PostgresWalExtractor.UnreconstructableValueException e) {
+                    // PG 逻辑复制没把某列的值发过来（未变更的 TOAST），而这一列又是定位行必需的。
+                    // 猜一个值写下去就是改错行/丢行，且不会有任何报错
+                    logger.error("WAL 事件缺少必需的列值，停止抽取: {}", e.getMessage());
+                    writeExtractErrorStatus("E3025", e.getMessage());
                     running.set(false);
                     break;
                 } catch (MySQLBinlogExtractor.UnsupportedBinlogEventException e) {
@@ -448,15 +467,24 @@ public class ContinuousExtractMain {
 
         Arrays.sort(binlogFiles, Comparator.comparing(File::getName));
 
+        // 判定"capture 不会再写这个文件了"用**最后修改时间**，不用文件名。
+        // 文件名是 binlog_<时间戳>_<序号>.cap，而 capture 重启后序号从 0000 重来：
+        // 同一秒内轮转+重启就会产出一个名字比现存文件更小的**活跃**文件，按名字排序会
+        // 把它当成旧文件，读完即标完成，之后 capture 追加的内容再也不会被抽取 —— 静默丢数据。
+        long newestModified = 0;
+        for (File f : binlogFiles) {
+            newestModified = Math.max(newestModified, f.lastModified());
+        }
+
         int totalEvents = 0;
         for (File binlogFile : binlogFiles) {
             if (!running.get()) break;
-            totalEvents += processFileIncremental(binlogFile);
+            totalEvents += processFileIncremental(binlogFile, binlogFile.lastModified() >= newestModified);
         }
         return totalEvents;
     }
 
-    private int processFileIncremental(File binlogFile) throws Exception {
+    private int processFileIncremental(File binlogFile, boolean isNewest) throws Exception {
         FileProgress progress = fileProgressMap.get(binlogFile.getName());
 
         if (progress == null) {
@@ -468,34 +496,26 @@ public class ContinuousExtractMain {
         if (progress.completed) return 0;
 
         int totalLinesInFile = countLines(binlogFile);
-        if (totalLinesInFile <= progress.linesRead) return 0;
+        if (totalLinesInFile <= progress.linesRead) {
+            // 已经读完，且 capture 不会再往它里面写了 —— 就是处理完了。
+            //
+            // 旧判据（"连续 3 轮字节数没变"）实际上**永远不成立**：没有新行时上面这一句就返回了，
+            // 有新行时字节数必然也变了，fileStoppedGrowing 恒为 false。实测约 100 个真实任务的
+            // .extract_progress 里 completed 全是 false，于是 cleanupCompletedCapFiles() 从未生效
+            //（.cap 无限堆积），而且每轮扫描都要对每个 .cap 整文件 countLines 一遍。
+            markCompletedIfSettled(binlogFile, progress, isNewest);
+            return 0;
+        }
 
         int newLines = totalLinesInFile - progress.linesRead;
         logger.info("Processing binlog file: {} ({} new lines, already read: {}, total: {})",
                 binlogFile.getName(), newLines, progress.linesRead, totalLinesInFile);
 
         // 使用类级别 currentThlWriter 统一写入，按50MB大小轮转文件
-        int newEventCount = readAndExtractNewLines(binlogFile, progress, progress.linesRead);
+        int newEventCount = readAndExtractNewLines(binlogFile, progress, progress.linesRead, totalLinesInFile);
 
-        long currentSize = binlogFile.length();
-        boolean fileStoppedGrowing = (currentSize == progress.lastFileSize && currentSize > 0);
-        progress.lastFileSize = currentSize;
-
-        if (fileStoppedGrowing) {
-            progress.stableCheckCount++;
-        } else {
-            progress.stableCheckCount = 0;
-        }
-
-        // 正在收集 XA 分支时不标 completed、也不清理 .cap：崩溃重启要从分支起点把这些行重读一遍，
-        // 文件被当成"已处理完"或直接删掉，重读就无从谈起
-        boolean xaCollecting = mysqlExtractor != null && mysqlExtractor.isXaBranchActive();
-        if (progress.stableCheckCount >= 3 && !xaCollecting) {
-            progress.completed = true;
-            logger.info("Binlog file {} appears complete, marking as completed", binlogFile.getName());
-            // 文件处理完成，清理旧的已完成cap文件
-            cleanupCompletedCapFiles();
-        }
+        progress.lastFileSize = binlogFile.length();
+        markCompletedIfSettled(binlogFile, progress, isNewest);
 
         logger.info("Processed binlog file: {} -> {} new events", binlogFile.getName(), newEventCount);
         if (newEventCount > 0) {
@@ -530,6 +550,11 @@ public class ContinuousExtractMain {
             heartbeat.setSourceId(captureType);
             heartbeat.addMetadata("event_type", "HEARTBEAT");
             heartbeat.addMetadata("heartbeat_timestamp", now);
+            // 这条心跳的时间戳是**本机时钟**，不是源端时钟：它只能证明 extract 还活着，
+            // 不能用来算延迟。下游拿它做 `now - sourceTstamp` 恒得 ≈0 ——
+            // capture 死掉时 extract 空转、每秒造一条，面板就会显示"延迟极低"而实际一条数据都没动。
+            // 打上标记，increment 见到只推进位点与活性、不刷 rto_metric。
+            heartbeat.addMetadata(SYNTHETIC_HEARTBEAT, Boolean.TRUE);
 
             currentThlWriter.writeEvent(heartbeat);
 
@@ -570,12 +595,64 @@ public class ContinuousExtractMain {
         }
     }
 
+    /**
+     * 文件里<b>已写完整</b>的行数（不含末尾那条还没写完的）。
+     *
+     * <p>capture 是一边写一边被读的：一条记录写进 {@code BufferedWriter} 时，若跨过 8192 字符的
+     * 缓冲边界，它会分两次落到文件上。读取方正好夹在两次之间扫到文件，就会看到半条记录 ——
+     * 而 {@code readLine()} 对"文件末尾没有换行符"和"一行正常结束"给出的结果一模一样。
+     * 把半行当完整事件消费掉，前半截会被当成合法事件写进 THL（字段够数时下游根本发现不了），
+     * 后半截在下一轮变成字段数不足的孤行被丢掉 —— 两头都是静默的。
+     *
+     * <p>所以以换行符为准：文件不以换行结束时，末行一律留到下一轮再读。
+     * （对照 THL 那一跳：分帧格式里半条记录是能被显式识别的，见 {@code THLFileReader}。）
+     */
     private int countLines(File file) throws IOException {
         int count = 0;
         try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
             while (reader.readLine() != null) count++;
         }
+        if (count > 0 && !endsWithNewline(file)) {
+            count--;
+        }
         return count;
+    }
+
+    /**
+     * 已读完、且 capture 不会再写它的 .cap 文件，标记为处理完成。
+     *
+     * @param isNewest 是否是目录里最后被修改的那个 .cap —— capture 只往它里面追加
+     */
+    private void markCompletedIfSettled(File binlogFile, FileProgress progress, boolean isNewest) {
+        if (progress.completed || isNewest) {
+            return;
+        }
+        // 再等一个静默期才收口：标完成之后这个文件既不再读也可能被清理掉，
+        // 判断错一次就是永久丢掉那段事件，宁可晚一点
+        if (System.currentTimeMillis() - binlogFile.lastModified() < capSettleMs) {
+            return;
+        }
+        // 正在收集 XA 分支时不标 completed、也不清理 .cap：崩溃重启要从分支起点把这些行重读一遍，
+        // 文件被当成"已处理完"或直接删掉，重读就无从谈起
+        if (mysqlExtractor != null && mysqlExtractor.isXaBranchActive()) {
+            return;
+        }
+        progress.completed = true;
+        logger.info("Binlog file {} 已读完且不再有写入，标记为处理完成", binlogFile.getName());
+        cleanupCompletedCapFiles();
+        saveProgress();
+    }
+
+    /** 文件最后一个字节是否是换行符（空文件按"未结束"处理）。 */
+    private boolean endsWithNewline(File file) throws IOException {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "r")) {
+            long len = raf.length();
+            if (len == 0) {
+                return false;
+            }
+            raf.seek(len - 1);
+            return raf.read() == '\n';
+        }
     }
 
     /** 创建 THL 文件写入器（根据加密配置自动选择） */
@@ -680,14 +757,20 @@ public class ContinuousExtractMain {
         return one;
     }
 
-    private int readAndExtractNewLines(File binlogFile,
-                                        FileProgress progress, int skipLines) throws Exception {
+    /**
+     * @param maxLines 本轮最多读到第几行（即 {@link #countLines} 数出的完整行数）。
+     *                 读的时候 capture 可能又追加了内容，末行未必写完 —— 以进入本轮时数出的
+     *                 完整行数为准，多出来的留到下一轮，避免消费半行（见 {@link #countLines}）
+     */
+    private int readAndExtractNewLines(File binlogFile, FileProgress progress,
+                                       int skipLines, int maxLines) throws Exception {
         int[] eventCount = {0};
         int currentLine = 0;
         try (BufferedReader reader = new BufferedReader(new FileReader(binlogFile))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 currentLine++;
+                if (currentLine > maxLines) break;
                 if (currentLine <= skipLines) continue;
                 if (line.trim().isEmpty()) {
                     progress.linesRead++;
@@ -823,14 +906,12 @@ public class ContinuousExtractMain {
         String fileName;
         int linesRead;
         long lastFileSize;
-        int stableCheckCount;
         boolean completed;
 
         FileProgress(String fileName) {
             this.fileName = fileName;
             this.linesRead = 0;
             this.lastFileSize = 0;
-            this.stableCheckCount = 0;
             this.completed = false;
         }
     }

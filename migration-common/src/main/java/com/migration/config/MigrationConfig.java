@@ -95,9 +95,9 @@ public class MigrationConfig {
         // flavor：TiDB 归一成 dbType=mysql，快照手法却完全不同（MVCC 无锁 vs FTWRL），
         // 故单独带一个 flavor 传给一致性快照
         sourceConfig.setFlavor(props.getProperty("source.db.flavor"));
-        // 传输层加密：默认 DISABLED，与历史行为完全一致；配了才走 TLS
-        sourceConfig.setSslMode(props.getProperty("source.db.ssl.mode"));
-        sourceConfig.setSslRootCert(props.getProperty("source.db.ssl.root.cert"));
+        // 传输层加密：默认 DISABLED，与历史行为完全一致；配了才走 TLS。
+        // 走 SslMaterial.from 而不是逐个 setter，客户端证书（mTLS）才不会在这里被漏掉。
+        sourceConfig.setSsl(com.migration.common.ssl.SslMaterial.from(props, "source"));
 
         String sourceSchema = props.getProperty("source.db.schema");
         if (sourceSchema != null && !sourceSchema.isEmpty()) {
@@ -114,8 +114,7 @@ public class MigrationConfig {
         );
 
         targetConfig.setFlavor(props.getProperty("target.db.flavor"));
-        targetConfig.setSslMode(props.getProperty("target.db.ssl.mode"));
-        targetConfig.setSslRootCert(props.getProperty("target.db.ssl.root.cert"));
+        targetConfig.setSsl(com.migration.common.ssl.SslMaterial.from(props, "target"));
 
         String targetSchema = props.getProperty("target.db.schema");
         if (targetSchema != null && !targetSchema.isEmpty()) {

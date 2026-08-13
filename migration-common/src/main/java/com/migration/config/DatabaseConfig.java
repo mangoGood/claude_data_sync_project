@@ -1,5 +1,7 @@
 package com.migration.config;
 
+import com.migration.common.ssl.SslMaterial;
+
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -119,61 +121,39 @@ public class DatabaseConfig {
     }
 
     /**
-     * 传输层加密档位：{@code DISABLED（默认）| PREFERRED | REQUIRED | VERIFY_CA | VERIFY_IDENTITY}。
+     * 传输层加密材料（档位 + 证书路径）。默认 {@link SslMaterial#disabled()}，行为与之前完全一致。
      *
-     * <p>此前全仓 34 处硬编码 {@code useSSL=false}，且没有任何 SSL 配置项——
-     * 平台把凭证 AES-GCM 落库加密、THL 文件也能加密，唯独<b>真正流动的业务数据在网络上是明文的</b>。
-     * 金融政企的入网评审基本过不了这一关。默认仍是 DISABLED，行为与之前完全一致。
+     * <p>档位映射与 SSLContext 构造统一收在 {@link SslMaterial}——此前这段 switch 在仓库里
+     * 抄了三份（这里、后端的 {@code JdbcSslOptions}、增量的 {@code targetSslParams}），
+     * 且已经开始漂移。
      */
-    private String sslMode = "DISABLED";
-    /** CA 证书/信任库路径（VERIFY_CA / VERIFY_IDENTITY 时用） */
-    private String sslRootCert;
+    private SslMaterial ssl = SslMaterial.disabled();
 
     public void setSslMode(String sslMode) {
         if (sslMode != null && !sslMode.trim().isEmpty()) {
-            this.sslMode = sslMode.trim().toUpperCase();
+            this.ssl = SslMaterial.of(sslMode, ssl.rootCert());
         }
     }
 
     public String getSslMode() {
-        return sslMode;
+        return ssl.mode();
     }
 
     public void setSslRootCert(String sslRootCert) {
-        this.sslRootCert = sslRootCert;
+        this.ssl = SslMaterial.of(ssl.mode(), sslRootCert);
+    }
+
+    /** 完整的加密材料（含客户端证书/keystore），供需要 SSLContext 的链路取用。 */
+    public SslMaterial getSsl() {
+        return ssl;
+    }
+
+    public void setSsl(SslMaterial ssl) {
+        this.ssl = ssl != null ? ssl : SslMaterial.disabled();
     }
 
     public boolean isSslEnabled() {
-        return !"DISABLED".equalsIgnoreCase(sslMode);
-    }
-
-    /** MySQL 的 SSL 参数段（Connector/J 8 的 sslMode 取代了老的 useSSL/requireSSL 组合）。 */
-    private String mysqlSslParams() {
-        if (!isSslEnabled()) {
-            return "useSSL=false";
-        }
-        StringBuilder sb = new StringBuilder("sslMode=").append(sslMode);
-        if (sslRootCert != null && !sslRootCert.isEmpty()) {
-            sb.append("&trustCertificateKeyStoreUrl=file:").append(sslRootCert);
-        }
-        return sb.toString();
-    }
-
-    /** PG 的 sslmode 取值与我们的档位一一对应。 */
-    private String pgSslParams() {
-        String mode;
-        switch (sslMode) {
-            case "PREFERRED":       mode = "prefer"; break;
-            case "REQUIRED":        mode = "require"; break;
-            case "VERIFY_CA":       mode = "verify-ca"; break;
-            case "VERIFY_IDENTITY": mode = "verify-full"; break;
-            default:                mode = "disable";
-        }
-        StringBuilder sb = new StringBuilder("sslmode=").append(mode);
-        if (isSslEnabled() && sslRootCert != null && !sslRootCert.isEmpty()) {
-            sb.append("&sslrootcert=").append(sslRootCert);
-        }
-        return sb.toString();
+        return ssl.enabled();
     }
 
     public String getJdbcUrl() {
@@ -181,17 +161,22 @@ public class DatabaseConfig {
             String currentSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
             return withExtraOptions(String.format(
                     "jdbc:postgresql://%s:%d/%s?currentSchema=%s&stringtype=unspecified&%s",
-                    host, port, database, currentSchema, pgSslParams()));
+                    host, port, database, currentSchema, ssl.pgUrlParams()));
         }
         if ("oracle".equals(dbType)) {
             // Oracle 使用 service name 方式连接: jdbc:oracle:thin:@host:port/service
-            // database 字段存储服务名/SID
+            // database 字段存储服务名/SID。开启 TLS 时协议与 URL 结构都要换（TCPS + DESCRIPTION），
+            // 查询串在 Oracle 的 thin URL 里根本不存在，信任材料走连接属性
+            // （见 SslMaterial#applyOracleProperties）。
             String service = (database != null && !database.isEmpty()) ? database : "ORCL";
+            if (ssl.enabled()) {
+                return ssl.oracleTcpsUrl(host, port, service);
+            }
             return String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, service);
         }
         return withExtraOptions(String.format(
                 "jdbc:mysql://%s:%d/%s?%s&serverTimezone=UTC&characterEncoding=utf8&autoReconnect=true&connectTimeout=30000&socketTimeout=0",
-                host, port, database, mysqlSslParams()));
+                host, port, database, ssl.mysqlUrlParams()));
     }
 
     public String getJdbcDriverClass() {
@@ -215,16 +200,24 @@ public class DatabaseConfig {
         return "CREATE DATABASE IF NOT EXISTS `" + database + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci";
     }
 
+    /**
+     * 不指定库名的连接（建库用）。与 {@link #getJdbcUrl()} 走同一份加密材料——
+     * 此前这里硬编码 {@code useSSL=false}，等于"业务连接加密了、建库那一跳明文"。
+     */
     public String getRootJdbcUrl() {
         if ("postgresql".equals(dbType)) {
-            return String.format("jdbc:postgresql://%s:%d/postgres?stringtype=unspecified", host, port);
+            return String.format("jdbc:postgresql://%s:%d/postgres?stringtype=unspecified&%s",
+                                 host, port, ssl.pgUrlParams());
         }
         if ("oracle".equals(dbType)) {
             String service = (database != null && !database.isEmpty()) ? database : "ORCL";
+            if (ssl.enabled()) {
+                return ssl.oracleTcpsUrl(host, port, service);
+            }
             return String.format("jdbc:oracle:thin:@%s:%d/%s", host, port, service);
         }
-        return String.format("jdbc:mysql://%s:%d/?useSSL=false&serverTimezone=UTC&characterEncoding=utf8",
-                           host, port);
+        return String.format("jdbc:mysql://%s:%d/?%s&serverTimezone=UTC&characterEncoding=utf8",
+                           host, port, ssl.mysqlUrlParams());
     }
 
     public boolean isOracle() {

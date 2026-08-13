@@ -50,6 +50,50 @@ public class TaskCreatedMessage {
     /** 本条管线的来源实例标识（跨实例汇聚的 leg 用，写进来源标识列） */
     private String routeNodeId;
 
+    /**
+     * 源/目标端的传输加密档位与证书 id。
+     *
+     * <p>下发的是<b>证书 id 而不是证书内容</b>：控制面消息会经 Kafka、可能落到 broker 磁盘上，
+     * 私钥不该在那条路上流动。agent 拿到 id 后用它自己那条元数据库连接把证书取下来。
+     */
+    private String sourceSslMode;
+    private String sourceSslCertId;
+    private String targetSslMode;
+    private String targetSslCertId;
+
+    public String getSourceSslMode() { return sourceSslMode; }
+    public void setSourceSslMode(String sourceSslMode) { this.sourceSslMode = sourceSslMode; }
+    public String getSourceSslCertId() { return sourceSslCertId; }
+    public void setSourceSslCertId(String sourceSslCertId) { this.sourceSslCertId = sourceSslCertId; }
+    public String getTargetSslMode() { return targetSslMode; }
+    public void setTargetSslMode(String targetSslMode) { this.targetSslMode = targetSslMode; }
+    public String getTargetSslCertId() { return targetSslCertId; }
+    public void setTargetSslCertId(String targetSslCertId) { this.targetSslCertId = targetSslCertId; }
+
+    /**
+     * 把任务的加密配置搬进消息。
+     *
+     * <p><b>务必用这个方法，不要在各处手抄四行 setter。</b> 平台里有 6 处构造
+     * {@code TaskCreatedMessage} 的地方（launch / resume / 灾备影子 / 倒换 / fan-out /
+     * 跨实例汇聚 leg），手抄必然漏掉其中一两处——而漏掉的表现是那条腿<b>静默走明文</b>，
+     * 任务全绿、没有任何报错。
+     *
+     * @param swap 源与目标对调（灾备影子任务 B→A、以及主备倒换后用）
+     */
+    public void applySsl(String srcMode, String srcCertId, String tgtMode, String tgtCertId, boolean swap) {
+        if (swap) {
+            this.sourceSslMode = tgtMode;
+            this.sourceSslCertId = tgtCertId;
+            this.targetSslMode = srcMode;
+            this.targetSslCertId = srcCertId;
+        } else {
+            this.sourceSslMode = srcMode;
+            this.sourceSslCertId = srcCertId;
+            this.targetSslMode = tgtMode;
+            this.targetSslCertId = tgtCertId;
+        }
+    }
+
     public String getTargetAgentId() {
         return targetAgentId;
     }

@@ -216,6 +216,15 @@ public class FanoutDispatcherService {
         public String getDatabase() { return database; }
         public String getUsername() { return username; }
         public String getPassword() { return password; }
+
+        /** 传输加密材料。默认 DISABLED（历史行为）；由 FanoutManager 从任务配置注入。 */
+        private com.migration.common.ssl.SslMaterial ssl = com.migration.common.ssl.SslMaterial.disabled();
+
+        public com.migration.common.ssl.SslMaterial getSsl() { return ssl; }
+
+        public void setSsl(com.migration.common.ssl.SslMaterial ssl) {
+            this.ssl = ssl != null ? ssl : com.migration.common.ssl.SslMaterial.disabled();
+        }
     }
 
     private static class TargetConnection {
@@ -227,8 +236,11 @@ public class FanoutDispatcherService {
         }
 
         void connect() throws SQLException {
-            String url = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true",
-                    config.getHost(), config.getPort(), config.getDatabase());
+            // fan-out 的每个目标都是一条独立的到用户库的连接：主目标加密而分发目标明文，
+            // 等于业务数据换条路又明文发了一遍（而且是 N 份）。
+            String url = String.format("jdbc:mysql://%s:%d/%s?%s&serverTimezone=UTC&allowPublicKeyRetrieval=true",
+                    config.getHost(), config.getPort(), config.getDatabase(),
+                    config.getSsl().mysqlUrlParams());
             connection = DriverManager.getConnection(url, config.getUsername(), config.getPassword());
         }
 

@@ -29,6 +29,12 @@ public class SlaMetricsCollector {
 
     private final String taskId;
     private final String sourceConnectionString;
+    /**
+     * 源库连接的传输加密材料。默认 DISABLED —— 采集器只查源库时钟，
+     * 但那也是一条到用户库的连接：任务开了 TLS 而它明文，等于在加密链路旁边
+     * 常年挂着一条明文连接（并且带着同一套凭证）。
+     */
+    private final com.migration.common.ssl.SslMaterial ssl;
 
     /** sourceNow − localNow，毫秒。用它把本地时钟换算成源库时钟，避免每次采集都打源库一次。 */
     private volatile long clockOffsetMs = 0;
@@ -42,8 +48,14 @@ public class SlaMetricsCollector {
     private long deadletterLines = 0;
 
     public SlaMetricsCollector(String taskId, String sourceConnectionString) {
+        this(taskId, sourceConnectionString, com.migration.common.ssl.SslMaterial.disabled());
+    }
+
+    public SlaMetricsCollector(String taskId, String sourceConnectionString,
+                               com.migration.common.ssl.SslMaterial ssl) {
         this.taskId = taskId;
         this.sourceConnectionString = sourceConnectionString;
+        this.ssl = ssl != null ? ssl : com.migration.common.ssl.SslMaterial.disabled();
     }
 
     /**
@@ -99,16 +111,19 @@ public class SlaMetricsCollector {
         String sql;
         switch (type) {
             case "postgresql" -> {
-                url = "jdbc:postgresql://" + info.getHost() + ":" + info.getPort() + "/" + info.getDatabase();
+                url = "jdbc:postgresql://" + info.getHost() + ":" + info.getPort() + "/" + info.getDatabase()
+                        + "?" + ssl.pgUrlParams();
                 sql = "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint";
             }
             case "oracle" -> {
-                url = "jdbc:oracle:thin:@" + info.getHost() + ":" + info.getPort() + "/" + info.getDatabase();
+                url = ssl.enabled()
+                        ? ssl.oracleTcpsUrl(info.getHost(), info.getPort(), info.getDatabase())
+                        : "jdbc:oracle:thin:@" + info.getHost() + ":" + info.getPort() + "/" + info.getDatabase();
                 sql = "SELECT (CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE) - DATE '1970-01-01') * 86400000 FROM dual";
             }
             case "mysql", "tidb" -> {
                 url = "jdbc:mysql://" + info.getHost() + ":" + info.getPort() + "/" + info.getDatabase()
-                        + "?useSSL=false&serverTimezone=UTC&connectTimeout=5000&socketTimeout=5000";
+                        + "?" + ssl.mysqlUrlParams() + "&serverTimezone=UTC&connectTimeout=5000&socketTimeout=5000";
                 sql = "SELECT ROUND(UNIX_TIMESTAMP(NOW(3)) * 1000)";
             }
             default -> {

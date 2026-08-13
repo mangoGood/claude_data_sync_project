@@ -361,6 +361,73 @@ public final class MongoSyncMain {
         return session;
     }
 
+    /**
+     * 源库时钟与本机时钟的偏移。change stream 事件的时间戳是源集群时钟，
+     * 而延迟按 {@code 本机 now − 事件时间戳} 算，不折算就把两端时钟差算进了延迟。
+     */
+    private final com.migration.common.clock.SourceClockOffset sourceClock =
+            new com.migration.common.clock.SourceClockOffset();
+    private long lastRtoReportMs = 0;
+    private static final long RTO_REPORT_INTERVAL_MS = 3000;
+
+    /** 用 {@code hello} 回包的 localTime 刷新时钟偏移（往返取中点，抵掉一半 RTT）。 */
+    private void refreshClockOffset(MongoClient source) {
+        try {
+            long before = System.currentTimeMillis();
+            Document reply = source.getDatabase("admin").runCommand(new Document("hello", 1));
+            long after = System.currentTimeMillis();
+            Object localTime = reply.get("localTime");
+            if (localTime instanceof java.util.Date d) {
+                sourceClock.observe(d.getTime(), before, after);
+                if (sourceClock.isSuspicious(5000)) {
+                    logger.warn("源集群与本机时钟相差 {} ms，延迟指标已按该偏移折算；请检查两端 NTP",
+                            sourceClock.offsetMs());
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("读取源集群时间失败，延迟指标不做时钟校正: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 增量延迟指标。
+     *
+     * <p>改造前 mongo→mongo 同步<b>一个延迟指标都没有</b>（只有 mongo→Kafka 订阅那条链路有），
+     * agent 去读 {@code binlog_output/rto_metric} 读不到文件，面板上 RTO/RPO 一直是空的。
+     * 这里按与其它链路完全一致的格式写同一个文件，agent 侧无需任何改动。
+     *
+     * <p>时间基准优先用事件的 {@code wallTime}（毫秒，MongoDB 6.0+），退回 {@code clusterTime}
+     * （只有秒级精度，亚秒延迟量不出来）。
+     */
+    private void reportRto(ChangeStreamDocument<Document> event, long now) {
+        long sourceMs;
+        if (event.getWallTime() != null) {
+            sourceMs = event.getWallTime().getValue();
+        } else if (event.getClusterTime() != null) {
+            sourceMs = event.getClusterTime().getTime() * 1000L;
+        } else {
+            return;
+        }
+        if (now - lastRtoReportMs < RTO_REPORT_INTERVAL_MS) {
+            return;
+        }
+        lastRtoReportMs = now;
+        long appliedSourceTs = sourceClock.toLocal(sourceMs);
+        long rtoMs = now - appliedSourceTs;
+        if (rtoMs < 0) {
+            // 不静默丢弃：负值本身就说明两端时钟没对齐，是需要有人知道的事实
+            logger.warn("算出负延迟 {} ms（源端时间戳 {} 晚于本机当前时间），"
+                    + "说明时钟偏移未校准；按 0 上报", rtoMs, appliedSourceTs);
+            rtoMs = 0;
+        }
+        File dir = new File("files/" + taskId + "/binlog_output");
+        if (!dir.exists() && !dir.mkdirs()) {
+            return;
+        }
+        com.migration.common.io.AtomicFileWriter.writeStringQuietly(
+                new File(dir, "rto_metric"), now + "|" + rtoMs + "|" + appliedSourceTs + "\n");
+    }
+
     /** 当前 clusterTime（{@code hello} 回包的 operationTime），作为本次全量的位点。 */
     private String readClusterTime(MongoClient source) {
         try {
@@ -566,6 +633,9 @@ public final class MongoSyncMain {
 
         long lastFlush = System.currentTimeMillis();
         int sinceFlush = 0;
+        // 最后一条**处理完**的事件的 token。位点只能推进到这里，不能用 cursor 当前的 token ——
+        // 那个已经跑到失败事件之后了，用它落盘就等于把失败的那条永久跳过去
+        BsonDocument lastAppliedToken = null;
         ReplaceOptions upsert = new ReplaceOptions().upsert(true);
 
         // 防回环状态机：与 MySQL binlog / PG WAL 用的是同一个 BidiLoopGuard，
@@ -604,15 +674,32 @@ public final class MongoSyncMain {
                     }
 
                     if (propagate) {
-                        applyEvent(target, event, upsert);
+                        try {
+                            applyEvent(target, event, upsert);
+                        } catch (ApplyFailedException e) {
+                            // 位点只推进到"最后一条成功应用的事件"：把已经应用成功的那一批
+                            // 先落盘（否则重启会从更早的位置重放），失败的这条及其之后的一律不计入
+                            if (lastAppliedToken != null) {
+                                saveCheckpoint(lastAppliedToken,
+                                        guard.currentTxnMarked() ? currentTxnKey : null, sourceId);
+                            }
+                            throw e;
+                        }
                         incrEvents++;
                     }
+                    // 本条已处理完（应用成功、或按防回环规则有意跳过），它的位点才可以落盘
+                    lastAppliedToken = event.getResumeToken();
+                    reportRto(event, System.currentTimeMillis());
                     sinceFlush++;
                 }
 
                 // resume token 周期性持久化（含空闲时的 postBatchResumeToken，推进断点避免重放过多）
                 if (sinceFlush >= TOKEN_FLUSH_EVERY_EVENTS || now - lastFlush >= TOKEN_FLUSH_INTERVAL_MS) {
-                    BsonDocument token = cursor.getResumeToken();
+                    // 顺带刷新时钟偏移（这个周期本来就在做落盘，不额外增加往返频率）
+                    refreshClockOffset(source);
+                    // 空闲时用 cursor 的 postBatchResumeToken 推进；有事件时只认最后一条**处理完**的，
+                    // cursor 的 token 可能已经跑到失败事件之后了
+                    BsonDocument token = sinceFlush > 0 ? lastAppliedToken : cursor.getResumeToken();
                     if (token != null) {
                         saveCheckpoint(token, guard.currentTxnMarked() ? currentTxnKey : null, sourceId);
                     }
@@ -667,9 +754,19 @@ public final class MongoSyncMain {
                 applyDml(target.getDatabase(db).getCollection(coll), db, coll, event, upsert, null);
             }
         } catch (Exception e) {
-            // 单事件失败记日志继续（upsert/delete 幂等，绝大多数为暂时性错误，
-            // 下轮 resume 重放可自愈；不因单事件卡死整个流）
-            logger.error("应用增量事件失败: {} {}.{}: {}", op, db, coll, e.getMessage());
+            // 这里绝不能"记个日志继续"：外层紧接着就把 cursor.getResumeToken() 落盘，
+            // 位点越过刚失败的这条，重放永远不会再碰到它 —— 目标端一次唯一索引冲突、
+            // 一次 WriteConflict、一次网络抖动 = 永久丢一条文档变更，而任务全绿。
+            // 与 MySQL/PG 链路的 fail-stop 语义对齐：停下、上报，位点停在最后一条成功应用的事件上。
+            throw new ApplyFailedException(String.format(
+                    "应用增量事件失败: %s %s.%s: %s", op, db, coll, e.getMessage()), e);
+        }
+    }
+
+    /** 单条增量事件应用失败。位点必须停在它之前，否则这条变更永久消失。 */
+    static class ApplyFailedException extends RuntimeException {
+        ApplyFailedException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -967,9 +1064,26 @@ public final class MongoSyncMain {
         // directConnection：只连指定节点，不按副本集配置里的内部主机名（容器 hostname 等）
         // 重路由；Change Streams 与写入在直连 Primary 下均正常工作
         uri.append(host).append(':').append(port).append("/?authSource=admin&directConnection=true");
-        return MongoClientSettings.builder()
-                .applyConnectionString(new ConnectionString(uri.toString()))
-                .build();
+
+        // 传输加密：Mongo 驱动只认 SSLContext 对象，不认 URI 上的证书参数。
+        // invalidHostNameAllowed 与档位对齐：VERIFY_IDENTITY 才校验主机名，
+        // 其余档位（含 VERIFY_CA）只校验证书链——与 MySQL/PG 的档位语义保持一致。
+        com.migration.common.ssl.SslMaterial ssl =
+                com.migration.common.ssl.SslMaterial.from(props, prefix);
+        MongoClientSettings.Builder builder = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(uri.toString()));
+        if (ssl.enabled()) {
+            try {
+                final javax.net.ssl.SSLContext ctx = ssl.sslContext();
+                builder.applyToSslSettings(b -> b.enabled(true)
+                        .invalidHostNameAllowed(!ssl.verifyIdentity())
+                        .context(ctx));
+            } catch (Exception e) {
+                // 拿不到证书材料就连不上；绝不能"降级明文继续"
+                throw new IllegalStateException("MongoDB 传输加密材料装配失败: " + e.getMessage(), e);
+            }
+        }
+        return builder.build();
     }
 
     private static String urlEncode(String s) {

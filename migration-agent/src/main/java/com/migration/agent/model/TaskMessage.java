@@ -57,6 +57,15 @@ public class TaskMessage implements Serializable {
     private String routeConfig;
     /** 本条管线的来源实例标识（跨实例汇聚的 leg 用） */
     private String routeNodeId;
+    /**
+     * 源/目标端的传输加密档位与证书 id。下发的是 <b>id 而不是证书内容</b>——
+     * 控制面消息经 Kafka，私钥不该在那条路上流动；agent 用自己那条元数据库连接去取
+     * （见 {@link com.migration.agent.service.CertificateStore}）。
+     */
+    private String sourceSslMode;
+    private String sourceSslCertId;
+    private String targetSslMode;
+    private String targetSslCertId;
 
     public String getTargetAgentId() {
         return targetAgentId;
@@ -374,4 +383,13 @@ public class TaskMessage implements Serializable {
     public void setRouteConfig(String routeConfig) { this.routeConfig = routeConfig; }
     public String getRouteNodeId() { return routeNodeId; }
     public void setRouteNodeId(String routeNodeId) { this.routeNodeId = routeNodeId; }
+
+    public String getSourceSslMode() { return sourceSslMode; }
+    public void setSourceSslMode(String sourceSslMode) { this.sourceSslMode = sourceSslMode; }
+    public String getSourceSslCertId() { return sourceSslCertId; }
+    public void setSourceSslCertId(String sourceSslCertId) { this.sourceSslCertId = sourceSslCertId; }
+    public String getTargetSslMode() { return targetSslMode; }
+    public void setTargetSslMode(String targetSslMode) { this.targetSslMode = targetSslMode; }
+    public String getTargetSslCertId() { return targetSslCertId; }
+    public void setTargetSslCertId(String targetSslCertId) { this.targetSslCertId = targetSslCertId; }
 }

@@ -19,6 +19,15 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
 
     private static final char FIELD_SEP = '\001';
 
+    /**
+     * "值未随事件下发"的行内哨兵（对应 {@link com.migration.common.wire.CapTupleMarkers#UNCHANGED}）。
+     *
+     * <p>刻意用 {@code new String} 造一个独一无二的对象，判定一律走同一性比较（见 {@code isAbsent}），
+     * 这样任何真实列值都不可能被误判成哨兵。
+     */
+    @SuppressWarnings("StringOperationCanBeSimplified")
+    private static final String ABSENT = new String("__value_not_sent__");
+
     private String outputDir;
     private long seqno = 1;
     private String seqnoFile;
@@ -131,6 +140,15 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         thlEvent.addMetadata("wal_lsn_numeric", lsnNumeric);
         thlEvent.addMetadata("xid", xid);
 
+        if ("SYNC_HEARTBEAT".equals(eventType)) {
+            // capture 在源库空闲时打的心跳，时间戳取自**源库时钟**（已折算到本机时钟域），
+            // 下游据此算出的空闲期延迟才是真的在量链路耗时，而不是 extract 自造的那个恒为 0 的数
+            thlEvent.setType(THLEvent.HEARTBEAT_EVENT);
+            thlEvent.addMetadata("operation", "HEARTBEAT");
+            thlEvent.addMetadata("source_db_timestamp", timestamp);
+            return thlEvent;
+        }
+
         if ("BEGIN".equals(eventType)) {
             parseBeginEvent(thlEvent, eventData);
         } else if ("COMMIT".equals(eventType)) {
@@ -141,6 +159,8 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
             parseUpdateEvent(thlEvent, eventData);
         } else if ("DELETE".equals(eventType)) {
             parseDeleteEvent(thlEvent, eventData);
+        } else if ("TRUNCATE".equals(eventType)) {
+            parseTruncateEvent(thlEvent, eventData);
         } else if ("WAL_EVENT".equals(eventType)) {
             thlEvent.addMetadata("operation", "WAL_EVENT");
             thlEvent.addMetadata("raw_data", eventData);
@@ -182,6 +202,28 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         }
     }
 
+    /**
+     * TRUNCATE 走既有的 DDL 通道（{@code event_type=QUERY} + {@code sql}），
+     * 库名/表名映射与方言翻译都在那条路上，这里只负责把语句原样交过去。
+     */
+    private void parseTruncateEvent(THLEvent thlEvent, String eventData) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("sql:\\s*(.+)$", java.util.regex.Pattern.DOTALL).matcher(eventData);
+        if (!m.find()) {
+            logger.warn("TRUNCATE 事件里没有 sql 段，跳过: {}", eventData);
+            return;
+        }
+        java.util.regex.Matcher schemaMatcher =
+                java.util.regex.Pattern.compile("schema:\\s*(\\S+)").matcher(eventData);
+        if (schemaMatcher.find()) {
+            thlEvent.addMetadata("database_name", schemaMatcher.group(1));
+        }
+        // 覆盖成 QUERY：下游按 event_type 分派，DDL 的入口就是 QUERY
+        thlEvent.addMetadata("event_type", "QUERY");
+        thlEvent.addMetadata("operation", "QUERY");
+        thlEvent.addMetadata("sql", m.group(1).trim());
+    }
+
     private void parseBeginEvent(THLEvent thlEvent, String eventData) {
         thlEvent.addMetadata("operation", "BEGIN");
         Long xid = extractXidFromBegin(eventData);
@@ -218,6 +260,9 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         WalRowData rowData = parseWalRowEvent(eventData);
         if (rowData != null) {
             populateTableMetadata(thlEvent, rowData);
+            // INSERT 的 tuple 按协议不会出现"值未下发"（'u' 只用于 UPDATE 的未变更 TOAST）。
+            // 真出现了就是还原不出这一行，写 NULL 等于静默塞错值，停下让人看。
+            requireAllPresent(rowData, rowData.newValues, "INSERT");
 
             String formattedRow = formatRowData(rowData.newValues, rowData.columnNames, rowData.columnTypes);
             thlEvent.addMetadata("row_data", formattedRow);
@@ -235,19 +280,39 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         thlEvent.addMetadata("operation", "UPDATE");
 
         WalRowData rowData = parseWalRowEvent(eventData);
-        if (rowData != null) {
-            populateTableMetadata(thlEvent, rowData);
+        if (rowData == null) {
+            return;
+        }
+        populateTableMetadata(thlEvent, rowData);
 
-            if (rowData.newValues != null) {
-                String formattedNew = formatRowData(rowData.newValues, rowData.columnNames, rowData.columnTypes);
-                thlEvent.addMetadata("row_data", formattedNew);
-                attachTypedRow(thlEvent, "rows_typed", rowData.newValues, rowData.columnTypes);
-            }
-            if (rowData.oldValues != null) {
-                String formattedOld = formatRowData(rowData.oldValues, rowData.columnNames, rowData.columnTypes);
-                thlEvent.addMetadata("row_data_before", formattedOld);
-                attachTypedRow(thlEvent, "rows_before_typed", rowData.oldValues, rowData.columnTypes);
-            }
+        // 未随事件下发的列（行外存储里本次未变更的 TOAST 值）必须整列从 SET 里摘掉：
+        // 写 NULL 会把目标端已经正确的大字段抹掉，且全程无报错。摘掉之后 SET 列表不再是
+        // 全列，靠 update_column_names 告诉下游这一批值对应哪些列。
+        Subset after = rowData.newValues == null ? null
+                : dropAbsentColumns(rowData, rowData.newValues, "UPDATE 后镜像");
+        Subset before = rowData.oldValues == null ? null
+                : dropAbsentColumns(rowData, rowData.oldValues, "UPDATE 前镜像");
+
+        if (after != null) {
+            thlEvent.addMetadata("row_data",
+                    formatRowData(after.values, after.names, after.types));
+            attachTypedRow(thlEvent, "rows_typed", after.values, after.types);
+        }
+        if (before != null) {
+            thlEvent.addMetadata("row_data_before",
+                    formatRowData(before.values, before.names, before.types));
+            attachTypedRow(thlEvent, "rows_before_typed", before.values, before.types);
+        }
+
+        // 两个列名清单只在**确实摘掉了列**时下发：没摘时事件仍是全列，走既有的全宽路径，
+        // 行为与改造前逐字节一致。摘过时下游（文本与类型化两条路径都读这两个 key）按子集生成 SQL。
+        boolean trimmed = (after != null && after.dropped) || (before != null && before.dropped);
+        if (trimmed && after != null) {
+            thlEvent.addMetadata("update_column_names", String.join(",", after.names));
+            // 没有前镜像时，下游（THLToSqlConverter 与 TypedDmlConverter 都是如此）拿后镜像当前镜像用，
+            // 所以 WHERE 侧的列名清单必须与 SET 侧一致，否则列名与值对不上
+            thlEvent.addMetadata("update_before_column_names",
+                    String.join(",", before != null ? before.names : after.names));
         }
     }
 
@@ -257,10 +322,126 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         WalRowData rowData = parseWalRowEvent(eventData);
         if (rowData != null) {
             populateTableMetadata(thlEvent, rowData);
+            // DELETE 的值只用于定位行。有主键时非主键列压根不参与 WHERE，未下发的值置空即可；
+            // 主键列本身未下发、或整表无主键（WHERE 用整行）时定位不出来，只能停机。
+            List<String> values = clearAbsentForDelete(rowData);
 
-            String formattedRow = formatRowData(rowData.oldValues, rowData.columnNames, rowData.columnTypes);
+            String formattedRow = formatRowData(values, rowData.columnNames, rowData.columnTypes);
             thlEvent.addMetadata("row_data", formattedRow);
-            attachTypedRow(thlEvent, "rows_typed", rowData.oldValues, rowData.columnTypes);
+            attachTypedRow(thlEvent, "rows_typed", values, rowData.columnTypes);
+        }
+    }
+
+    /** 摘掉"值未随事件下发"的列之后，列名/类型/值三者对齐的子集。 */
+    private static final class Subset {
+        final List<String> names;
+        final List<String> types;
+        final List<String> values;
+        final boolean dropped;
+
+        Subset(List<String> names, List<String> types, List<String> values, boolean dropped) {
+            this.names = names;
+            this.types = types;
+            this.values = values;
+            this.dropped = dropped;
+        }
+    }
+
+    /**
+     * 摘掉值未下发的列。主键列未下发时无法定位行，抛出让抽取停下——继续跑要么写错行，
+     * 要么把这一行静默丢掉。
+     */
+    private Subset dropAbsentColumns(WalRowData rowData, List<String> values, String what) {
+        List<String> names = rowData.columnNames;
+        List<String> types = rowData.columnTypes;
+        if (!hasAbsent(values)) {
+            return new Subset(names, types, values, false);
+        }
+        List<String> keptNames = new ArrayList<>();
+        List<String> keptTypes = new ArrayList<>();
+        List<String> keptValues = new ArrayList<>();
+        for (int i = 0; i < values.size(); i++) {
+            String name = (names != null && i < names.size()) ? names.get(i) : "column" + i;
+            if (isAbsent(values.get(i))) {
+                if (isPrimaryKey(rowData, name)) {
+                    throw new UnreconstructableValueException(String.format(
+                            "%s.%s 的主键列 %s 未随 WAL 事件下发（%s），无法定位目标行",
+                            rowData.schemaName, rowData.tableName, name, what));
+                }
+                continue;
+            }
+            keptNames.add(name);
+            keptTypes.add((types != null && i < types.size()) ? types.get(i) : "");
+            keptValues.add(values.get(i));
+        }
+        logger.debug("{}.{} {} 摘掉 {} 个未下发的列，剩余列: {}", rowData.schemaName, rowData.tableName,
+                what, values.size() - keptValues.size(), keptNames);
+        return new Subset(keptNames, keptTypes, keptValues, true);
+    }
+
+    /** DELETE：非主键列的未下发值置为 null（不参与 WHERE）；定位不出行时抛出。 */
+    private List<String> clearAbsentForDelete(WalRowData rowData) {
+        List<String> values = rowData.oldValues;
+        if (values == null || !hasAbsent(values)) {
+            return values;
+        }
+        boolean hasPk = rowData.primaryKeys != null && !rowData.primaryKeys.isEmpty();
+        List<String> out = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            String name = (rowData.columnNames != null && i < rowData.columnNames.size())
+                    ? rowData.columnNames.get(i) : "column" + i;
+            if (isAbsent(values.get(i))) {
+                if (!hasPk || isPrimaryKey(rowData, name)) {
+                    throw new UnreconstructableValueException(String.format(
+                            "%s.%s 的 DELETE 前镜像里列 %s 未随 WAL 事件下发，%s",
+                            rowData.schemaName, rowData.tableName, name,
+                            hasPk ? "该列是主键，无法定位目标行" : "该表无主键，WHERE 需要整行前镜像"));
+                }
+                out.add(null);
+            } else {
+                out.add(values.get(i));
+            }
+        }
+        return out;
+    }
+
+    private void requireAllPresent(WalRowData rowData, List<String> values, String what) {
+        if (hasAbsent(values)) {
+            throw new UnreconstructableValueException(String.format(
+                    "%s.%s 的 %s 事件里有列的值未随 WAL 下发，无法还原",
+                    rowData.schemaName, rowData.tableName, what));
+        }
+    }
+
+    private static boolean isPrimaryKey(WalRowData rowData, String column) {
+        return rowData.primaryKeys != null && rowData.primaryKeys.contains(column);
+    }
+
+    private static boolean hasAbsent(List<String> values) {
+        if (values == null) {
+            return false;
+        }
+        for (String v : values) {
+            if (isAbsent(v)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 该值是否"未随事件下发"。用同一性比较而非 equals：{@link #ABSENT} 是本类唯一的产地，
+     * 真实列值再怎么巧合也不会是同一个对象，杜绝"某行数据恰好等于哨兵"的误判。
+     */
+    @SuppressWarnings("StringEquality")
+    private static boolean isAbsent(String value) {
+        return value == ABSENT;
+    }
+
+    /** 值未随 WAL 事件下发，且无法从别处还原（PG 的未变更 TOAST 落在主键上等）。 */
+    static class UnreconstructableValueException extends RuntimeException {
+        UnreconstructableValueException(String message) {
+            super(message);
         }
     }
 
@@ -394,20 +575,34 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
 
         resolveTableSchema(rowData);
 
+        // 事件自带的列名/类型优先于回查源库当前定义。capture 那边是按 Relation 消息
+        // （与行值同一时刻的权威结构）解析出来的，而这里回查的是**现在**的定义 ——
+        // 源端在链路积压期间 DROP/ADD COLUMN 之后，两者列数就对不上了，
+        // 按下标把值配到当前列名上就是整行错位的静默写坏。
+        List<String> inbandTypes = parseColumnTypes(eventData);
+        if (inbandTypes != null && !inbandTypes.isEmpty()) {
+            rowData.columnTypes = inbandTypes;
+        }
+
         String newTupleContent = extractBracedContent(eventData, "new-tuple:");
         if (newTupleContent != null) {
             rowData.newValues = parseTupleData(newTupleContent, rowData.columnNames);
+            adoptInbandColumnNames(rowData, newTupleContent);
         }
 
         String oldTupleContent = extractBracedContent(eventData, "old-tuple:");
         if (oldTupleContent != null) {
             rowData.oldValues = parseTupleData(oldTupleContent, rowData.columnNames);
+            if (rowData.newValues == null) {
+                adoptInbandColumnNames(rowData, oldTupleContent);
+            }
         }
 
         if (rowData.newValues == null && !eventData.contains("old-tuple")) {
             String tupleContent = extractBracedContent(eventData, "tuple:");
             if (tupleContent != null) {
                 rowData.newValues = parseTupleData(tupleContent, rowData.columnNames);
+                adoptInbandColumnNames(rowData, tupleContent);
             }
         }
 
@@ -416,6 +611,51 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
         }
 
         return rowData;
+    }
+
+    /**
+     * 事件自带的列类型（{@code column_types:{integer,character varying,…}}）。
+     * 老的 .cap 没有这一段，返回 null 表示"沿用回查源库的结果"。
+     */
+    private List<String> parseColumnTypes(String eventData) {
+        String content = extractBracedContent(eventData, "column_types:");
+        if (content == null || content.isEmpty()) {
+            return null;
+        }
+        List<String> types = new ArrayList<>();
+        for (String t : content.split(",")) {
+            types.add(t.trim());
+        }
+        return types;
+    }
+
+    /**
+     * 采用 tuple 里自带的列名（形如 {@code id:1,tag:'x'}）。
+     *
+     * <p>这些列名是 capture 按 Relation 消息写下的、与行值同一时刻的权威信息；
+     * {@link #resolveTableSchema} 查到的是**当前**定义。两者列数不同就说明源端在链路
+     * 积压期间改过表结构，此时必须以事件自带的为准，否则值会整体错位一格写进相邻列。
+     */
+    private void adoptInbandColumnNames(WalRowData rowData, String tupleContent) {
+        List<String> names = new ArrayList<>();
+        for (String part : splitTupleParts(tupleContent)) {
+            String s = part.trim();
+            int colonIdx = s.indexOf(':');
+            if (colonIdx <= 0) {
+                return;                     // 形态不符（老 .cap 或异常），保持回查结果
+            }
+            names.add(s.substring(0, colonIdx).trim());
+        }
+        if (names.isEmpty()) {
+            return;
+        }
+        List<String> current = rowData.columnNames;
+        if (current != null && !current.isEmpty() && !current.equals(names)) {
+            logger.info("{}.{} 事件自带的列清单与源库当前定义不一致（源端已做过 DDL），"
+                            + "按事件自带的解析: 事件={} 当前={}",
+                    rowData.schemaName, rowData.tableName, names, current);
+        }
+        rowData.columnNames = names;
     }
 
     /**
@@ -482,8 +722,11 @@ public class PostgresWalExtractor extends AbstractExtractor<byte[], THLEvent> {
                 value = value.substring(colonIdx + 1).trim();
             }
 
-            if (value.startsWith("[null]")) {
+            if (value.startsWith(com.migration.common.wire.CapTupleMarkers.NULL)) {
                 values.add(null);
+            } else if (value.startsWith(com.migration.common.wire.CapTupleMarkers.UNCHANGED)) {
+                // 值没随事件发过来（未变更的 TOAST）——与 NULL 是两回事，绝不能合流
+                values.add(ABSENT);
             } else if (value.startsWith("'") && value.endsWith("'")) {
                 values.add(value.substring(1, value.length() - 1));
             } else {
