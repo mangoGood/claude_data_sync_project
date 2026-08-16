@@ -46,7 +46,7 @@ public class ValidationTaskService {
     private final Gson gson = new Gson();
 
     private static final Pattern CONNECTION_PATTERN = Pattern.compile(
-        "(mysql|postgresql|mongodb|elastic)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
+        "(mysql|postgresql|mongodb|elastic|oracle)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
     );
 
     public static class ParsedConnection {
@@ -109,6 +109,11 @@ public class ValidationTaskService {
 
     private String buildJdbcUrl(String type, String host, int port, String database) {
         String db = (database != null && !database.isEmpty()) ? database : "";
+        if ("oracle".equalsIgnoreCase(type)) {
+            // Oracle 的"库"是服务名/PDB，连接串里 host:port 后面那一段就是它
+            return String.format("jdbc:oracle:thin:@%s:%d/%s", host, port,
+                    db.isEmpty() ? "FREEPDB1" : db);
+        }
         if ("postgresql".equalsIgnoreCase(type)) {
             if (!db.isEmpty()) {
                 return String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, db);
@@ -169,6 +174,12 @@ public class ValidationTaskService {
         if ("CONTENT".equals(compareType)) {
             if (workflow.getTargetConnection().startsWith("elastic")) {
                 throw new RuntimeException("Elasticsearch 任务暂不支持内容对比，请使用行数对比（按索引文档数）");
+            }
+            // Oracle 逐行内容对比（checksum 口径、类型/大小写折算）尚未实现。这里要明确说清楚，
+            // 否则会一路走到连接解析才报"连接串格式不正确"——那个提示跟真实原因毫无关系。
+            if (workflow.getSourceConnection().startsWith("oracle")
+                    || workflow.getTargetConnection().startsWith("oracle")) {
+                throw new RuntimeException("Oracle 任务暂不支持内容对比，请使用行数对比");
             }
             boolean srcMongo = workflow.getSourceConnection().startsWith("mongodb");
             boolean tgtMongo = workflow.getTargetConnection().startsWith("mongodb");
@@ -631,7 +642,7 @@ public class ValidationTaskService {
                     buildJdbcUrl(targetConn.type, targetConn.host, targetConn.port,
                         targetConn.database != null ? targetConn.database : targetDb),
                     targetConn.username, targetConn.password)) {
-                newSourceCount = getRowCountSafe(srcVerify, sourceDb, sourceTable, isPg);
+                newSourceCount = getRowCountSafe(srcVerify, sourceDb, sourceTable, null);
                 // 复核也要按路由后的落点数，否则汇聚会拿"整张合并表"、拆分会拿"第一片"跟源表比，
                 // 修得再对也永远显示没收敛
                 if (mergeTarget != null) {
@@ -639,12 +650,12 @@ public class ValidationTaskService {
                 } else if (splitTargets != null) {
                     newTargetCount = 0;
                     for (String[] read : splitTargets.shards) {
-                        long n = getRowCountSafe(tgtVerify, read[0], read[1], isPg);
+                        long n = getRowCountSafe(tgtVerify, read[0], read[1], sourceDb);
                         if (n < 0) { newTargetCount = -1; break; }
                         newTargetCount += n;
                     }
                 } else {
-                    newTargetCount = getRowCountSafe(tgtVerify, targetDb, targetTable, isPg);
+                    newTargetCount = getRowCountSafe(tgtVerify, targetDb, targetTable, sourceDb);
                 }
                 verified = newSourceCount >= 0 && newSourceCount == newTargetCount;
             } catch (Exception e) {
@@ -1621,12 +1632,12 @@ public class ValidationTaskService {
         try {
             boolean sourceIsPg = isPostgresqlConnection(sourceDb);
             boolean targetIsPg = isPostgresqlConnection(targetDb);
-            long sourceRowCount = getRowCountSafe(sourceDb, sourceDbName, tableName, sourceIsPg);
+            long sourceRowCount = getRowCountSafe(sourceDb, sourceDbName, tableName, null);
             long targetRowCount;
             if (splitTargets != null) {
                 targetRowCount = 0;
                 for (String[] shard : splitTargets.shards) {
-                    long shardRows = getRowCountSafe(targetDb, shard[0], shard[1], targetIsPg);
+                    long shardRows = getRowCountSafe(targetDb, shard[0], shard[1], sourceDbName);
                     if (shardRows < 0) {
                         result.error = "分片 " + shard[0] + "." + shard[1] + " 行数获取失败";
                         return result;
@@ -1689,9 +1700,10 @@ public class ValidationTaskService {
             boolean sourceIsPg = isPostgresqlConnection(sourceDb);
             boolean targetIsPg = isPostgresqlConnection(targetDb);
 
-            long sourceRowCount = getRowCountSafe(sourceDb, sourceDbName, tableName, sourceIsPg);
-            // 表名映射（表级同步）：目标端按映射后的表名取行数
-            long targetRowCount = getRowCountSafe(targetDb, targetDbName, targetTableName, targetIsPg);
+            long sourceRowCount = getRowCountSafe(sourceDb, sourceDbName, tableName, null);
+            // 表名映射（表级同步）：目标端按映射后的表名取行数。
+            // schemaHint 传源库名：mysql→pg / oracle→pg 的目标表就建在这个 schema 下
+            long targetRowCount = getRowCountSafe(targetDb, targetDbName, targetTableName, sourceDbName);
 
             if (sourceRowCount < 0 || targetRowCount < 0) {
                 result.error = "获取行数失败";
@@ -1728,11 +1740,76 @@ public class ValidationTaskService {
         return conn.getMetaData().getDatabaseProductName().toLowerCase().contains("postgresql");
     }
 
-    private long getRowCount(Connection conn, String dbName, String tableName, boolean isPg) throws SQLException {
+    /** 连接方言。行数查询要按方言拼限定名，PG 还得先定位表实际落在哪个 schema。 */
+    private enum Dialect { MYSQL, POSTGRESQL, ORACLE }
+
+    private Dialect dialectOf(Connection conn) throws SQLException {
+        String product = conn.getMetaData().getDatabaseProductName().toLowerCase();
+        if (product.contains("postgresql")) {
+            return Dialect.POSTGRESQL;
+        }
+        if (product.contains("oracle")) {
+            return Dialect.ORACLE;
+        }
+        return Dialect.MYSQL;
+    }
+
+    /**
+     * 定位 PG 表实际所在的 schema。
+     *
+     * <p>不能想当然按 public：<b>mysql→pg / oracle→pg 的同步引擎把目标表建在「源库名」那个
+     * schema 下</b>，不是 public。按 public 查会抛 relation does not exist，被
+     * {@link #getRowCountSafe} 吞成 0 行——于是一条同步完全正常的链路，对比结论看着像
+     * 目标端数据全丢了（这正是该方法存在的原因，别再改回不带 schema 的写法）。
+     *
+     * <p>同时把**表名的实际大小写**一并返回：oracle→pg 的建表会把 Oracle 的大写表名转成小写
+     * （见 SchemaMigration 对 sourceIsOracle && targetIsPostgresql 的处理），而同步对象里记的是
+     * 大写 AT_LOAD。PG 的双引号限定名是区分大小写的，照原样拼就又变成"表不存在=0 行"了。
+     *
+     * @param schemaHint 首选 schema（目标端传源库名：mysql→pg 的落点就是它）
+     * @return {schema, 实际表名}；确实不存在返回 null，由调用方按"表不存在"处理
+     */
+    private String[] resolvePgTable(Connection conn, String tableName, String schemaHint) {
+        String sql = "SELECT table_schema, table_name FROM information_schema.tables "
+                + "WHERE lower(table_name) = lower(?) "
+                + "AND table_schema NOT IN ('pg_catalog', 'information_schema') "
+                // 同名表落在多个 schema 时：先认调用方给的落点提示，再 public，最后按名字稳定排序
+                + "ORDER BY (lower(table_schema) = lower(?)) DESC, "
+                + "(table_schema = 'public') DESC, table_schema";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, tableName);
+            ps.setString(2, schemaHint == null ? "" : schemaHint);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new String[]{rs.getString(1), rs.getString(2)} : null;
+            }
+        } catch (SQLException e) {
+            logger.warn("定位 PG 表 {} 失败: {}", tableName, e.getMessage());
+            return null;
+        }
+    }
+
+    private long getRowCount(Connection conn, String dbName, String tableName, String schemaHint)
+            throws SQLException {
+        String sql;
+        switch (dialectOf(conn)) {
+            case POSTGRESQL: {
+                String[] loc = resolvePgTable(conn, tableName, schemaHint);
+                if (loc == null) {
+                    // 与 MySQL 的"表不存在"走同一条路：由 getRowCountSafe 判成 0 行
+                    throw new SQLException("relation \"" + tableName + "\" does not exist");
+                }
+                sql = "SELECT COUNT(*) FROM \"" + loc[0] + "\".\"" + loc[1] + "\"";
+                break;
+            }
+            case ORACLE:
+                // Oracle 的"库"就是 schema(owner)，标识符默认大写存储
+                sql = "SELECT COUNT(*) FROM \"" + dbName.toUpperCase() + "\".\""
+                        + tableName.toUpperCase() + "\"";
+                break;
+            default:
+                sql = "SELECT COUNT(*) FROM `" + dbName + "`.`" + tableName + "`";
+        }
         try (Statement stmt = conn.createStatement()) {
-            String sql = isPg
-                ? "SELECT COUNT(*) FROM \"" + tableName + "\""
-                : "SELECT COUNT(*) FROM `" + dbName + "`.`" + tableName + "`";
             try (ResultSet rs = stmt.executeQuery(sql)) {
                 if (rs.next()) {
                     return rs.getLong(1);
@@ -1742,9 +1819,9 @@ public class ValidationTaskService {
         return 0;
     }
 
-    private long getRowCountSafe(Connection conn, String dbName, String tableName, boolean isPg) {
+    private long getRowCountSafe(Connection conn, String dbName, String tableName, String schemaHint) {
         try {
-            return getRowCount(conn, dbName, tableName, isPg);
+            return getRowCount(conn, dbName, tableName, schemaHint);
         } catch (SQLException e) {
             String msg = e.getMessage();
             if (msg != null && (msg.contains("doesn't exist") || msg.contains("does not exist")

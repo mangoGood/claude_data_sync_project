@@ -88,7 +88,16 @@ public class SwitchoverService {
             Map<String, Object> last = null;
             while (System.currentTimeMillis() < deadline) {
                 last = drainState(taskId);
-                if (Boolean.TRUE.equals(last.get("caughtUp"))) {
+                // 两把尺子都要过：
+                //   1) capture 已经读过了停写那一刻的源端位点（reachedBoundary）
+                //   2) 读到的东西已经全部应用完（caughtUp：pending_events==0 且无未应用 THL 文件）
+                // 只看 2) 会漏掉最危险的那一段：**capture 还没把最后一批写入读出来**时，
+                // THL 里根本没有这些事件，pending_events 自然是 0，于是判成"已追平"就切了，
+                // 方向一对调，那批数据永远留在旧主。实测这么丢过 28 行（PG 必现、MySQL 偶发）。
+                Boolean reached = captureReachedBoundary(taskId, src, cfg, sourceIsPg, boundary);
+                last.put("reachedBoundary", reached);
+                last.put("boundary", boundary);
+                if (Boolean.TRUE.equals(reached) && Boolean.TRUE.equals(last.get("caughtUp"))) {
                     DrainResult r = new DrainResult(true, "已追平");
                     r.details.putAll(last);
                     r.details.put("fenced", fenced);
@@ -106,7 +115,11 @@ public class SwitchoverService {
                     logger.error("[{}] 追平超时后解除旧主只读失败，请人工处理: {}", taskId, err);
                 }
             }
-            DrainResult r = new DrainResult(false, "等待追平超时（" + timeoutMs + "ms），已放弃切换并解除旧主只读");
+            String why = (last != null && !Boolean.TRUE.equals(last.get("reachedBoundary")))
+                    ? "capture 尚未读到停写位点 " + boundary
+                    : "已捕获的变更尚未应用完";
+            DrainResult r = new DrainResult(false,
+                    "等待追平超时（" + timeoutMs + "ms，" + why + "），已放弃切换并解除旧主只读");
             if (last != null) {
                 r.details.putAll(last);
             }
@@ -228,6 +241,102 @@ public class SwitchoverService {
             return null;
         } catch (Exception e) {
             return e.getMessage();
+        }
+    }
+
+    /**
+     * capture 是否已经读过了停写那一刻的源端位点。
+     *
+     * @return true 已越过；false 还没到；null 判不出来（判不出来一律不算追平——
+     *         "读不出来就当作已追平"正是最危险的误判方向）
+     */
+    private Boolean captureReachedBoundary(String taskId, Connection src, Properties cfg,
+                                           boolean pg, String boundary) {
+        if (boundary == null || boundary.isEmpty() || "-".equals(boundary)) {
+            return null;
+        }
+        if (pg) {
+            Long want = parseLsn(boundary);
+            if (want == null) {
+                return null;
+            }
+            // 首选复制槽的 confirmed_flush_lsn：它由解码端的反馈推动，PG 的 keepalive 也会推着它走，
+            // 所以停写之后它照样能追到当前 WAL 位点。capture 自己那份位点文件是按事件数落盘的，
+            // 停写之后没有新事件就不再刷新，拿它当唯一依据会让切换永远等不到。
+            String slot = cfg.getProperty("capture.wal.slot.name",
+                    "migration_slot_" + taskId.replaceAll("[^a-z0-9_]", "_"));
+            try (java.sql.PreparedStatement ps = src.prepareStatement(
+                    "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = ?")) {
+                ps.setString(1, slot);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        Long cur = parseLsn(rs.getString(1));
+                        if (cur != null) {
+                            return cur >= want;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("[{}] 读复制槽 {} 的 confirmed_flush_lsn 失败: {}", taskId, slot, e.getMessage());
+            }
+            Long cur = parseLsn(captureProperty(taskId, "wal.lsn"));
+            return cur == null ? null : cur >= want;
+        }
+
+        String file = captureProperty(taskId, "binlog.file");
+        String pos = captureProperty(taskId, "binlog.position");
+        if (file == null || pos == null) {
+            return null;
+        }
+        int sep = boundary.lastIndexOf(':');
+        if (sep <= 0) {
+            return null;
+        }
+        try {
+            String wantFile = boundary.substring(0, sep).trim();
+            long wantPos = Long.parseLong(boundary.substring(sep + 1).trim());
+            int cmp = file.trim().compareTo(wantFile);
+            if (cmp != 0) {
+                // binlog 文件名带定长序号（mysql-bin.000021），字典序即时间序
+                return cmp > 0;
+            }
+            return Long.parseLong(pos.trim()) >= wantPos;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 读 capture 进程自己持久化的位点属性。 */
+    private String captureProperty(String taskId, String key) {
+        File f = new File("files/" + taskId + "/binlog_output/capture_position.properties");
+        if (!f.isFile()) {
+            return null;
+        }
+        Properties p = new Properties();
+        try (FileInputStream in = new FileInputStream(f)) {
+            p.load(in);
+            String v = p.getProperty(key);
+            return (v == null || v.trim().isEmpty()) ? null : v.trim();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** PG LSN 文本 "1/AD34E928" → 可比较的数值（高 32 位/低 32 位拼接）。 */
+    static Long parseLsn(String lsn) {
+        if (lsn == null || lsn.trim().isEmpty()) {
+            return null;
+        }
+        String s = lsn.trim();
+        int slash = s.indexOf('/');
+        try {
+            if (slash < 0) {
+                return Long.parseLong(s);
+            }
+            return (Long.parseUnsignedLong(s.substring(0, slash), 16) << 32)
+                    + Long.parseUnsignedLong(s.substring(slash + 1), 16);
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

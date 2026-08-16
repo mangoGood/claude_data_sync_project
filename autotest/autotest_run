@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# ============================================================================
+# 同步平台端到端自动化测试 —— 启动入口
+#
+#   ./autotest/autotest_run                          默认用例集（standard，约 30 分钟）
+#   ./autotest/autotest_run --profile full           所有链路
+#   ./autotest/autotest_run --suite sync_mysql2mysql 只跑 mysql→mysql 同步
+#   ./autotest/autotest_run --suite dr_mysql         只跑 mysql 灾备（单向+双向）
+#   ./autotest/autotest_run --suite subscribe_mysql  只跑 mysql 数据订阅
+#   ./autotest/autotest_run --resume                 接着上次跑
+#   ./autotest/autotest_run --list                   列出全部用例
+#
+# 退出码：0 全部通过；1 有用例未通过；2 环境不可用（后端连不上等）。
+# 未通过的用例**不清理**任务与数据库，任务 id 见控制台与报告。
+# ============================================================================
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+AT="$ROOT/autotest"
+
+# ---------- 挑解释器：优先项目自带 venv（已装 mysql-connector/psycopg2/pymongo/kafka/oracledb）----------
+PY=""
+for cand in "$ROOT/.venv_fi/bin/python" "$AT/.venv/bin/python" "$(command -v python3 || true)"; do
+  [ -n "$cand" ] && [ -x "$cand" ] || continue
+  if "$cand" - <<'PROBE' >/dev/null 2>&1
+import mysql.connector, psycopg2, pymongo
+PROBE
+  then PY="$cand"; break; fi
+done
+if [ -z "$PY" ]; then
+  echo "!! 找不到装齐依赖的 Python 解释器。"
+  echo "   需要 mysql-connector-python / psycopg2-binary / pymongo（订阅用例另需 kafka-python，Oracle 用例另需 oracledb）。"
+  echo "   例如： python3 -m venv .venv_fi && .venv_fi/bin/pip install -r autotest/requirements.txt"
+  exit 2
+fi
+
+# ---------- 密钥环境：与 start.sh 同源，缺了会连不上库/解不开密文连接串 ----------
+for f in .synctask_master_key:SYNCTASK_MASTER_KEY \
+         .synctask_jwt_secret:JWT_SECRET \
+         .synctask_agent_token:AGENT_API_TOKEN; do
+  file="${f%%:*}"; var="${f##*:}"
+  if [ -f "$ROOT/$file" ] && [ -z "${!var:-}" ]; then
+    export "$var"="$(cat "$ROOT/$file")"
+  fi
+done
+
+mkdir -p "$AT/logs" "$AT/reports"
+LOG="$AT/logs/autotest-$(date +%Y%m%d-%H%M%S).log"
+
+# ---------- 单实例互斥：两轮用例同时跑会互相踩库 ----------
+PIDFILE="$AT/.autotest.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "!! 已有一轮用例在跑（PID $(cat "$PIDFILE")）。先跑 ./autotest/autotest_stop，或等它结束。"
+  exit 2
+fi
+
+# ---------- 可选：按需拉起灾备专用实例（灾备两端必须是不同实例）----------
+# 三个 profile 都含灾备用例，所以默认就要拉；只有用 --suite/--group 明确挑了
+# **不含 dr 的**子集时才跳过
+need_dr=1
+if printf '%s\n' "$@" | grep -qE '^--(suite|group)$|^--(suite|group)='; then
+  printf '%s\n' "$@" | grep -q 'dr' || need_dr=0
+fi
+if [ "$need_dr" = "1" ] && ! docker ps --format '{{.Names}}' | grep -q '^dr-mysql-a$'; then
+  echo ">> 灾备用例需要独立实例，拉起 docker-compose-synctask-dr.yml ..."
+  docker compose -f "$ROOT/docker-compose-synctask-dr.yml" up -d >/dev/null 2>&1 || \
+    echo "   （拉起失败，相关灾备用例会因环境不满足而跳过）"
+  sleep 12
+fi
+
+echo ">> 解释器: $PY"
+echo ">> 日志  : $LOG"
+echo ""
+
+set -o pipefail
+# PID 文件由 main.py 自己写（管道里的 $! 是 tee 的 PID，不是用例进程的）
+"$PY" -u "$AT/main.py" "$@" 2>&1 | tee "$LOG"
+exit ${PIPESTATUS[0]}

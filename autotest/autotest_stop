@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# ============================================================================
+# 同步平台端到端自动化测试 —— 停止入口
+#
+#   ./autotest/autotest_stop            停掉正在跑的那一轮（当前用例跑完即停，保留现场）
+#   ./autotest/autotest_stop --force    立即停（不等当前用例收尾）
+#   ./autotest/autotest_stop --clean    停掉之后，把状态文件里登记的残留任务/库/索引/topic 清干净
+#
+# 只停不清时现场完整保留，可以接着 ./autotest/autotest_run --resume 跑。
+# ============================================================================
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+AT="$ROOT/autotest"
+PIDFILE="$AT/.autotest.pid"
+
+FORCE=0; CLEAN=0
+for a in "$@"; do
+  case "$a" in
+    --force) FORCE=1 ;;
+    --clean) CLEAN=1 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    *) echo "未知参数: $a"; exit 2 ;;
+  esac
+done
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  PID="$(cat "$PIDFILE")"
+  if [ "$FORCE" = "1" ]; then
+    echo ">> 立即终止用例进程 $PID ..."
+    kill -TERM "$PID" 2>/dev/null; sleep 1; kill -TERM "$PID" 2>/dev/null
+    sleep 2; kill -KILL "$PID" 2>/dev/null || true
+  else
+    echo ">> 通知用例进程 $PID 收尾停止（当前用例跑完即停，报告照常生成）..."
+    kill -TERM "$PID" 2>/dev/null
+    for _ in $(seq 1 120); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+  fi
+  rm -f "$PIDFILE"
+  echo ">> 已停止。"
+else
+  echo ">> 当前没有在跑的用例进程。"
+fi
+
+if [ "$CLEAN" = "1" ]; then
+  PY=""
+  for cand in "$ROOT/.venv_fi/bin/python" "$AT/.venv/bin/python" "$(command -v python3 || true)"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    if "$cand" - <<'PROBE' >/dev/null 2>&1
+import mysql.connector, psycopg2, pymongo
+PROBE
+    then PY="$cand"; break; fi
+  done
+  [ -z "$PY" ] && { echo "!! 找不到装齐依赖的 Python，无法清理"; exit 2; }
+  for f in .synctask_master_key:SYNCTASK_MASTER_KEY .synctask_jwt_secret:JWT_SECRET \
+           .synctask_agent_token:AGENT_API_TOKEN; do
+    file="${f%%:*}"; var="${f##*:}"
+    [ -f "$ROOT/$file" ] && [ -z "${!var:-}" ] && export "$var"="$(cat "$ROOT/$file")"
+  done
+  echo ">> 清理状态文件中登记的残留资源..."
+  "$PY" -u "$AT/main.py" --clean-only
+fi

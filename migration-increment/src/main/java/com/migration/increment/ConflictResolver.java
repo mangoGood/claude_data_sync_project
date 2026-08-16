@@ -208,7 +208,6 @@ public class ConflictResolver {
         if (!isActive()) {
             return Decision.APPLY;
         }
-        conflicts.incrementAndGet();
         long storedTs = 0;
         String storedNode = null;
         if (tableReady && table != null && rowKey != null) {
@@ -229,6 +228,23 @@ public class ConflictResolver {
             }
         }
 
+        // 同源不是冲突：这一行上一次就是本方向写的，现在来的是**同一个源**的下一个版本，
+        // 两端没有分叉可裁决，直接应用。
+        //
+        // 走到这里说明前镜像守卫没匹配上，但"没匹配上"并不总是意味着本端被别人改过：
+        // PG 的 UPDATE 在 REPLICA IDENTITY DEFAULT 下**不带前镜像**（只有主键变了才带），
+        // 守卫因此必然落空。此前这种情况会掉进下面的裁决：storedNode 等于 nodeId 时
+        // 走不进 LWW 的时间戳比较，退化成"节点 id 与 localNodeId 比字典序"，
+        // 而 "127.0.0.1:5432/db".compareTo("local") < 0 恒成立 —— 于是每一条 UPDATE 都判本端赢、
+        // 被静默丢掉。表现是双向灾备两端行数一模一样、任务全绿，值却停在更新前。
+        // MySQL 侧碰不到是因为 binlog 带全前镜像，守卫本来就能匹配上。
+        if (storedNode != null && storedNode.equals(nodeId)) {
+            logger.debug("前镜像守卫落空但来源与上次写入同为 {}，非冲突，直接应用: {}.{}",
+                    nodeId, table, rowKey);
+            return Decision.APPLY;
+        }
+
+        conflicts.incrementAndGet();
         boolean win;
         switch (policy) {
             case NODE_PRIORITY:

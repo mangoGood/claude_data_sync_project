@@ -359,6 +359,41 @@ public class SchemaMigration {
         logger.debug("已删除表: {}", targetName);
     }
 
+    private String sourceDialectName() {
+        return sourceConnection.getConfig().getDbType();
+    }
+
+    private String targetDialectName() {
+        return targetConnection.getConfig().getDbType();
+    }
+
+    /** 目标表是否已存在（用户预建结构的场景要放行，不能一律报错）。 */
+    private boolean targetTableExists(String tableName) {
+        try (java.sql.ResultSet rs = targetConnection.getConnection().getMetaData()
+                .getTables(null, null, tableName, new String[]{"TABLE"})) {
+            if (rs.next()) {
+                return true;
+            }
+        } catch (SQLException e) {
+            logger.warn("检查目标表 {} 是否存在失败: {}", tableName, e.getMessage());
+        }
+        // 大小写不敏感再找一遍：Oracle 存大写、MySQL 建库时可能是小写
+        for (String variant : new String[]{tableName.toUpperCase(), tableName.toLowerCase()}) {
+            if (variant.equals(tableName)) {
+                continue;
+            }
+            try (java.sql.ResultSet rs = targetConnection.getConnection().getMetaData()
+                    .getTables(null, null, variant, new String[]{"TABLE"})) {
+                if (rs.next()) {
+                    return true;
+                }
+            } catch (SQLException ignored) {
+                // 探测失败按"不存在"处理，让上层给出明确报错
+            }
+        }
+        return false;
+    }
+
     private void createTable(TableInfo table) throws SQLException {
         // 异构迁移：按源→目标库对的翻译器生成目标建表 SQL
         if (!translator.isHomogeneous()) {
@@ -377,9 +412,23 @@ public class SchemaMigration {
         // 同构迁移：沿用源端 CREATE TABLE 语句
         String createSql = table.getCreateSql();
         if (createSql == null || createSql.isEmpty()) {
-            // 源端没有提供 CREATE TABLE SQL（如 Oracle），并且未走上述专门路径，则跳过
-            logger.warn("表 {} 未提供 CREATE TABLE SQL，跳过结构迁移", table.getTableName());
-            return;
+            // 源端没提供 CREATE TABLE SQL（Oracle 就不提供），且该源→目标库对没有专门的
+            // 建表翻译器。此时只有一种情况可以往下走：目标表本来就在（用户预建好了）。
+            //
+            // 目标表不存在还"跳过"就是**假成功**：调用方会把这张表记成"结构迁移成功"，
+            // 紧接着几百行数据全部以 "Table ... doesn't exist" 写失败，最后报一个
+            // "全量迁移失败，退出码 1"——真正的原因（这个库对压根不支持自动建表）
+            // 一个字都没出现在结论里。实测 oracle→mysql 就是这么失败的。
+            if (targetTableExists(table.getTargetTableName())) {
+                logger.warn("表 {} 未提供 CREATE TABLE SQL，但目标表已存在，沿用目标端现有结构",
+                        table.getTableName());
+                return;
+            }
+            throw new SQLException(String.format(
+                    "表 %s 无法在目标端自动建表：源端(%s)不提供 CREATE TABLE 语句，"
+                            + "且 %s→%s 尚无建表翻译器。请先在目标库手工建好表再重跑，"
+                            + "或改用受支持的目标库类型。",
+                    table.getTableName(), sourceDialectName(), sourceDialectName(), targetDialectName()));
         }
         createSql = cleanCreateSql(createSql);
         createSql = renameTableInCreateSql(createSql, table.getTableName(), table.getTargetTableName());

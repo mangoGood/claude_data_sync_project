@@ -35,6 +35,9 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
     private String outputDir;
     private String taskId;
     private String slotName;
+    /** 位点按时间兜底落盘的间隔（与 MySQLBinlogCapture 保持一致） */
+    private static final long POSITION_SAVE_INTERVAL_MS = 5000;
+    private long lastPositionSaveTime = System.currentTimeMillis();
     private String publicationName;
 
     private Connection conn;
@@ -840,6 +843,16 @@ public class PostgresWalCapture extends AbstractCapture<byte[]> {
             if (count % 1000 == 0) {
                 logger.info("Captured {} WAL events, current LSN: {}", count, currentLsn);
                 savePosition();
+                lastPositionSaveTime = System.currentTimeMillis();
+            } else {
+                // 按时间兜底落位点（与 MySQL/TiCDC 一致）：只按"每 1000 事件"存，
+                // 低流量任务的位点文件会长期停在很旧的 LSN——位点可视化看着像卡住了，
+                // 计划内切换的"capture 是否已读到停写位点"也会因此永远等不到。
+                long now = System.currentTimeMillis();
+                if (now - lastPositionSaveTime >= POSITION_SAVE_INTERVAL_MS) {
+                    savePosition();
+                    lastPositionSaveTime = now;
+                }
             }
             checkRetentionQuietly();
         } catch (Exception e) {
