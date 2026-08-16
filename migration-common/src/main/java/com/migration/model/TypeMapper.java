@@ -570,6 +570,193 @@ public class TypeMapper {
     }
 
     /**
+     * Oracle 无参 {@code NUMBER} 经 JDBC 上报的精度哨兵值。
+     * 它是该类型的内部字节长度（22），不是十进制精度——Oracle 的 DATA_PRECISION 此时为 NULL。
+     */
+    private static final int ORACLE_UNCONSTRAINED_NUMBER_PRECISION = 22;
+
+    /** 从 {@code timestamp(6)} 这类类型名里取括号中的精度；没有括号返回 -1。 */
+    private static int parenPrecision(String lowerType) {
+        int l = lowerType.indexOf('(');
+        int r = lowerType.indexOf(')', l + 1);
+        if (l < 0 || r < 0) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(lowerType.substring(l + 1, r).trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * Oracle 列 → MySQL 列定义（含类型、NOT NULL、DEFAULT）。
+     *
+     * <p>几处刻意的取舍，都是为了<b>不静默丢数据</b>：
+     * <ul>
+     *   <li><b>无精度 NUMBER</b> → {@code DECIMAL(65,20)}。MySQL 的 DECIMAL 上限是 65 位精度
+     *       /30 位小数，而 Oracle 无精度 NUMBER 最多 38 位有效数字；(65,20) 留出 45 位整数位，
+     *       足以容纳 Oracle 的全部整数取值，同时保留 20 位小数。映射成 DOUBLE 会把精确十进制
+     *       变成二进制浮点，是这类迁移最常见的静默失真来源。</li>
+     *   <li><b>TIMESTAMP WITH [LOCAL] TIME ZONE</b> → {@code VARCHAR(64)}。MySQL 没有带时区的
+     *       时间类型，映射成 DATETIME 会把时区偏移<b>静默抹掉</b>；用字符串原样保留，宁可让下游
+     *       自己解析，也不装作转换成功。</li>
+     *   <li><b>大对象</b>一律 LONGTEXT/LONGBLOB：MySQL 的 TEXT 上限 64KB，CLOB 装不下。</li>
+     * </ul>
+     */
+    public static String mapOracleToMysqlColumnDef(ColumnInfo column) {
+        String oracleType = column.getDataType();
+        if (oracleType == null) {
+            return "LONGTEXT";
+        }
+        String lowerType = oracleType.toLowerCase().trim();
+
+        String mysqlType;
+        // 大对象/长文本列在 MySQL 里不允许带 DEFAULT，单独标记
+        boolean lobLike = false;
+
+        if (lowerType.startsWith("varchar2") || lowerType.startsWith("nvarchar2")
+                || lowerType.startsWith("varchar") || lowerType.startsWith("nvarchar")) {
+            int size = column.getColumnSize();
+            if (size <= 0) {
+                mysqlType = "VARCHAR(255)";
+            } else if (size <= 4000) {
+                mysqlType = "VARCHAR(" + size + ")";
+            } else {
+                // 行内 VARCHAR 受 65535 字节行长限制，utf8mb4 下 4000 字符已接近上限
+                mysqlType = "LONGTEXT";
+                lobLike = true;
+            }
+        } else if (lowerType.startsWith("nchar")
+                || (lowerType.startsWith("char") && !lowerType.startsWith("character"))) {
+            int size = column.getColumnSize();
+            if (size <= 0) {
+                mysqlType = "CHAR(1)";
+            } else if (size <= 255) {
+                mysqlType = "CHAR(" + size + ")";
+            } else {
+                mysqlType = "VARCHAR(" + size + ")";
+            }
+        } else if (lowerType.startsWith("clob") || lowerType.startsWith("nclob")
+                || lowerType.startsWith("xmltype")) {
+            mysqlType = "LONGTEXT";
+            lobLike = true;
+        } else if (lowerType.startsWith("long raw")) {
+            mysqlType = "LONGBLOB";
+            lobLike = true;
+        } else if (lowerType.startsWith("long")) {
+            mysqlType = "LONGTEXT";
+            lobLike = true;
+        } else if (lowerType.startsWith("blob") || lowerType.startsWith("bfile")) {
+            mysqlType = "LONGBLOB";
+            lobLike = true;
+        } else if (lowerType.startsWith("raw")) {
+            int size = column.getColumnSize();
+            mysqlType = size > 0 ? "VARBINARY(" + size + ")" : "VARBINARY(2000)";
+        } else if (lowerType.startsWith("number")) {
+            int precision = column.getColumnSize();
+            int scale = column.getDecimalDigits();
+            if (scale > 0) {
+                int p = Math.min(precision > 0 ? precision : 38, 65);
+                int sc = Math.min(scale, 30);
+                if (sc >= p) {
+                    // DECIMAL 要求 scale <= precision，Oracle 允许 NUMBER(4,6) 这种
+                    p = Math.min(sc + 1, 65);
+                }
+                mysqlType = "DECIMAL(" + p + "," + sc + ")";
+            } else if (scale < 0) {
+                // 负 scale（NUMBER(8,-2)：按百位取整）没有 MySQL 对应物，退回整数类型
+                mysqlType = "DECIMAL(" + Math.min(precision > 0 ? precision : 38, 65) + ",0)";
+            } else if (precision > 0 && precision <= 2) {
+                mysqlType = "TINYINT";
+            } else if (precision > 0 && precision <= 4) {
+                mysqlType = "SMALLINT";
+            } else if (precision > 0 && precision <= 6) {
+                mysqlType = "MEDIUMINT";
+            } else if (precision > 0 && precision <= 9) {
+                mysqlType = "INT";
+            } else if (precision > 0 && precision <= 18) {
+                mysqlType = "BIGINT";
+            } else if (precision == ORACLE_UNCONSTRAINED_NUMBER_PRECISION) {
+                // 无参 NUMBER：Oracle 的 DATA_PRECISION 是 NULL，JDBC 报的 22 是该类型的**内部字节长度**
+                // 而不是精度。照着建 DECIMAL(22,0) 会把小数位整个抹掉（实测
+                // 12345678901234567890.5 落库变成 ...891，且两端都不报错）。
+                // DECIMAL(65,20) 留 45 位整数位，覆盖 Oracle NUMBER 的全部 38 位有效数字，再带 20 位小数。
+                // 代价是真正声明成 NUMBER(22) 的列也会用上这个宽类型——只多占空间，不丢数据。
+                mysqlType = "DECIMAL(65,20)";
+            } else if (precision > 18 && precision <= 65) {
+                mysqlType = "DECIMAL(" + precision + ",0)";
+            } else {
+                mysqlType = "DECIMAL(65,20)";
+            }
+        } else if (lowerType.equals("float") || lowerType.startsWith("binary_double")) {
+            mysqlType = "DOUBLE";
+        } else if (lowerType.startsWith("binary_float")) {
+            mysqlType = "FLOAT";
+        } else if (lowerType.startsWith("date")) {
+            // Oracle DATE 含日期+时间，映射成 MySQL DATE 会把时分秒丢掉
+            mysqlType = "DATETIME";
+        } else if (lowerType.startsWith("timestamp") && lowerType.contains("time zone")) {
+            mysqlType = "VARCHAR(64)";
+        } else if (lowerType.startsWith("timestamp")) {
+            // 小数秒精度优先从类型名里取：Oracle JDBC 对 TIMESTAMP(6) 的 decimalDigits 常报 0，
+            // 只信 decimalDigits 会把 DATETIME(6) 建成 DATETIME，微秒被静默截成 .000000
+            int fsp = parenPrecision(lowerType);
+            if (fsp < 0) {
+                fsp = column.getDecimalDigits();
+            }
+            fsp = Math.max(0, Math.min(fsp, 6));            // MySQL 小数秒最多 6 位
+            mysqlType = fsp > 0 ? "DATETIME(" + fsp + ")" : "DATETIME";
+        } else if (lowerType.startsWith("interval")) {
+            mysqlType = "VARCHAR(64)";
+        } else if (lowerType.startsWith("rowid")) {
+            mysqlType = "VARCHAR(18)";
+        } else if (lowerType.startsWith("urowid")) {
+            mysqlType = "VARCHAR(4000)";
+        } else if (lowerType.startsWith("json")) {
+            mysqlType = "JSON";
+            lobLike = true;
+        } else if (lowerType.startsWith("boolean") || lowerType.equals("bool")) {
+            mysqlType = "TINYINT(1)";
+        } else {
+            mysqlType = "LONGTEXT";
+            lobLike = true;
+        }
+
+        StringBuilder sb = new StringBuilder(mysqlType);
+
+        if (!column.isNullable()) {
+            sb.append(" NOT NULL");
+        }
+
+        String defaultVal = column.getDefaultValue();
+        // MySQL 的 BLOB/TEXT/JSON 列不允许带字面量 DEFAULT，带了直接建表报错
+        if (!lobLike && defaultVal != null && !defaultVal.trim().isEmpty()) {
+            String trimmed = defaultVal.trim();
+            boolean timeLike = mysqlType.startsWith("DATETIME") || mysqlType.startsWith("TIMESTAMP");
+            if (trimmed.equalsIgnoreCase("CURRENT_TIMESTAMP") || trimmed.equalsIgnoreCase("SYSTIMESTAMP")
+                    || trimmed.equalsIgnoreCase("SYSDATE") || trimmed.equalsIgnoreCase("CURRENT_DATE")) {
+                // CURRENT_TIMESTAMP 只有时间类型能用，落到别的类型上是建表错误
+                if (timeLike) {
+                    sb.append(" DEFAULT CURRENT_TIMESTAMP");
+                }
+            } else if (trimmed.equalsIgnoreCase("NULL")) {
+                // 可空列本就默认 NULL，不写
+            } else if (trimmed.toUpperCase().startsWith("SYS_GUID")) {
+                // 函数默认值 MySQL 不支持，跳过（值本身由数据迁移带过来）
+            } else if (trimmed.matches("-?\\d+(\\.\\d+)?")) {
+                sb.append(" DEFAULT ").append(trimmed);
+            } else if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+                sb.append(" DEFAULT ").append(trimmed);
+            } else if (!timeLike) {
+                sb.append(" DEFAULT '").append(trimmed.replace("'", "''")).append("'");
+            }
+        }
+
+        return sb.toString();
+    }
+
+    /**
      * 判断给定类型名称是否为 Oracle 的 LOB 类型（CLOB/BLOB/NCLOB/LONG/LONG RAW）。
      */
     public static boolean isOracleLobType(String oracleType) {

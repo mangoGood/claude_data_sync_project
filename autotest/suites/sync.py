@@ -13,6 +13,7 @@
 """
 import json
 import time
+from decimal import Decimal
 
 from ..framework import config as C
 from ..framework import endpoints as E
@@ -425,26 +426,30 @@ def _oracle_alive():
 
 @suite("sync_oracle2pg", "Oracle → PostgreSQL 同步（全量+增量+对比）", "sync",
        est_secs=120, requires=_oracle_alive, tags=("oracle2pg",))
-def sync_oracle(ctx):
+def sync_oracle_pg(ctx):
+    # 目标表实际落在哪个 schema 由引擎决定，全量完成后用 resolve_schema() 现查
+    return _run_oracle_link(ctx, "postgresql", E.SqlEndpoint(C.PG, "%s_ora_tgt" % P), "PG")
+
+
+def _run_oracle_link(ctx, target_type, tgt, tgt_spec_name):
     api = ctx.api
     src = E.OracleEndpoint(C.ORACLE)
-    tgt_db = "%s_ora_tgt" % P
-    # 目标表实际落在哪个 schema 由引擎决定，全量完成后用 resolve_schema() 现查
-    tgt = E.SqlEndpoint(C.PG, tgt_db)
+    tgt_db = tgt.db
 
-    ctx.step("重建 Oracle 源表 %s.%s，重建 PG 目标库 %s" % (src.db, src.table, tgt_db))
+    ctx.step("重建 Oracle 源表 %s.%s，重建目标库 %s" % (src.db, src.table, tgt_db))
     src.reset_source()
     tgt.reset_target()
     ctx.reg_oracle_table()
-    ctx.reg_sql_db("PG", tgt_db)
+    ctx.reg_sql_db(tgt_spec_name, tgt_db)
 
     src.seed(C.SEED_ROWS, base=1)
 
-    tid = api.create_workflow("autotest-oracle2pg-%d" % int(time.time()), "oracle", "postgresql")
+    tid = api.create_workflow("autotest-oracle2%s-%d" % (tgt.kind, int(time.time())),
+                              "oracle", target_type)
     ctx.reg_task(tid)
     api.config_workflow(tid, {
         "sourceConnection": src.conn_str(), "targetConnection": tgt.conn_str(),
-        "migrationMode": "fullAndIncre", "sourceType": "oracle", "targetType": "postgresql",
+        "migrationMode": "fullAndIncre", "sourceType": "oracle", "targetType": target_type,
         # Oracle 的 sourceDbName 是**服务名/PDB**（FREEPDB1），不是 schema；
         # syncObjects 的 key 才是 schema（APP_USER）。填成 schema 会让 checkpoint 初始化取不到 SCN。
         "sourceDbName": src.service, "targetDbName": tgt_db, "syncObjects": src.sync_objects(),
@@ -469,6 +474,201 @@ def sync_oracle(ctx):
         ok, sfp, tfp = ctx.wait_converge(src, tgt, task_id=tid)
         ctx.check("增量同步：目标端追平源端（含更新与删除）", ok,
                   "源 %s / 目标 %s" % (E.fmt_fp(sfp), E.fmt_fp(tfp)))
+
+    vid, res = api.run_compare(tid, "ROW_COUNT")
+    ctx.register({"type": "validation", "id": vid})
+    ctx.check("行数对比：结论一致、无差异表",
+              res.get("status") == "COMPLETED" and (res.get("failedTables") or 0) == 0,
+              "status=%s failed=%s %s" % (res.get("status"), res.get("failedTables"),
+                                          _diff_detail(res)))
+
+    api.stop(tid)
+    return {"task_id": tid}
+
+
+@suite("sync_oracle2mysql", "Oracle → MySQL 同步（全量+增量+对比）", "sync",
+       est_secs=140, requires=_oracle_alive, tags=("oracle2mysql",))
+def sync_oracle_mysql(ctx):
+    """Oracle → MySQL 与 Oracle → PG 共用同一套流程，只换目标端。
+
+    这条链路的目标表沿用 Oracle 的**大写**表名（OracleToMysqlTranslator 刻意不转小写：
+    MySQL 在 Linux 上表名大小写敏感，转了小写会让增量 apply 与行数对比各找各的表）。
+    """
+    tgt = E.SqlEndpoint(C.MYSQL, "%s_ora_my_tgt" % P, table=E.TABLE.upper())
+    return _run_oracle_link(ctx, "mysql", tgt, "MYSQL")
+
+
+# ----------------------------------------------------------------- Oracle → MySQL 类型覆盖
+TYPES_TABLE = "AT_TYPES"
+
+# (Oracle 列定义, 期望的 MySQL 列类型)。期望值与 TypeMapper.mapOracleToMysqlColumnDef 对齐，
+# 在真库上跑一遍才算数——单测只证明"生成的 DDL 文本对"，不证明"MySQL 认这条 DDL"。
+TYPE_MATRIX = [
+    ("ID NUMBER(10) PRIMARY KEY", "id", "bigint"),
+    ("D DATE", "d", "datetime"),
+    ("TS TIMESTAMP(6)", "ts", "datetime(6)"),
+    ("AMT NUMBER(12,2)", "amt", "decimal(12,2)"),
+    ("CNT NUMBER(4)", "cnt", "smallint"),
+    ("BIGNUM NUMBER", "bignum", "decimal(65,20)"),
+    ("TXT VARCHAR2(100)", "txt", "varchar(100)"),
+    ("BODY CLOB", "body", "longtext"),
+    ("BIN RAW(16)", "bin", "varbinary(16)"),
+]
+
+
+def _ora_types_ddl():
+    return "CREATE TABLE %s (\n  %s\n)" % (
+        TYPES_TABLE, ",\n  ".join(c[0] for c in TYPE_MATRIX))
+
+
+def _ora_types_row(i):
+    """一行造数：日期/时间戳/小数/大数/CLOB/RAW 都给上真值。"""
+    return ("INSERT INTO %s (ID,D,TS,AMT,CNT,BIGNUM,TXT,BODY,BIN) VALUES ("
+            "%d, TO_DATE('2026-08-1%d 10:20:30','YYYY-MM-DD HH24:MI:SS'), "
+            "TO_TIMESTAMP('2026-08-1%d 10:20:30.123456','YYYY-MM-DD HH24:MI:SS.FF6'), "
+            "%d.25, %d, 12345678901234567890.5, 'txt-%d', 'clob-body-%d', HEXTORAW('AABB%02X'))"
+            % (TYPES_TABLE, i, i % 10, i % 10, 100 + i, i, i, i, i % 256))
+
+
+def _mysql_types(tgt):
+    """目标端实际列类型（小写），用于核对建表翻译的落点。"""
+    rows = tgt.exec(
+        "SELECT LOWER(COLUMN_NAME), LOWER(COLUMN_TYPE) FROM information_schema.columns "
+        "WHERE TABLE_SCHEMA='%s' AND TABLE_NAME='%s'" % (tgt.db, TYPES_TABLE), db=tgt.db)
+    return {r[0]: r[1] for r in rows}
+
+
+def _norm_types_rows(rows):
+    """把两端的行归一成可比较的元组：数值用字符串化的 Decimal，时间到微秒，二进制转 hex。"""
+    out = {}
+    for r in rows:
+        rid, d, ts, amt, cnt, bignum, txt, body, binv = r
+        if isinstance(binv, (bytes, bytearray)):
+            binv = binv.hex().upper()
+        elif binv is not None:
+            binv = str(binv).upper()
+        out[int(rid)] = (
+            None if d is None else d.strftime("%Y-%m-%d %H:%M:%S"),
+            None if ts is None else ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            # 用 Decimal 归一，不能用 float：%.1f 会把 20 位大数压成浮点，
+            # 两端一起失真反而把"目标端真丢了小数位"掩盖掉
+            None if amt is None else str(Decimal(str(amt)).quantize(Decimal("0.01"))),
+            None if cnt is None else int(cnt),
+            None if bignum is None else str(Decimal(str(bignum)).normalize()),
+            txt,
+            None if body is None else str(body),
+            binv,
+        )
+    return out
+
+
+def _read_types_oracle(src):
+    c = src.conn()
+    cur = c.cursor()
+    cur.execute("SELECT ID,D,TS,AMT,CNT,BIGNUM,TXT,BODY,BIN FROM %s" % TYPES_TABLE)
+    rows = []
+    for r in cur.fetchall():
+        body = r[7]
+        rows.append((r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+                     body.read() if hasattr(body, "read") else body, r[8]))
+    cur.close()
+    c.close()
+    return rows
+
+
+def _read_types_mysql(tgt):
+    return tgt.exec("SELECT ID,D,TS,AMT,CNT,BIGNUM,TXT,BODY,BIN FROM `%s`" % TYPES_TABLE, db=tgt.db)
+
+
+@suite("sync_oracle2mysql_types", "Oracle → MySQL 类型覆盖（建表映射 + 增量字面量）", "sync",
+       est_secs=160, requires=_oracle_alive, tags=("oracle2mysql",))
+def sync_oracle_mysql_types(ctx):
+    """把 Oracle→MySQL 翻译器最容易出事的两处放到真库上验：
+
+    1. **建表类型映射**：DATE 必须落 DATETIME（落 DATE 会把时分秒丢掉）、无精度 NUMBER 必须落
+       DECIMAL 而不是 DOUBLE（精确十进制变二进制浮点是静默失真）、CLOB 必须落 LONGTEXT。
+    2. **增量字面量翻译**：LogMiner 的 SQL_REDO 里日期是 ``TO_DATE(...)``、二进制是
+       ``HEXTORAW(...)``。PG 恰好也有同名函数，所以 Oracle→PG 原样透传能跑；MySQL 没有，
+       不翻译的话增量的每一条 INSERT 都会以 FUNCTION does not exist 失败。
+    """
+    api = ctx.api
+    src = E.OracleEndpoint(C.ORACLE)
+    tgt = E.SqlEndpoint(C.MYSQL, "%s_ora_types" % P, table=TYPES_TABLE)
+
+    ctx.step("重建 Oracle 源表 %s（9 种类型），重建 MySQL 目标库 %s" % (TYPES_TABLE, tgt.db))
+    src.exec("DROP TABLE %s" % TYPES_TABLE, ignore=True)
+    src.exec(_ora_types_ddl())
+    src.exec("ALTER TABLE %s ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS" % TYPES_TABLE, ignore=True)
+    tgt.reset_target()
+    ctx.register({"type": "oracle_table_named", "table": TYPES_TABLE})
+    ctx.reg_sql_db("MYSQL", tgt.db)
+
+    ctx.step("播种存量 5 行")
+    for i in range(1, 6):
+        src.exec(_ora_types_row(i))
+
+    tid = api.create_workflow("autotest-ora2my-types-%d" % int(time.time()), "oracle", "mysql")
+    ctx.reg_task(tid)
+    api.config_workflow(tid, {
+        "sourceConnection": src.conn_str(), "targetConnection": tgt.conn_str(),
+        "migrationMode": "fullAndIncre", "sourceType": "oracle", "targetType": "mysql",
+        "sourceDbName": src.service, "targetDbName": tgt.db,
+        "syncObjects": json.dumps({src.db: {"tables": [TYPES_TABLE]}}),
+    })
+    api.launch(tid)
+    ctx.log("    任务 id: %s" % tid)
+
+    ok, st = api.wait_status(tid, {"FULL_COMPLETED", "INCREMENT_RUNNING"}, C.LAUNCH_TIMEOUT)
+    ctx.require("任务进入运行态", ok, "当前状态=%s" % st)
+
+    ok, n = ctx.wait_count(tgt, 5)
+    ctx.require("全量同步：目标端 5 行", ok, "实际 %s" % n)
+
+    # ---- 1. 建表类型映射落点 ----
+    actual = _mysql_types(tgt)
+    bad = []
+    for _, col, want in TYPE_MATRIX:
+        got = actual.get(col)
+        if got != want:
+            bad.append("%s 期望 %s 实际 %s" % (col, want, got))
+    ctx.check("建表类型映射：9 列全部落到预期的 MySQL 类型", not bad, "; ".join(bad))
+
+    ok_rows = _norm_types_rows(_read_types_oracle(src)) == _norm_types_rows(_read_types_mysql(tgt))
+    ctx.check("全量数据：日期/时间戳/小数/大数/CLOB/RAW 逐列一致", ok_rows,
+              "" if ok_rows else "源 %s / 目标 %s"
+              % (_norm_types_rows(_read_types_oracle(src)).get(1),
+                 _norm_types_rows(_read_types_mysql(tgt)).get(1)))
+
+    # ---- 2. 增量字面量翻译 ----
+    ok, st = api.wait_status(tid, "INCREMENT_RUNNING", C.LAUNCH_TIMEOUT)
+    ctx.require("任务进入增量同步（LogMiner）", ok, "当前状态=%s" % st)
+
+    ctx.step("增量写入：TO_DATE / TO_TIMESTAMP / HEXTORAW 字面量都会出现在 SQL_REDO 里")
+    for i in range(6, 10):
+        src.exec(_ora_types_row(i))
+    src.exec("UPDATE %s SET TXT='updated', AMT=999.99, "
+             "D=TO_DATE('2026-12-31 23:59:59','YYYY-MM-DD HH24:MI:SS') WHERE ID=1" % TYPES_TABLE)
+    src.exec("DELETE FROM %s WHERE ID=2" % TYPES_TABLE)
+
+    ok, n = ctx.wait_count(tgt, 8)     # 5 + 4 新增 - 1 删除
+    ctx.check("增量同步：目标端行数追平（8 行）", ok, "实际 %s" % n)
+
+    deadline = time.time() + C.CONVERGE_TIMEOUT
+    same = False
+    while time.time() < deadline:
+        same = _norm_types_rows(_read_types_oracle(src)) == _norm_types_rows(_read_types_mysql(tgt))
+        if same:
+            break
+        time.sleep(C.POLL_INTERVAL)
+    if not same:
+        so = _norm_types_rows(_read_types_oracle(src))
+        to = _norm_types_rows(_read_types_mysql(tgt))
+        diff = [("id=%s 源=%s 目标=%s" % (k, so[k], to.get(k))) for k in sorted(so)
+                if to.get(k) != so[k]][:3]
+        ctx.check("增量数据：逐列一致（含 TO_DATE/HEXTORAW 字面量翻译）", False, "; ".join(diff))
+    else:
+        ctx.check("增量数据：逐列一致（含 TO_DATE/HEXTORAW 字面量翻译）", True,
+                  "比对 %d 行" % len(_read_types_mysql(tgt)))
 
     vid, res = api.run_compare(tid, "ROW_COUNT")
     ctx.register({"type": "validation", "id": vid})

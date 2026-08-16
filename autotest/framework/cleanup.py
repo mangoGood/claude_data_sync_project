@@ -50,6 +50,10 @@ def clean_one(api, d):
                                           if _spec(d["spec"])["kind"] == "pg" else "mysql"), False)
             return True, "解除 %s 只读围栏" % d["spec"]
 
+        if t == "oracle_table_named":
+            E.OracleEndpoint(C.ORACLE).exec("DROP TABLE %s" % d["table"], ignore=True)
+            return True, "Oracle 表 %s" % d["table"]
+
         if t == "oracle_table":
             E.OracleEndpoint(C.ORACLE).drop_db()
             return True, "Oracle 表 %s" % C.TABLE.upper()

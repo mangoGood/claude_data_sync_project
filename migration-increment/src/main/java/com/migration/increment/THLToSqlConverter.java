@@ -45,6 +45,16 @@ public class THLToSqlConverter {
     private boolean isPostgresql;
     private boolean sourceIsPostgresql;
     private boolean sourceIsMysql;
+    private boolean sourceIsOracle;
+    /**
+     * 源端字面量是否需要按库对翻译成目标库吃得下的形态。
+     *
+     * <p>pg→mysql 是 bool/bytea/{@code ::type} 后缀；oracle→mysql 是 LogMiner SQL_REDO 里的
+     * {@code TO_DATE(...)} / {@code HEXTORAW(...)} 这类 Oracle 函数——PG 恰好也有同名函数所以
+     * oracle→pg 透传就能跑，MySQL 没有，不翻译的话每条 DML 都会失败
+     * （实测 {@code HEXTORAW('AABB06')} 被当成字符串塞进 VARBINARY(16)，报 Data too long）。
+     */
+    private boolean needsLiteralTranslation;
     private boolean targetIsPostgresql;
     private SqlDialect targetDialect;
     // 跨库逐值转换与全量共用同一套 per-pair 实现（TypeTranslator.convertLiteral），杜绝增量/全量行为漂移
@@ -96,6 +106,8 @@ public class THLToSqlConverter {
         this.isPostgresql = "postgresql".equalsIgnoreCase(props.getProperty("target.db.type", "mysql"));
         this.sourceIsPostgresql = "postgresql".equalsIgnoreCase(props.getProperty("source.db.type", "mysql"));
         this.sourceIsMysql = "mysql".equalsIgnoreCase(props.getProperty("source.db.type", "mysql"));
+        this.sourceIsOracle = "oracle".equalsIgnoreCase(props.getProperty("source.db.type", "mysql"));
+        this.needsLiteralTranslation = (sourceIsPostgresql || sourceIsOracle) && !targetIsPostgresql;
         this.targetIsPostgresql = this.isPostgresql;
         this.targetDialect = SqlDialect.forType(props.getProperty("target.db.type", "mysql"));
         this.translator = TypeTranslator.forPair(
@@ -603,8 +615,8 @@ public class THLToSqlConverter {
             if (changed) rowDataStr = String.join(",", insVals);
         }
 
-        if (sourceIsPostgresql && !targetIsPostgresql) {
-            rowDataStr = convertPgRowDataToMysql(rowDataStr, columnTypes);
+        if (needsLiteralTranslation) {
+            rowDataStr = convertRowDataLiterals(rowDataStr, columnTypes);
         }
 
         StringBuilder sql = new StringBuilder();
@@ -1056,7 +1068,8 @@ public class THLToSqlConverter {
         return formatValue(value);
     }
 
-    private String convertPgRowDataToMysql(String rowDataStr, String[] columnTypes) {
+    /** 逐值调用 per-pair 翻译器把源端字面量转成目标库字面量（pg→mysql / oracle→mysql 共用）。 */
+    private String convertRowDataLiterals(String rowDataStr, String[] columnTypes) {
         if (rowDataStr == null || rowDataStr.isEmpty()) {
             return rowDataStr;
         }
@@ -1075,8 +1088,8 @@ public class THLToSqlConverter {
         return result.toString();
     }
 
-    // PG→MySQL 增量逐值转换（bool/bytea/去 ::type 后缀）已下沉到 PgToMysqlTranslator.convertLiteral，
-    // 与全量对象路径 convertValue 同处维护；增量端经 translator.convertLiteral 调用，杜绝行为漂移。
+    // 增量逐值转换已下沉到各 per-pair 翻译器的 convertLiteral（PgToMysqlTranslator 的 bool/bytea、
+    // OracleToMysqlTranslator 的 TO_DATE/HEXTORAW），与全量对象路径 convertValue 同处维护，杜绝行为漂移。
 
     private java.util.List<String> generateUpdateSql(THLEvent event, Map<String, Object> metadata) {
         java.util.List<String> statements = new java.util.ArrayList<>();
@@ -1151,7 +1164,7 @@ public class THLToSqlConverter {
         String[] values = parseRowDataValues(rowDataStr);
         String[] beforeValues = rowDataBeforeStr != null ? parseRowDataValues(rowDataBeforeStr) : values;
 
-        if (sourceIsPostgresql && !targetIsPostgresql) {
+        if (needsLiteralTranslation) {
             for (int i = 0; i < values.length; i++) {
                 String type = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : "";
                 values[i] = translator.convertLiteral(values[i], type);
@@ -1369,7 +1382,7 @@ public class THLToSqlConverter {
 
         String[] values = parseRowDataValues(rowDataStr);
 
-        if (sourceIsPostgresql && !targetIsPostgresql) {
+        if (needsLiteralTranslation) {
             for (int i = 0; i < values.length; i++) {
                 String type = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : "";
                 values[i] = translator.convertLiteral(values[i], type);
