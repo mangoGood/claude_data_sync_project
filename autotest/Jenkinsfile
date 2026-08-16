@@ -1,0 +1,75 @@
+// 同步平台端到端自动化测试的 Jenkins 流水线。
+//
+// 用例本身是单线程串行的（见 autotest/README.md 的说明），所以这里也不要并行 stage：
+// 并行只会让 agent 同时拉起十几个 JVM 子进程，失败原因全变成资源不足，测不出产品问题。
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'PROFILE', choices: ['standard', 'quick', 'full'],
+               description: '用例集：quick≈3 分钟冒烟 / standard≈8 分钟主干 / full 全部链路')
+        string(name: 'SUITE', defaultValue: '',
+               description: '只跑指定用例（留空跑整个用例集）。支持前缀，如 dr_mysql、sync_*')
+        choice(name: 'CLEANUP', choices: ['auto', 'always', 'never'],
+               description: 'auto=通过即清理、失败保留现场（默认）')
+        string(name: 'BUDGET_MINS', defaultValue: '30',
+               description: '总时长预算（分钟），塞不下的用例跳过并在报告注明；0=不限')
+    }
+
+    options {
+        timeout(time: 2, unit: 'HOURS')
+        disableConcurrentBuilds()      // 两轮同时跑会互相踩测试库
+    }
+
+    stages {
+        stage('准备环境') {
+            steps {
+                sh '''
+                    # 基础设施与后端/agent 由环境统一维护，这里只做可用性确认
+                    curl -sf -m 5 -X POST http://localhost:38080/api/auth/login \
+                         -H 'Content-Type: application/json' \
+                         -d '{"username":"admin","password":"admin123"}' > /dev/null \
+                      || { echo "后端 38080 不可用，请先 ./start.sh"; exit 2; }
+                '''
+            }
+        }
+
+        stage('跑用例') {
+            steps {
+                script {
+                    def args = "--profile ${params.PROFILE} --cleanup ${params.CLEANUP} " +
+                               "--budget-mins ${params.BUDGET_MINS}"
+                    if (params.SUITE?.trim()) {
+                        args += " --suite ${params.SUITE.trim()}"
+                    }
+                    // 有用例未通过时退出码为 1：标成 UNSTABLE 而不是直接 FAILURE，
+                    // 好让后面的报告归档照常执行（失败详情和任务 id 都在报告里）
+                    def rc = sh(script: "./autotest/autotest_run ${args}", returnStatus: true)
+                    if (rc == 2) {
+                        error('环境不可用，用例未执行')
+                    } else if (rc != 0) {
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            junit allowEmptyResults: true, testResults: 'autotest/reports/*/junit.xml'
+            archiveArtifacts artifacts: 'autotest/reports/*/**, autotest/logs/*.log',
+                             allowEmptyArchive: true
+            publishHTML(target: [reportDir: 'autotest/reports', reportFiles: 'latest/report.html',
+                                 reportName: '同步平台自动化测试报告',
+                                 keepAll: true, alwaysLinkToLastBuild: true])
+        }
+        unstable {
+            echo '有用例未通过：相关任务与数据库已保留，任务 id 见测试报告。'
+        }
+        cleanup {
+            // 构建被中断（abort）时进程可能还在，收个尾；--clean 只清登记过的资源
+            sh './autotest/autotest_stop --force || true'
+        }
+    }
+}

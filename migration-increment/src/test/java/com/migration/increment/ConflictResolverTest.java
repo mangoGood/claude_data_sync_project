@@ -75,6 +75,35 @@ class ConflictResolverTest {
     }
 
     @Test
+    @DisplayName("前镜像守卫落空但同源：不是冲突，必须照常应用")
+    void sameOriginGuardMissIsNotConflict() throws Exception {
+        // PG 的 UPDATE 在 REPLICA IDENTITY DEFAULT 下不带前镜像，前镜像守卫必然落空，
+        // 于是每条 UPDATE 都会走到 decideOnMismatch。此时"上次写这行的"就是同一个源，
+        // 两端根本没有分叉——判成冲突再按节点 id 字典序裁决，会把这条 UPDATE 直接丢掉：
+        // 双向灾备两端行数一致、任务全绿，值却停在更新前（实测 PG 侧 12 条 UPDATE 全丢）。
+        ConflictResolver a = resolver("127.0.0.1:5432/db", "LWW_SOURCE_TS", null);
+        a.record(conn, "t", "1", 1000);
+
+        assertEquals(ConflictResolver.Decision.APPLY,
+                a.decideOnMismatch(conn, "t", "1", 1001),
+                "同源写入必须照常应用，不能当成写写冲突丢弃");
+        assertEquals(0, a.getConflictCount(), "同源不该计入冲突数");
+        assertEquals(0, a.getSkippedCount());
+    }
+
+    @Test
+    @DisplayName("前镜像守卫落空且异源：仍按 LWW 裁决")
+    void peerOriginGuardMissStillArbitrates() throws Exception {
+        ConflictResolver a = resolver("dbA", "LWW_SOURCE_TS", null);
+        a.record(conn, "t", "1", 5000);
+
+        // 对端 dbB 带着更早的时间戳撞上来：该输，且要计入冲突
+        ConflictResolver b = resolver("dbB", "LWW_SOURCE_TS", null);
+        assertEquals(ConflictResolver.Decision.SKIP, b.decideOnMismatch(conn, "t", "1", 4000));
+        assertEquals(1, b.getConflictCount());
+    }
+
+    @Test
     @DisplayName("LWW：更旧的对端写入被判输并计入冲突")
     void olderPeerWriteLoses() throws Exception {
         ConflictResolver a = resolver("dbA", "LWW_SOURCE_TS", null);

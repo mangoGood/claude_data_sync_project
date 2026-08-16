@@ -1,0 +1,7 @@
+# 自动化用例依赖（项目已有 .venv_fi 装齐了这些，autotest_run 会自动挑到它）
+mysql-connector-python>=8.0     # MySQL / TiDB 端点
+psycopg2-binary>=2.9            # PostgreSQL 端点
+pymongo>=4.0                    # MongoDB 端点
+kafka-python>=2.0               # 订阅链路（消费下游 Kafka 事件）
+oracledb>=1.4                   # Oracle 链路（不跑 Oracle 用例可不装）
+# Redis 走 docker exec redis-cli、Elasticsearch 走 HTTP，均无需额外依赖

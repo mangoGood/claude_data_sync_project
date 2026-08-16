@@ -1,0 +1,6 @@
+reports/
+logs/
+.autotest_state.json
+.autotest.pid
+__pycache__/
+*.pyc
