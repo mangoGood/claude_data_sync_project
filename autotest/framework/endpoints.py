@@ -63,7 +63,7 @@ def fmt_fp(fp):
 class SqlEndpoint:
     """MySQL / TiDB（kind=mysql）与 PostgreSQL（kind=pg）共用。"""
 
-    def __init__(self, spec, db, schema=None):
+    def __init__(self, spec, db, schema=None, table=None):
         self.kind = spec["kind"]
         self.host = spec["host"]
         self.port = spec["port"]
@@ -73,6 +73,9 @@ class SqlEndpoint:
         self.db = db
         # mysql→pg 同步把表落在「源库名」schema 下（非 public）；pg→pg 落 public。
         self.schema = schema or "public"
+        # oracle→mysql 的目标表沿用 Oracle 的大写名（MySQL 在 Linux 上表名大小写敏感，
+        # 翻译器刻意不转小写），所以表名要能覆盖
+        self.table = table or TABLE
 
     # -- 连接 --
     def conn(self, db=None, autocommit=True):
@@ -99,7 +102,7 @@ class SqlEndpoint:
         return "mysql" if self.kind == "mysql" else "postgres"
 
     def _t(self):
-        return "`%s`" % TABLE if self.kind == "mysql" else TABLE
+        return "`%s`" % self.table if self.kind == "mysql" else self.table
 
     def exec(self, sql, args=None, db=None):
         c = self.conn(db or self.db)
@@ -174,7 +177,7 @@ class SqlEndpoint:
                   `payload` VARCHAR(512),
                   `n` BIGINT,
                   PRIMARY KEY (`id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""" % TABLE)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""" % self.table)
         else:
             cur.execute("""
                 CREATE TABLE %s (
@@ -183,7 +186,7 @@ class SqlEndpoint:
                   val VARCHAR(128),
                   payload VARCHAR(512),
                   n BIGINT
-                )""" % TABLE)
+                )""" % self.table)
         cur.close()
         c.close()
 
@@ -260,10 +263,11 @@ class SqlEndpoint:
         c.close()
         return n
 
-    def resolve_schema(self, table=TABLE):
+    def resolve_schema(self, table=None):
         """目标表由同步引擎自动创建，落在哪个 schema 因链路而异（pg→pg 落 public，
         mysql→pg 落"源库名"schema，oracle→pg 落源 schema 名）。这里查一次实际落点，
         免得把"落点假设写错"当成"数据没同步"。查不到就保持原配置，让断言如实失败。"""
+        table = table or self.table
         if self.kind != "pg":
             return self.schema
         try:
@@ -327,8 +331,8 @@ class SqlEndpoint:
         # MySQL 的 key 是**库名**；PG 的 key 是 **schema 名**（库名已经在连接串里了）。
         # PG 传库名当 key 会被启动前预检判成 "schema xxx 不存在" 而直接拒绝启动。
         if self.kind == "mysql":
-            return json.dumps({self.db: {"tables": [TABLE]}})
-        return json.dumps({"public": [TABLE]})
+            return json.dumps({self.db: {"tables": [self.table]}})
+        return json.dumps({"public": [self.table]})
 
 
 # ----------------------------------------------------------------- MongoDB
@@ -643,6 +647,10 @@ class OracleEndpoint:
 
     def conn(self):
         import oracledb
+        # NUMBER 默认按 float 取回：无精度 NUMBER 的 20 位大数会被压成
+        # 1.2345678901234567E+19，用例自己先把精度丢了，再去跟目标端比就成了假失败
+        # （更糟的是它也可能掩盖目标端真的丢了小数位）。要 Decimal。
+        oracledb.defaults.fetch_decimals = True
         return oracledb.connect(user=self.user, password=self.password,
                                 dsn="%s:%d/%s" % (self.host, self.port, self.service))
 

@@ -48,8 +48,10 @@ class TypeTranslatorTest {
         assertInstanceOf(OracleToPgTranslator.class, TypeTranslator.forPair("oracle", "postgresql"));
         assertInstanceOf(HomogeneousTranslator.class, TypeTranslator.forPair("mysql", "mysql"));
         assertInstanceOf(HomogeneousTranslator.class, TypeTranslator.forPair("postgresql", "postgresql"));
-        // 历史行为：oracle→mysql 无专用转换路径，按同构处理（沿用源端 DDL）
-        assertInstanceOf(HomogeneousTranslator.class, TypeTranslator.forPair("oracle", "mysql"));
+        assertInstanceOf(OracleToMysqlTranslator.class, TypeTranslator.forPair("oracle", "mysql"));
+        // tidb 目标端与 mysql 同路（产品内部就把 tidb 归一成 mysql）
+        assertInstanceOf(OracleToMysqlTranslator.class, TypeTranslator.forPair("oracle", "tidb"));
+        assertInstanceOf(HomogeneousTranslator.class, TypeTranslator.forPair("oracle", "oracle"));
     }
 
     @Test

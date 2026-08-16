@@ -43,18 +43,23 @@ public interface TypeTranslator {
     /**
      * 按源/目标库类型选择翻译器。分发优先级与历史实现
      * （SchemaMigration.createTable / DataMigration 值转换分支）保持一致，
-     * 对全部受支持的库对（mysql↔mysql、mysql→pg、pg→mysql、oracle→pg）行为完全等价。
+     * 对全部受支持的库对（mysql↔mysql、mysql→pg、pg→mysql、oracle→pg、oracle→mysql）行为完全等价。
      */
     static TypeTranslator forPair(String sourceType, String targetType) {
         boolean srcPg = "postgresql".equalsIgnoreCase(sourceType);
         boolean srcOracle = "oracle".equalsIgnoreCase(sourceType);
         boolean tgtPg = "postgresql".equalsIgnoreCase(targetType);
+        // tidb 在产品内部就归一成 mysql（source.db.type=mysql + flavor=tidb），目标端同理
+        boolean tgtMysql = "mysql".equalsIgnoreCase(targetType) || "tidb".equalsIgnoreCase(targetType);
 
         if (srcPg && !tgtPg) {
             return new PgToMysqlTranslator();
         }
         if (srcOracle && tgtPg) {
             return new OracleToPgTranslator();
+        }
+        if (srcOracle && tgtMysql) {
+            return new OracleToMysqlTranslator();
         }
         if (!srcPg && !srcOracle && tgtPg) {
             return new MysqlToPgTranslator();

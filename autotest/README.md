@@ -38,7 +38,7 @@
 | --- | --- | --- |
 | `quick` | mysql→mysql 同步 + mysql 单向灾备 + mysql 订阅 | ≈2 分钟 |
 | `standard` | 主干链路：4 条 SQL 同步 + mongo 同步 + mysql 单向/双向灾备 + mysql 订阅 | ≈8 分钟 |
-| `full`（默认） | 全部 20 条用例（含 redis / ES / TiDB / Oracle / PG 灾备 / 各源订阅） | ≈13 分钟 |
+| `full`（默认） | 全部 22 条用例（含 redis / ES / TiDB / Oracle / PG 灾备 / 各源订阅） | ≈14 分钟 |
 
 `--budget-mins`（默认 30）是总时长预算：塞不下的用例会被跳过，并在报告里写明"因预算跳过"，
 而不是跑到一半被 kill 掉留一地残留。`--budget-mins 0` 关掉限制。
@@ -107,7 +107,7 @@
 
 | 分组 | 用例 | 判据要点 |
 | --- | --- | --- |
-| sync | `sync_mysql2mysql` `sync_mysql2pg` `sync_pg2pg` `sync_pg2mysql` `sync_tidb2mysql` `sync_mongo2mongo` `sync_redis2redis` `sync_mysql2es` `sync_oracle2pg` | 全量一致；增量（含 UPDATE/DELETE）追平；行数对比；内容对比；**在目标端人为改坏一行，对比必须抓到**；一键修复后复核一致 |
+| sync | `sync_mysql2mysql` `sync_mysql2pg` `sync_pg2pg` `sync_pg2mysql` `sync_tidb2mysql` `sync_mongo2mongo` `sync_redis2redis` `sync_mysql2es` `sync_oracle2pg` `sync_oracle2mysql` `sync_oracle2mysql_types` | 全量一致；增量（含 UPDATE/DELETE）追平；行数对比；内容对比；**在目标端人为改坏一行，对比必须抓到**；一键修复后复核一致 |
 | dr | `dr_mysql_uni` `dr_pg_uni` `dr_mongo_uni` | 灾备全量/增量一致；**主备倒换不丢数据**（倒换前故意写一批不等追平）；倒换后源目标对调、旧主被置只读、反向同步生效 |
 | dr | `dr_mysql_bidi` `dr_pg_bidi` `dr_mongo_bidi` | 反向影子任务自动创建并进增量；**双写两个方向都同步**；防回环（两端行数相等、静置后不再变化）；最终一致；双向灾备拒绝倒换 |
 | subscribe | `subscribe_mysql` `subscribe_pg` `subscribe_tidb` `subscribe_mongo` `subscribe_oracle` | 任务进订阅态；**不丢**（写入真值都能在 Kafka 事件里找到）；**可收敛**（按投递顺序回放的最终状态 == 源表） |
@@ -120,7 +120,7 @@
 
 | 分组 | 用例数 | 结论 |
 | --- | --- | --- |
-| sync | 9 | 全部通过 |
+| sync | 11 | 全部通过 |
 | dr | 6 | 全部通过 |
 | subscribe | 5 | 全部通过 |
 
@@ -228,8 +228,31 @@ def sync_foo(ctx):
    直接 `return`，调用方随即记 "结构迁移成功"，接着 300 行数据全部以
    `Table ... doesn't exist` 写失败，最后报一个跟真实原因毫无关系的"全量迁移失败，退出码 1"。
    → 跳过前先看目标表在不在：在（用户预建）就沿用，不在就**明确报错**说清是哪个库对不支持自动建表。
-   注意 oracle→mysql 的类型翻译器本就没实现（`TypeTranslatorTest` 里就是这么断言的），
-   这里修的是"假成功"，不是补上这个库对——本用例集的 Oracle 链路因此打到 PostgreSQL。
+   （当时 oracle→mysql 的类型翻译器还没实现，这里修的是"假成功"；翻译器已在后续单独实现，
+   见下一节。）
+
+## Oracle → MySQL 库对（后补实现）
+
+`OracleToMysqlTranslator` + `TypeMapper.mapOracleToMysqlColumnDef`，由
+`sync_oracle2mysql`（常规链路）与 `sync_oracle2mysql_types`（9 种类型的建表映射 + 增量字面量）两条用例守着。
+实现期间这两条用例又抓出 4 个问题，都已修：
+
+- **增量字面量根本没被翻译**：`THLToSqlConverter` 里调 `translator.convertLiteral` 的开关写死成
+  `sourceIsPostgresql && !targetIsPostgresql`，Oracle 源压根进不去。已改成统一的
+  `needsLiteralTranslation`（pg 或 oracle 源 + 非 pg 目标）。
+- **函数字面量外面还裹着一层引号**：THL 文本行数据里的真实形态是 `'HEXTORAW(''aabb06'')'`
+  ——外层一对单引号、内层单引号翻倍。不先剥壳，18 个字符会被当字符串塞进 `VARBINARY(16)`，
+  报 Data too long。
+- **时间值差一个时区**：`java.sql.Timestamp` 表示时间点，从 Oracle 读出按 JVM 时区解释、写进 MySQL 又按
+  连接的 `serverTimezone=UTC` 折算一次，`10:20:30` 落库成 `02:20:30`，两端都不报错。
+  改成交 `LocalDateTime`（墙上时间）。
+- **两个精度陷阱**：Oracle JDBC 对 `TIMESTAMP(6)` 的 `decimalDigits` 常报 0（只信它会建成
+  `DATETIME`，微秒被截成 `.000000`），对无参 `NUMBER` 报的 `22` 是内部字节长度而非精度
+  （照建 `DECIMAL(22,0)` 会把小数位整个抹掉）。前者改从类型名取括号里的精度，后者只把 22 这个哨兵值
+  当作"无精度"→ `DECIMAL(65,20)`，真正声明出来的精度照常保留。
+
+已知边界：Oracle 的 `TIMESTAMP WITH [LOCAL] TIME ZONE` 落 `VARCHAR(64)` 原样保留偏移量——
+MySQL 没有带时区的时间类型，映射成 DATETIME 会静默抹掉时区。
 
 ## 一个坑（别再踩）
 
