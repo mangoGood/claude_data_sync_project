@@ -61,6 +61,15 @@ public class TaskCreatedMessage {
     private String targetSslMode;
     private String targetSslCertId;
 
+    /**
+     * 流量复制/回放的专属配置（JSON）。
+     *
+     * <p>用一个 JSON 串而不是把 20 个字段平铺进来：这些字段只对 6 种任务类型里的 2 种有意义，
+     * 平铺会让每条任务派发消息都拖着一大片恒为 null 的字段，而且以后加一个档位就要改
+     * DTO / TaskMessage / 序列化三处。
+     */
+    private String trafficConfig;
+
     public String getSourceSslMode() { return sourceSslMode; }
     public void setSourceSslMode(String sourceSslMode) { this.sourceSslMode = sourceSslMode; }
     public String getSourceSslCertId() { return sourceSslCertId; }
@@ -334,4 +343,12 @@ public class TaskCreatedMessage {
     public void setRouteConfig(String routeConfig) { this.routeConfig = routeConfig; }
     public String getRouteNodeId() { return routeNodeId; }
     public void setRouteNodeId(String routeNodeId) { this.routeNodeId = routeNodeId; }
+
+    public String getTrafficConfig() {
+        return trafficConfig;
+    }
+
+    public void setTrafficConfig(String trafficConfig) {
+        this.trafficConfig = trafficConfig;
+    }
 }

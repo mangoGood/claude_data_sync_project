@@ -147,6 +147,12 @@ public class AgentMain {
         
         recoveryService = new RecoveryService(agentConfig.getMysqlDbUrl(), agentConfig.getMysqlDbUser(), agentConfig.getMysqlDbPassword());
 
+        // 流量复制的源库开关兜底还原（"四道保险"的最后一道）。
+        // agent 上一次是硬崩（SIGKILL/OOM/容器驱逐）的话，捕获子进程没有任何机会
+        // 关掉源库的 general_log——源库会一直往日志表写，直到把它的磁盘写满。
+        // 崩的那一刻没有代码在跑，只有下一次启动的自己能发现并收拾，所以必须放在这里。
+        new com.migration.agent.service.TrafficSourceGuardService().sweepOnStartup();
+
         // 集群化：把本 agent 注册进元数据库并开始心跳/续租。必须在恢复任务之前——
         // 恢复要按"任务是否归属自己"过滤，没有身份就没法过滤。
         agentRegistry = new com.migration.agent.service.AgentRegistryService(
@@ -865,7 +871,16 @@ public class AgentMain {
     private boolean isSingleProcessEngine(TaskMessage taskMessage) {
         return "mongodb".equalsIgnoreCase(taskMessage.getSourceType())
                 || "elasticsearch".equalsIgnoreCase(taskMessage.getTargetType())
-                || "redis".equalsIgnoreCase(taskMessage.getSourceType());
+                || "redis".equalsIgnoreCase(taskMessage.getSourceType())
+                // 流量复制/回放同样是单进程引擎。漏掉这一条的表现是：任务被路由去跑
+                // SQL 全量迁移（migration-full），随即以 "exit code 1" 失败——
+                // 报错里没有任何字样能让人联想到"路由错了"。
+                || isTrafficTask(taskMessage);
+    }
+
+    private static boolean isTrafficTask(TaskMessage taskMessage) {
+        String t = taskMessage.getTaskType();
+        return "TRAFFIC_CAPTURE".equals(t) || "TRAFFIC_REPLAY".equals(t);
     }
 
     private void processTask(TaskMessage taskMessage, String taskId, String migrationMode) {

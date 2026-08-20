@@ -19,6 +19,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 # 同步/对比链路用的常规实例（docker-compose-synctask*.yml 起的那套）
 MYSQL = dict(kind="mysql", host="127.0.0.1", port=33306, user="root", password="rootpassword",
              container="synctask-mysql")
+# 流量回放的目标端：必须与 MYSQL 是**不同实例**（产品硬拦"回放到录制源库自己"）。
+# 用 docker-compose-synctask.yml 里那台 synctask-mysql-b（33307）。
+MYSQL_B = dict(kind="mysql", host="127.0.0.1", port=33307, user="root", password="rootpassword",
+               container="synctask-mysql-b")
 PG = dict(kind="pg", host="127.0.0.1", port=5432, user="app_user", password="userpassword",
           container="postgres_db")
 MONGO_A = dict(kind="mongo", host="127.0.0.1", port=27117, user="root", password="rootpassword",

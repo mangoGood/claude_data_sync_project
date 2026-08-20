@@ -561,6 +561,14 @@ public class ConfigService {
             logger.info("SUBSCRIBE task detected, setting task.type=SUBSCRIBE, migration.mode=subscribe");
         }
 
+        if ("TRAFFIC_CAPTURE".equals(taskType) || "TRAFFIC_REPLAY".equals(taskType)) {
+            props.setProperty("task.type", taskType);
+            props.setProperty("migration.mode",
+                    "TRAFFIC_REPLAY".equals(taskType) ? "trafficReplay" : "trafficCapture");
+            props.setProperty("task.name", taskMessage.getTaskName() == null ? taskId : taskMessage.getTaskName());
+            writeTrafficProps(props, taskId, taskMessage);
+        }
+
         if (taskMessage.getKafkaBootstrapServers() != null && !taskMessage.getKafkaBootstrapServers().isEmpty()) {
             props.setProperty("subscribe.kafka.bootstrap.servers", taskMessage.getKafkaBootstrapServers());
             logger.info("Subscribe Kafka bootstrap servers: {}", taskMessage.getKafkaBootstrapServers());
@@ -941,6 +949,70 @@ public class ConfigService {
      * <p>值可能是口令（Schema Registry 的 basic auth），所以<b>只记键名不记值</b>——
      * config.properties 里的口令由 CredentialCipher 负责加密，日志里不该再泄一遍。
      */
+    /**
+     * 展开流量任务的专属配置。
+     *
+     * <p>派发消息里带的是一个 JSON 串（{@code trafficConfig}），而不是 20 个平铺字段——
+     * 这些档位只对两种任务类型有意义，平铺会让每条派发消息都拖着一大片 null，
+     * 而且以后加一个档位要改 DTO / TaskMessage / 序列化三处。
+     */
+    @SuppressWarnings("unchecked")
+    private void writeTrafficProps(Properties props, String taskId, TaskMessage taskMessage) {
+        Map<String, Object> cfg = new java.util.HashMap<>();
+        String json = taskMessage.getTrafficConfig();
+        if (json != null && !json.isEmpty()) {
+            try {
+                Map<String, Object> parsed = gson.fromJson(json, Map.class);
+                if (parsed != null) cfg = parsed;
+            } catch (Exception e) {
+                logger.warn("流量任务配置解析失败，按默认档位运行: {}", e.getMessage());
+            }
+        }
+
+        putIfPresent(props, cfg, "captureBackend", "traffic.capture.backend");
+        putIfPresent(props, cfg, "captureDatabases", "traffic.capture.databases");
+        putIfPresent(props, cfg, "captureClasses", "traffic.capture.classes");
+        putIfPresent(props, cfg, "captureUsers", "traffic.capture.users");
+        putIfPresent(props, cfg, "captureSampleRate", "traffic.capture.sample.rate");
+        putIfPresent(props, cfg, "captureEnrich", "traffic.capture.enrich");
+        putIfPresent(props, cfg, "captureMaxDurationMs", "traffic.capture.max.duration.ms");
+        putIfPresent(props, cfg, "captureMaxBytes", "traffic.capture.max.bytes");
+        putIfPresent(props, cfg, "captureMaxRecords", "traffic.capture.max.records");
+
+        putIfPresent(props, cfg, "replaySpeed", "traffic.replay.speed");
+        putIfPresent(props, cfg, "replayClasses", "traffic.replay.classes");
+        putIfPresent(props, cfg, "replayLagPolicy", "traffic.replay.lag.policy");
+        putIfPresent(props, cfg, "replayLagSkipMs", "traffic.replay.lag.skip.ms");
+        putIfPresent(props, cfg, "replayGapPolicy", "traffic.replay.gap.policy");
+        putIfPresent(props, cfg, "replayMaxSessions", "traffic.replay.max.sessions");
+        putIfPresent(props, cfg, "replayCompare", "traffic.replay.compare");
+        putIfPresent(props, cfg, "replayAllowDcl", "traffic.replay.allow.dcl");
+        putIfPresent(props, cfg, "replayAllowDangerous", "traffic.replay.allow.dangerous");
+        putIfPresent(props, cfg, "replayAllowSameInstance", "traffic.replay.allow.same.instance");
+        putIfPresent(props, cfg, "replayAbortErrorRate", "traffic.replay.abort.error.rate");
+        putIfPresent(props, cfg, "replayRecordingSha256", "traffic.replay.recording.sha256");
+
+        // 回放的输入目录：录制文件由 agent 侧提前放到这里（同机直接软链/拷贝，
+        // 跨机则从产出它的那台 agent 拉回来）。
+        props.setProperty("traffic.replay.recording.dir", "files/" + taskId + "/traffic_in");
+        Object srcTask = cfg.get("replayRecordingTaskId");
+        if (srcTask != null) {
+            props.setProperty("traffic.replay.recording.source.task", String.valueOf(srcTask));
+        }
+        Object srcAgent = cfg.get("replayRecordingAgentId");
+        if (srcAgent != null) {
+            props.setProperty("traffic.replay.recording.source.agent", String.valueOf(srcAgent));
+        }
+    }
+
+    private static void putIfPresent(Properties props, Map<String, Object> cfg, String key, String prop) {
+        Object v = cfg.get(key);
+        if (v == null) return;
+        String s = String.valueOf(v);
+        if (s.isEmpty() || "null".equals(s)) return;
+        props.setProperty(prop, s);
+    }
+
     private void writeStringPropFromEnv(java.util.Properties props, String key, String envName) {
         String v = System.getenv(envName);
         if (v == null || v.trim().isEmpty()) v = System.getProperty(envName);

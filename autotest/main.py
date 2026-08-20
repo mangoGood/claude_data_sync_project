@@ -47,7 +47,7 @@ def build_parser():
     p.add_argument("--suite", action="append", default=[],
                    help="只跑指定用例，支持前缀与通配（可重复；如 dr_mysql、sync_*）")
     p.add_argument("--group", action="append", default=[],
-                   choices=["sync", "dr", "subscribe", "feature"], help="只跑指定分组（可重复）")
+                   choices=["sync", "dr", "subscribe", "traffic", "feature"], help="只跑指定分组（可重复）")
     p.add_argument("--cleanup", default=os.environ.get("AT_CLEANUP", "auto"),
                    choices=["auto", "always", "never"],
                    help="清理策略：auto=通过就删、失败保留（默认）；always=一律删；never=一律留")
@@ -68,7 +68,7 @@ def cmd_list():
     groups = {}
     for k, s in sorted(SUITES.items()):
         groups.setdefault(s.group, []).append((k, s))
-    for g in ("sync", "dr", "subscribe", "feature"):
+    for g in ("sync", "dr", "subscribe", "traffic", "feature"):
         if g not in groups:
             continue
         print("  [%s]" % g)

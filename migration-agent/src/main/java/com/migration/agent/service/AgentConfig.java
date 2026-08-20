@@ -69,6 +69,7 @@ public class AgentConfig {
         props.setProperty("jar.mongo.path", "migration-mongo/target/migration-mongo-1.0.0.jar");
         props.setProperty("jar.elastic.path", "migration-elastic/target/migration-elastic-1.0.0.jar");
         props.setProperty("jar.redis.path", "migration-redis/target/migration-redis-1.0.0.jar");
+        props.setProperty("jar.traffic.path", "migration-traffic/target/migration-traffic-1.0.0.jar");
 
         // TiDB 增量：TiCDC OpenAPI 地址 + changefeed 的 Kafka sink 地址。
         // sink 地址是 TiCDC 容器视角的 broker（容器内解析 synctask-kafka），
@@ -233,6 +234,10 @@ public class AgentConfig {
 
     public String getElasticJarPath() {
         return props.getProperty("jar.elastic.path");
+    }
+
+    public String getTrafficJarPath() {
+        return props.getProperty("jar.traffic.path");
     }
 
     public String getRedisJarPath() {

@@ -50,6 +50,22 @@ public enum SyncErrorCode {
     ELASTIC_PROCESS_START_FAILED("E3101", "Elastic同步进程启动失败", "请检查Agent日志，确认elastic模块JAR包存在且配置正确"),
     ELASTIC_SYNC_FAILED("E3102", "Elastic同步失败", "请检查Agent日志，确认Elasticsearch连接正常、索引可写且源库binlog可访问"),
 
+    // ==================== 流量复制与回放（E312x）====================
+    TRAFFIC_GENERAL_LOG_ENABLE_FAILED("E3120", "源库语句日志开启失败",
+            "流量复制要把源库的 general_log 打开、log_output 切到 TABLE 才能拿到语句流（binlog 里没有 SELECT）。改这两个全局变量需要 SUPER 或 SYSTEM_VARIABLES_ADMIN 权限，只读副本上也改不了。请给采集账号补权限，或换一个可写的实例作为源"),
+    TRAFFIC_LOG_ROTATE_FAILED("E3121", "源库语句日志轮转失败",
+            "mysql.general_log 只能靠 RENAME 换表来轮转（日志表不支持 DELETE，会报 ER_CANT_LOCK_LOG_TABLE），而 RENAME 需要 mysql 库上的 CREATE/DROP/ALTER 权限。轮转做不了，这张表就会在源库上无限增长直到把 datadir 写满。请给采集账号补 mysql 库权限后重启任务"),
+    TRAFFIC_CAPTURE_BACKLOG("E3122", "捕获追不上源库产生速度",
+            "每轮轮转读回的语句量持续超过高水位，说明源库产生语句的速度比捕获消费的快。再不干预，源库的日志表会越堆越大并拖慢源库本身。请降低 traffic.capture.sample.rate 按会话采样、缩小库/语句类别白名单，或改在低峰期录制"),
+    TRAFFIC_RECORDING_CORRUPT("E3123", "录制文件损坏或不可用",
+            "录制缺少 manifest.json、分段文件对不上、或校验和不符。常见原因：捕获任务被强杀后没来得及封口、跨机取文件时中断、文件被清理策略回收。请重新同步录制元数据；确认文件确实损坏时，只能重新录一份——语句流没有位点可续，丢掉的那段拿不回来"),
+    TRAFFIC_REPLAY_SAME_INSTANCE("E3124", "回放目标就是录制源库",
+            "目标库与录制源的 server_uuid 相同。回放会把源库上已经发生过的操作<b>再做一遍</b>：自增累加会翻倍、INSERT 会重复插入、DROP 是真的删。请换一个独立实例作为回放目标；确需如此（例如目标是从该实例恢复出来的克隆）时，显式打开 traffic.replay.allow.same.instance"),
+    TRAFFIC_REPLAY_ERROR_RATE("E3125", "回放错误率超过阈值",
+            "目标库上失败的语句占比超过 traffic.replay.abort.error.rate，已停止回放以免继续制造破坏。常见原因：目标库缺少录制里用到的库/表、字符集或 sql_mode 与源库不一致、账号权限不足。请看回放报告里的错误明细定位；确认这些错误可以接受时，调高该阈值"),
+    TRAFFIC_SOURCE_RESTORE_FAILED("E3126", "源库语句日志未能还原",
+            "任务已结束，但没能确认把源库的 general_log/log_output 改回原值。源库会继续把每一条语句写进 mysql.general_log，直到把它的磁盘写满——这是本功能最严重的运维风险。请立刻在源库上手工执行 SET GLOBAL general_log=<原值>; SET GLOBAL log_output='<原值>'，原值可在任务详情里查到"),
+
     FULL_MIGRATION_FAILED("E4001", "全量同步失败", "请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常"),
     FULL_MIGRATION_TIMEOUT("E4002", "全量同步超时", "请检查数据量是否过大，考虑分批同步或优化网络带宽"),
     TARGET_DB_WRITE_FAILED("E4003", "目标数据库写入失败", "请检查目标数据库磁盘空间、表结构是否与源库一致、是否有写入权限"),
