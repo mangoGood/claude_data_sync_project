@@ -311,7 +311,7 @@ def main():
     ap.add_argument("--mode", choices=["uni", "bidi"], default="uni")
     ap.add_argument("--phase", choices=["full", "incre", "both"], default="both")
     ap.add_argument("--minutes", type=float, default=5)
-    # Mongo 链路的一致性指纹在 Python 侧算（Mongo 没有 BIT_XOR 之类的聚合指纹），
+    # Mongo 链路的一致性指纹在 Python 侧算（Mongo 没有 SUM(CRC32) 之类的库内聚合指纹），
     # 默认播种量相应调小；SQL 链路仍用库内聚合指纹，可以跑到几十万行。
     ap.add_argument("--seed-rows", type=int, default=None)
     args = ap.parse_args()

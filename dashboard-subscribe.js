@@ -86,23 +86,23 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 <div class="table-cell col-name">
                     <div>
                         <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">订阅</span>${escapeHtml(task.name)}${window.consistencyBadgeHtml(task.consistency_mode)}</div>
-                        <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${task.status === 'CONFIGURING' ? `openSubscribeConfig('${task.id}', '${task.source_type || 'mysql'}', '${escapeAttr(task.name)}')` : `showSubscribeDetail('${task.id}')`}">${task.id}</div>
+                        <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${task.status === 'CONFIGURING' ? `openSubscribeConfig('${task.id}', '${task.source_type || 'mysql'}', '${escapeAttr(task.name)}')` : `showSubscribeDetail('${task.id}')`}">${escapeHtml(task.id)}</div>
                     </div>
                 </div>
                 <div class="table-cell col-status">
-                    <span class="status-tag ${statusInfo.class}">
+                    <span class="status-tag ${escapeHtml(statusInfo.class)}">
                         ${statusHtml}
-                        ${statusInfo.text}
+                        ${escapeHtml(statusInfo.text)}
                     </span>
                 </div>
                 <div class="table-cell col-source">
-                    <span style="font-size: 12px; color: #666;">${sourceTypeText}</span>
+                    <span style="font-size: 12px; color: #666;">${escapeHtml(sourceTypeText)}</span>
                 </div>
                 <div class="table-cell col-kafka">
-                    <span style="font-size: 12px; color: #666;" title="${task.kafka_bootstrap_servers || ''}">${kafkaDisplay}</span>
+                    <span style="font-size: 12px; color: #666;" title="${escapeHtml(task.kafka_bootstrap_servers || '')}">${escapeHtml(kafkaDisplay)}</span>
                 </div>
                 <div class="table-cell col-topic">
-                    <span style="font-size: 12px; color: #666;">${topicStrategyText}</span>
+                    <span style="font-size: 12px; color: #666;">${escapeHtml(topicStrategyText)}</span>
                 </div>
                 <div class="table-cell col-delay">
                     ${task.status === 'SUBSCRIBE_RUNNING' ?
@@ -510,7 +510,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                     statusDiv.className = 'connection-status error';
                     const errMsg = (result.data && result.data.errorMessage) ? result.data.errorMessage : (result.message || '无法连接到数据库');
                     const suggestion = (result.data && result.data.suggestion) ? result.data.suggestion : '';
-                    statusDiv.innerHTML = `<div>✗ 连接失败：${errMsg.substring(0, 120)}</div>${window.sslRenderTlsBadge(result.data)}${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
+                    statusDiv.innerHTML = `<div>✗ 连接失败：${escapeHtml(errMsg.substring(0, 120))}</div>${window.sslRenderTlsBadge(result.data)}${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     subSourceTested = false;
                 }
             })
@@ -562,7 +562,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                     const data = result.data || {};
                     const errMsg = data.errorMessage || result.message || '无法连接到Kafka';
                     const suggestion = data.suggestion || '';
-                    statusDiv.innerHTML = `<div>✗ 连接失败：${errMsg.substring(0, 80)}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
+                    statusDiv.innerHTML = `<div>✗ 连接失败：${escapeHtml(errMsg.substring(0, 80))}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     subKafkaTested = false;
                 }
             })
@@ -644,7 +644,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                     subDatabasesCache = result.data.databases;
                     subRenderDatabases();
                 } else {
-                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${result.message || '加载失败'}</div>`;
+                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 sourceList.innerHTML = '<div class="empty-selection" style="color: #f5222d;">加载失败，请检查连接串</div>';
@@ -712,7 +712,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                     subTablesCache[db] = result.data.tables;
                     subRenderTables(db);
                 } else {
-                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${result.message || '加载失败'}</div>`;
+                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 tableList.innerHTML = '<div style="padding: 16px; color: #f5222d; font-size: 12px;">加载失败</div>';
@@ -825,7 +825,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                     subSchemasCache = result.data.schemas;
                     subRenderSchemas();
                 } else {
-                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${result.message || '加载失败'}</div>`;
+                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 sourceList.innerHTML = '<div class="empty-selection" style="color: #f5222d;">加载失败，请检查连接信息</div>';
@@ -884,12 +884,12 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 if (result.success && result.data) {
                     subRenderValidationResult(result.data);
                 } else {
-                    resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验失败: ${result.message || '未知错误'}</div>`;
+                    resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验失败: ${escapeHtml(result.message || '未知错误')}</div>`;
                     subValidationPassed = false;
                 }
             } catch (error) {
                 console.error('校验失败:', error);
-                resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验请求失败: ${error.message}</div>`;
+                resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验请求失败: ${escapeHtml(error.message)}</div>`;
                 subValidationPassed = false;
             } finally {
                 runBtn.disabled = false;
@@ -1280,7 +1280,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             const tag = document.createElement('span');
             tag.className = 'filter-tag';
             tag.dataset.type = type;
-            tag.innerHTML = `${label}：${value}<span class="tag-remove" onclick="removeSubscribeFilterTag('${type}')">×</span>`;
+            tag.innerHTML = `${escapeHtml(label)}：${escapeHtml(value)}<span class="tag-remove" onclick="removeSubscribeFilterTag('${escapeHtml(type)}')">×</span>`;
             filterTags.appendChild(tag);
         }
 

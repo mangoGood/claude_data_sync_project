@@ -33,9 +33,54 @@ public class ColumnProcessingConfig {
     public static final String FILTER_PREFIX = "column.filter.";
     public static final String MAPPING_PREFIX = "column.mapping.";
     public static final String EXTRA_PREFIX = "column.extra.";
+    /** 脱敏规则：{@code column.mask.<源库>.<源表>} = {@code 列:规则[:参数...][;列:规则...]} */
+    public static final String MASK_PREFIX = "column.mask.";
+    /** 脱敏盐（部署级）：同一盐下 HASH/FAKE 对同一输入恒产出同一结果。 */
+    public static final String MASK_SALT_KEY = "column.mask.salt";
 
     /** 附加列类型 */
     public enum ExtraColumnKind { CREATE_TIME, UPDATE_TIME, CUSTOM }
+
+    /** 脱敏规则类型。 */
+    public enum MaskKind {
+        /** 整值替换为固定串。 */
+        MASK_ALL,
+        /** 保留首 N / 尾 M 位，中间替换（手机号、身份证的常见形态）。 */
+        MASK_PARTIAL,
+        /** 不可逆哈希，但<b>保留可连接性</b>：同值恒同结果，跨表 JOIN 仍成立。 */
+        HASH,
+        /** 置空。列必须可空，否则目标端写入会失败。 */
+        NULLIFY,
+        /** 生成同型假数据（NAME / EMAIL / PHONE / ADDRESS / ID_CARD）。 */
+        FAKE
+    }
+
+    /**
+     * 一条脱敏规则。
+     *
+     * <p><b>所有规则都必须是确定性的</b>——同一输入恒产出同一输出。
+     * 这不是美观要求：增量重放、断点续传、以及全量与增量对同一行的两次处理
+     * 都依赖"再算一遍还是那个值"。若脱敏带随机性，幂等 upsert 会把每次重放
+     * 都看成一次真实变更，目标端与源端将<b>永远对不齐</b>。
+     */
+    public static class MaskRule {
+        public final String column;
+        public final MaskKind kind;
+        /** MASK_PARTIAL 的保留首位数；其余规则无意义。 */
+        public final int keepPrefix;
+        /** MASK_PARTIAL 的保留尾位数。 */
+        public final int keepSuffix;
+        /** FAKE 的类型（NAME/EMAIL/PHONE/ADDRESS/ID_CARD）；MASK_ALL 的替换串。 */
+        public final String arg;
+
+        public MaskRule(String column, MaskKind kind, int keepPrefix, int keepSuffix, String arg) {
+            this.column = column;
+            this.kind = kind;
+            this.keepPrefix = Math.max(0, keepPrefix);
+            this.keepSuffix = Math.max(0, keepSuffix);
+            this.arg = arg;
+        }
+    }
 
     /** 附加列定义：列名 + 类型 +（CUSTOM 时的）输入值 */
     public static class ExtraColumn {
@@ -161,9 +206,15 @@ public class ColumnProcessingConfig {
     private final Map<String, List<FilterCondition>> filtersLower = new LinkedHashMap<>();
     private final Map<String, Map<String, String>> mappingsLower = new LinkedHashMap<>();
     private final Map<String, List<ExtraColumn>> extrasLower = new LinkedHashMap<>();
+    /** "源库.源表" → (列名小写 → 脱敏规则) */
+    private final Map<String, Map<String, MaskRule>> masks = new LinkedHashMap<>();
+    private final Map<String, Map<String, MaskRule>> masksLower = new LinkedHashMap<>();
+    /** 脱敏盐。空盐也能工作，但同一份数据在不同部署会脱出相同结果——生产应当配。 */
+    private String maskSalt = "";
 
     public static ColumnProcessingConfig loadFromProperties(Properties props) {
         ColumnProcessingConfig config = new ColumnProcessingConfig();
+        config.maskSalt = props.getProperty(MASK_SALT_KEY, "");
         for (String name : props.stringPropertyNames()) {
             if (name.startsWith(FILTER_PREFIX)) {
                 String key = name.substring(FILTER_PREFIX.length());
@@ -179,6 +230,13 @@ public class ColumnProcessingConfig {
                     config.mappings.put(key, map);
                     config.mappingsLower.put(key.toLowerCase(), map);
                 }
+            } else if (name.startsWith(MASK_PREFIX) && !name.equals(MASK_SALT_KEY)) {
+                String key = name.substring(MASK_PREFIX.length());
+                Map<String, MaskRule> map = parseMasks(props.getProperty(name, ""));
+                if (!key.isEmpty() && !map.isEmpty()) {
+                    config.masks.put(key, map);
+                    config.masksLower.put(key.toLowerCase(), map);
+                }
             } else if (name.startsWith(EXTRA_PREFIX)) {
                 String key = name.substring(EXTRA_PREFIX.length());
                 List<ExtraColumn> list = parseExtras(props.getProperty(name, ""));
@@ -189,6 +247,176 @@ public class ColumnProcessingConfig {
             }
         }
         return config;
+    }
+
+    /**
+     * 解析脱敏规则串：{@code 列:规则[:参数...]}，分号分隔。
+     *
+     * <pre>
+     *   phone:MASK_PARTIAL:3:4     保留前 3 后 4
+     *   id_card:MASK_ALL:******    整值替换
+     *   email:HASH                 可连接的不可逆哈希
+     *   remark:NULLIFY             置空
+     *   name:FAKE:NAME             同型假数据
+     * </pre>
+     */
+    private static Map<String, MaskRule> parseMasks(String raw) {
+        Map<String, MaskRule> map = new LinkedHashMap<>();
+        if (raw == null) {
+            return map;
+        }
+        for (String part : raw.split(";")) {
+            String[] f = part.split(":", 4);
+            if (f.length < 2 || f[0].trim().isEmpty()) {
+                continue;
+            }
+            String col = f[0].trim();
+            MaskKind kind;
+            try {
+                kind = MaskKind.valueOf(f[1].trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                // 不认识的规则直接跳过而不是"当成不脱敏"——那样会静默把敏感数据原样搬过去。
+                // 这里只能跳过（配置层没有抛的通道），但校验发生在控制面：
+                // RouteConfigValidator 会在建任务时挡下非法规则。
+                continue;
+            }
+            int keepPrefix = 0, keepSuffix = 0;
+            String arg = null;
+            if (kind == MaskKind.MASK_PARTIAL) {
+                keepPrefix = parseIntSafe(f.length > 2 ? f[2] : "0", 0);
+                keepSuffix = parseIntSafe(f.length > 3 ? f[3] : "0", 0);
+            } else if (f.length > 2) {
+                arg = f[2].trim();
+            }
+            map.put(col.toLowerCase(), new MaskRule(col, kind, keepPrefix, keepSuffix, arg));
+        }
+        return map;
+    }
+
+    private static int parseIntSafe(String s, int dflt) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return dflt;
+        }
+    }
+
+    // ================================================================ 脱敏
+
+    /** 该表是否配了脱敏。 */
+    public boolean hasMask(String db, String table) {
+        return !maskRules(db, table).isEmpty();
+    }
+
+    /** 该表被脱敏的列（小写）。内容对比要用它把这些列排除掉。 */
+    public java.util.Set<String> maskedColumns(String db, String table) {
+        return java.util.Collections.unmodifiableSet(maskRules(db, table).keySet());
+    }
+
+    /** 全部配了脱敏的 "库.表" key。 */
+    public java.util.Set<String> maskedTables() {
+        return java.util.Collections.unmodifiableSet(masks.keySet());
+    }
+
+    private Map<String, MaskRule> maskRules(String db, String table) {
+        String key = db + "." + table;
+        Map<String, MaskRule> m = masks.get(key);
+        if (m == null) {
+            m = masksLower.get(key.toLowerCase());
+        }
+        return m == null ? Collections.emptyMap() : m;
+    }
+
+    /**
+     * 对一个列值应用脱敏；该列没配规则时<b>原样返回</b>。
+     *
+     * <p>null 一律保持 null——脱敏不该把"没有值"变成"有一个假值"，
+     * 那会让下游分不清缺失与已脱敏。
+     */
+    public Object maskValue(String db, String table, String column, Object value) {
+        if (column == null) {
+            return value;
+        }
+        MaskRule rule = maskRules(db, table).get(column.trim().toLowerCase());
+        if (rule == null || value == null) {
+            return value;
+        }
+        String s = String.valueOf(value);
+        switch (rule.kind) {
+            case NULLIFY:
+                return null;
+            case MASK_ALL:
+                return (rule.arg == null || rule.arg.isEmpty()) ? "******" : rule.arg;
+            case MASK_PARTIAL:
+                return maskPartial(s, rule.keepPrefix, rule.keepSuffix);
+            case HASH:
+                return hashHex(s);
+            case FAKE:
+                return fake(s, rule.arg);
+            default:
+                return value;
+        }
+    }
+
+    /**
+     * 保留首 N 尾 M，中间以 * 填充。
+     *
+     * <p>中间用<b>固定 6 个</b> * 而不是按原长度填：按原长度填会泄露原值的长度，
+     * 而长度对身份证、手机号这类定长字段等于泄露了格式，对密码类字段更是直接的信息。
+     */
+    private static String maskPartial(String s, int keepPrefix, int keepSuffix) {
+        if (keepPrefix + keepSuffix >= s.length()) {
+            // 保留位数不小于原值长度：整值遮蔽，绝不能退化成"原样返回"
+            return "******";
+        }
+        return s.substring(0, keepPrefix) + "******" + s.substring(s.length() - keepSuffix);
+    }
+
+    /** 可连接的不可逆哈希：同值恒同结果，跨表 JOIN 仍成立。 */
+    private String hashHex(String s) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            md.update(maskSalt.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            byte[] h = md.digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(32);
+            for (int i = 0; i < 16; i++) {
+                sb.append(String.format("%02x", h[i]));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException("脱敏哈希失败", e);
+        }
+    }
+
+    private static final String[] FAKE_NAMES = {
+            "张伟", "王芳", "李娜", "刘洋", "陈静", "杨勇", "赵敏", "黄磊", "周杰", "吴强"};
+    private static final String[] FAKE_CITIES = {
+            "北京市朝阳区", "上海市浦东新区", "广州市天河区", "深圳市南山区", "杭州市西湖区"};
+
+    /**
+     * 同型假数据。<b>由原值确定性导出</b>——同一个原值恒得到同一个假值，
+     * 否则增量重放会把每次都当成一次真实变更。
+     */
+    private String fake(String s, String type) {
+        int h = Math.abs(hashHex(s).hashCode());
+        String t = type == null ? "" : type.trim().toUpperCase();
+        switch (t) {
+            case "NAME":
+                return FAKE_NAMES[h % FAKE_NAMES.length];
+            case "EMAIL":
+                return "user" + (h % 1000000) + "@example.com";
+            case "PHONE":
+                return "138" + String.format("%08d", h % 100000000);
+            case "ADDRESS":
+                return FAKE_CITIES[h % FAKE_CITIES.length] + (h % 900 + 100) + "号";
+            case "ID_CARD":
+                return "11010119" + String.format("%02d", h % 90 + 10)
+                        + String.format("%02d", h % 12 + 1) + String.format("%02d", h % 28 + 1)
+                        + String.format("%04d", h % 10000);
+            default:
+                // 没指定类型：退化成哈希而不是原样返回——"不认识的类型"绝不能等于"不脱敏"
+                return hashHex(s);
+        }
     }
 
     private static List<FilterCondition> parseFilters(String raw) {
@@ -310,8 +538,18 @@ public class ColumnProcessingConfig {
     }
 
     /** 是否存在任何列处理配置（无配置时调用方可整体短路）。 */
+    /**
+     * 是否没有任何列处理配置。
+     *
+     * <p><b>masks 必须算在内</b>：调用方用它决定"要不要走列处理这条路"，
+     * 漏掉 masks 的后果是——只配了脱敏的任务被判定为"无列处理"，
+     * 增量侧整条脱敏逻辑被跳过，<b>原值直接写进目标端</b>。
+     * 而全量侧走的是另一条判断，照常脱敏——于是出现
+     * "全量脱了、增量没脱"这种最难察觉的半脱敏状态。
+     * 这个洞是脱敏的端到端判据抓出来的，单测碰不到（单测直接构造配置对象）。
+     */
     public boolean isEmpty() {
-        return filters.isEmpty() && mappings.isEmpty() && extras.isEmpty();
+        return filters.isEmpty() && mappings.isEmpty() && extras.isEmpty() && masks.isEmpty();
     }
 
     /**

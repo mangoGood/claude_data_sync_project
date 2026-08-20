@@ -2,6 +2,7 @@ package com.migration.agent.service;
 
 import com.google.gson.Gson;
 import com.migration.agent.model.TaskMessage;
+import com.migration.common.security.TaskDirPermissions;
 import com.migration.agent.util.ConnectionStringParser;
 import com.migration.agent.util.ConnectionStringParser.ConnectionInfo;
 import com.migration.dialect.SqlDialect;
@@ -64,8 +65,33 @@ public class ConfigService {
             thlOutputDir.mkdirs();
             logger.info("THL output directory created: {}", thlOutputDir.getAbsolutePath());
         }
-        
+
+        // 任务目录收成 0700。这里放着整条链路的中间数据——.cap（源端原始事件）、
+        // .thl（抽取后的事件）、sql_output、checkpoint、以及带加密连接串的
+        // config.properties。默认 umask 会让它们落成 0755/0644，
+        // 也就是同机任何用户都能读走全部业务数据。
+        //
+        // 收目录而不是逐个收文件：全仓 54 处创建文件的地方，逐处加必然漏；
+        // 而目录没有 x 权限就进不去，里面文件是什么模式都够不着。
+        for (File d : new File[]{taskDir, checkpointDir, logsDir,
+                binlogOutputDir, sqlOutputDir, thlOutputDir}) {
+            TaskDirPermissions.hardenDir(d);
+        }
+
         Properties props = new Properties();
+
+        // 落盘加密：部署级开关，下发到每个任务。
+        //
+        // 做成部署级而不是任务级，与 CONTROL_PLANE_DB_SSL_MODE 同一个理由——
+        // "这台机器上的中间数据要不要加密"是环境属性，按任务配会出现
+        // "同一个目录下有的任务加密有的不加密"这种没人能推理的状态。
+        //
+        // capture 与 thl 用同一个开关：对使用者"落盘加密"是一个概念，
+        // 不该出现 THL 加了、.cap 没加这种只有读代码才知道的差异。
+        String stagingEnc = System.getenv().getOrDefault("SYNCTASK_STAGING_ENCRYPTION", "false");
+        props.setProperty("capture.encryption.enabled", stagingEnc);
+        props.setProperty("thl.encryption.enabled", stagingEnc);
+
         
         File configFile = new File(taskDir, "config.properties");
         logger.info("Config file path: {}", configFile.getAbsolutePath());
@@ -185,6 +211,7 @@ public class ConfigService {
         Map<String, String> collectedColumnFilters = new java.util.LinkedHashMap<>();
         Map<String, String> collectedColumnMappings = new java.util.LinkedHashMap<>();
         Map<String, String> collectedExtraColumns = new java.util.LinkedHashMap<>();
+        Map<String, String> collectedColumnMasks = new java.util.LinkedHashMap<>();
         boolean syncObjectsUpdated = false;
 
         if (taskMessage.getSyncObjects() != null && !taskMessage.getSyncObjects().isEmpty()) {
@@ -268,7 +295,7 @@ public class ConfigService {
                         }
                     }
                     collectColumnProcessing(dbName, dbValue,
-                            collectedColumnFilters, collectedColumnMappings, collectedExtraColumns);
+                            collectedColumnFilters, collectedColumnMappings, collectedExtraColumns, collectedColumnMasks);
                 }
             }
 
@@ -355,7 +382,7 @@ public class ConfigService {
         if (syncObjectsUpdated) {
             for (String name : props.stringPropertyNames()) {
                 if (name.startsWith("column.filter.") || name.startsWith("column.mapping.")
-                        || name.startsWith("column.extra.")) {
+                        || name.startsWith("column.extra.") || name.startsWith("column.mask.")) {
                     props.remove(name);
                 }
             }
@@ -370,6 +397,22 @@ public class ConfigService {
             for (Map.Entry<String, String> m : collectedExtraColumns.entrySet()) {
                 props.setProperty("column.extra." + m.getKey(), m.getValue());
                 logger.info("附加列已配置: {} -> {}", m.getKey(), m.getValue());
+            }
+            for (Map.Entry<String, String> m : collectedColumnMasks.entrySet()) {
+                props.setProperty("column.mask." + m.getKey(), m.getValue());
+                // 只记规则不记值——这行日志本身不该成为"哪些列敏感"的清单外泄口，
+                // 但表与列名是排障必需的，值则从来不会出现在这里。
+                logger.info("列脱敏已配置: {} -> {}", m.getKey(), m.getValue());
+            }
+            if (!collectedColumnMasks.isEmpty()) {
+                // 脱敏盐：部署级。同一盐下 HASH/FAKE 对同一输入恒产出同一结果——
+                // 这是幂等重放与跨表 JOIN 可连接性的前提。缺省用主密钥派生，
+                // 免得再管第二个秘密。
+                String salt = System.getenv("SYNCTASK_MASK_SALT");
+                if (salt == null || salt.isEmpty()) {
+                    salt = System.getenv("SYNCTASK_MASTER_KEY");
+                }
+                props.setProperty("column.mask.salt", salt == null ? "" : salt);
             }
         }
 
@@ -699,6 +742,9 @@ public class ConfigService {
         try (OutputStream output = new FileOutputStream(configFile)) {
             props.store(output, "Updated by Migration Agent for task: " + taskId);
         }
+        // 口令虽已 ENC 加密，但连接串里的主机/库/用户名仍是明文，
+        // 且密文只挡得住没有主密钥的人——文件本身不该世界可读。
+        TaskDirPermissions.hardenFile(configFile);
 
         createLogbackConfig(taskDir, taskId);
         
@@ -1032,6 +1078,76 @@ public class ConfigService {
     private static final java.util.Set<String> FILTER_OPS =
             java.util.Set.of("<", "<=", ">", ">=", "=", "!=");
     /** CUSTOM 附加列输入值白名单：字母数字与 _-.，禁止引号/@/分隔符（值会拼进建表 DEFAULT 字面量） */
+    /** 脱敏规则名白名单。 */
+    private static final java.util.Set<String> MASK_KINDS =
+            java.util.Set.of("MASK_ALL", "MASK_PARTIAL", "HASH", "NULLIFY", "FAKE");
+    /** FAKE 的同型类型白名单。 */
+    private static final java.util.Set<String> FAKE_TYPES =
+            java.util.Set.of("NAME", "EMAIL", "PHONE", "ADDRESS", "ID_CARD");
+
+    /**
+     * 解析脱敏配置并序列化成 {@code column.mask.<库>.<表>} 的属性值。
+     *
+     * <p>JSON 形如：{@code {"columnMask":{"t1":[
+     *   {"column":"phone","rule":"MASK_PARTIAL","keepPrefix":3,"keepSuffix":4},
+     *   {"column":"email","rule":"HASH"},
+     *   {"column":"name","rule":"FAKE","arg":"NAME"}]}}}
+     *
+     * <p>非法项<b>跳过并告警</b>，与其它列处理一致。但要注意这里的"跳过"语义比别处重：
+     * 跳过一条脱敏规则 = 那一列原样搬到目标端。因此控制面在建任务时会先做一次强校验
+     * （见 {@code RouteConfigValidator}），这里只是最后一道。
+     */
+    private void collectColumnMask(String dbName, Map<?, ?> dbValue, Map<String, String> outMasks) {
+        Object maskObj = dbValue.get("columnMask");
+        if (!(maskObj instanceof Map)) {
+            return;
+        }
+        for (Map.Entry<?, ?> t : ((Map<?, ?>) maskObj).entrySet()) {
+            String table = String.valueOf(t.getKey());
+            if (!(t.getValue() instanceof List)) continue;
+            StringBuilder sb = new StringBuilder();
+            for (Object item : (List<?>) t.getValue()) {
+                if (!(item instanceof Map)) continue;
+                Map<?, ?> e = (Map<?, ?>) item;
+                String col = String.valueOf(e.get("column"));
+                String rule = String.valueOf(e.get("rule")).toUpperCase();
+                if (!IDENTIFIER_PATTERN.matcher(col).matches() || !MASK_KINDS.contains(rule)) {
+                    logger.warn("忽略非法脱敏规则: {}.{} [{} {}]", dbName, table, col, rule);
+                    continue;
+                }
+                if (sb.length() > 0) sb.append(";");
+                sb.append(col).append(":").append(rule);
+                if ("MASK_PARTIAL".equals(rule)) {
+                    int kp = intOf(e.get("keepPrefix"), 0);
+                    int ks = intOf(e.get("keepSuffix"), 0);
+                    sb.append(":").append(kp).append(":").append(ks);
+                } else if ("FAKE".equals(rule)) {
+                    String arg = e.get("arg") == null ? "" : String.valueOf(e.get("arg")).toUpperCase();
+                    if (!FAKE_TYPES.contains(arg)) {
+                        logger.warn("脱敏 FAKE 类型非法，退化为 HASH: {}.{} [{} {}]", dbName, table, col, arg);
+                        sb.setLength(sb.length() - (col.length() + 1 + rule.length()));
+                        sb.append(col).append(":HASH");
+                    } else {
+                        sb.append(":").append(arg);
+                    }
+                } else if ("MASK_ALL".equals(rule) && e.get("arg") != null) {
+                    String arg = String.valueOf(e.get("arg"));
+                    if (CUSTOM_VALUE_PATTERN.matcher(arg).matches()) {
+                        sb.append(":").append(arg);
+                    }
+                }
+            }
+            if (sb.length() > 0) {
+                outMasks.put(dbName + "." + table, sb.toString());
+            }
+        }
+    }
+
+    private static int intOf(Object o, int dflt) {
+        if (o instanceof Number) return ((Number) o).intValue();
+        try { return Integer.parseInt(String.valueOf(o)); } catch (Exception e) { return dflt; }
+    }
+
     private static final java.util.regex.Pattern CUSTOM_VALUE_PATTERN =
             java.util.regex.Pattern.compile("[A-Za-z0-9_.\\-]{1,128}");
 
@@ -1047,7 +1163,9 @@ public class ConfigService {
     private void collectColumnProcessing(String dbName, Map<?, ?> dbValue,
                                          Map<String, String> outFilters,
                                          Map<String, String> outMappings,
-                                         Map<String, String> outExtras) {
+                                         Map<String, String> outExtras,
+                                         Map<String, String> outMasks) {
+        collectColumnMask(dbName, dbValue, outMasks);
         Object filterObj = dbValue.get("columnFilter");
         if (filterObj instanceof Map) {
             for (Map.Entry<?, ?> t : ((Map<?, ?>) filterObj).entrySet()) {

@@ -14,6 +14,12 @@ public class RegisterRequest {
 
     private String email;
 
+    /**
+     * 角色：ADMIN / USER / VIEWER。留空按 USER（最小可用权限），不再是隐式写死。
+     * 只有 ADMIN 能调用注册接口，因此这里允许指定角色不构成提权。
+     */
+    private String role;
+
     public String getUsername() {
         return username;
     }
@@ -36,5 +42,13 @@ public class RegisterRequest {
 
     public void setEmail(String email) {
         this.email = email;
+    }
+
+    public String getRole() {
+        return role;
+    }
+
+    public void setRole(String role) {
+        this.role = role;
     }
 }

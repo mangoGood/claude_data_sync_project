@@ -29,6 +29,19 @@ public final class RouteConfigValidator {
     private static final List<String> ROUTABLE_ENGINES = List.of("mysql", "postgresql");
     /** 文档型引擎：路由由各自引擎实现（mongo 走集合、ES 走索引），不读 JDBC 侧的 route.* */
     private static final List<String> DOCUMENT_ENGINES = List.of("mongodb", "elasticsearch");
+    /**
+     * 会让任务<b>整体</b>失去对比资格的列处理键。
+     *
+     * <p><b>{@code columnMask} 刻意不在其中，别加进来。</b>
+     * 这三项会改变行的存在与否（过滤）、列的构成（映射/附加列），
+     * 目标端与源端在结构上就对不齐，只能整表放弃对比。
+     * 而脱敏只改<b>被脱敏那几列的值</b>，行数、其余列、主键都不受影响——
+     * 产品语义是"脱敏列不参与内容对比，其余照常"，
+     * 把 columnMask 加进这个数组会让整个任务失去对比能力，与需求相反。
+     *
+     * <p>脱敏列的排除发生在 {@code ContentCompareService#startCompare}，
+     * 并由 {@code TableCompareTask.maskedExcludedColumns} 明示给用户。
+     */
     private static final String[] COLUMN_PROCESSING_KEYS = {"columnFilter", "columnMapping", "extraColumns"};
 
     private RouteConfigValidator() {

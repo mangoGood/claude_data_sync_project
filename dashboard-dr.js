@@ -116,33 +116,33 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 const statusInfo = drStatusMap[task.status] || { text: task.status, class: 'status-pending', dot: true };
                 let monitorHtml = '-';
                 if (task.rto_ms !== null && task.rto_ms !== undefined) {
-                    monitorHtml = `<div style="font-size: 12px;">RTO: ${formatDelay(task.rto_ms)}</div>`;
+                    monitorHtml = `<div style="font-size: 12px;">RTO: ${escapeHtml(formatDelay(task.rto_ms))}</div>`;
                 }
                 if (task.rpo_ms !== null && task.rpo_ms !== undefined) {
-                    monitorHtml += `<div style="font-size: 12px;">RPO: ${formatDelay(task.rpo_ms)}</div>`;
+                    monitorHtml += `<div style="font-size: 12px;">RPO: ${escapeHtml(formatDelay(task.rpo_ms))}</div>`;
                 }
                 
                 // 灾备任务源库/目标库类型当前恒一致；双向灾备尚未支持，先恒为单向箭头，
                 // 后续接入双向灾备后按标记切换为 ↔
                 const drIsBidirectional = task.dr_mode === 'BIDIRECTIONAL';
-                const drDbTypeHtml = `${formatDbTypeLabel(task.source_type)} ${drIsBidirectional ? '↔' : '→'} ${formatDbTypeLabel(task.target_type)}`;
+                const drDbTypeHtml = `${escapeHtml(formatDbTypeLabel(task.source_type))} ${escapeHtml(drIsBidirectional ? '↔' : '→')} ${escapeHtml(formatDbTypeLabel(task.target_type))}`;
 
-                return `<div class="table-row" data-task-id="${task.id}">
+                return `<div class="table-row" data-task-id="${escapeHtml(task.id)}">
                     <div class="table-cell col-name">
                         <div>
                             <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">灾备</span>${escapeHtml(task.name)}${window.consistencyBadgeHtml(task.consistency_mode)}</div>
-                            <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${task.status === 'CONFIGURING' ? `openDrConfig('${task.id}', '${task.source_type || 'mysql'}')` : `showDrTaskDetail('${task.id}')`}">${task.id}</div>
+                            <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${escapeHtml(task.status === 'CONFIGURING' ? `openDrConfig('${task.id}', '${task.source_type || 'mysql'}')` : `showDrTaskDetail('${task.id}')`)}">${escapeHtml(task.id)}</div>
                         </div>
                     </div>
                     <div class="table-cell col-dbtype">${drDbTypeHtml}</div>
                     <div class="table-cell col-status">
-                        <span class="status-tag ${statusInfo.class}">
+                        <span class="status-tag ${escapeHtml(statusInfo.class)}">
                             ${statusInfo.dot ? '<span class="status-dot"></span>' : statusInfo.icon ? `<span class="status-icon">${statusInfo.icon}</span>` : ''}
-                            ${statusInfo.text}
+                            ${escapeHtml(statusInfo.text)}
                         </span>
                     </div>
                     <div class="table-cell col-monitor">${monitorHtml}</div>
-                    <div class="table-cell col-time">${formatDateTime(task.created_at)}</div>
+                    <div class="table-cell col-time">${escapeHtml(formatDateTime(task.created_at))}</div>
                     <div class="table-cell col-action">
                         <div class="action-btns">
                             ${task.status === 'CONFIGURING' ?
@@ -263,36 +263,36 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                     content.innerHTML = `
                         <div style="display: grid; grid-template-columns: 120px 1fr; gap: 12px 16px; font-size: 13px;">
                             <div style="color: #666;">任务ID:</div>
-                            <div>${task.id}</div>
+                            <div>${escapeHtml(task.id)}</div>
                             <div style="color: #666;">任务名称:</div>
                             <div>${escapeHtml(task.name)}</div>
                             <div style="color: #666;">任务类型:</div>
                             <div>灾备任务</div>
                             <div style="color: #666;">状态:</div>
-                            <div><span class="status-tag ${statusInfo.class}">${statusInfo.dot ? '<span class="status-dot"></span>' : ''}${statusInfo.text}</span></div>
+                            <div><span class="status-tag ${escapeHtml(statusInfo.class)}">${statusInfo.dot ? '<span class="status-dot"></span>' : ''}${escapeHtml(statusInfo.text)}</span></div>
                             <div style="color: #666;">灾备方向:</div>
-                            <div>${detailIsBidirectional ? '双向（A ↔ B 双活互同步）' : '单向（主库 → 灾备库）'}</div>
-                            <div style="color: #666;">${detailIsBidirectional ? '节点A:' : '主库:'}</div>
-                            <div>${sourceInfo}</div>
-                            <div style="color: #666;">${detailIsBidirectional ? '节点B:' : '备库:'}</div>
-                            <div>${targetInfo}</div>
+                            <div>${escapeHtml(detailIsBidirectional ? '双向（A ↔ B 双活互同步）' : '单向（主库 → 灾备库）')}</div>
+                            <div style="color: #666;">${escapeHtml(detailIsBidirectional ? '节点A:' : '主库:')}</div>
+                            <div>${escapeHtml(sourceInfo)}</div>
+                            <div style="color: #666;">${escapeHtml(detailIsBidirectional ? '节点B:' : '备库:')}</div>
+                            <div>${escapeHtml(targetInfo)}</div>
                             <div style="color: #666;">灾备模式:</div>
                             <div>全量+增量（强制）</div>
                             <div style="color: #666;">灾备对象:</div>
                             <div>${syncObjectsHtml}</div>
                             <div style="color: #666;">全量同步进度:</div>
                             <div>
-                                <div class="progress-bar" style="width: 200px;"><div class="progress-fill" style="width: ${task.progress || 0}%"></div></div>
-                                <span style="margin-left: 8px; font-size: 11px; color: #666;">${task.progress || 0}%</span>
+                                <div class="progress-bar" style="width: 200px;"><div class="progress-fill" style="width: ${escapeHtml(task.progress || 0)}%"></div></div>
+                                <span style="margin-left: 8px; font-size: 11px; color: #666;">${escapeHtml(task.progress || 0)}%</span>
                             </div>
                             <div style="color: #666;">RTO:</div>
-                            <div>${task.rto_ms !== null && task.rto_ms !== undefined ? formatDelay(task.rto_ms) : '-'}</div>
+                            <div>${escapeHtml(task.rto_ms !== null && task.rto_ms !== undefined ? formatDelay(task.rto_ms) : '-')}</div>
                             <div style="color: #666;">RPO:</div>
-                            <div>${task.rpo_ms !== null && task.rpo_ms !== undefined ? formatDelay(task.rpo_ms) : '-'}</div>
+                            <div>${escapeHtml(task.rpo_ms !== null && task.rpo_ms !== undefined ? formatDelay(task.rpo_ms) : '-')}</div>
                             <div style="color: #666;">倒换次数:</div>
-                            <div>${task.dr_switch_count || 0}</div>
+                            <div>${escapeHtml(task.dr_switch_count || 0)}</div>
                             <div style="color: #666;">创建时间:</div>
-                            <div>${formatDateTime(task.created_at)}</div>
+                            <div>${escapeHtml(formatDateTime(task.created_at))}</div>
                             <div style="color: #666;">是否计费中:</div>
                             <div>${task.is_billing ? '<span style="color: #52c41a;">是</span>' : '<span style="color: #999;">否</span>'}</div>
                         </div>
@@ -620,11 +620,11 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 document.getElementById('drValidationResults').innerHTML = checks.map(c => `
                     <div style="display: flex; align-items: center; padding: 12px 0; border-bottom: 1px solid #f0f0f0;">
                         <span style="width: 24px; text-align: center; margin-right: 12px;">
-                            ${c.status === 'running' ? '⏳' : c.status === 'passed' ? '✅' : c.status === 'failed' ? '❌' : '⬜'}
+                            ${escapeHtml(c.status === 'running' ? '⏳' : c.status === 'passed' ? '✅' : c.status === 'failed' ? '❌' : '⬜')}
                         </span>
-                        <span style="font-size: 14px; color: ${c.status === 'failed' ? '#f5222d' : '#333'};">${c.name}</span>
-                        <span style="margin-left: auto; font-size: 12px; color: ${c.status === 'passed' ? '#52c41a' : c.status === 'failed' ? '#f5222d' : '#999'};">
-                            ${c.status === 'running' ? '检查中...' : c.status === 'passed' ? '通过' : c.status === 'failed' ? '未通过' : '待检查'}
+                        <span style="font-size: 14px; color: ${escapeHtml(c.status === 'failed' ? '#f5222d' : '#333')};">${escapeHtml(c.name)}</span>
+                        <span style="margin-left: auto; font-size: 12px; color: ${escapeHtml(c.status === 'passed' ? '#52c41a' : c.status === 'failed' ? '#f5222d' : '#999')};">
+                            ${escapeHtml(c.status === 'running' ? '检查中...' : c.status === 'passed' ? '通过' : c.status === 'failed' ? '未通过' : '待检查')}
                         </span>
                     </div>
                 `).join('');
@@ -740,7 +740,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             const tag = document.createElement('span');
             tag.className = 'filter-tag';
             tag.dataset.type = type;
-            tag.innerHTML = `${label}：${escapeHtml(value)}<span class="tag-remove" onclick="removeDrFilterTag('${type}')">×</span>`;
+            tag.innerHTML = `${escapeHtml(label)}：${escapeHtml(value)}<span class="tag-remove" onclick="removeDrFilterTag('${escapeHtml(type)}')">×</span>`;
             filterTags.appendChild(tag);
             updateDrClearFiltersVisibility();
         }

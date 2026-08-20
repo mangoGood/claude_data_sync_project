@@ -336,11 +336,26 @@ public class ContinuousIncrementMain {
                     skipEventIds, skipSeqnos);
         }
 
-        applyParallelism = Math.max(1, Integer.parseInt(props.getProperty("increment.apply.parallelism", "1")));
         applyBatchSize = Math.max(1, Integer.parseInt(props.getProperty("increment.apply.batch.size", "500")));
 
         txApplyMode = "TRANSACTION".equalsIgnoreCase(
                 props.getProperty("apply.transaction.mode", "EVENT").trim());
+
+        // 并行度默认值<b>随一致性档位走</b>，而不是一律 1。
+        //
+        // 并行应用的机制（按 表+主键 冲突矩阵分片、同键保序）早就写好了，
+        // 但默认 1 意味着<b>没人会用上它</b>——用户得先读文档发现有这个开关。
+        // 而在最终一致档位下并发投递本来就是该档位的语义（源事务可被打散/合并），
+        // 冲突矩阵已经保证了同一行的先后顺序，默认串行是白白留在桌上的吞吐。
+        //
+        // 事务一致档位仍默认 1：那个档位的口径是"目标提交顺序 = 源事务提交顺序"，
+        // 多 worker 并发提交必然打乱全局顺序（下面的 strictOrder 分支会再强制一次）。
+        //
+        // 取 4 而不是核数：瓶颈在目标库的往返延迟而非本机 CPU，并发度太高只会
+        // 把连接数和目标库的锁竞争推上去。要更高由部署方显式配。
+        int defaultParallelism = txApplyMode ? 1 : 4;
+        applyParallelism = Math.max(1, Integer.parseInt(
+                props.getProperty("increment.apply.parallelism", String.valueOf(defaultParallelism))));
         txMaxRows = Math.max(1, Long.parseLong(props.getProperty("apply.transaction.max.rows", "50000")));
         txIdleFlushMs = Math.max(100, Long.parseLong(props.getProperty("apply.transaction.idle.flush.ms", "3000")));
 
@@ -427,9 +442,28 @@ public class ContinuousIncrementMain {
         }
         // useServerPrepStmts=true 是大字段流式写入的<b>前提</b>而非调优：客户端预编译下驱动会把
         // setBinaryStream 的内容整个读进内存再组包，1GB 的值照样 OOM（有对照实测）。
+        //
+        // cachePrepStmts 则是它的必要搭档：服务端预编译下，executeTypedOn 每行都
+        // prepareStatement → executeUpdate → close，也就是每行三次往返
+        // （COM_STMT_PREPARE / EXECUTE / CLOSE）。而增量反复用的只有那几条 SQL 形状
+        // （每张表的 INSERT/UPDATE/DELETE），缓存命中率接近 100%，
+        // close() 变成"还回缓存"而不是真的关掉，三次往返降到一次。
+        //
+        // 缓存容量按"表数 × 语句形状数"给：256 条能覆盖 80 张表左右的常规链路；
+        // sqlLimit 放大到 4096 是因为宽表的 INSERT 语句很长，超限就不进缓存、白配。
+        //
+        // <b>实测说明</b>：在本机（源/目标/agent 全在 localhost）这项<b>量不出提升</b>——
+        // 20,000 行 INSERT 档 3,552 vs 3,743 行/秒，在噪声内。原因是 localhost 的
+        // 一次往返只有几十微秒，省两次往返几乎等于零。真实部署里 agent 与目标库之间
+        // 通常有 0.5~2ms 的网络延迟，那时"每行三次往返降到一次"才会显出来。
+        // 保留它是因为机制成立、可配、且实测无害；但<b>不要拿它当性能承诺</b>。
         return com.migration.common.lob.LobJdbc.withStreamingParams(
                 "jdbc:mysql://" + targetHost + ":" + targetPort + "/" + targetDatabase +
-                "?" + targetSslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true");
+                "?" + targetSslParams() + "&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true"
+                + "&cachePrepStmts=" + props.getProperty("increment.apply.cache.prep.stmts", "true")
+                + "&prepStmtCacheSize=" + props.getProperty("increment.apply.prep.stmt.cache.size", "256")
+                + "&prepStmtCacheSqlLimit="
+                + props.getProperty("increment.apply.prep.stmt.cache.sql.limit", "4096"));
     }
 
     private void connectToTargetDatabase() throws SQLException {
@@ -878,7 +912,7 @@ public class ContinuousIncrementMain {
                                     }
                                 } else {
                                     txFailed = true;
-                                    logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}", event.getSeqno(), dml, errorMsg);
+                                    logDmlError(event, dml, errorMsg);
                                     writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event);
                                     break;
                                 }
@@ -935,7 +969,7 @@ public class ContinuousIncrementMain {
 
                             if (!isRecoverable) {
                                 txFailed = true;
-                                logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}", event.getSeqno(), sql.substring(0, Math.min(200, sql.length())), errorMsg);
+                                logDmlError(event, sql.substring(0, Math.min(200, sql.length())), errorMsg);
                                 writeErrorStatus("E3004", "不可恢复的SQL错误: " + errorMsg, event);
                                 break;
                             }
@@ -1564,6 +1598,28 @@ public class ContinuousIncrementMain {
      * 才在 DEBUG 打出带值的语句。事件级的汇总行（"为 seqno=N 生成了 M 条…"）仍是 INFO，
      * 既能看出进度，也够判定写放大。
      */
+    /**
+     * 不可恢复 SQL 错误的日志。
+     *
+     * <p>与 {@link #logAppliedDml} 共用 {@code logging.include.row.values} 门控。
+     * 此前错误分支是<b>不过门控</b>的：直接把整条 dml / sql 前 200 字符打进日志，
+     * 而这恰恰是最容易被打包进排障包、贴进工单外发的那一份——
+     * "默认不记行值"的承诺在最该兑现的地方失效了。
+     *
+     * <p>默认只留 seqno / 库表名 / 错误信息，定位足够；要看语句本身，
+     * 显式开 {@code logging.include.row.values=true}（开启时启动会打合规告警）。
+     */
+    private void logDmlError(THLEvent event, Object statement, String errorMsg) {
+        if (logRowValues) {
+            logger.error("不可恢复的SQL错误 (seqno={}): {} - 错误: {}",
+                    event.getSeqno(), statement, errorMsg);
+        } else {
+            logger.error("不可恢复的SQL错误 (seqno={}, table={}) - 错误: {}（语句已按"
+                            + " logging.include.row.values=false 隐去）",
+                    event.getSeqno(), event.getMetadata("table_name"), errorMsg);
+        }
+    }
+
     private void logAppliedDml(THLEvent event, String kind, Object detail) {
         if (logRowValues) {
             logger.debug("执行{} (seqno={}): {}", kind, event.getSeqno(), detail);

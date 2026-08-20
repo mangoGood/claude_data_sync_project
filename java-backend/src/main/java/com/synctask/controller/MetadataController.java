@@ -1,5 +1,7 @@
 package com.synctask.controller;
 
+import com.synctask.entity.AuditLog;
+import com.synctask.audit.Audited;
 import com.synctask.dto.ConnectionRequest;
 import com.synctask.dto.ContentCompareSession;
 import com.synctask.dto.DatabaseInfo;
@@ -61,6 +63,7 @@ public class MetadataController {
     }
 
     @PostMapping("/test-connection")
+    @Audited(AuditLog.Action.BROWSE_METADATA)
     public ResponseEntity<?> testConnection(@RequestBody Map<String, String> request,
                                             org.springframework.security.core.Authentication authentication) {
         try {
@@ -277,6 +280,7 @@ public class MetadataController {
     }
 
     @PostMapping("/databases")
+    @Audited(AuditLog.Action.BROWSE_METADATA)
     public ResponseEntity<?> listDatabases(@RequestBody ConnectionRequest request) {
         try {
             logger.info("查询数据库列表: {}", maskConnection(request.getSourceConnection()));
@@ -398,6 +402,7 @@ public class MetadataController {
     }
 
     @PostMapping("/compare-content/start")
+    @Audited(AuditLog.Action.RUN_VALIDATION)
     public ResponseEntity<?> startContentCompare(@RequestBody Map<String, Object> request) {
         try {
             String sourceConnection = (String) request.get("sourceConnection");

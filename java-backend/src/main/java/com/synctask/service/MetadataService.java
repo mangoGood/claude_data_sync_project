@@ -28,8 +28,17 @@ public class MetadataService {
 
     // 口令部分用 * 而非 +：空口令实例（如默认安装的 TiDB root）连接串形如
     // mysql://root:@host:port，用 + 会整体匹配失败并报“连接串格式不正确”。
+    /**
+     * 连接串正则。第一道闸门（第二道见 {@code JdbcUrlSafety}）。
+     *
+     * <p>原来的 database 组是 {@code (.*)}，端口是无长度限制的 {@code \d+}。前者让
+     * {@code db?allowLoadLocalInfile=true&…} 这类 payload 完整通过校验并被拼进 JDBC URL；
+     * 后者让 {@code :99999999999} 走到 {@code Integer.parseInt} 才炸出难懂的
+     * NumberFormatException。这里把两处都收到字符集/长度上。
+     */
     private static final Pattern CONNECTION_PATTERN = Pattern.compile(
-        "(?:mysql|postgresql|oracle|mongodb|elastic|redis)://([^:]+):([^@]*)@([^:]+):(\\d+)(?:/(.*))?"
+        "(?:mysql|postgresql|oracle|mongodb|elastic|redis)://([^:@/]+):([^@]*)@"
+            + "([A-Za-z0-9._\\-\\[\\]:]+):(\\d{1,5})(?:/([A-Za-z0-9_$.\\-]*))?"
     );
 
     public static class ParsedConnection {
@@ -97,9 +106,12 @@ public class MetadataService {
 
         String username = matcher.group(1);
         String password = matcher.group(2);
-        String host = matcher.group(3);
-        int port = Integer.parseInt(matcher.group(4));
-        String database = matcher.group(5);
+        // host / database 直接进 JDBC URL 的 format，必须过闸门：正则里 database 组是
+        // (.*)，问号与 & 一路放行，等于把驱动参数的控制权交给了调用方
+        // （allowLoadLocalInfile → 读本机任意文件；socketFactory / autoDeserialize → RCE）。
+        String host = com.synctask.util.JdbcUrlSafety.requireSafeHost(matcher.group(3));
+        int port = com.synctask.util.JdbcUrlSafety.requireSafePort(Integer.parseInt(matcher.group(4)));
+        String database = com.synctask.util.JdbcUrlSafety.requireSafeDatabase(matcher.group(5));
 
         return new ParsedConnection(username, password, host, port, database, dbType);
     }
@@ -262,20 +274,29 @@ public class MetadataService {
         if (conn.password != null) {
             connProps.setProperty("password", conn.password);
         }
+        // 参数一律进 connProps，URL 只留标识符：库名来自用户连接串，
+        // 拼进查询串前面就等于把驱动参数的控制权交出去（见 JdbcConnections 的说明）。
         if (isPg) {
             String pgSsl = taskSsl
                     ? com.synctask.util.JdbcSslOptions.postgres(ssl.mode, ssl.material)
                     : com.synctask.util.JdbcSslOptions.postgres();
-            jdbcUrl = String.format("jdbc:postgresql://%s:%d/%s?connectTimeout=15&socketTimeout=15&stringtype=unspecified&%s",
-                conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "postgres", pgSsl);
+            String pgDb = (conn.database != null && !conn.database.isEmpty()) ? conn.database : "postgres";
+            jdbcUrl = com.synctask.util.JdbcConnections.postgresUrl(conn.host, conn.port, pgDb);
+            connProps.setProperty("connectTimeout", "15");
+            connProps.setProperty("socketTimeout", "15");
+            connProps.setProperty("stringtype", "unspecified");
+            connProps.putAll(com.synctask.util.JdbcConnections.parseParams(pgSsl));
         } else if (isOracle) {
             // Oracle 的 thin URL 不带查询串：开启 TLS 要换协议（TCPS）与端口（通常 2484），
             // 信任材料走连接属性。见 OracleSslSupport。
-            String service = (conn.database != null && !conn.database.isEmpty()) ? conn.database : "ORCL";
+            String service = com.synctask.util.JdbcUrlSafety.requireSafeDatabase(
+                    (conn.database != null && !conn.database.isEmpty()) ? conn.database : "ORCL");
+            String oraHost = com.synctask.util.JdbcUrlSafety.requireSafeHost(conn.host);
+            int oraPort = com.synctask.util.JdbcUrlSafety.requireSafePort(conn.port);
             jdbcUrl = taskSsl
-                    ? com.synctask.util.OracleSslSupport.tcpsUrl(conn.host, conn.port, service,
+                    ? com.synctask.util.OracleSslSupport.tcpsUrl(oraHost, oraPort, service,
                             com.synctask.util.OracleSslSupport.serverDn())
-                    : String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
+                    : String.format("jdbc:oracle:thin:@%s:%d/%s", oraHost, oraPort, service);
             if (taskSsl) {
                 com.synctask.util.OracleSslSupport.applyProperties(connProps, ssl.mode, ssl.material);
             }
@@ -283,8 +304,14 @@ public class MetadataService {
             String mysqlSsl = taskSsl
                     ? com.synctask.util.JdbcSslOptions.mysql(ssl.mode, ssl.material)
                     : com.synctask.util.JdbcSslOptions.mysql();
-            jdbcUrl = String.format("jdbc:mysql://%s:%d/%s?" + mysqlSsl + "&serverTimezone=UTC&characterEncoding=utf8&connectTimeout=15000&socketTimeout=15000&allowPublicKeyRetrieval=true",
-                conn.host, conn.port, (conn.database != null && !conn.database.isEmpty()) ? conn.database : "");
+            String myDb = (conn.database != null && !conn.database.isEmpty()) ? conn.database : null;
+            jdbcUrl = com.synctask.util.JdbcConnections.mysqlUrl(conn.host, conn.port, myDb);
+            connProps.setProperty("serverTimezone", "UTC");
+            connProps.setProperty("characterEncoding", "utf8");
+            connProps.setProperty("connectTimeout", "15000");
+            connProps.setProperty("socketTimeout", "15000");
+            connProps.setProperty("allowPublicKeyRetrieval", "true");
+            connProps.putAll(com.synctask.util.JdbcConnections.parseParams(mysqlSsl));
         }
 
         // 测试连接必须用一次性直连（DriverManager），不能走连接池：
@@ -689,7 +716,7 @@ public class MetadataService {
                 Class.forName("oracle.jdbc.OracleDriver");
             }
             String jdbcUrl = buildJdbcUrl(conn, database);
-            try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
+            try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password, driverProps(conn))) {
                 String sql;
                 if (conn.isPostgresql()) {
                     sql = "SELECT schema_name FROM information_schema.schemata " +
@@ -722,7 +749,7 @@ public class MetadataService {
             try {
                 Class.forName("org.postgresql.Driver");
                 String jdbcUrl = buildJdbcUrl(conn, database);
-                try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
+                try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password, driverProps(conn))) {
                     String effectiveSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
                     try (PreparedStatement stmt = connection.prepareStatement(
                              "SELECT tablename FROM pg_tables WHERE schemaname = ?")) {
@@ -747,7 +774,7 @@ public class MetadataService {
             try {
                 Class.forName("oracle.jdbc.OracleDriver");
                 String jdbcUrl = buildJdbcUrl(conn, database);
-                try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password)) {
+                try (Connection connection = DataSourcePoolManager.getConnection(jdbcUrl, conn.username, conn.password, driverProps(conn))) {
                     String owner = (schema != null && !schema.isEmpty()) ? schema.toUpperCase() : conn.username.toUpperCase();
                     try (PreparedStatement stmt = connection.prepareStatement(
                              "SELECT table_name FROM all_tables WHERE owner = ? ORDER BY table_name")) {
@@ -769,21 +796,52 @@ public class MetadataService {
         return listTables(connectionStr, database);
     }
 
+    /**
+     * JDBC URL。<b>只放标识符，不带任何查询串</b>——驱动参数走
+     * {@link #driverProps(ParsedConnection)} 的 Properties。
+     *
+     * <p>此前这里是 {@code String.format("jdbc:mysql://%s:%d/%s?...", host, port, database)}，
+     * 而 database 来自用户提供的连接串。库名里混一个 {@code ?}，后面全部变成驱动参数：
+     * {@code allowLoadLocalInfile} 让恶意服务端读走本机文件，{@code socketFactory} /
+     * {@code autoDeserialize} 直接是 RCE。字符集校验（{@link com.synctask.util.JdbcUrlSafety}）
+     * 已经挡了一道，这里再从结构上断掉——URL 里根本没有 {@code ?} 可供接管。
+     */
     private String buildJdbcUrl(ParsedConnection conn, String database) {
+        String db = (database != null && !database.isEmpty()) ? database : null;
         if (conn.isPostgresql()) {
-            if (database != null && !database.isEmpty()) {
-                return String.format("jdbc:postgresql://%s:%d/%s?currentSchema=public&stringtype=unspecified", conn.host, conn.port, database);
-            }
-            return String.format("jdbc:postgresql://%s:%d/?currentSchema=public&stringtype=unspecified", conn.host, conn.port);
+            return com.synctask.util.JdbcConnections.postgresUrl(conn.host, conn.port, db);
         }
         if (conn.isOracle()) {
-            String service = (database != null && !database.isEmpty()) ? database : (conn.database != null && !conn.database.isEmpty() ? conn.database : "ORCL");
-            return String.format("jdbc:oracle:thin:@%s:%d/%s", conn.host, conn.port, service);
+            // Oracle thin URL 本来就没有查询串这个概念，信任材料走连接属性；
+            // 但服务名同样来自用户输入，仍要过闸门
+            String service = db != null ? db
+                    : (conn.database != null && !conn.database.isEmpty() ? conn.database : "ORCL");
+            return String.format("jdbc:oracle:thin:@%s:%d/%s",
+                    com.synctask.util.JdbcUrlSafety.requireSafeHost(conn.host),
+                    com.synctask.util.JdbcUrlSafety.requireSafePort(conn.port),
+                    com.synctask.util.JdbcUrlSafety.requireSafeDatabase(service));
         }
-        if (database != null && !database.isEmpty()) {
-            return String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port, database);
+        return com.synctask.util.JdbcConnections.mysqlUrl(conn.host, conn.port, db);
+    }
+
+    /**
+     * 与 {@link #buildJdbcUrl} 配套的驱动参数。取值与改造前拼在 URL 里的那串逐项一致。
+     *
+     * <p>Oracle 走 thin URL + 连接属性，这里返回的只有用户名口令。
+     */
+    private java.util.Properties driverProps(ParsedConnection conn) {
+        if (conn.isPostgresql()) {
+            return com.synctask.util.JdbcConnections.postgresProps(
+                    conn.username, conn.password,
+                    com.synctask.util.JdbcConnections.pgSchema("public"));
         }
-        return String.format("jdbc:mysql://%s:%d/?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", conn.host, conn.port);
+        if (conn.isOracle()) {
+            java.util.Properties p = new java.util.Properties();
+            if (conn.username != null) p.setProperty("user", conn.username);
+            p.setProperty("password", conn.password == null ? "" : conn.password);
+            return p;
+        }
+        return com.synctask.util.JdbcConnections.mysqlProps(conn.username, conn.password, null);
     }
     
     private String buildJdbcUrl(ParsedConnection conn) {
@@ -814,7 +872,7 @@ public class MetadataService {
             }
             connection = DataSourcePoolManager.getConnection(
                     buildJdbcUrl(conn, null),
-                    conn.username, conn.password);
+                    conn.username, conn.password, driverProps(conn));
             
             boolean valid = connection.isValid(5);
             connection.close();
@@ -864,7 +922,7 @@ public class MetadataService {
             
             try (Connection connection = DataSourcePoolManager.getConnection(
                     buildJdbcUrl(conn, null),
-                    conn.username, conn.password)) {
+                    conn.username, conn.password, driverProps(conn))) {
                 
                 if (conn.isPostgresql()) {
                     try (Statement stmt = connection.createStatement();
@@ -958,7 +1016,7 @@ public class MetadataService {
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
             try (Connection connection = DataSourcePoolManager.getConnection(
-                    buildJdbcUrl(conn, database), conn.username, conn.password);
+                    buildJdbcUrl(conn, database), conn.username, conn.password, driverProps(conn));
                  PreparedStatement stmt = connection.prepareStatement(
                      "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLUMN_KEY FROM information_schema.COLUMNS " +
                      "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION")) {
@@ -998,7 +1056,7 @@ public class MetadataService {
         try {
             Class.forName("org.postgresql.Driver");
             try (Connection connection = DataSourcePoolManager.getConnection(
-                    buildJdbcUrl(conn, conn.database), conn.username, conn.password)) {
+                    buildJdbcUrl(conn, conn.database), conn.username, conn.password, driverProps(conn))) {
                 // 主键列集合
                 Set<String> pkColumns = new HashSet<>();
                 try (PreparedStatement stmt = connection.prepareStatement(
@@ -1166,7 +1224,7 @@ public class MetadataService {
 
             try (Connection connection = DataSourcePoolManager.getConnection(
                     buildJdbcUrl(conn, database),
-                    conn.username, conn.password)) {
+                    conn.username, conn.password, driverProps(conn))) {
                 
                 if (conn.isPostgresql()) {
                     try (Statement stmt = connection.createStatement();
@@ -1312,7 +1370,7 @@ public class MetadataService {
 
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(sourceConn, sourceIsPg),
-                sourceConn.username, sourceConn.password)) {
+                sourceConn.username, sourceConn.password, driverProps(sourceConn))) {
 
             String dbTypeName = sourceIsPg ? "PostgreSQL" : (sourceIsOracle ? "Oracle" : "MySQL");
             result.addItem("源库连接", "源数据库连接检查", true,
@@ -1587,10 +1645,10 @@ public class MetadataService {
 
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(sourceConn),
-                sourceConn.username, sourceConn.password);
+                sourceConn.username, sourceConn.password, driverProps(sourceConn));
              Connection targetDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(targetConn),
-                targetConn.username, targetConn.password)) {
+                targetConn.username, targetConn.password, driverProps(targetConn))) {
 
             String sourceLabel = sourceIsPg ? "PostgreSQL"
                     : (sourceIsOracle ? "Oracle" : (sourceIsTidb ? "TiDB" : "MySQL"));
@@ -1738,7 +1796,7 @@ public class MetadataService {
 
         // 源库：连接 + 增量所需 binlog 配置（与 mysql→mysql 相同的三项检查）
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
-                buildJdbcUrl(sourceConn), sourceConn.username, sourceConn.password)) {
+                buildJdbcUrl(sourceConn), sourceConn.username, sourceConn.password, driverProps(sourceConn))) {
             result.addItem("源库连接", "源数据库连接检查", true, "MySQL源库连接成功", "info");
             String sourceVersion = getMySQLVersion(sourceDb);
             checkSourceVersionSupported(sourceVersion, result);
@@ -2120,8 +2178,9 @@ public class MetadataService {
     
     private String buildJdbcUrl(ParsedConnection conn, boolean isPg) {
         if (isPg) {
-            return String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified",
-                conn.host, conn.port, conn.database);
+            // 与另外两个重载一致：URL 只放标识符，stringtype 走 driverProps
+            return com.synctask.util.JdbcConnections.postgresUrl(
+                    conn.host, conn.port, conn.database);
         }
         return buildJdbcUrl(conn);
     }
@@ -2134,10 +2193,10 @@ public class MetadataService {
         
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(sourceConn),
-                sourceConn.username, sourceConn.password);
+                sourceConn.username, sourceConn.password, driverProps(sourceConn));
              Connection targetDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(targetConn),
-                targetConn.username, targetConn.password)) {
+                targetConn.username, targetConn.password, driverProps(targetConn))) {
             
             String sourceVersion = getMySQLVersion(sourceDb);
             String targetVersion = getMySQLVersion(targetDb);

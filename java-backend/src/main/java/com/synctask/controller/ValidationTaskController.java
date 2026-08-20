@@ -1,5 +1,7 @@
 package com.synctask.controller;
 
+import com.synctask.entity.AuditLog;
+import com.synctask.audit.Audited;
 import com.synctask.dto.ApiResponse;
 import com.synctask.entity.ValidationTask;
 import com.synctask.entity.Workflow;
@@ -86,6 +88,7 @@ public class ValidationTaskController {
     }
 
     @PostMapping
+    @Audited(AuditLog.Action.RUN_VALIDATION)
     public ResponseEntity<?> createValidationTask(
             @RequestBody Map<String, Object> request,
             Authentication authentication) {
@@ -125,6 +128,7 @@ public class ValidationTaskController {
     }
 
     @PostMapping("/{id}/repair")
+    @Audited(value = AuditLog.Action.RUN_VALIDATION, idArg = 0)
     public ResponseEntity<?> repairValidationTask(@PathVariable String id, Authentication authentication) {
         try {
             Long userId = getUserId(authentication);

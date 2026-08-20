@@ -1,5 +1,6 @@
 package com.synctask.controller;
 
+import com.synctask.audit.Audited;
 import com.synctask.entity.AuditLog;
 import com.synctask.entity.Workflow;
 import com.synctask.entity.WorkflowLog;
@@ -310,6 +311,7 @@ public class WorkflowController {
      * body 可选 {"seqno": N}；不传时从任务错误信息里解析 seqno=N。
      */
     @PostMapping("/{id}/skip-event")
+    @Audited(value = AuditLog.Action.SKIP_EVENT, idArg = 0)
     public ResponseEntity<?> skipEventAndRetry(
             @PathVariable String id,
             @RequestBody(required = false) Map<String, Object> body,
@@ -530,6 +532,7 @@ public class WorkflowController {
 
     /** 排障压缩包下载（代理 agent）：日志尾部 + 脱敏 config + checkpoint + THL 尾部。 */
     @GetMapping("/{id}/diagnostics")
+    @Audited(value = AuditLog.Action.DOWNLOAD_DIAGNOSTICS, idArg = 0)
     public ResponseEntity<?> getDiagnosticsBundle(
             @PathVariable String id,
             Authentication authentication) {
@@ -547,6 +550,7 @@ public class WorkflowController {
 
     /** 死信记录：人工裁决跳过的增量事件清单（代理 agent）。 */
     @GetMapping("/{id}/deadletter")
+    @Audited(value = AuditLog.Action.VIEW_DEADLETTER, idArg = 0)
     public ResponseEntity<?> getDeadletterRecords(
             @PathVariable String id,
             Authentication authentication) {

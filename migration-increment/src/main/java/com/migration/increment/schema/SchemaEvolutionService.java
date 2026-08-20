@@ -41,6 +41,10 @@ public class SchemaEvolutionService {
     private final DdlTranslator translator;
     private final Connection targetConnection;
     private final String manualDdlLogPath;
+    private final String pendingDdlPath;
+    /** 当前处理中的事件定位，写待审批记录时带上——审批通过后要能找回是哪一条。 */
+    private volatile long currentSeqno = -1;
+    private volatile String currentEventId;
     private final boolean sourceIsPostgresql;
     private final boolean targetIsPostgresql;
     /** 同引擎（mysql→mysql / pg→pg）：标识符映射全权交给 DdlIdentifierRewriter，不走 DdlTranslator 正则 */
@@ -99,6 +103,11 @@ public class SchemaEvolutionService {
         this.targetConnection = targetConnection;
         this.manualDdlLogPath = props.getProperty("schema.ddl.manual.log.path",
                 "logs/manual_ddl.log");
+        // 结构化的待审批记录。纯文本日志是给人看的，控制面要的是能解析的——
+        // 沿用 deadletter.jsonl 的既有做法：任务目录下一行一条 JSON，
+        // agent 有现成的读取端点模式，backend 据此建审批单。
+        this.pendingDdlPath = props.getProperty("schema.ddl.pending.path",
+                "files/" + props.getProperty("task.id", "unknown") + "/schema_pending.jsonl");
         this.sourceIsPostgresql = "postgresql".equalsIgnoreCase(props.getProperty("source.db.type", "mysql"));
         this.targetIsPostgresql = "postgresql".equalsIgnoreCase(props.getProperty("target.db.type", "mysql"));
         this.dbLevelSync = Boolean.parseBoolean(props.getProperty("sync.db.level", "false"));
@@ -682,6 +691,82 @@ public class SchemaEvolutionService {
         } catch (IOException e) {
             logger.error("写入人工 DDL 日志失败: {}", e.getMessage());
         }
+        writePendingDdl(sql, ddlSubType, sourceDb, reason);
+    }
+
+    /**
+     * 写一条结构化待审批记录。
+     *
+     * <p>与上面那份纯文本日志并存而不是取代它：日志是给人翻的，这份是给控制面解析的。
+     * 一行一条 JSON（jsonl），崩溃最多丢最后一行——而最后一行对应的 DDL 会在
+     * 重启重放时重新产生，不会真的丢。
+     *
+     * <p>带上 seqno / eventId 是为了让审批通过后能定位回具体是哪一条 DDL；
+     * 也让控制面能按 (taskId, seqno) 去重——引擎重启会重放这段 THL，
+     * 不去重就会把同一条 DDL 反复建成新单。
+     */
+    private void writePendingDdl(String sql, String ddlSubType, String sourceDb, String reason) {
+        if (pendingDdlPath == null || pendingDdlPath.isEmpty()) {
+            return;
+        }
+        try {
+            File f = new File(pendingDdlPath);
+            File dir = f.getParentFile();
+            if (dir != null && !dir.exists()) {
+                dir.mkdirs();
+            }
+            StringBuilder sb = new StringBuilder(256);
+            sb.append('{')
+              .append("\"ts\":").append(System.currentTimeMillis()).append(',')
+              .append("\"seqno\":").append(currentSeqno).append(',')
+              .append("\"eventId\":").append(jsonStr(currentEventId)).append(',')
+              .append("\"ddlType\":").append(jsonStr(ddlSubType)).append(',')
+              .append("\"db\":").append(jsonStr(sourceDb)).append(',')
+              .append("\"table\":").append(jsonStr(tableNameOf(sql))).append(',')
+              .append("\"reason\":").append(jsonStr(reason)).append(',')
+              .append("\"sql\":").append(jsonStr(sql))
+              .append("}\n");
+            try (BufferedWriter w = new BufferedWriter(new FileWriter(f, true))) {
+                w.write(sb.toString());
+            }
+        } catch (IOException e) {
+            logger.error("写入待审批 DDL 记录失败: {}", e.getMessage());
+        }
+    }
+
+    /** 供调用方在处理每条 DDL 前告知事件定位。 */
+    public void setCurrentEvent(long seqno, String eventId) {
+        this.currentSeqno = seqno;
+        this.currentEventId = eventId;
+    }
+
+    /** 从 DDL 里粗取表名，只用于展示与分级查询，取不到返回 null。 */
+    private static String tableNameOf(String sql) {
+        if (sql == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "(?i)\\b(?:TABLE|INTO)\\s+`?([A-Za-z0-9_$]+)`?(?:\\.`?([A-Za-z0-9_$]+)`?)?")
+                .matcher(sql);
+        if (!m.find()) return null;
+        return m.group(2) != null ? m.group(2) : m.group(1);
+    }
+
+    private static String jsonStr(String s) {
+        if (s == null) return "null";
+        StringBuilder sb = new StringBuilder(s.length() + 16).append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else sb.append(c);
+            }
+        }
+        return sb.append('"').toString();
     }
 
     /** 获取统计信息 */

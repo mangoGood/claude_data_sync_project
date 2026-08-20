@@ -120,26 +120,26 @@ function sslRenderPanel(idPrefix, label, opts) {
     host.innerHTML = `
         <div style="margin-top: 10px; padding: 10px 12px; background: #fafafa; border: 1px solid #f0f0f0; border-radius: 4px;">
             <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; color: #333;">
-                <input type="checkbox" id="${idPrefix}SslEnabled" onchange="sslOnToggle('${idPrefix}')">
+                <input type="checkbox" id="${escapeHtml(idPrefix)}SslEnabled" onchange="sslOnToggle('${escapeHtml(idPrefix)}')">
                 <span>启用 SSL/TLS 加密连接</span>
                 <span style="font-size: 11px; color: #999;">（不勾选 = 明文，与当前行为一致）</span>
             </label>
-            <div id="${idPrefix}SslBody" style="display: none; margin-top: 10px; padding-left: 22px;">
+            <div id="${escapeHtml(idPrefix)}SslBody" style="display: none; margin-top: 10px; padding-left: 22px;">
                 <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                     <label style="font-size: 13px; color: #333;">加密档位</label>
-                    <select class="form-input" id="${idPrefix}SslMode" style="max-width: 280px; height: 32px;"
-                            onchange="sslOnModeChange('${idPrefix}')">
+                    <select class="form-input" id="${escapeHtml(idPrefix)}SslMode" style="max-width: 280px; height: 32px;"
+                            onchange="sslOnModeChange('${escapeHtml(idPrefix)}')">
                         ${modes.filter(m => m.value !== 'DISABLED')
                                .map(m => `<option value="${m.value}"${m.value === 'REQUIRED' ? ' selected' : ''}>${m.label}</option>`).join('')}
                     </select>
                     <label style="font-size: 13px; color: #333; margin-left: 8px;">证书</label>
-                    <select class="form-input" id="${idPrefix}SslCertId" style="max-width: 240px; height: 32px;"
-                            onchange="sslOnCertChange('${idPrefix}')">
+                    <select class="form-input" id="${escapeHtml(idPrefix)}SslCertId" style="max-width: 240px; height: 32px;"
+                            onchange="sslOnCertChange('${escapeHtml(idPrefix)}')">
                         <option value="">（不使用证书）</option>
                     </select>
-                    <button type="button" class="btn-test" onclick="sslOpenUploadModal('${idPrefix}')">上传证书</button>
+                    <button type="button" class="btn-test" onclick="sslOpenUploadModal('${escapeHtml(idPrefix)}')">上传证书</button>
                 </div>
-                <div id="${idPrefix}SslHint" style="font-size: 11px; color: #999; margin-top: 6px;"></div>
+                <div id="${escapeHtml(idPrefix)}SslHint" style="font-size: 11px; color: #999; margin-top: 6px;"></div>
             </div>
         </div>`;
     // 刻意不在这里拉证书列表：紧随其后的 sslSetConfig() 也要拉一次，两个异步调用会打架
@@ -240,8 +240,8 @@ async function sslRefreshCertOptions(idPrefix, keepValue) {
             if (c.hasClientCert) flags.push('mTLS');
             if (c.expired) flags.push('已过期');
             else if (c.expiringSoon) flags.push('即将到期');
-            const suffix = flags.length ? ` [${flags.join(' / ')}]` : '';
-            return `<option value="${c.id}">${sslEscape(c.name)}${suffix}</option>`;
+            const suffix = flags.length ? ` [${escapeHtml(flags.join(' / '))}]` : '';
+            return `<option value="${escapeHtml(c.id)}">${sslEscape(c.name)}${escapeHtml(suffix)}</option>`;
         }).join('');
     if (current) sel.value = current;
 }

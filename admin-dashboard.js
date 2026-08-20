@@ -276,8 +276,8 @@
                 const rpoColor = rpoMs != null && rpoMs < 5000 ? '#52c41a' : rpoMs != null && rpoMs < 30000 ? '#faad14' : rpoMs != null ? '#ff4d4f' : '#999';
                 const rtoColor = rtoMs != null && rtoMs < 5000 ? '#52c41a' : rtoMs != null && rtoMs < 30000 ? '#faad14' : rtoMs != null ? '#ff4d4f' : '#999';
                 monitorCell.innerHTML = `<div style="font-size: 11px; line-height: 1.6;">
-                    <div style="color: ${rpoColor};">RPO: ${rpoMs != null ? formatDelay(rpoMs) : '-'}</div>
-                    <div style="color: ${rtoColor};">RTO: ${rtoMs != null ? formatDelay(rtoMs) : '-'}</div>
+                    <div style="color: ${escapeHtml(rpoColor)};">RPO: ${escapeHtml(rpoMs != null ? formatDelay(rpoMs) : '-')}</div>
+                    <div style="color: ${escapeHtml(rtoColor)};">RTO: ${escapeHtml(rtoMs != null ? formatDelay(rtoMs) : '-')}</div>
                 </div>`;
             } else if (monitorCell) {
                 monitorCell.innerHTML = '<span style="color: #999;">-</span>';
@@ -387,11 +387,23 @@
             }
             const response = await fetch(url, options);
 
-            // 401 = token 缺失/过期/失效（后端已统一未认证语义）；403 兜底兼容旧后端
-            // （Spring Security 默认对无效 token 返回 403，本应用无角色级授权，403 同样意味着需要重新登录）
-            if (response.status === 401 || response.status === 403) {
+            // 401 = 没登录 / token 失效 → 引导重新登录
+            //
+            // 403 **不再**当成 token 失效。加了三级 RBAC（ADMIN/USER/VIEWER）之后，
+            // 403 的含义变成"登录着但角色不够"——把它当成过期会把只读用户
+            // 从一个他本来就无权访问的按钮上强制踢出登录，且怎么重新登录都没用。
+            // 后端的 401/403 已经分开返回（见 SecurityConfig 的两个 handler）。
+            if (response.status === 401) {
                 showTokenExpiredModal();
                 return new Promise(() => {});
+            }
+            if (response.status === 403) {
+                try {
+                    const body = await response.clone().json();
+                    showToast(body.message || '当前角色无权执行该操作', 'error');
+                } catch (e) {
+                    showToast('当前角色无权执行该操作', 'error');
+                }
             }
 
             return response;
@@ -656,24 +668,24 @@
             
             row.innerHTML = `
                 <div class="table-cell col-checkbox">
-                    <input type="checkbox" class="batch-cb" data-id="${workflow.id}" ${window.__dash.batchSelected.has(workflow.id) ? 'checked' : ''}
-                           onchange="advToggleBatchSelect('${workflow.id}', this.checked)">
+                    <input type="checkbox" class="batch-cb" data-id="${escapeHtml(workflow.id)}" ${escapeHtml(window.__dash.batchSelected.has(workflow.id) ? 'checked' : '')}
+                           onchange="advToggleBatchSelect('${escapeHtml(workflow.id)}', this.checked)">
                 </div>
                 <div class="table-cell col-name">
                     <div>
                         <div><span style="background: #f6ffed; color: #52c41a; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px;">同步</span>${escapeHtml(workflow.name)}${consistencyBadgeHtml(workflow.consistency_mode)}</div>
-                        <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${workflow.status === 'CONFIGURING' ? `openTaskConfig('${workflow.id}')` : `showTaskDetail('${workflow.id}')`}">${workflow.id}</div>
+                        <div style="font-size: 11px; color: #1890ff; cursor: pointer;" onclick="${escapeHtml(workflow.status === 'CONFIGURING' ? `openTaskConfig('${workflow.id}')` : `showTaskDetail('${workflow.id}')`)}">${escapeHtml(workflow.id)}</div>
                     </div>
                 </div>
-                <div class="table-cell col-dbtype">${formatDbTypeLabel(workflow.source_type)}→ ${formatDbTypeLabel(workflow.target_type)}</div>
+                <div class="table-cell col-dbtype">${escapeHtml(formatDbTypeLabel(workflow.source_type))}→ ${escapeHtml(formatDbTypeLabel(workflow.target_type))}</div>
                 <div class="table-cell col-status">
-                    <span class="status-tag ${statusInfo.class}">
+                    <span class="status-tag ${escapeHtml(statusInfo.class)}">
                         ${statusInfo.dot ? '<span class="status-dot"></span>' : statusInfo.icon ? `<span class="status-icon">${statusInfo.icon}</span>` : ''}
-                        ${statusInfo.text}
+                        ${escapeHtml(statusInfo.text)}
                     </span>
                 </div>
                 <div class="table-cell col-created">
-                    <div style="font-size: 12px; color: #666;">${formatDateTime(workflow.created_at)}</div>
+                    <div style="font-size: 12px; color: #666;">${escapeHtml(formatDateTime(workflow.created_at))}</div>
                 </div>
                 <div class="table-cell col-monitor">
                     ${workflow.status === 'INCREMENT_RUNNING' || workflow.status === 'FULL_COMPLETED' ?
@@ -977,7 +989,7 @@
                         displayMsg = '✗ 连接失败：' + errorMsg.substring(0, 80);
                     }
                     
-                    statusDiv.innerHTML = `<div>${displayMsg}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
+                    statusDiv.innerHTML = `<div>${escapeHtml(displayMsg)}</div>${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     connectionTestStatus[type] = false;
                 } else {
                     statusDiv.className = 'connection-status error';
@@ -1227,12 +1239,12 @@
                 if (result.success && result.data) {
                     renderValidationResult(result.data);
                 } else {
-                    resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验失败: ${result.message || '未知错误'}</div>`;
+                    resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验失败: ${escapeHtml(result.message || '未知错误')}</div>`;
                     validationPassed = false;
                 }
             } catch (error) {
                 console.error('校验失败:', error);
-                resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验请求失败: ${error.message}</div>`;
+                resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验请求失败: ${escapeHtml(error.message)}</div>`;
                 validationPassed = false;
             } finally {
                 runBtn.disabled = false;
@@ -1320,7 +1332,7 @@
                     schemasCache = result.data.schemas;
                     renderSchemas(database);
                 } else {
-                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${result.message || '加载失败'}</div>`;
+                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 console.error('加载schema列表失败:', error);
@@ -1389,7 +1401,7 @@
                     tablesCache[`pg-${schema}`] = result.data.tables;
                     renderPgTables(database, schema);
                 } else {
-                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${result.message || '加载失败'}</div>`;
+                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 console.error('加载PG表列表失败:', error);
@@ -1491,7 +1503,7 @@
                     databasesCache = result.data.databases;
                     renderDatabases();
                 } else {
-                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${result.message || '加载失败'}</div>`;
+                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 console.error('加载数据库列表失败:', error);
@@ -1564,7 +1576,7 @@
                     tablesCache[db] = result.data.tables;
                     renderTables(db);
                 } else {
-                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${result.message || '加载失败'}</div>`;
+                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 console.error('加载表列表失败:', error);
@@ -2061,10 +2073,10 @@
                             <div style="font-size: 13px;">${escapeHtml(task.name)}</div>
                             
                             <div style="font-size: 13px; color: #666;">任务ID:</div>
-                            <div style="font-size: 13px; font-family: monospace;">${task.id}</div>
+                            <div style="font-size: 13px; font-family: monospace;">${escapeHtml(task.id)}</div>
                             
                             <div style="font-size: 13px; color: #666;">同步模式:</div>
-                            <div style="font-size: 13px;">${task.migration_mode === 'fullAndIncre' ? '全量+增量' : '仅全量'}</div>
+                            <div style="font-size: 13px;">${escapeHtml(task.migration_mode === 'fullAndIncre' ? '全量+增量' : '仅全量')}</div>
 
                             <div style="font-size: 13px; color: #666;">一致性语义:</div>
                             <div style="font-size: 13px;">
@@ -2076,9 +2088,9 @@
                             
                             <div style="font-size: 13px; color: #666;">当前状态:</div>
                             <div>
-                                <span class="status-tag ${statusInfo.class}">
+                                <span class="status-tag ${escapeHtml(statusInfo.class)}">
                                     ${statusInfo.dot ? '<span class="status-dot"></span>' : statusInfo.icon ? `<span class="status-icon">${statusInfo.icon}</span>` : ''}
-                                    ${statusInfo.text}
+                                    ${escapeHtml(statusInfo.text)}
                                 </span>
                                 ${task.status === 'CONFIGURING' ? `<button class="action-btn" style="margin-left: 8px;" onclick="closeDetailModal(); openTaskConfig('${task.id}')">前往配置</button>` : ''}
                             </div>
@@ -2086,18 +2098,18 @@
                             <div style="font-size: 13px; color: #666;">全量同步进度:</div>
                             <div>
                                 <div class="progress-bar" style="width: 200px;">
-                                    <div class="progress-fill" style="width: ${task.progress || 0}%"></div>
+                                    <div class="progress-fill" style="width: ${escapeHtml(task.progress || 0)}%"></div>
                                 </div>
-                                <span style="margin-left: 8px; font-size: 11px; color: #666;">${task.progress || 0}%</span>
+                                <span style="margin-left: 8px; font-size: 11px; color: #666;">${escapeHtml(task.progress || 0)}%</span>
                             </div>
                             
                             <div style="font-size: 13px; color: #666;">是否计费中:</div>
                             <div>${task.is_billing ? '<span style="color: #52c41a;">是</span>' : '<span style="color: #999;">否</span>'}</div>
                             
                             <div style="font-size: 13px; color: #666;">库表同步类型:</div>
-                            <div style="font-size: 13px;">${syncGranularity}</div>
+                            <div style="font-size: 13px;">${escapeHtml(syncGranularity)}</div>
 
-                            <div style="font-size: 13px; color: #666;">${syncGranularity === '库级' ? '同步库:' : '同步表:'}</div>
+                            <div style="font-size: 13px; color: #666;">${escapeHtml(syncGranularity === '库级' ? '同步库:' : '同步表:')}</div>
                             <div style="font-size: 13px;">${syncObjectsHtml}</div>
 
                             ${colProcHtml ? `
@@ -2111,19 +2123,19 @@
                             ` : ''}
 
                             <div style="font-size: 13px; color: #666;">源库类型:</div>
-                            <div style="font-size: 13px;">${sourceTypeLabel}</div>
+                            <div style="font-size: 13px;">${escapeHtml(sourceTypeLabel)}</div>
 
                             <div style="font-size: 13px; color: #666;">源库地址:</div>
-                            <div style="font-size: 13px; font-family: monospace;">${sourceAddr}</div>
+                            <div style="font-size: 13px; font-family: monospace;">${escapeHtml(sourceAddr)}</div>
 
                             <div style="font-size: 13px; color: #666;">目标库类型:</div>
-                            <div style="font-size: 13px;">${targetTypeLabel}</div>
+                            <div style="font-size: 13px;">${escapeHtml(targetTypeLabel)}</div>
 
                             <div style="font-size: 13px; color: #666;">目标库地址:</div>
-                            <div style="font-size: 13px; font-family: monospace;">${targetAddr}</div>
+                            <div style="font-size: 13px; font-family: monospace;">${escapeHtml(targetAddr)}</div>
                             
                             <div style="font-size: 13px; color: #666;">创建时间:</div>
-                            <div style="font-size: 13px;">${formatDateTime(task.created_at)}</div>
+                            <div style="font-size: 13px;">${escapeHtml(formatDateTime(task.created_at))}</div>
                             
                             ${task.updated_at ? `
                                 <div style="font-size: 13px; color: #666;">更新时间:</div>
@@ -2155,14 +2167,14 @@
                         <div style="margin-top: 20px; border-top: 2px solid #1890ff; padding-top: 16px;">
                             <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
                                 <div style="font-size: 14px; font-weight: 600; color: #1890ff;">高级监控</div>
-                                <button class="btn-test" onclick="downloadDiagnosticsBundle('${task.id}')" title="打包日志尾部+脱敏config+checkpoint+THL尾部，供排障">下载排障包</button>
+                                <button class="btn-test" onclick="downloadDiagnosticsBundle('${escapeHtml(task.id)}')" title="打包日志尾部+脱敏config+checkpoint+THL尾部，供排障">下载排障包</button>
                             </div>
                             <div class="adv-tabs">
-                                <div class="adv-tab active" onclick="switchAdvTab('${task.id}', 'checkpoint')">断点续传</div>
-                                <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'latency')">延迟热力图</div>
-                                <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'ddl')">在线DDL</div>
-                                <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'fanout')">多目标分发</div>
-                                <div class="adv-tab" onclick="switchAdvTab('${task.id}', 'route')">分片分布</div>
+                                <div class="adv-tab active" onclick="switchAdvTab('${escapeHtml(task.id)}', 'checkpoint')">断点续传</div>
+                                <div class="adv-tab" onclick="switchAdvTab('${escapeHtml(task.id)}', 'latency')">延迟热力图</div>
+                                <div class="adv-tab" onclick="switchAdvTab('${escapeHtml(task.id)}', 'ddl')">在线DDL</div>
+                                <div class="adv-tab" onclick="switchAdvTab('${escapeHtml(task.id)}', 'fanout')">多目标分发</div>
+                                <div class="adv-tab" onclick="switchAdvTab('${escapeHtml(task.id)}', 'route')">分片分布</div>
                             </div>
                             <div class="adv-tab-content active" id="advTab-checkpoint">
                                 <div class="adv-empty"><div class="adv-empty-icon">○</div>加载中...</div>
@@ -2280,7 +2292,7 @@
                 const data = await resp.json();
                 renderCheckpoint(data);
             } catch (e) {
-                el.innerHTML = `<div class="adv-empty"><div class="adv-empty-icon">⚠</div>加载失败: ${e.message}<br><span style="font-size:11px;color:#ccc;">请确认 Agent (端口8083) 正在运行</span></div>`;
+                el.innerHTML = `<div class="adv-empty"><div class="adv-empty-icon">⚠</div>加载失败: ${escapeHtml(e.message)}<br><span style="font-size:11px;color:#ccc;">请确认 Agent (端口8083) 正在运行</span></div>`;
             }
         }
 
@@ -2332,51 +2344,51 @@
                 <div class="adv-metric-grid">
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">Binlog 位点</div>
-                        <div class="adv-metric-value" style="font-size:13px;font-family:monospace;">${binlog.file || '-'}</div>
-                        <div class="adv-metric-sub">pos: ${binlog.position || '-'}</div>
+                        <div class="adv-metric-value" style="font-size:13px;font-family:monospace;">${escapeHtml(binlog.file || '-')}</div>
+                        <div class="adv-metric-sub">pos: ${escapeHtml(binlog.position || '-')}</div>
                         <div style="margin-top:4px;">${advStatusBadge(binlogStatus)}</div>
                     </div>
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">THL Seqno</div>
-                        <div class="adv-metric-value">${thl.seqno != null ? thl.seqno : '-'}</div>
-                        <div class="adv-metric-sub">${thl.available ? '可用' : '不可用'}</div>
+                        <div class="adv-metric-value">${escapeHtml(thl.seqno != null ? thl.seqno : '-')}</div>
+                        <div class="adv-metric-sub">${escapeHtml(thl.available ? '可用' : '不可用')}</div>
                         <div style="margin-top:4px;">${advStatusBadge(thlStatus)}</div>
                     </div>
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">Checkpoint</div>
-                        <div class="adv-metric-value">${cp.seqno != null ? cp.seqno : '-'}</div>
-                        <div class="adv-metric-sub">${cp.updated_at || '-'}</div>
+                        <div class="adv-metric-value">${escapeHtml(cp.seqno != null ? cp.seqno : '-')}</div>
+                        <div class="adv-metric-sub">${escapeHtml(cp.updated_at || '-')}</div>
                         <div style="margin-top:4px;">${advStatusBadge(cpStatus)}</div>
                     </div>
                 </div>
                 <div class="adv-metric-grid" style="grid-template-columns: repeat(2, 1fr);">
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">待应用事件数</div>
-                        <div class="adv-metric-value ${pendingEvents > 100 ? 'bad' : ''}" style="${pendingEvents > 100 ? 'color:#f5222d;' : ''}">${pendingEvents}</div>
+                        <div class="adv-metric-value ${escapeHtml(pendingEvents > 100 ? 'bad' : '')}" style="${escapeHtml(pendingEvents > 100 ? 'color:#f5222d;' : '')}">${escapeHtml(pendingEvents)}</div>
                     </div>
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">Binlog 位点差距</div>
-                        <div class="adv-metric-value">${binlogGap}</div>
+                        <div class="adv-metric-value">${escapeHtml(binlogGap)}</div>
                     </div>
                 </div>
                 <div class="adv-metric-grid" style="grid-template-columns: repeat(2, 1fr);">
                     <div class="adv-metric-card" style="background:#e6f7ff;border-color:#91d5ff;">
                         <div class="adv-metric-label">RPO (数据丢失容忍)</div>
-                        <div class="adv-metric-value" style="color:#1890ff;">${rpo != null ? rpo + ' ms' : '-'}</div>
+                        <div class="adv-metric-value" style="color:#1890ff;">${escapeHtml(rpo != null ? rpo + ' ms' : '-')}</div>
                     </div>
                     <div class="adv-metric-card" style="background:#fff7e6;border-color:#ffd591;">
                         <div class="adv-metric-label">RTO (恢复时间)</div>
-                        <div class="adv-metric-value" style="color:#fa8c16;">${rto != null ? rto + ' ms' : '-'}</div>
+                        <div class="adv-metric-value" style="color:#fa8c16;">${escapeHtml(rto != null ? rto + ' ms' : '-')}</div>
                     </div>
                 </div>
                 <div class="adv-link-flow">
-                    <div class="adv-link-node ${binlog.available ? 'ok' : ''}">capture</div>
+                    <div class="adv-link-node ${escapeHtml(binlog.available ? 'ok' : '')}">capture</div>
                     <span class="adv-link-arrow">→</span>
-                    <div class="adv-link-node ${thl.available ? 'ok' : ''}">extract</div>
+                    <div class="adv-link-node ${escapeHtml(thl.available ? 'ok' : '')}">extract</div>
                     <span class="adv-link-arrow">→</span>
-                    <div class="adv-link-node ${cp.available ? 'ok' : ''}">increment</div>
+                    <div class="adv-link-node ${escapeHtml(cp.available ? 'ok' : '')}">increment</div>
                     <span class="adv-link-arrow">→</span>
-                    <div class="adv-link-node ${cp.available ? 'ok' : ''}">checkpoint</div>
+                    <div class="adv-link-node ${escapeHtml(cp.available ? 'ok' : '')}">checkpoint</div>
                 </div>
                 <div id="ckptHistoryBox" style="margin-top:14px;"></div>
             `;
@@ -2413,7 +2425,7 @@
                             </tr>`).join('')}</tbody>
                     </table>`;
             } catch (e) {
-                box.innerHTML = `<div style="font-size:12px;color:#999;">位点历史加载失败: ${e.message}</div>`;
+                box.innerHTML = `<div style="font-size:12px;color:#999;">位点历史加载失败: ${escapeHtml(e.message)}</div>`;
             }
         }
 
@@ -2457,7 +2469,7 @@
                 _latencyExpandedTable = null;
                 renderLatency(data);
             } catch (e) {
-                el.innerHTML = `<div class="adv-empty"><div class="adv-empty-icon">⚠</div>加载失败: ${e.message}<br><span style="font-size:11px;color:#ccc;">请确认 Agent (端口8083) 正在运行</span></div>`;
+                el.innerHTML = `<div class="adv-empty"><div class="adv-empty-icon">⚠</div>加载失败: ${escapeHtml(e.message)}<br><span style="font-size:11px;color:#ccc;">请确认 Agent (端口8083) 正在运行</span></div>`;
             }
         }
 
@@ -2496,16 +2508,16 @@
                 <div class="adv-metric-grid">
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">总表数</div>
-                        <div class="adv-metric-value">${totalTables}</div>
+                        <div class="adv-metric-value">${escapeHtml(totalTables)}</div>
                     </div>
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">平均延迟</div>
-                        <div class="adv-metric-value">${avgLatency} ms</div>
+                        <div class="adv-metric-value">${escapeHtml(avgLatency)} ms</div>
                     </div>
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">最大延迟</div>
-                        <div class="adv-metric-value" style="color:#f5222d;">${maxLatency} ms</div>
-                        <div class="adv-metric-sub">瓶颈表: ${bottleneck}</div>
+                        <div class="adv-metric-value" style="color:#f5222d;">${escapeHtml(maxLatency)} ms</div>
+                        <div class="adv-metric-sub">瓶颈表: ${escapeHtml(bottleneck)}</div>
                     </div>
                 </div>
                 <table class="adv-heatmap-table">
@@ -2514,7 +2526,7 @@
                             <th>表名</th><th>P50</th><th>P95</th><th>P99</th><th>最大</th><th>级别</th>
                         </tr>
                     </thead>
-                    <tbody>${rows}</tbody>
+                    <tbody>${escapeHtml(rows)}</tbody>
                 </table>
                 <div id="latencyChartArea" style="margin-top:12px;display:none;"></div>
             `;
@@ -2539,13 +2551,13 @@
             if (_latencyTrendChart) { _latencyTrendChart.destroy(); _latencyTrendChart = null; }
 
             if (!points.length) {
-                area.innerHTML = `<div style="padding:12px;background:#fafafa;border-radius:6px;font-size:12px;color:#666;">表 <b>${tableName}</b> 暂无延迟历史数据点</div>`;
+                area.innerHTML = `<div style="padding:12px;background:#fafafa;border-radius:6px;font-size:12px;color:#666;">表 <b>${escapeHtml(tableName)}</b> 暂无延迟历史数据点</div>`;
                 return;
             }
 
             area.innerHTML = `
                 <div style="padding:8px 12px;background:#fafafa;border-radius:6px;">
-                    <div style="font-size:12px;color:#666;margin-bottom:8px;">表 <b>${tableName}</b> 最近 ${points.length} 次应用延迟趋势</div>
+                    <div style="font-size:12px;color:#666;margin-bottom:8px;">表 <b>${escapeHtml(tableName)}</b> 最近 ${escapeHtml(points.length)} 次应用延迟趋势</div>
                     <div style="height:180px;"><canvas id="latencyTrendCanvas"></canvas></div>
                 </div>
             `;
@@ -2626,8 +2638,8 @@
             }).join('');
 
             el.innerHTML = `
-                <div style="font-size:12px;color:#666;margin-bottom:12px;">共 ${ddlLogs.length} 条DDL变更记录</div>
-                <div class="adv-timeline">${items}</div>
+                <div style="font-size:12px;color:#666;margin-bottom:12px;">共 ${escapeHtml(ddlLogs.length)} 条DDL变更记录</div>
+                <div class="adv-timeline">${escapeHtml(items)}</div>
             `;
         }
 
@@ -2677,16 +2689,16 @@
             }).join('');
             el.innerHTML = `
                 <div style="padding:10px 12px;font-size:12px;color:#666;">
-                    模式: <b>${d.mode === 'MERGE' ? '汇聚（按来源统计）' : '拆分（按分片统计）'}</b>
-                    ・共 ${entries.length} 个${isSplit ? '分片' : '来源'}
-                    ・累计 ${total.toLocaleString()} 行
-                    ・未路由 <b style="color:${Number(d.unrouted) > 0 ? '#fa8c16' : '#666'};">${Number(d.unrouted) || 0}</b> 行
-                    ${isSplit ? `・跨分片搬迁 ${Number(d.crossShardMoves) || 0} 次` : ''}
+                    模式: <b>${escapeHtml(d.mode === 'MERGE' ? '汇聚（按来源统计）' : '拆分（按分片统计）')}</b>
+                    ・共 ${escapeHtml(entries.length)} 个${escapeHtml(isSplit ? '分片' : '来源')}
+                    ・累计 ${escapeHtml(total.toLocaleString())} 行
+                    ・未路由 <b style="color:${escapeHtml(Number(d.unrouted) > 0 ? '#fa8c16' : '#666')};">${escapeHtml(Number(d.unrouted) || 0)}</b> 行
+                    ${escapeHtml(isSplit ? `・跨分片搬迁 ${Number(d.crossShardMoves) || 0} 次` : '')}
                 </div>
                 ${skewed ? `<div style="margin:0 12px 8px;padding:6px 10px;background:#fffbe6;border:1px solid #ffe58f;border-radius:4px;font-size:12px;color:#fa8c16;">
                     分布偏斜：最大的${isSplit ? '分片' : '来源'}行数超过均值 2 倍，${isSplit ? '分片键可能选得不均匀' : '某个分库数据量明显更大'}。
                 </div>` : ''}
-                ${rows}
+                ${escapeHtml(rows)}
                 <div style="font-size:11px;color:#bbb;padding:8px 12px;">数据来自增量应用进程，每 5 秒刷新一次；仅统计增量阶段应用的行。</div>
             `;
         }
@@ -2699,7 +2711,7 @@
                 const data = await resp.json();
                 renderFanout(data);
             } catch (e) {
-                el.innerHTML = `<div class="adv-empty"><div class="adv-empty-icon">⚠</div>加载失败: ${e.message}<br><span style="font-size:11px;color:#ccc;">请确认 Agent (端口8083) 正在运行</span></div>`;
+                el.innerHTML = `<div class="adv-empty"><div class="adv-empty-icon">⚠</div>加载失败: ${escapeHtml(e.message)}<br><span style="font-size:11px;color:#ccc;">请确认 Agent (端口8083) 正在运行</span></div>`;
             }
         }
 
@@ -2744,15 +2756,15 @@
                 <div class="adv-metric-grid">
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">总分发数</div>
-                        <div class="adv-metric-value">${total}</div>
+                        <div class="adv-metric-value">${escapeHtml(total)}</div>
                     </div>
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">成功 / 失败</div>
-                        <div class="adv-metric-value"><span style="color:#52c41a;">${success}</span> / <span style="color:#f5222d;">${failure}</span></div>
+                        <div class="adv-metric-value"><span style="color:#52c41a;">${escapeHtml(success)}</span> / <span style="color:#f5222d;">${escapeHtml(failure)}</span></div>
                     </div>
                     <div class="adv-metric-card">
                         <div class="adv-metric-label">目标数 / 并行度</div>
-                        <div class="adv-metric-value">${targetCount} / ${parallelism}</div>
+                        <div class="adv-metric-value">${escapeHtml(targetCount)} / ${escapeHtml(parallelism)}</div>
                     </div>
                 </div>
                 <table class="adv-heatmap-table">
@@ -2982,6 +2994,9 @@
         let cfgColumnFilters = {};   // -> [{column, op, value}]
         let cfgColumnMappings = {};  // -> {源列: 目标列}
         let cfgExtraColumns = {};    // -> [{name, kind, value}]  kind: CREATE_TIME|UPDATE_TIME|CUSTOM
+        // "库.表" -> [{column, rule, keepPrefix, keepSuffix, arg}]
+        // rule: MASK_ALL|MASK_PARTIAL|HASH|NULLIFY|FAKE
+        let cfgColumnMasks = {};
         let cfgColumnsCache = {};    // -> [{name, dataType, columnType, primaryKey, filterable}]
         // 内容对比差异分页游标（openTaskConfig 打开时重置）。原为隐式全局（未声明直接赋值），
         // 经典脚本 sloppy 模式下静默建 window 属性；改用 "use strict"+IIFE 后未声明赋值会 ReferenceError。
@@ -3020,6 +3035,7 @@
             cfgColumnFilters = {};
             cfgColumnMappings = {};
             cfgExtraColumns = {};
+            cfgColumnMasks = {};
         }
 
         function cfgClearColumnProcessingForTable(db, tableName) {
@@ -3130,8 +3146,10 @@
                     cfgSelectedSyncObjects[db].forEach(t => tables.push(db + '.' + t));
                 }
             });
-            ['cfgFilterTableSelect', 'cfgMappingTableSelect', 'cfgExtraTableSelect'].forEach(id => {
+            ['cfgFilterTableSelect', 'cfgMappingTableSelect', 'cfgExtraTableSelect',
+             'cfgMaskTableSelect'].forEach(id => {
                 const select = document.getElementById(id);
+                if (!select) return;
                 const prev = select.value;
                 let options = '<option value="">请选择表</option>';
                 tables.forEach(t => {
@@ -3141,9 +3159,11 @@
                 if (prev && tables.includes(prev)) select.value = prev;
             });
             cfgOnExtraKindChange();
+            cfgOnMaskRuleChange();
             cfgRenderFilterList();
             cfgRenderMappingRows();
             cfgRenderExtraList();
+            cfgRenderMaskList();
             cfgRefreshRouteExclusion();
         }
 
@@ -3326,7 +3346,7 @@
                 mergeList.innerHTML = cfgRouteConfig.merge.length === 0
                     ? '<div style="color:#999;">暂无汇聚规则</div>'
                     : cfgRouteConfig.merge.map((r, i) => row(
-                        `${r.match} → ${r.target}（主键: ${r.pkStrategy === 'KEEP' ? '沿用源主键' : '主键+来源列'}，DDL: ${r.ddlPolicy}）`,
+                        `${escapeHtml(r.match)} → ${escapeHtml(r.target)}（主键: ${escapeHtml(r.pkStrategy === 'KEEP' ? '沿用源主键' : '主键+来源列')}，DDL: ${escapeHtml(r.ddlPolicy)}）`,
                         'merge', i)).join('');
             }
             const splitList = document.getElementById('cfgSplitRuleList');
@@ -3334,7 +3354,7 @@
                 splitList.innerHTML = cfgRouteConfig.split.length === 0
                     ? '<div style="color:#999;">暂无拆分规则</div>'
                     : cfgRouteConfig.split.map((r, i) => row(
-                        `${r.match} 按 ${r.shardKey}/${r.algo}${r.count ? ' ' + r.count + ' 片' : ''} → ${r.targetDb || '<默认库>'}.${r.targetTable || '<源表名>'}（未路由: ${r.unrouted}）`,
+                        `${escapeHtml(r.match)} 按 ${escapeHtml(r.shardKey)}/${escapeHtml(r.algo)}${escapeHtml(r.count ? ' ' + r.count + ' 片' : '')} → ${r.targetDb || '<默认库>'}.${r.targetTable || '<源表名>'}（未路由: ${escapeHtml(r.unrouted)}）`,
                         'split', i)).join('');
             }
             const legList = document.getElementById('cfgRouteLegList');
@@ -3342,7 +3362,7 @@
                 legList.innerHTML = cfgRouteConfig.legs.length === 0
                     ? '<div style="color:#999;">未配置跨实例来源（只汇聚当前源实例上的库表）</div>'
                     : cfgRouteConfig.legs.map((l, i) => row(
-                        `${l.nodeId} — ${l.host}:${l.port}`, 'legs', i)).join('');
+                        `${escapeHtml(l.nodeId)} — ${escapeHtml(l.host)}:${escapeHtml(l.port)}`, 'legs', i)).join('');
             }
             cfgRefreshRouteExclusion();
         }
@@ -3408,7 +3428,7 @@
 
         /** 只切页签，不回头重算可用性（供 cfgRefreshRouteExclusion 内部调用，避免相互递归）。 */
         function cfgSwitchColTabInternal(tab) {
-            ['filter', 'mapping', 'extra', 'route'].forEach(t => {
+            ['filter', 'mapping', 'extra', 'mask', 'route'].forEach(t => {
                 const btn = document.getElementById('cfgColTab' + t.charAt(0).toUpperCase() + t.slice(1) + 'Btn');
                 const pane = document.getElementById('cfgColPane' + t.charAt(0).toUpperCase() + t.slice(1));
                 if (btn) btn.className = 'colproc-tab' + (t === tab ? ' active' : '');
@@ -3471,6 +3491,28 @@
                     await cfgLoadColumns(sel.substring(0, dot), sel.substring(dot + 1));
                 }
                 cfgRenderMappingRows();
+            } else if (tab === 'mask') {
+                const sel = document.getElementById('cfgMaskTableSelect').value;
+                const colSelect = document.getElementById('cfgMaskColumnSelect');
+                colSelect.innerHTML = '<option value="">加载中...</option>';
+                if (!sel) { colSelect.innerHTML = '<option value="">请先选择表</option>'; return; }
+                const dot = sel.indexOf('.');
+                const columns = await cfgLoadColumns(sel.substring(0, dot), sel.substring(dot + 1));
+                if (!columns) { colSelect.innerHTML = '<option value="">加载失败</option>'; return; }
+                // 主键列不可脱敏：主键是内容对比配对两端行的依据，脱敏后无从配对；
+                // 且哈希类规则会改变值的类型，目标端写入直接失败。这里连选都不让选，
+                // 比让用户配完再在保存时报错要好。
+                const maskable = columns.filter(c => !c.primaryKey);
+                if (maskable.length === 0) {
+                    colSelect.innerHTML = '<option value="">该表只有主键列，主键不可脱敏</option>';
+                    return;
+                }
+                let options = '<option value="">请选择列</option>';
+                maskable.forEach(c => {
+                    options += `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}（${escapeHtml(c.columnType)}）</option>`;
+                });
+                colSelect.innerHTML = options;
+                cfgRenderMaskList();
             } else {
                 const sel = document.getElementById('cfgExtraTableSelect').value;
                 if (sel) {
@@ -3479,6 +3521,93 @@
                 }
                 cfgRenderExtraList();
             }
+        }
+
+        // ---------- 数据脱敏 ----------
+
+        window.cfgOnMaskRuleChange = function() {
+            const rule = document.getElementById('cfgMaskRuleSelect').value;
+            document.getElementById('cfgMaskPrefixInput').style.display = rule === 'MASK_PARTIAL' ? '' : 'none';
+            document.getElementById('cfgMaskSuffixInput').style.display = rule === 'MASK_PARTIAL' ? '' : 'none';
+            document.getElementById('cfgMaskFakeSelect').style.display = rule === 'FAKE' ? '' : 'none';
+        }
+
+        window.cfgAddMaskRule = function() {
+            const table = document.getElementById('cfgMaskTableSelect').value;
+            const column = document.getElementById('cfgMaskColumnSelect').value;
+            const rule = document.getElementById('cfgMaskRuleSelect').value;
+            if (!table) { showToast('请先选择表', 'warning'); return; }
+            if (!column) { showToast('请选择要脱敏的列', 'warning'); return; }
+
+            const list = cfgColumnMasks[table] || (cfgColumnMasks[table] = []);
+            // 同一列只允许一条规则：两条并存时后一条会覆盖前一条，
+            // 那是"以为配了强规则、实际生效弱规则"，在脱敏上尤其危险
+            if (list.some(r => r.column.toLowerCase() === column.toLowerCase())) {
+                showToast(`列 ${column} 已配置脱敏规则，请先删除再重新添加`, 'warning');
+                return;
+            }
+
+            const item = { column: column, rule: rule };
+            if (rule === 'MASK_PARTIAL') {
+                const kp = parseInt(document.getElementById('cfgMaskPrefixInput').value, 10);
+                const ks = parseInt(document.getElementById('cfgMaskSuffixInput').value, 10);
+                if (!(kp >= 0) || !(ks >= 0)) { showToast('保留位数需为非负整数', 'warning'); return; }
+                if (kp === 0 && ks === 0) { showToast('首尾都不保留请改用「整体遮蔽」', 'warning'); return; }
+                item.keepPrefix = kp; item.keepSuffix = ks;
+            } else if (rule === 'FAKE') {
+                item.arg = document.getElementById('cfgMaskFakeSelect').value;
+            }
+            list.push(item);
+            cfgRenderMaskList();
+            showToast(`已为 ${column} 添加脱敏规则；该列将不参与内容对比`, 'success');
+        }
+
+        window.cfgRemoveMaskRule = function(table, index) {
+            const list = cfgColumnMasks[table];
+            if (!list) return;
+            list.splice(index, 1);
+            if (list.length === 0) delete cfgColumnMasks[table];
+            cfgRenderMaskList();
+        }
+
+        function cfgMaskRuleLabel(r) {
+            switch (r.rule) {
+                case 'MASK_ALL': return '整体遮蔽';
+                case 'MASK_PARTIAL': return `保留首 ${r.keepPrefix} 尾 ${r.keepSuffix}`;
+                case 'HASH': return '哈希（可关联）';
+                case 'NULLIFY': return '置空';
+                case 'FAKE': return `假数据（${{NAME:'姓名',EMAIL:'邮箱',PHONE:'手机号',ADDRESS:'地址',ID_CARD:'身份证号'}[r.arg] || r.arg}）`;
+                default: return r.rule;
+            }
+        }
+
+        function cfgRenderMaskList() {
+            const box = document.getElementById('cfgMaskList');
+            if (!box) return;
+            const tables = Object.keys(cfgColumnMasks).filter(t => (cfgColumnMasks[t] || []).length > 0);
+            if (tables.length === 0) {
+                box.innerHTML = '<div style="color:#999;font-size:12px;">尚未配置脱敏规则</div>';
+                return;
+            }
+            let html = '';
+            let total = 0;
+            tables.forEach(t => {
+                (cfgColumnMasks[t] || []).forEach((r, i) => {
+                    total++;
+                    html += `<div style="display:flex;align-items:center;gap:10px;padding:6px 8px;border-bottom:1px solid #f0f0f0;">
+                        <span style="color:#666;min-width:180px;">${escapeHtml(t)}</span>
+                        <span style="font-weight:500;min-width:120px;">${escapeHtml(r.column)}</span>
+                        <span style="color:#1890ff;">${escapeHtml(cfgMaskRuleLabel(r))}</span>
+                        <span style="flex:1;"></span>
+                        <button type="button" class="action-btn" onclick="cfgRemoveMaskRule('${escapeAttr(t)}', ${i})">删除</button>
+                    </div>`;
+                });
+            });
+            html += `<div style="margin-top:10px;padding:8px 10px;background:#fffbe6;border:1px solid #ffe58f;border-radius:4px;font-size:12px;color:#874d00;">
+                共 ${total} 列已配置脱敏。<b>如果选择了脱敏，则无法完成脱敏列内容对比</b>——
+                这些列会被自动排除在内容对比之外，行数对比与其余列的对比不受影响。
+            </div>`;
+            box.innerHTML = html;
         }
 
         // ---------- 列名过滤 ----------
@@ -3843,7 +3972,7 @@
                                     if (tgt && tgt !== src) cfgTableNameMapping[db + '.' + src] = tgt;
                                 });
                             }
-                            // 恢复列处理配置（表级 entry 的 columnFilter/columnMapping/extraColumns，按表存放）
+                            // 恢复列处理配置（表级 entry 的 columnFilter/columnMapping/extraColumns/columnMask，按表存放）
                             if (dbValue && dbValue.columnFilter && typeof dbValue.columnFilter === 'object') {
                                 Object.entries(dbValue.columnFilter).forEach(([t, conds]) => {
                                     if (Array.isArray(conds) && conds.length > 0) cfgColumnFilters[db + '.' + t] = conds;
@@ -3857,6 +3986,11 @@
                             if (dbValue && dbValue.extraColumns && typeof dbValue.extraColumns === 'object') {
                                 Object.entries(dbValue.extraColumns).forEach(([t, cols]) => {
                                     if (Array.isArray(cols) && cols.length > 0) cfgExtraColumns[db + '.' + t] = cols;
+                                });
+                            }
+                            if (dbValue && dbValue.columnMask && typeof dbValue.columnMask === 'object') {
+                                Object.entries(dbValue.columnMask).forEach(([t, rules]) => {
+                                    if (Array.isArray(rules) && rules.length > 0) cfgColumnMasks[db + '.' + t] = rules;
                                 });
                             }
                         }
@@ -4126,7 +4260,7 @@
                     else if (errorType === 'SSL_NOT_SUPPORTED') displayMsg = '✗ ' + errorMsg;
                     // 后端 errorMsg 已是完整描述（如"连接失败：xxx"），直接展示，避免"✗ 连接失败：连接失败："重复前缀
                     else displayMsg = '✗ ' + errorMsg.substring(0, 100);
-                    statusDiv.innerHTML = `<div>${displayMsg}</div>${sslRenderTlsBadge(result.data)}${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
+                    statusDiv.innerHTML = `<div>${escapeHtml(displayMsg)}</div>${sslRenderTlsBadge(result.data)}${suggestion ? '<div style="font-size:11px;color:#999;margin-top:2px;">💡 ' + suggestion + '</div>' : ''}`;
                     cfgConnectionTestStatus[type] = false;
                 } else {
                     statusDiv.className = 'connection-status error';
@@ -4307,7 +4441,7 @@
                         }
                         // 列处理（仅表级 + mysql→mysql）：columnFilter/columnMapping/extraColumns 按表写入
                         if (cfgColProcSupported()) {
-                            const colFilter = {}, colMapping = {}, extraCols = {};
+                            const colFilter = {}, colMapping = {}, extraCols = {}, colMask = {};
                             cfgSelectedSyncObjects[db].forEach(t => {
                                 const key = db + '.' + t;
                                 if (Array.isArray(cfgColumnFilters[key]) && cfgColumnFilters[key].length > 0) {
@@ -4319,10 +4453,18 @@
                                 if (Array.isArray(cfgExtraColumns[key]) && cfgExtraColumns[key].length > 0) {
                                     extraCols[t] = cfgExtraColumns[key];
                                 }
+                                if (Array.isArray(cfgColumnMasks[key]) && cfgColumnMasks[key].length > 0) {
+                                    colMask[t] = cfgColumnMasks[key];
+                                }
                             });
                             if (Object.keys(colFilter).length > 0) syncObjectsData[db].columnFilter = colFilter;
                             if (Object.keys(colMapping).length > 0) syncObjectsData[db].columnMapping = colMapping;
                             if (Object.keys(extraCols).length > 0) syncObjectsData[db].extraColumns = extraCols;
+                            // columnMask 与上面三项<b>分开</b>：那三项会让任务整体失去对比资格
+                            // （行的存在与否、列的构成都变了），而脱敏只改被脱敏那几列的值——
+                            // 只排除这些列，行数与其余列照常对比。后端 RouteConfigValidator
+                            // 的 COLUMN_PROCESSING_KEYS 里刻意不含 columnMask，两侧口径要一致。
+                            if (Object.keys(colMask).length > 0) syncObjectsData[db].columnMask = colMask;
                         }
                     }
                     // 库名映射：只写与源库名不同的有效映射（表级/库级均支持）
@@ -4426,12 +4568,12 @@
                 if (result.success && result.data) {
                     cfgRenderValidationResult(result.data);
                 } else {
-                    resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验失败: ${result.message || '未知错误'}</div>`;
+                    resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验失败: ${escapeHtml(result.message || '未知错误')}</div>`;
                     cfgValidationPassed = false;
                 }
             } catch (error) {
                 console.error('校验失败:', error);
-                resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验请求失败: ${error.message}</div>`;
+                resultDiv.innerHTML = `<div class="validation-empty" style="color: #f5222d;">校验请求失败: ${escapeHtml(error.message)}</div>`;
                 cfgValidationPassed = false;
             } finally {
                 runBtn.disabled = false;
@@ -4569,7 +4711,7 @@
                     cfgDatabasesCache = result.data.databases;
                     cfgRenderDatabases();
                 } else {
-                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${result.message || '加载失败'}</div>`;
+                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 sourceList.innerHTML = '<div class="empty-selection" style="color: #f5222d;">加载失败，请检查连接串</div>';
@@ -4646,7 +4788,7 @@
                     cfgTablesCache[db] = result.data.tables;
                     cfgRenderTables(db);
                 } else {
-                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${result.message || '加载失败'}</div>`;
+                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 tableList.innerHTML = '<div style="padding: 16px; color: #f5222d; font-size: 12px;">加载失败</div>';
@@ -4822,7 +4964,7 @@
                     cfgSchemasCache = result.data.schemas;
                     cfgRenderSchemas(database);
                 } else {
-                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${result.message || '加载失败'}</div>`;
+                    sourceList.innerHTML = `<div class="empty-selection" style="color: #f5222d;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 sourceList.innerHTML = '<div class="empty-selection" style="color: #f5222d;">加载失败，请检查连接信息</div>';
@@ -4882,7 +5024,7 @@
                     cfgTablesCache[`pg-${schema}`] = result.data.tables;
                     cfgRenderPgTables(database, schema);
                 } else {
-                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${result.message || '加载失败'}</div>`;
+                    tableList.innerHTML = `<div style="padding: 16px; color: #f5222d; font-size: 12px;">${escapeHtml(result.message || '加载失败')}</div>`;
                 }
             } catch (error) {
                 tableList.innerHTML = '<div style="padding: 16px; color: #f5222d; font-size: 12px;">加载失败</div>';
@@ -4959,6 +5101,240 @@
         
         let _pendingMetricsTaskId = null;
 
+        // ==================== 数据治理：血缘 / 分级 / Schema 审批 ====================
+
+        const GOV_LEVEL_COLOR = {
+            PUBLIC: '#8c8c8c', INTERNAL: '#1890ff', SENSITIVE: '#fa8c16', RESTRICTED: '#f5222d'
+        };
+        const GOV_OP_LABEL = {
+            IDENTITY: '原样', RENAME: '改名', MASK: '脱敏', FILTER: '行过滤',
+            DEFAULT_VALUE: '附加列', ROUTE_SPLIT: '分片拆分', ROUTE_MERGE: '分片汇聚', DROP: '不同步'
+        };
+
+        async function govApi(path, opts) {
+            const o = Object.assign({}, opts || {});
+            o.headers = Object.assign({ 'Content-Type': 'application/json' }, getAuthHeaders());
+            const res = await fetchWithAuth(API_BASE_URL + path, o);
+            if (res.status === 403) {
+                // fetchWithAuth 已经弹过提示，这里只需要让调用方停下来
+                throw new Error('当前角色无权执行该操作');
+            }
+            return res.json();
+        }
+
+        /** 任务下拉：策略校验与 DDL 同步都要选任务 */
+        async function govFillTaskSelects() {
+            try {
+                const r = await govApi('/workflows?page=1&pageSize=200&taskType=SYNC');
+                const items = (r.data && (r.data.items || r.data.list)) || [];
+                const opts = '<option value="">请选择任务</option>' + items.map(w =>
+                    `<option value="${escapeAttr(w.id)}">${escapeHtml(w.name || w.id)}</option>`).join('');
+                ['clPolicyTask', 'saSyncTask'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.innerHTML = opts;
+                });
+            } catch (e) { /* 下拉填不上不影响其余功能 */ }
+        }
+
+        // ---------- 血缘 ----------
+
+        window.lnQuery = async function() {
+            const db = document.getElementById('lnDb').value.trim();
+            const table = document.getElementById('lnTable').value.trim();
+            const column = document.getElementById('lnColumn').value.trim();
+            const dir = document.getElementById('lnDirection').value;
+            const box = document.getElementById('lnResult');
+            if (!db || !table || !column) { showToast('库/表/列都要填', 'warning'); return; }
+            box.innerHTML = '<span style="color:#999;">查询中…</span>';
+            try {
+                const q = `?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}&depth=5`;
+                const r = await govApi('/governance/lineage/' + (dir === 'impact' ? 'impact' : 'upstream') + q);
+                const d = r.data || {};
+                const hops = d.downstreamByHop || d.upstreamByHop || [];
+                const list = d.downstream || d.upstream || [];
+                if (list.length === 0) {
+                    box.innerHTML = `<div style="color:#999;">${escapeHtml(d.origin || '')} 没有${dir === 'impact' ? '下游' : '上游'}。`
+                        + `若任务刚建好，先在任务配置里保存一次以生成血缘。</div>`;
+                    return;
+                }
+                let html = `<div style="margin-bottom:12px;">
+                    <b>${escapeHtml(d.origin)}</b>
+                    <span style="color:#999;font-size:12px;">共 ${list.length} 个${dir === 'impact' ? '下游' : '上游'}字段</span>
+                </div>`;
+                if (d.hasMask) {
+                    html += `<div style="background:#fffbe6;border:1px solid #ffe58f;border-radius:4px;padding:8px 10px;margin-bottom:12px;font-size:12px;color:#874d00;">
+                        路径上存在<b>脱敏</b>：下游那些列不参与内容对比。</div>`;
+                }
+                (d.operators || []).forEach(() => {});
+                if ((d.operators || []).length) {
+                    html += `<div style="margin-bottom:12px;font-size:12px;color:#666;">路径算子：`
+                        + (d.operators || []).map(o =>
+                            `<span style="display:inline-block;padding:1px 7px;margin-right:6px;background:#f0f5ff;color:#1890ff;border-radius:3px;">${escapeHtml(GOV_OP_LABEL[o] || o)}</span>`).join('')
+                        + '</div>';
+                }
+                hops.forEach((layer, i) => {
+                    html += `<div style="margin-bottom:10px;">
+                        <div style="font-size:12px;color:#999;margin-bottom:4px;">第 ${i + 1} 跳（${layer.length}）</div>
+                        <div style="display:flex;flex-wrap:wrap;gap:6px;">`
+                        + layer.map(c => `<span style="padding:3px 9px;background:#fafafa;border:1px solid #e8e8e8;border-radius:3px;font-family:monospace;font-size:12px;">${escapeHtml(c)}</span>`).join('')
+                        + '</div></div>';
+                });
+                box.innerHTML = html;
+            } catch (e) {
+                box.innerHTML = `<div style="color:#f5222d;">查询失败：${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        // ---------- 分级 ----------
+
+        window.clLoadRules = async function() {
+            const box = document.getElementById('clRules');
+            if (!box) return;
+            try {
+                const r = await govApi('/governance/classification/rules');
+                const rules = r.data || [];
+                if (rules.length === 0) { box.innerHTML = '<span style="color:#999;">暂无规则</span>'; return; }
+                box.innerHTML = rules.sort((a, b) => (a.priority || 0) - (b.priority || 0)).map(x =>
+                    `<div style="display:flex;align-items:center;gap:12px;padding:5px 0;border-bottom:1px solid #f5f5f5;">
+                        <span style="min-width:90px;font-weight:500;">${escapeHtml(x.name)}</span>
+                        <code style="flex:1;color:#666;">${escapeHtml(x.columnPattern)}</code>
+                        <span style="color:${GOV_LEVEL_COLOR[x.level] || '#666'};font-weight:500;min-width:100px;">${escapeHtml(x.level)}</span>
+                        <span style="color:#999;font-size:12px;">${escapeHtml(x.tags || '')}</span>
+                    </div>`).join('');
+            } catch (e) {
+                box.innerHTML = `<span style="color:#f5222d;">${escapeHtml(e.message)}</span>`;
+            }
+        }
+
+        window.clLoadFlows = async function() {
+            const level = document.getElementById('clLevel').value;
+            const box = document.getElementById('clResult');
+            box.innerHTML = '<span style="color:#999;">查询中…</span>';
+            try {
+                const r = await govApi('/governance/classification/flows?level=' + encodeURIComponent(level));
+                const rows = r.data || [];
+                if (rows.length === 0) {
+                    box.innerHTML = `<div style="color:#999;">没有标为 ${escapeHtml(level)} 的列，或它们还没有血缘。</div>`;
+                    return;
+                }
+                box.innerHTML = `<div style="margin-bottom:10px;"><b>${escapeHtml(level)}</b> 级别的列流向（${rows.length} 条）</div>`
+                    + `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:13px;">
+                        <thead><tr style="background:#fafafa;">
+                          <th style="text-align:left;padding:8px;">源列</th>
+                          <th style="text-align:left;padding:8px;">目标</th>
+                          <th style="text-align:left;padding:8px;">变换</th>
+                          <th style="text-align:left;padding:8px;">是否脱敏</th>
+                        </tr></thead><tbody>`
+                    + rows.map(x => `<tr style="border-bottom:1px solid #f0f0f0;">
+                        <td style="padding:8px;font-family:monospace;">${escapeHtml(x.column)}</td>
+                        <td style="padding:8px;font-family:monospace;">${escapeHtml(x.target)}</td>
+                        <td style="padding:8px;">${escapeHtml(GOV_OP_LABEL[x.operator] || x.operator)}</td>
+                        <td style="padding:8px;color:${x.masked ? '#52c41a' : '#f5222d'};">${x.masked ? '已脱敏' : '未脱敏'}</td>
+                      </tr>`).join('') + '</tbody></table></div>';
+            } catch (e) {
+                box.innerHTML = `<div style="color:#f5222d;">${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        window.clCheckPolicy = async function() {
+            const wid = document.getElementById('clPolicyTask').value;
+            const box = document.getElementById('clResult');
+            if (!wid) { showToast('请先选择任务', 'warning'); return; }
+            box.innerHTML = '<span style="color:#999;">校验中…</span>';
+            try {
+                const r = await govApi('/governance/classification/policy/' + encodeURIComponent(wid));
+                const d = r.data || {};
+                let html = d.hasViolation
+                    ? '<div style="color:#f5222d;font-weight:500;margin-bottom:12px;">发现策略违规</div>'
+                    : '<div style="color:#52c41a;font-weight:500;margin-bottom:12px;">未发现策略违规</div>';
+                const section = (title, items, color) => items && items.length
+                    ? `<div style="margin-bottom:12px;"><div style="font-size:13px;color:${color};margin-bottom:6px;">${title}（${items.length}）</div>`
+                      + items.map(x => `<div style="padding:4px 8px;background:#fafafa;border-left:2px solid ${color};margin-bottom:4px;font-family:monospace;font-size:12px;">${escapeHtml(x)}</div>`).join('')
+                      + '</div>' : '';
+                html += section('目标端级别低于源端（数据流动中被降级）', d.downgrades, '#f5222d');
+                html += section('RESTRICTED 列未脱敏', d.unmaskedSensitive, '#fa8c16');
+                html += section('高敏列流向（供参考，非违规）', d.sensitiveFlows, '#1890ff');
+                box.innerHTML = html;
+            } catch (e) {
+                box.innerHTML = `<div style="color:#f5222d;">${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        // ---------- Schema 审批 ----------
+
+        window.saSync = async function() {
+            const wid = document.getElementById('saSyncTask').value;
+            if (!wid) { showToast('请先选择任务', 'warning'); return; }
+            try {
+                const r = await govApi('/governance/schema-changes/sync/' + encodeURIComponent(wid), { method: 'POST' });
+                showToast(`已同步 ${((r.data || {}).created) || 0} 条待审批变更`, 'success');
+                saLoad();
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        window.saLoad = async function() {
+            const box = document.getElementById('saList');
+            if (!box) return;
+            box.innerHTML = '<span style="color:#999;">加载中…</span>';
+            try {
+                const r = await govApi('/governance/schema-changes/pending');
+                const rows = r.data || [];
+                if (rows.length === 0) {
+                    box.innerHTML = '<div style="color:#999;">没有待审批的 Schema 变更。</div>';
+                    return;
+                }
+                box.innerHTML = rows.map(x => {
+                    const lv = x.maxLevel
+                        ? `<span style="color:${GOV_LEVEL_COLOR[x.maxLevel]};font-weight:500;">${escapeHtml(x.maxLevel)}</span>`
+                        : '<span style="color:#999;">未分级</span>';
+                    return `<div style="border:1px solid #e8e8e8;border-radius:4px;padding:12px;margin-bottom:12px;">
+                        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+                            <span style="font-weight:500;">${escapeHtml(x.dbName || '')}.${escapeHtml(x.tableName || '')}</span>
+                            <span style="color:#999;font-size:12px;">${escapeHtml(x.ddlType || '')}</span>
+                            <span style="color:#999;font-size:12px;">seqno=${escapeHtml(String(x.seqno == null ? '-' : x.seqno))}</span>
+                            <span style="flex:1;"></span>
+                            <span style="font-size:12px;">最高敏感级别：${lv}</span>
+                        </div>
+                        <pre style="background:#f5f5f5;padding:10px;border-radius:3px;font-size:12px;overflow-x:auto;margin:0 0 8px;">${escapeHtml(x.ddlSql || '')}</pre>
+                        ${x.affectedColumns ? `<div style="font-size:12px;color:#666;margin-bottom:8px;">受影响的下游字段（来自血缘）：<span style="font-family:monospace;">${escapeHtml(x.affectedColumns)}</span></div>` : ''}
+                        <div style="display:flex;gap:8px;align-items:center;">
+                            <input type="text" class="form-input" id="saComment${x.id}" placeholder="审批意见（可选）" style="flex:1;height:32px;">
+                            <button type="button" class="btn-test" onclick="saApprove(${x.id})">批准并应用</button>
+                            <button type="button" class="action-btn" onclick="saReject(${x.id})">驳回</button>
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                box.innerHTML = `<div style="color:#f5222d;">${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        window.saApprove = async function(id) {
+            const c = document.getElementById('saComment' + id);
+            if (!confirm('批准后会立即把这条 DDL 应用到目标库，确认？')) return;
+            try {
+                const r = await govApi('/governance/schema-changes/' + id + '/approve', {
+                    method: 'POST', body: JSON.stringify({ comment: c ? c.value : '' })
+                });
+                const st = (r.data || {}).status;
+                if (st === 'APPLIED') showToast('已批准并应用到目标库', 'success');
+                else if (st === 'FAILED') showToast('已批准但应用失败：' + ((r.data || {}).errorMessage || ''), 'error');
+                else showToast(r.message || '操作完成', 'warning');
+                saLoad();
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        window.saReject = async function(id) {
+            const c = document.getElementById('saComment' + id);
+            try {
+                await govApi('/governance/schema-changes/' + id + '/reject', {
+                    method: 'POST', body: JSON.stringify({ comment: c ? c.value : '' })
+                });
+                showToast('已驳回', 'success');
+                saLoad();
+            } catch (e) { showToast(e.message, 'error'); }
+        }
+
         function switchPage(page) {
             console.log('switchPage called with:', page);
             // 菜单高亮按 data-page 匹配（原先按 menuItems 索引定位，新增菜单项会整体错位）
@@ -4967,12 +5343,29 @@
             });
 
             ['syncPage', 'validationPage', 'drPage', 'subscribePage', 'metricsPage',
-             'auditPage', 'automationPage', 'alertPage', 'slowsqlPage'].forEach(id => {
+             'auditPage', 'automationPage', 'alertPage', 'slowsqlPage',
+             'lineagePage', 'classificationPage', 'schemaApprovalPage'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.style.display = 'none';
             });
             stopMetricsAutoRefresh();
 
+            if (page === 'lineage') {
+                document.getElementById('lineagePage').style.display = 'block';
+                return;
+            }
+            if (page === 'classification') {
+                document.getElementById('classificationPage').style.display = 'block';
+                clLoadRules();
+                govFillTaskSelects();
+                return;
+            }
+            if (page === 'schemaApproval') {
+                document.getElementById('schemaApprovalPage').style.display = 'block';
+                govFillTaskSelects();
+                saLoad();
+                return;
+            }
             if (page === 'sync') {
                 document.getElementById('syncPage').style.display = 'block';
             } else if (page === 'validation') {
@@ -5055,11 +5448,11 @@
                     document.getElementById('auditNextBtn').disabled = data.page + 1 >= (data.totalPages || 1);
                 } else {
                     document.getElementById('auditLogTableBody').innerHTML =
-                        `<tr><td colspan="7" style="padding:24px;text-align:center;color:#f5222d;">${data.message || '加载失败'}</td></tr>`;
+                        `<tr><td colspan="7" style="padding:24px;text-align:center;color:#f5222d;">${escapeHtml(data.message || '加载失败')}</td></tr>`;
                 }
             } catch (e) {
                 document.getElementById('auditLogTableBody').innerHTML =
-                    `<tr><td colspan="7" style="padding:24px;text-align:center;color:#f5222d;">加载失败: ${e.message}</td></tr>`;
+                    `<tr><td colspan="7" style="padding:24px;text-align:center;color:#f5222d;">加载失败: ${escapeHtml(e.message)}</td></tr>`;
             }
         }
 
@@ -5077,23 +5470,32 @@
                 const details = log.details ? (log.details.length > 80 ? log.details.substring(0, 80) + '...' : log.details) : '-';
                 const error = log.errorMessage ? `<div style="color:#f5222d;font-size:12px;">${escapeHtml(log.errorMessage)}</div>` : '';
                 return `<tr style="border-bottom:1px solid #f0f0f0;">
-                    <td style="padding:12px;">${time}</td>
+                    <td style="padding:12px;">${escapeHtml(time)}</td>
                     <td style="padding:12px;">${escapeHtml(log.username || '-')}</td>
-                    <td style="padding:12px;"><span style="background:#e6f7ff;color:#1890ff;padding:2px 8px;border-radius:4px;font-size:12px;">${_auditActionLabels[log.action] || log.action}</span></td>
+                    <td style="padding:12px;"><span style="background:#e6f7ff;color:#1890ff;padding:2px 8px;border-radius:4px;font-size:12px;">${escapeHtml(_auditActionLabels[log.action] || log.action)}</span></td>
                     <td style="padding:12px;">${escapeHtml(log.workflowName || log.workflowId || '-')}</td>
-                    <td style="padding:12px;">${resultBadge}</td>
-                    <td style="padding:12px;max-width:300px;word-break:break-all;">${escapeHtml(details)}${error}</td>
+                    <td style="padding:12px;">${escapeHtml(resultBadge)}</td>
+                    <td style="padding:12px;max-width:300px;word-break:break-all;">${escapeHtml(details)}${escapeHtml(error)}</td>
                     <td style="padding:12px;">${escapeHtml(log.clientIp || '-')}</td>
                 </tr>`;
             }).join('');
         }
 
+        // HTML 文本转义。所有插进 innerHTML 的**文本**都必须过它。
+        //
+        // 两个坑：
+        //  1. 原来是 `if (!str) return ''`，于是 escapeHtml(0) 和 escapeHtml(false)
+        //     都返回空串——数字 0 会在页面上凭空消失。改成只挡 null/undefined。
+        //  2. 挂到 window 上：dashboard-advanced.js / -subscribe.js / -dr.js 是
+        //     type="module"，模块作用域看不见普通脚本里的函数声明，
+        //     它们调用 escapeHtml 会 ReferenceError。
         function escapeHtml(str) {
-            if (!str) return '';
+            if (str === null || str === undefined) return '';
             return String(str).replace(/[&<>"']/g, c => ({
                 '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
             })[c]);
         }
+        window.escapeHtml = escapeHtml;
 
         // 用于内联事件属性（onclick="fn('...')"）里的字符串实参：先转义 JS 字符串里的
         // 反斜杠/引号/换行，再 HTML 转义整体——因为该值最终嵌在 HTML 属性值内。
@@ -6014,7 +6416,7 @@
             const tag = document.createElement('span');
             tag.className = 'filter-tag';
             tag.dataset.type = type;
-            tag.innerHTML = `${label}：${value}<span class="tag-remove" onclick="removeFilterTag('${type}')">×</span>`;
+            tag.innerHTML = `${escapeHtml(label)}：${escapeHtml(value)}<span class="tag-remove" onclick="removeFilterTag('${escapeHtml(type)}')">×</span>`;
             filterTags.appendChild(tag);
             updateClearFiltersVisibility();
         }
@@ -6182,10 +6584,10 @@
                 dropdown.innerHTML = filtered.map(t => {
                     const typeLabel = _metricsTaskTypeMap[t.taskType] || t.taskType || '同步';
                     const typeColor = t.taskType === 'SUBSCRIBE' ? '#52c41a' : t.taskType === 'DR' ? '#722ed1' : '#1890ff';
-                    return `<div class="metrics-task-option" data-id="${t.id}" style="padding: 8px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px;">
-                        <span style="background: ${typeColor}15; color: ${typeColor}; padding: 1px 6px; border-radius: 3px; font-size: 11px; white-space: nowrap;">${typeLabel}</span>
-                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${t.name || t.id}</span>
-                        <span style="color: #999; font-size: 11px; margin-left: auto; flex-shrink: 0;">${t.status || ''}</span>
+                    return `<div class="metrics-task-option" data-id="${escapeHtml(t.id)}" style="padding: 8px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px;">
+                        <span style="background: ${escapeHtml(typeColor)}15; color: ${escapeHtml(typeColor)}; padding: 1px 6px; border-radius: 3px; font-size: 11px; white-space: nowrap;">${escapeHtml(typeLabel)}</span>
+                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(t.name || t.id)}</span>
+                        <span style="color: #999; font-size: 11px; margin-left: auto; flex-shrink: 0;">${escapeHtml(t.status || '')}</span>
                     </div>`;
                 }).join('');
             }
@@ -6598,10 +7000,10 @@
                 const cbState = p.circuitBreakerState || 'CLOSED';
                 const cbLabel = cbState === 'OPEN' ? '<span style="color:#f5222d;font-size:11px;">断路器开启</span>' : '';
                 return `<div class="process-status-item">
-                    <div class="process-name">${p.name}</div>
-                    <div class="process-state ${stateClass}">${stateText}</div>
-                    <div class="process-meta">PID: ${p.pid || '-'} | 运行: ${p.uptime || '-'}</div>
-                    <div class="process-meta">重试: ${p.retryCount || 0}次 ${cbLabel}</div>
+                    <div class="process-name">${escapeHtml(p.name)}</div>
+                    <div class="process-state ${escapeHtml(stateClass)}">${escapeHtml(stateText)}</div>
+                    <div class="process-meta">PID: ${escapeHtml(p.pid || '-')} | 运行: ${escapeHtml(p.uptime || '-')}</div>
+                    <div class="process-meta">重试: ${escapeHtml(p.retryCount || 0)}次 ${escapeHtml(cbLabel)}</div>
                 </div>`;
             }).join('');
         }
@@ -6642,12 +7044,12 @@
             overlay.innerHTML = `
                 <div class="chart-modal-panel">
                     <div class="chart-modal-header">
-                        <div class="chart-modal-title">${title}</div>
+                        <div class="chart-modal-title">${escapeHtml(title)}</div>
                         <div class="chart-modal-controls">
-                            <button class="time-grain-btn ${_chartModalGrain === '5s' ? 'active' : ''}" onclick="setChartGrain('5s')">5秒</button>
-                            <button class="time-grain-btn ${_chartModalGrain === '30s' ? 'active' : ''}" onclick="setChartGrain('30s')">30秒</button>
-                            <button class="time-grain-btn ${_chartModalGrain === '1m' ? 'active' : ''}" onclick="setChartGrain('1m')">1分钟</button>
-                            <button class="time-grain-btn ${_chartModalGrain === '5m' ? 'active' : ''}" onclick="setChartGrain('5m')">5分钟</button>
+                            <button class="time-grain-btn ${escapeHtml(_chartModalGrain === '5s' ? 'active' : '')}" onclick="setChartGrain('5s')">5秒</button>
+                            <button class="time-grain-btn ${escapeHtml(_chartModalGrain === '30s' ? 'active' : '')}" onclick="setChartGrain('30s')">30秒</button>
+                            <button class="time-grain-btn ${escapeHtml(_chartModalGrain === '1m' ? 'active' : '')}" onclick="setChartGrain('1m')">1分钟</button>
+                            <button class="time-grain-btn ${escapeHtml(_chartModalGrain === '5m' ? 'active' : '')}" onclick="setChartGrain('5m')">5分钟</button>
                             <div class="chart-modal-close" onclick="closeChartModal()">&times;</div>
                         </div>
                     </div>

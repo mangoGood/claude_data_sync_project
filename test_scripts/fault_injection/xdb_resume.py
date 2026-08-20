@@ -30,7 +30,7 @@ import dblib as D  # noqa: E402
 
 
 def fmt(fp):
-    return f"(count={fp[0]}, xor={fp[1]:#010x})"
+    return f"(count={fp[0]}, sum={fp[1]})"
 
 
 def run_incremental(link, minutes):

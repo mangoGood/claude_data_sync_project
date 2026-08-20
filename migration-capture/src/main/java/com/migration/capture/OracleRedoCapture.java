@@ -1306,7 +1306,7 @@ public class OracleRedoCapture extends AbstractCapture<byte[]> {
         String fileName = String.format("binlog_%s_%04d.cap", timestamp, fileCounter.get());
 
         File outputFile = new File(outputDir, fileName);
-        writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(outputFile), StandardCharsets.UTF_8));
+        writer = newCapWriter(outputFile);
         currentFileEvents = 0;
 
         logger.info("Opened new Oracle redo capture output file: {}", outputFile.getAbsolutePath());

@@ -69,6 +69,27 @@ public class ContentCompareService {
                                                Map<String, Map<String, String>> explicitTableMappings,
                                                Map<String, String> explicitDbMappings,
                                                String routeConfigJson, String routeNodeId) {
+        return startCompare(sourceConnection, targetConnection, sourceType, targetType,
+                syncObjects, explicitTableMappings, explicitDbMappings, routeConfigJson, routeNodeId, null);
+    }
+
+    /**
+     * @param maskedColumns 被脱敏的列（库 → 表 → 列名小写集合）。<b>这些列不参与内容对比</b>。
+     *
+     *  <p>为什么必须排除：脱敏发生在写入目标端之前，目标端存的本来就不是源端的值。
+     *  拿它去比，每一行都会报差异——而那是设计如此，不是数据问题。用户会看到一堆
+     *  "不一致"却查不出原因，比不比对更糟。
+     *
+     *  <p>排除的列会写进 {@code session.maskedExcluded}，由前端明示"这些列因脱敏未参与对比"，
+     *  而不是悄悄少比几列——悄悄少比会让人误以为"全表都比过了"。
+     */
+    public ContentCompareSession startCompare(String sourceConnection, String targetConnection,
+                                               String sourceType, String targetType,
+                                               Map<String, List<String>> syncObjects,
+                                               Map<String, Map<String, String>> explicitTableMappings,
+                                               Map<String, String> explicitDbMappings,
+                                               String routeConfigJson, String routeNodeId,
+                                               Map<String, Map<String, java.util.Set<String>>> maskedColumns) {
         if (!sourceType.equalsIgnoreCase(targetType)) {
             throw new IllegalArgumentException("内容对比仅支持源库和目标库为相同类型的数据库");
         }
@@ -168,7 +189,28 @@ public class ContentCompareService {
                     String qualifiedTarget = isPg ? targetTableName : mappedTargetDb + "." + targetTableName;
 
                     task.setPrimaryKeyColumn(detectPrimaryKey(sourceDb, qualifiedSource, isPg, sourceConn.database));
-                    task.setColumns(getColumnMeta(sourceDb, qualifiedSource, isPg, sourceConn.database));
+                    List<ColumnMeta> allCols = getColumnMeta(sourceDb, qualifiedSource, isPg, sourceConn.database);
+                    java.util.Set<String> masked = maskedOf(maskedColumns, dbName, tableName);
+                    if (!masked.isEmpty()) {
+                        List<ColumnMeta> kept = new ArrayList<>();
+                        List<String> excluded = new ArrayList<>();
+                        for (ColumnMeta cm : allCols) {
+                            // 主键即使被脱敏也必须留下：它是配对两端行的依据，
+                            // 去掉主键就没法逐行比了。控制面已禁止对主键配脱敏，
+                            // 这里是最后一道，防止历史配置漏网。
+                            boolean isPk = cm.getName() != null
+                                    && cm.getName().equalsIgnoreCase(task.getPrimaryKeyColumn());
+                            if (!isPk && masked.contains(cm.getName().toLowerCase())) {
+                                excluded.add(cm.getName());
+                            } else {
+                                kept.add(cm);
+                            }
+                        }
+                        task.setColumns(kept);
+                        task.setMaskedExcludedColumns(excluded);
+                    } else {
+                        task.setColumns(allCols);
+                    }
                     task.setSourceRowCount(getRowCount(sourceDb, qualifiedSource, isPg));
                     task.setCursor(calculateCursorRange(sourceDb, qualifiedSource, task.getPrimaryKeyColumn(), isPg));
                     task.setStatus("PENDING");
@@ -930,6 +972,26 @@ public class ContentCompareService {
         return "id";
     }
 
+    /** 取某表被脱敏的列（小写）；未配置返回空集。 */
+    private static java.util.Set<String> maskedOf(
+            Map<String, Map<String, java.util.Set<String>>> maskedColumns, String db, String table) {
+        if (maskedColumns == null) {
+            return java.util.Collections.emptySet();
+        }
+        Map<String, java.util.Set<String>> byTable = maskedColumns.get(db);
+        if (byTable == null) {
+            byTable = maskedColumns.get(db == null ? null : db.toLowerCase());
+        }
+        if (byTable == null) {
+            return java.util.Collections.emptySet();
+        }
+        java.util.Set<String> s = byTable.get(table);
+        if (s == null) {
+            s = byTable.get(table == null ? null : table.toLowerCase());
+        }
+        return s == null ? java.util.Collections.emptySet() : s;
+    }
+
     private List<ColumnMeta> getColumnMeta(Connection conn, String qualifiedTable, boolean isPg, String dbName) throws SQLException {
         List<ColumnMeta> columns = new ArrayList<>();
         String sql = isPg ?
@@ -1123,15 +1185,22 @@ public class ContentCompareService {
             throw new SQLException("驱动未找到: " + e.getMessage());
         }
 
+        // URL 只放标识符，驱动参数走 Properties——内容对比是逐行把两端业务数据
+        // 读回来比的，这条连接拿到的权限最大，最不该让库名有机会接管驱动参数。
         String url;
+        java.util.Properties props;
         if (isPg) {
-            url = String.format("jdbc:postgresql://%s:%d/%s?currentSchema=public&stringtype=unspecified",
-                conn.host, conn.port, conn.database != null ? conn.database : "postgres");
+            url = com.synctask.util.JdbcConnections.postgresUrl(
+                    conn.host, conn.port, conn.database != null ? conn.database : "postgres");
+            props = com.synctask.util.JdbcConnections.postgresProps(
+                    conn.username, conn.password,
+                    com.synctask.util.JdbcConnections.pgSchema("public"));
         } else {
-            url = String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true",
-                conn.host, conn.port, conn.database != null ? conn.database : "");
+            url = com.synctask.util.JdbcConnections.mysqlUrl(
+                    conn.host, conn.port, conn.database);
+            props = com.synctask.util.JdbcConnections.mysqlProps(conn.username, conn.password, null);
         }
 
-        return DataSourcePoolManager.getConnection(url, conn.username, conn.password);
+        return DataSourcePoolManager.getConnection(url, conn.username, conn.password, props);
     }
 }

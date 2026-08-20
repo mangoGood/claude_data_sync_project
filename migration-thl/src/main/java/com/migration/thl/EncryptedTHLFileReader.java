@@ -23,6 +23,8 @@ public class EncryptedTHLFileReader extends THLFileReader {
     private final ThlEncryptionService encryptionService;
     private final boolean encryptionEnabled;
     private final boolean fileEncrypted;
+    /** 加密文件头里的格式版本：决定 payload 用 ThlCodec 还是原生反序列化。 */
+    private short encFormatVersion = ThlEncryptionService.VERSION_CODEC;
     private ObjectInputStream cachedOis = null;
 
     public EncryptedTHLFileReader(String thlFile, ThlEncryptionService encryptionService) throws IOException {
@@ -41,7 +43,8 @@ public class EncryptedTHLFileReader extends THLFileReader {
         if (encryptionEnabled) {
             fileEncrypted = encryptionService.isEncryptedFile(file);
             if (fileEncrypted) {
-                if (!encryptionService.verifyHeader(fis)) {
+                encFormatVersion = encryptionService.readHeaderVersion(fis);
+                if (encFormatVersion < 0) {
                     throw new IOException("无效的加密文件头: " + thlFile);
                 }
             }
@@ -81,7 +84,12 @@ public class EncryptedTHLFileReader extends THLFileReader {
         }
 
         byte[] decrypted = encryptionService.decryptRecord(encrypted);
-        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(decrypted))) {
+        if (encFormatVersion == ThlEncryptionService.VERSION_CODEC) {
+            return ThlCodec.decode(decrypted);
+        }
+        // v1 存量：payload 仍是 Java 原生序列化，过白名单过滤器
+        try (ObjectInputStream ois =
+                     ThlObjectInputFilter.install(new ObjectInputStream(new ByteArrayInputStream(decrypted)))) {
             return (THLEvent) ois.readObject();
         }
     }
@@ -89,7 +97,7 @@ public class EncryptedTHLFileReader extends THLFileReader {
     private THLEvent readPlainEvent() throws IOException, ClassNotFoundException {
         if (cachedOis == null) {
             if (fis.available() <= 0) return null;
-            cachedOis = new ObjectInputStream(fis);
+            cachedOis = ThlObjectInputFilter.install(new ObjectInputStream(fis));
         }
         try {
             return (THLEvent) cachedOis.readObject();

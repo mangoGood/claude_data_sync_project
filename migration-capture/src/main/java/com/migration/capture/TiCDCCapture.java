@@ -463,7 +463,7 @@ public class TiCDCCapture extends AbstractCapture<byte[]> {
         // 文件名沿用 binlog_ 前缀：extract 侧按该前缀 + .cap 后缀扫描输入目录
         String fileName = String.format("binlog_%s_%04d.cap", timestamp, fileCounter.get());
         File outputFile = new File(outputDir, fileName);
-        writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(outputFile), StandardCharsets.UTF_8));
+        writer = newCapWriter(outputFile);
         currentFileEvents = 0;
         logger.info("打开新的捕获输出文件: {}", outputFile.getAbsolutePath());
     }

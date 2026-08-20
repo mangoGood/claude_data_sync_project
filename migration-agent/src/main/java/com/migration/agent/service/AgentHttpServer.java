@@ -36,6 +36,9 @@ public class AgentHttpServer {
     private final TableLatencyService tableLatencyService;
     private final DiagnosticsBundleService diagnosticsBundleService;
     private final Map<String, FanoutDispatcherService> fanoutServices = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 逃生开关：未配 token 时是否仍对匿名开放只读端点。默认 false（原来是无条件放行）。 */
+    private final boolean allowAnonymousReadonly =
+            Boolean.parseBoolean(System.getenv().getOrDefault("AGENT_READONLY_ALLOW_ANONYMOUS", "false"));
 
     public AgentHttpServer(AgentMain agentMain) {
         this.agentMain = agentMain;
@@ -92,8 +95,16 @@ public class AgentHttpServer {
             logger.info("Agent HTTP Server started on port {}", port);
             if (apiToken == null || apiToken.isEmpty()) {
                 logger.warn("⚠ 未配置 AGENT_API_TOKEN：敏感接口（主备倒换 failover / 启动增量 start-increment / " +
-                    "排障包下载 diagnostics）将返回 401 拒绝。只读监控接口不受影响。" +
+                    "排障包下载 diagnostics）将返回 401 拒绝。" +
                     "如需启用这些操作，请设置 AGENT_API_TOKEN 环境变量并让调用方带上 Bearer token。");
+                if (allowAnonymousReadonly) {
+                    logger.warn("⚠⚠ AGENT_READONLY_ALLOW_ANONYMOUS=true：只读监控接口对**任何人**开放。" +
+                        "这些接口会暴露同步位点、表级延迟、路由分片与双向冲突记录（含行数据）。" +
+                        "仅限完全隔离的内网调试使用。");
+                } else {
+                    logger.warn("只读监控接口同样返回 401（默认不对匿名开放）。" +
+                        "确需匿名只读请显式设置 AGENT_READONLY_ALLOW_ANONYMOUS=true。");
+                }
             }
         } catch (IOException e) {
             logger.error("Failed to start Agent HTTP Server", e);
@@ -655,7 +666,12 @@ public class AgentHttpServer {
         String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
             String token = authHeader.substring(7);
-            if (apiToken.equals(token)) {
+            // 恒定时间比较：String.equals 在首个不同字节处就返回，逐字节的耗时差
+            // 足以让调用方把 token 一个字符一个字符地试出来。MessageDigest.isEqual
+            // 对等长输入不做短路；长度本身不是秘密（token 长度固定）。
+            if (java.security.MessageDigest.isEqual(
+                    apiToken.getBytes(StandardCharsets.UTF_8),
+                    token.getBytes(StandardCharsets.UTF_8))) {
                 return true;
             }
         }
@@ -664,13 +680,29 @@ public class AgentHttpServer {
     }
 
     /**
-     * 只读监控端点（metrics/checkpoint/table-latency/fanout/status）的鉴权：
-     * 仅暴露运行指标/位点，不含凭证——未配置 token 时放行（保证监控页可用），
-     * 配置了 token 时则强制校验（可选加固）。与敏感端点的"缺 token 即拒"区分开。
+     * 只读监控端点（metrics/checkpoint/table-latency/route-metrics/fanout/conflicts 等）的鉴权。
+     *
+     * <p><b>默认已改为"缺 token 即拒"</b>。原来是 fail-open——未配置 {@code AGENT_API_TOKEN}
+     * 就一律放行，理由是"保证监控页可用"。但这些端点暴露的是同步位点、表级延迟、
+     * 路由分片、以及双向冲突记录（其中带行数据），对匿名开放并不合适；
+     * 而且监控页现在走后端代理，并不直连 agent，那条理由已经不成立。
+     *
+     * <p>标准部署不受影响：{@code start.sh} 与 {@code create_env.sh} 一直会生成并注入
+     * {@code AGENT_API_TOKEN}，也就是说这些端点本来就在强制校验。真正受影响的只有
+     * "裸跑 agent 且不配 token"的用法——给它留一个显式逃生开关
+     * {@code AGENT_READONLY_ALLOW_ANONYMOUS=true}，并在启动时大声告警，
+     * 而不是让不安全成为默认。
      */
     private boolean checkAuthOptional(HttpExchange exchange) throws IOException {
         if (apiToken == null || apiToken.isEmpty()) {
-            return true;
+            if (allowAnonymousReadonly) {
+                return true;
+            }
+            sendResponse(exchange, 401, Map.of("success", false,
+                    "message", "Agent 未配置 AGENT_API_TOKEN，只读监控接口默认也不对匿名开放。"
+                            + "请设置该环境变量；确需匿名只读请显式设置 "
+                            + "AGENT_READONLY_ALLOW_ANONYMOUS=true。"));
+            return false;
         }
         return checkAuth(exchange);
     }

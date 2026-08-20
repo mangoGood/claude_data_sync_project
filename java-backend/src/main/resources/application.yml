@@ -178,6 +178,51 @@ synctask:
     dir: ${SYNCTASK_CERT_DIR:${user.dir}/certs}
 
 # ============================================================
+# OpenAPI / Swagger UI
+#
+# 契约本身（/v3/api-docs）与 UI（/swagger-ui.html）都归到 ADMIN——
+# 端点清单会把参数名、DTO 结构、乃至连接串字段一并暴露出来，
+# 对未授权者是一份现成的攻击面地图。
+# ============================================================
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+  packages-to-scan: com.synctask.controller
+
+# ============================================================
+# Actuator：控制面指标出口
+#
+# 只放 health / info / prometheus 三个端点——env、heapdump、threaddump、mappings
+# 这些默认关着的东西一旦开出去就是配置与凭证泄露面（env 会打印数据源 URL、
+# 各类 *_PASSWORD 环境变量名与部分取值）。
+#
+# 端口与业务端口分开（management.server.port）：这样 Prometheus 抓取口
+# 可以只在内网监听，不必跟着业务端口一起对外暴露。
+# ============================================================
+management:
+  server:
+    port: ${MANAGEMENT_PORT:8091}
+    address: ${MANAGEMENT_ADDRESS:127.0.0.1}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    tags:
+      application: synctask-backend
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+# ============================================================
 # 日志级别
 # ============================================================
 logging:

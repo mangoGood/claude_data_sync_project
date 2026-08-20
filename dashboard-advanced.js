@@ -94,7 +94,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>名称</th><th>任务</th><th>类型</th><th>cron</th><th>状态</th><th>上次触发</th><th>下次触发</th><th>已触发</th><th>操作</th>
-                </tr></thead><tbody>${rows}</tbody></table>`;
+                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -170,7 +170,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>策略名</th><th>任务</th><th>错误类型</th><th>最大次数</th><th>重试间隔</th><th>退避</th><th>状态</th><th>操作</th>
-                </tr></thead><tbody>${rows}</tbody></table>`;
+                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -230,7 +230,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>上游任务</th><th>下游任务</th><th>触发条件</th><th>已触发</th><th>上次触发</th><th>操作</th>
-                </tr></thead><tbody>${rows}</tbody></table>`;
+                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -331,7 +331,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>规则名</th><th>任务</th><th>触发条件</th><th>渠道</th><th>状态</th><th>已告警</th><th>最近告警</th><th>操作</th>
-                </tr></thead><tbody>${rows}</tbody></table>`;
+                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -404,7 +404,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>时间</th><th>规则</th><th>任务</th><th>指标值/阈值</th><th>消息</th><th>通知结果</th>
-                </tr></thead><tbody>${rows}</tbody></table>`;
+                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -452,7 +452,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>时间</th><th>任务</th><th>表</th><th>类型</th><th>耗时</th><th>SQL</th>
-                </tr></thead><tbody>${rows}</tbody></table>`;
+                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -522,7 +522,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             });
             container.innerHTML = `<table><thead><tr>
                 <th>版本</th><th>时间</th><th>变更描述</th><th>创建人</th><th>操作</th>
-            </tr></thead><tbody>${rows}</tbody></table>`;
+            </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
         }
 
         async function advRollbackConfig(versionNumber) {
@@ -618,7 +618,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             });
             container.innerHTML = `<table><thead><tr>
                 <th>seqno</th><th>跳过时间</th><th>表</th><th>事件类型</th><th>未应用的 SQL</th>
-            </tr></thead><tbody>${rows}</tbody></table>`;
+            </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
         }
 
         // ---------- 同步位点可视化 ----------

@@ -406,6 +406,14 @@ public class TypedDmlConverter {
             table = mergeCtx.targetTable;
         }
 
+        // 脱敏：挂在这一个点上，覆盖 INSERT / UPDATE / DELETE / 拆分 / 汇聚全部下游路径。
+        // 逐条路径去挂必然漏，而漏一条的表现是"某种 DML 把原值搬过去了"。
+        //
+        // before 镜像（UPDATE/DELETE 的 WHERE 值）<b>必须同样脱敏</b>：目标端存的是
+        // 脱敏后的值，拿原值做 WHERE 一行都匹配不上——UPDATE 影响 0 行、DELETE 删不掉，
+        // 而两者都不会报错，是典型的静默不一致。规则确定性保证了两侧脱出同一个值。
+        rowsTyped = maskRows(srcDb, srcTable, metadata, rowsTyped);
+
         switch (eventType) {
             case "INSERT":
             case "WRITE_ROWS":
@@ -414,7 +422,8 @@ public class TypedDmlConverter {
             case "UPDATE":
             case "UPDATE_ROWS":
             case "EXT_UPDATE_ROWS":
-                List<ArrayList<Object>> beforeTyped = castRows(metadata.get("rows_before_typed"));
+                List<ArrayList<Object>> beforeTyped =
+                        maskRows(srcDb, srcTable, metadata, castRows(metadata.get("rows_before_typed")));
                 if (beforeTyped == null) {
                     // 无前镜像（如 PG REPLICA IDENTITY DEFAULT 只带 PK，不带完整 old-tuple）：
                     // 退化为用 after 值做 WHERE，与文本路径 THLToSqlConverter 的兜底行为一致
@@ -431,6 +440,49 @@ public class TypedDmlConverter {
             default:
                 return null; // DDL/QUERY/心跳等走文本路径
         }
+    }
+
+    /**
+     * 对整批行逐列脱敏；该表没配脱敏时<b>返回原对象</b>（零拷贝、零开销）。
+     *
+     * <p>返回新列表而不是就地改：{@code rows_typed} 还挂在 metadata 上，
+     * 就地改会让同一份数据被后续逻辑（死信记录、冲突消解）看到已脱敏的值，
+     * 而那些地方要的是"源端到底是什么"。
+     */
+    private List<ArrayList<Object>> maskRows(String srcDb, String srcTable,
+                                             Map<String, Object> metadata,
+                                             List<ArrayList<Object>> rows) {
+        if (rows == null || !columnProcessingActive
+                || !columnProcessing.hasMask(srcDb, srcTable)) {
+            return rows;
+        }
+        String[] cols = columnNames(metadata);
+        if (cols == null) {
+            return rows;
+        }
+        List<ArrayList<Object>> out = new ArrayList<>(rows.size());
+        for (ArrayList<Object> row : rows) {
+            if (row.size() != cols.length) {
+                out.add(row);          // 列/值不齐：不猜，交给下游的既有校验去回退
+                continue;
+            }
+            ArrayList<Object> masked = new ArrayList<>(row.size());
+            for (int i = 0; i < row.size(); i++) {
+                masked.add(columnProcessing.maskValue(srcDb, srcTable, cols[i], row.get(i)));
+            }
+            out.add(masked);
+        }
+        return out;
+    }
+
+    /** 从 metadata 取列名数组（与各转换路径取列名的口径一致）。 */
+    private static String[] columnNames(Map<String, Object> metadata) {
+        Object v = metadata.get("column_names");
+        if (v == null) {
+            return null;
+        }
+        String s = String.valueOf(v);
+        return s.isEmpty() ? null : s.split(",");
     }
 
     /** 列过滤是否将该行排除（列处理未生效时恒 false）。 */

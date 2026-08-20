@@ -132,7 +132,10 @@ public class DiagnosticService {
             String username = parsed[1];
             String password = parsed[2];
 
-            conn = DriverManager.getConnection(jdbcUrl, username, password);
+            // 连接测试<b>必须用一次性直连</b>，不能走连接池：这个接口的语义是
+            // "验证当前这组凭证能不能连上"，而复用池中既有连接会掩盖凭证错误——
+            // 换了错密码照样"连接成功"。同 MetadataService#testConnectionDetailed。
+            conn = DriverManager.getConnection(jdbcUrl, mysqlDriverProps(username, password));
             result.put("status", "PASS");
             result.put("message", "连接成功");
             result.put("detail", "JDBC: " + jdbcUrl.replaceAll(password, "***"));
@@ -152,7 +155,7 @@ public class DiagnosticService {
         Connection conn = null;
         try {
             String[] parsed = parseConnectionUrl(connectionStr);
-            conn = DriverManager.getConnection(parsed[0], parsed[1], parsed[2]);
+            conn = pooledConn(parsed[0], parsed[1], parsed[2], mysqlDriverProps(parsed[1], parsed[2]));
 
             // 检查 log_bin 是否开启
             try (PreparedStatement stmt = conn.prepareStatement("SHOW VARIABLES LIKE 'log_bin'");
@@ -209,7 +212,7 @@ public class DiagnosticService {
         Connection conn = null;
         try {
             String[] parsed = parseConnectionUrl(connectionStr);
-            conn = DriverManager.getConnection(parsed[0], parsed[1], parsed[2]);
+            conn = pooledConn(parsed[0], parsed[1], parsed[2], mysqlDriverProps(parsed[1], parsed[2]));
 
             try (PreparedStatement stmt = conn.prepareStatement("SHOW GRANTS FOR CURRENT_USER()");
                  ResultSet rs = stmt.executeQuery()) {
@@ -1019,14 +1022,14 @@ public class DiagnosticService {
     }
 
     private Connection openPgConn(String connStr) throws Exception {
-        String url = connStr.replace("postgresql://", "");
-        int at = url.indexOf('@');
-        String[] up = url.substring(0, at).split(":", 2);
-        String hostDb = url.substring(at + 1);
-        if (!hostDb.contains("/")) {
-            hostDb = hostDb + "/postgres";
-        }
-        return DriverManager.getConnection("jdbc:postgresql://" + hostDb, up[0], up.length > 1 ? up[1] : "");
+        // 与 parseConnectionUrl 同样的理由：原来把整段 host:port/db 拼进 URL，
+        // 连接串里带查询串就能注入驱动参数（PG 的 socketFactory 是一条 RCE 链）
+        HostPortDb hpd = splitHostPortDb(connStr, "postgresql://", 5432);
+        String db = hpd.database() == null ? "postgres" : hpd.database();
+        return pooledConn(
+                com.synctask.util.JdbcConnections.postgresUrl(hpd.host(), hpd.port(), db),
+                hpd.username(), hpd.password(),
+                com.synctask.util.JdbcConnections.postgresProps(hpd.username(), hpd.password(), null));
     }
 
     private boolean pgSchemaExists(Connection c, String schema) throws Exception {
@@ -1553,7 +1556,20 @@ public class DiagnosticService {
 
     private Connection openConn(String connectionStr) throws Exception {
         String[] parsed = parseConnectionUrl(connectionStr);
-        return DriverManager.getConnection(parsed[0], parsed[1], parsed[2]);
+        return pooledConn(parsed[0], parsed[1], parsed[2], mysqlDriverProps(parsed[1], parsed[2]));
+    }
+
+    /**
+     * 诊断用的短连接。走连接池而不是 {@code DriverManager}——
+     * 这些是 SHOW VARIABLES / SHOW GRANTS 之类的一两条查询，
+     * 每次一个完整 TCP + TLS 握手 + 认证往返，全是白付的。
+     *
+     * <p><b>只用于短查询</b>：池容量是 10，任何"持有连接跨越一次长流程"的用法
+     * 都会把池占死（{@code DataValidationService} 就是这种，因此它保留裸连接）。
+     */
+    private Connection pooledConn(String jdbcUrl, String user, String password,
+                                  java.util.Properties props) throws java.sql.SQLException {
+        return com.synctask.util.DataSourcePoolManager.getConnection(jdbcUrl, user, password, props);
     }
 
     private Map<String, Object> check(String name, String status, String message, String detail) {
@@ -1583,21 +1599,68 @@ public class DiagnosticService {
     }
 
     /**
-     * 解析 mysql://user:pass@host:port/db 格式为JDBC连接串
+     * 解析 {@code mysql://user:pass@host:port/db} 为 JDBC 连接三元组。
+     *
+     * <p>此前这里是手工 {@code replace} + {@code indexOf('@')} 切串，然后把整段
+     * {@code host:port/db} 直接拼进 JDBC URL 并跟一个 {@code ?}——完全绕过了
+     * {@code MetadataService.parseConnection} 的校验，是一条独立的注入路径：
+     * 连接串里写 {@code .../db?allowLoadLocalInfile=true} 就能让恶意 MySQL 服务端
+     * 读走本机任意文件。现在 host/port/db 拆开各自过闸门，URL 不再带查询串。
      */
     private String[] parseConnectionUrl(String connStr) {
-        // mysql://root:rootpassword@192.168.107.6:3306/test_db1
-        String url = connStr.replace("mysql://", "");
-        int atIdx = url.indexOf('@');
-        String userPass = url.substring(0, atIdx);
-        String hostDb = url.substring(atIdx + 1);
+        HostPortDb hpd = splitHostPortDb(connStr, "mysql://", 3306);
+        String jdbcUrl = com.synctask.util.JdbcConnections.mysqlUrl(hpd.host, hpd.port, hpd.database);
+        return new String[]{jdbcUrl, hpd.username, hpd.password};
+    }
 
-        String[] up = userPass.split(":", 2);
-        String username = up[0];
-        String password = up.length > 1 ? up[1] : "";
+    /** 与 {@link #parseConnectionUrl} 配套的驱动参数（时区沿用本类历史取值）。 */
+    private java.util.Properties mysqlDriverProps(String username, String password) {
+        java.util.Map<String, String> tz = new java.util.LinkedHashMap<>();
+        tz.put("serverTimezone", "Asia/Shanghai");
+        return com.synctask.util.JdbcConnections.mysqlProps(username, password, tz);
+    }
 
-        String jdbcUrl = "jdbc:mysql://" + hostDb + "?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
+    /** 连接串拆解结果。 */
+    private record HostPortDb(String username, String password, String host, int port, String database) {
+    }
 
-        return new String[]{jdbcUrl, username, password};
+    /**
+     * 把 {@code <scheme>user:pass@host[:port][/db]} 拆开并逐段过闸门。
+     *
+     * <p>不复用 {@code MetadataService.parseConnection} 是因为本类是排障链路、
+     * 不注入那个 service；但校验必须是同一套，否则又是一条绕过口。
+     */
+    private HostPortDb splitHostPortDb(String connStr, String scheme, int defaultPort) {
+        String url = connStr.startsWith(scheme) ? connStr.substring(scheme.length()) : connStr;
+        int at = url.indexOf('@');
+        if (at < 0) {
+            throw new IllegalArgumentException("连接串缺少 '@'：" + scheme + "user:pass@host:port/db");
+        }
+        String[] up = url.substring(0, at).split(":", 2);
+        String rest = url.substring(at + 1);
+
+        String database = null;
+        int slash = rest.indexOf('/');
+        if (slash >= 0) {
+            database = rest.substring(slash + 1);
+            rest = rest.substring(0, slash);
+        }
+        int port = defaultPort;
+        int colon = rest.lastIndexOf(':');
+        if (colon >= 0) {
+            try {
+                port = Integer.parseInt(rest.substring(colon + 1));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("连接串端口非法: " + rest.substring(colon + 1));
+            }
+            rest = rest.substring(0, colon);
+        }
+        return new HostPortDb(
+                up[0],
+                up.length > 1 ? up[1] : "",
+                com.synctask.util.JdbcUrlSafety.requireSafeHost(rest),
+                com.synctask.util.JdbcUrlSafety.requireSafePort(port),
+                com.synctask.util.JdbcUrlSafety.requireSafeDatabase(
+                        database == null || database.isEmpty() ? null : database));
     }
 }

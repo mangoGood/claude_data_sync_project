@@ -87,7 +87,35 @@ public class AuditLog {
         FAILOVER_TASK,
         LOGIN,
         LOGOUT,
-        CHANGE_PASSWORD
+        CHANGE_PASSWORD,
+
+        // ---- 2026-08-19 补：此前 96 个端点里 58 个零审计，而漏掉的恰是碰数据最深的几类 ----
+        /** 证书上传/删除。带私钥，是整个平台最敏感的写操作。 */
+        UPLOAD_CERTIFICATE,
+        DELETE_CERTIFICATE,
+        /** 连接凭证的新增与变更。 */
+        UPDATE_CREDENTIAL,
+        /** 元数据探查：会用连接凭证连上用户库读结构。 */
+        BROWSE_METADATA,
+        /** 数据校验 / 内容对比：逐行把两端业务数据读回来比。 */
+        RUN_VALIDATION,
+        /** 排障包下载：内含配置与日志。 */
+        DOWNLOAD_DIAGNOSTICS,
+        /** 死信查看与裁决：死信记录里带行数据。 */
+        VIEW_DEADLETTER,
+        SKIP_EVENT,
+        /** 建号 / 改角色 / 停用账号。 */
+        MANAGE_USER,
+
+        // ---- V21 数据治理 ----
+        /** 重建字段级血缘 */
+        REBUILD_LINEAGE,
+        /** 打标 / 改分级 / 改分级规则 */
+        UPDATE_CLASSIFICATION,
+        /** 批准 Schema 变更——批准即应用到目标库，必须留痕 */
+        APPROVE_SCHEMA_CHANGE,
+        /** 驳回 Schema 变更 */
+        REJECT_SCHEMA_CHANGE
     }
 
     /** 操作结果枚举 */

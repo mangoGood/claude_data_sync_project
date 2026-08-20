@@ -169,8 +169,8 @@ def main():
                 f"UPDATE 档吞吐 {upd_rps:,.0f} 行/秒（追平耗时 {t1 - t0:.1f}s，阈值 {args.min_rps:,.0f}）")
 
         # 顺带留一条指纹，确认提速判据不是拿"少同步了"换来的
-        s = F.sql_fetch(CFG, SRC_DB, f"SELECT COUNT(*), BIT_XOR(CRC32(CONCAT_WS('|',id,grp,IFNULL(payload,'')))) FROM `{TABLE}`")
-        t = F.sql_fetch(CFG, TGT_DB, f"SELECT COUNT(*), BIT_XOR(CRC32(CONCAT_WS('|',id,grp,IFNULL(payload,'')))) FROM `{TABLE}`")
+        s = F.sql_fetch(CFG, SRC_DB, f"SELECT COUNT(*), SUM(CRC32(CONCAT_WS('|',id,grp,IFNULL(payload,'')))) FROM `{TABLE}`")
+        t = F.sql_fetch(CFG, TGT_DB, f"SELECT COUNT(*), SUM(CRC32(CONCAT_WS('|',id,grp,IFNULL(payload,'')))) FROM `{TABLE}`")
         ok = (s == t)
         (passed if ok else failed).append(f"两端指纹一致 src={s[0]} tgt={t[0]}")
     finally:

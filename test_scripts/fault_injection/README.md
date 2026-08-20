@@ -175,8 +175,8 @@ python3 fault_injection/monitoring_visibility.py --create-dr --create-sync --kee
 
 灾备用例的要点：
 
-- **一致性判定改为库内聚合指纹**（`drlib.fingerprint`，MySQL `BIT_XOR(CRC32(...))` / PG
-  `bit_xor(hashtext(...))`）。灾备两端恒为同引擎，不需要 dblib 那种跨引擎 Python 指纹，
+- **一致性判定改为库内聚合指纹**（`drlib.fingerprint`，MySQL `SUM(CRC32(...))` / PG
+  `sum(hashtext(...))`）。灾备两端恒为同引擎，不需要 dblib 那种跨引擎 Python 指纹，
   库内算才跑得动百万级数据量（8,000,000 行的指纹 0.2s，Python 版要几 GB 内存）。
 - **写入线程显式指定主键**（A 段 1000 万起、B 段 2000 万起）。双向灾备两端各自的自增序列
   会生成相同 id，那是测试制造的写写冲突（active-active 本就无法消解），不是产品缺陷；
@@ -193,7 +193,7 @@ python3 fault_injection/monitoring_visibility.py --create-dr --create-sync --kee
 - capture / extract / increment（以及 redis 引擎）都受 ProcessGuard 守护；SIGKILL 后自动重启，
   按各自 checkpoint 续传。重启窗口内重复投递的事件由**幂等应用**吸收
   （SQL：`INSERT ... ON DUPLICATE KEY UPDATE`；Redis：`RESTORE ... REPLACE`）。
-- 判定用顺序无关、对增删改敏感的整表指纹（SQL：`BIT_XOR(CRC32(...))`；Redis：整库键值 md5）。
+- 判定用顺序无关、对增删改敏感的整表指纹（SQL：`SUM(CRC32(...))`；Redis：整库键值 md5）。
 - migration-full **不受守护**，崩溃即 FAILED，靠 `retry` 触发恢复：按 `migration_progress`
   跳过已完成表、从断点续传。
 

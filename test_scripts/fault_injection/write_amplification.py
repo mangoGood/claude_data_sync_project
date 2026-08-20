@@ -238,8 +238,8 @@ def main():
                 print("  → 判定: 与源行数同量级")
 
         print("\n尺子3｜数据一致性")
-        src = F.sql_fetch(CFG, SRC_DB, "SELECT COUNT(*), BIT_XOR(CRC32(CONCAT_WS(',',id,grp,payload))) FROM bulk")[0]
-        tgt = F.sql_fetch(CFG, TGT_DB, "SELECT COUNT(*), BIT_XOR(CRC32(CONCAT_WS(',',id,grp,payload))) FROM bulk")[0]
+        src = F.sql_fetch(CFG, SRC_DB, "SELECT COUNT(*), SUM(CRC32(CONCAT_WS(',',id,grp,payload))) FROM bulk")[0]
+        tgt = F.sql_fetch(CFG, TGT_DB, "SELECT COUNT(*), SUM(CRC32(CONCAT_WS(',',id,grp,payload))) FROM bulk")[0]
         print(f"  源 = {src}")
         print(f"  目标 = {tgt}")
         if src != tgt:

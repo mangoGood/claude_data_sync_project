@@ -48,41 +48,90 @@ public class ThlEncryptionService {
     private static final Logger logger = LoggerFactory.getLogger(ThlEncryptionService.class);
 
     private static final byte[] MAGIC = "THLE".getBytes(StandardCharsets.US_ASCII);
-    private static final short VERSION = 1;
+    /**
+     * 加密文件格式版本。
+     * <p>1 = 记录 payload 是 Java 原生序列化；2 = payload 走 {@link com.migration.thl.ThlCodec}。
+     * 读侧按这个字段分派，因此存量 v1 加密文件仍然读得开。
+     */
+    private static final short VERSION = 2;
+    /** payload 仍是 Java 原生序列化的历史版本。 */
+    public static final short VERSION_JAVA_SER = 1;
+    public static final short VERSION_CODEC = 2;
     private static final String ALGORITHM = "AES";
     private static final String TRANSFORMATION = "AES/GCM/NoPadding";
     private static final int GCM_TAG_LENGTH = 16; // bytes
     private static final int GCM_IV_LENGTH = 12;  // bytes
     private static final int KEY_LENGTH = 32;     // AES-256
+    /** OWASP 对 PBKDF2-HMAC-SHA256 的推荐下限，与 CredentialCipher 一致。 */
+    static final int PBKDF2_ITERATIONS = 310_000;
 
     private final boolean enabled;
     private final SecretKey secretKey;
     private final SecureRandom secureRandom = new SecureRandom();
 
+    /**
+     * @param props 任务配置。{@code thl.encryption.enabled} 打开加密；
+     *              {@code thl.encryption.password} 可选，缺省时从主密钥派生。
+     */
     public ThlEncryptionService(Properties props) {
         this.enabled = Boolean.parseBoolean(props.getProperty("thl.encryption.enabled", "false"));
         String password = props.getProperty("thl.encryption.password", "");
 
         if (enabled) {
             if (password == null || password.isEmpty()) {
-                logger.warn("THL 加密已启用但未配置密码，使用默认密码（仅限测试环境）");
-                password = "default-thl-encryption-key-please-change";
+                // 原来这里回退到一个**写在源码里的公开常量**
+                // （"default-thl-encryption-key-please-change"）——任何人都能拿它解开
+                // 所谓"已加密"的 THL，比不加密更糟：运维以为数据保护住了。
+                //
+                // 改为从主密钥派生。主密钥（SYNCTASK_MASTER_KEY）本来就是 agent 与各
+                // 子进程共享的那一把，用它意味着开启 THL 加密不需要再管第二个秘密；
+                // 主密钥也没配时才拒绝启动——那种情况下无论如何都产不出真正的密文。
+                password = System.getenv("SYNCTASK_MASTER_KEY");
+                if (password == null || password.isEmpty()) {
+                    password = System.getProperty("synctask.master.key", "");
+                }
+                if (password == null || password.isEmpty()) {
+                    throw new IllegalStateException(
+                            "thl.encryption.enabled=true 但既未配置 thl.encryption.password，"
+                                    + "也没有 SYNCTASK_MASTER_KEY。拒绝用可预测的密钥加密——"
+                                    + "那样产出的密文任何人都能解开。");
+                }
+                logger.info("THL 加密未单独配置口令，改用主密钥派生");
             }
             this.secretKey = deriveKey(password);
             logger.info("ThlEncryptionService 初始化 | enabled=true | algorithm=AES-256-GCM");
+            // 覆盖范围必须说清楚：本服务只加密 .thl。数据在盘上要经过两跳——
+            // capture 先写 .cap（源端原始事件，**明文**），extract 才产出 .thl。
+            // 开了这个开关只保护了第二跳；同一批业务数据在 .cap 里仍是明文。
+            // 不打这条日志，运维会以为"落盘加密已开启"，那比不加密更危险。
+            logger.warn("注意：THL 加密只覆盖 .thl；capture 产出的 .cap 仍是明文。"
+                    + "任务目录已收到 0700（同机其它用户读不到），但备份/磁盘镜像/共享存储"
+                    + "仍会带走 .cap 明文——这些场景请依赖磁盘加密或卷加密。");
         } else {
             this.secretKey = null;
             logger.info("ThlEncryptionService 初始化 | enabled=false");
         }
     }
 
-    /** 从口令派生 AES 密钥 */
+    /**
+     * 从口令派生 AES 密钥。
+     *
+     * <p>PBKDF2-HMAC-SHA256 而不是裸 SHA-256：口令熵不足时裸哈希可直接字典攻击。
+     * 盐取固定常量而不是随机——密钥要能跨进程（capture/extract/increment 各是独立
+     * 子进程）重新派生出同一把，随密文存盐则每读一条记录都要重跑 31 万轮迭代。
+     * 与 {@code CredentialCipher} 同一取舍。
+     *
+     * <p>派生只在进程启动后首次用到时发生一次（约 200ms）。
+     */
     private SecretKey deriveKey(String password) {
         try {
-            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            byte[] hash = sha256.digest(password.getBytes(StandardCharsets.UTF_8));
-            // 取前 32 字节作为 AES-256 密钥
-            byte[] keyBytes = Arrays.copyOf(hash, KEY_LENGTH);
+            byte[] salt = MessageDigest.getInstance("SHA-256")
+                    .digest("synctask-thl-encryption-v1".getBytes(StandardCharsets.UTF_8));
+            javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(
+                    password.toCharArray(), salt, PBKDF2_ITERATIONS, KEY_LENGTH * 8);
+            byte[] keyBytes = javax.crypto.SecretKeyFactory
+                    .getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+            spec.clearPassword();
             return new SecretKeySpec(keyBytes, ALGORITHM);
         } catch (Exception e) {
             throw new RuntimeException("密钥派生失败", e);
@@ -148,19 +197,32 @@ public class ThlEncryptionService {
         out.write(VERSION & 0xFF);
     }
 
-    /** 读取并验证文件头 */
+    /** 读取并验证文件头。 */
     public boolean verifyHeader(InputStream in) throws IOException {
-        if (!enabled) return true;
+        return readHeaderVersion(in) >= 0;
+    }
+
+    /**
+     * 读取文件头并返回格式版本；magic 不符或版本不认识返回 -1。
+     *
+     * <p>读侧要靠这个版本号决定 payload 用哪套编解码——不能只判"等于当前 VERSION"，
+     * 那样一升版本，所有存量加密文件立刻读不开。
+     */
+    public short readHeaderVersion(InputStream in) throws IOException {
+        if (!enabled) return VERSION;
         byte[] magic = new byte[MAGIC.length];
         int read = in.read(magic);
         if (read != MAGIC.length || !Arrays.equals(magic, MAGIC)) {
-            return false;
+            return -1;
         }
         int v1 = in.read();
         int v2 = in.read();
-        if (v1 < 0 || v2 < 0) return false;
+        if (v1 < 0 || v2 < 0) return -1;
         short version = (short) ((v1 << 8) | v2);
-        return version == VERSION;
+        if (version != VERSION_JAVA_SER && version != VERSION_CODEC) {
+            return -1;
+        }
+        return version;
     }
 
     /** 判断文件是否为加密格式 */

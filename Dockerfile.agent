@@ -1,0 +1,68 @@
+# ============================================================
+# 执行面（migration-agent + 各 migration-* 子进程）
+#
+# agent 会 fork 出 capture / extract / increment / full 等子进程，
+# 它们跑的是同一个 fat jar，因此镜像里只需要 migration-agent 那一个产物。
+#
+# 构建: docker build -f Dockerfile.agent -t synctask/agent:1.0.0 .
+# ============================================================
+
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /src
+
+COPY pom.xml .
+COPY migration-common/pom.xml     migration-common/pom.xml
+COPY migration-thl/pom.xml        migration-thl/pom.xml
+COPY migration-full/pom.xml       migration-full/pom.xml
+COPY migration-capture/pom.xml    migration-capture/pom.xml
+COPY migration-extract/pom.xml    migration-extract/pom.xml
+COPY migration-increment/pom.xml  migration-increment/pom.xml
+COPY migration-subscribe/pom.xml  migration-subscribe/pom.xml
+COPY migration-mongo/pom.xml      migration-mongo/pom.xml
+COPY migration-elastic/pom.xml    migration-elastic/pom.xml
+COPY migration-redis/pom.xml      migration-redis/pom.xml
+COPY migration-agent/pom.xml      migration-agent/pom.xml
+RUN mvn -q -B dependency:go-offline || true
+
+COPY migration-common     migration-common
+COPY migration-thl        migration-thl
+COPY migration-full       migration-full
+COPY migration-capture    migration-capture
+COPY migration-extract    migration-extract
+COPY migration-increment  migration-increment
+COPY migration-subscribe  migration-subscribe
+COPY migration-mongo      migration-mongo
+COPY migration-elastic    migration-elastic
+COPY migration-redis      migration-redis
+COPY migration-agent      migration-agent
+# clean package 而不是 package：改了 migration-common 之后 fat jar 必须重打，
+# 否则 shade 进去的还是旧类（本仓库踩过这个坑）
+RUN mvn -q -B clean package -Dmaven.test.skip=true
+
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+
+RUN groupadd -r synctask && useradd -r -g synctask -d /app synctask \
+ && mkdir -p /app/files /app/logs /app/certs \
+ && chown -R synctask:synctask /app \
+ && chmod 700 /app/certs
+
+COPY --from=build --chown=synctask:synctask \
+     /src/migration-agent/target/migration-agent-1.0.0.jar /app/agent.jar
+
+USER synctask
+EXPOSE 8083
+
+# H2 的 AUTO_SERVER 会按主机名解析监听地址；容器里主机名解析到容器 IP 时
+# 跨进程轮询会卡住数分钟（本机上就是这么中的）。钉到回环。
+ENV JAVA_OPTS="-Dh2.bindAddress=127.0.0.1 -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError" \
+    SYNCTASK_CERT_DIR=/app/certs
+
+# /app/files 必须挂持久卷：任务目录里有 .cap / .thl / checkpoint，
+# 容器重建后丢了就等于所有运行中任务的断点全部作废。
+VOLUME ["/app/files"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD ["sh", "-c", "curl -fsS http://127.0.0.1:8083/api/agent/health || exit 1"]
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/agent.jar"]
