@@ -126,6 +126,9 @@ public class WorkflowService {
     private WorkflowRepository workflowRepository;
 
     @Autowired
+    private LineageService lineageService;
+
+    @Autowired
     private WorkflowLogRepository workflowLogRepository;
 
     @Autowired
@@ -566,8 +569,40 @@ public class WorkflowService {
         RouteConfigValidator.assertApplicable(workflow.getRouteConfig(), workflow.getSourceType(),
                 workflow.getTargetType(), workflow.getTaskType(), workflow.getSyncObjects());
 
+        // 脱敏配置强校验。与其它列处理"非法项跳过并告警"不同——跳过一条脱敏规则
+        // 等于把那一列的原值原样搬到目标端，用户看不见，直到出事。必须建任务时拦下。
+        // 传 null = 不在这里做主键检查：那需要连源库探查一次元数据，
+        // 会让"保存配置"这个纯本地动作变慢、并且在源库暂时不可达时直接失败。
+        // 主键这条约束由三处共同保证：
+        //   1. UI 不让对主键列选脱敏（前端已缓存列的 primaryKey 标记，即时反馈）
+        //   2. 内容对比即使遇到被脱敏的主键也强制保留它（否则无从配对两端的行）
+        //   3. 启动前预检连库时会再核一次
+        ColumnMaskValidator.Result maskResult =
+                ColumnMaskValidator.validate(workflow.getSyncObjects(), null);
+        if (!maskResult.ok()) {
+            throw new RuntimeException("脱敏配置有误：" + String.join("；", maskResult.errors));
+        }
+        if (maskResult.warning() != null) {
+            // 这条要落进任务日志：选了脱敏就意味着那些列的内容对比不再可用，
+            // 是产品语义的一部分，不能只在前端弹一次就没了
+            addLog(workflowId, WorkflowLog.LogLevel.WARNING, maskResult.warning());
+        }
+
         addLog(workflowId, WorkflowLog.LogLevel.INFO, "任务配置已更新");
-        return workflowRepository.save(workflow);
+        Workflow saved = workflowRepository.save(workflow);
+
+        // 血缘跟着配置走。放在保存之后、且失败不阻断——
+        // 血缘是<b>派生信息</b>，它算不出来不该让"改配置"这个主动作失败。
+        // 要用连源库探查列清单，源库暂时不可达时会退化成表级血缘（见 LineageService）。
+        try {
+            int edges = lineageService.rebuild(saved);
+            if (edges > 0) {
+                addLog(workflowId, WorkflowLog.LogLevel.INFO, "字段级血缘已重建：" + edges + " 条边");
+            }
+        } catch (Exception e) {
+            logger.warn("重建血缘失败（不阻断配置保存）: {}", e.getMessage());
+        }
+        return saved;
     }
 
     /**

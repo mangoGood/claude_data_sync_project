@@ -142,6 +142,7 @@ public class ContinuousExtractMain {
 
     @SuppressWarnings("unchecked")
     public void initialize(Properties props) throws Exception {
+        this.taskProps = props;
         this.inputDir = props.getProperty("extract.input.dir",
                 "files/" + props.getProperty("task.id", "unknown") + "/binlog_output");
         this.outputDir = props.getProperty("extract.output.dir",
@@ -481,7 +482,34 @@ public class ContinuousExtractMain {
             if (!running.get()) break;
             totalEvents += processFileIncremental(binlogFile, binlogFile.lastModified() >= newestModified);
         }
+        // 一轮扫描写完，把缓冲区交给内核。
+        //
+        // THLFileWriter 改成攒批 flush 之后（原来每条一次 flush，把 BufferedOutputStream
+        // 完全废掉），"写了就一定可见"不再自动成立：低流量链路下最后几条事件可能一直
+        // 躺在缓冲区里，直到下一条事件到来才被顺带刷出去——那可能是几分钟以后。
+        // 本仓库在"capture 位点低流量不落盘"上已经栽过同一类问题。
+        // 压在扫描周期边界上刷：可见性粒度与改动前的轮询周期一致，而 syscall 数
+        // 从"每事件一次"降到"每轮一次"。
+        if (currentThlWriter != null) {
+            try {
+                currentThlWriter.flush();
+            } catch (IOException e) {
+                logger.warn("THL 刷盘失败: {}", e.getMessage());
+            }
+        }
         return totalEvents;
+    }
+
+    /** .cap 逐行解密器（惰性初始化：未开加密时不做 KDF）。 */
+    private com.migration.common.security.CapLineCipher capCipher;
+    /** initialize 收到的配置，capCipher 要用它取加密开关与口令。 */
+    private Properties taskProps = new Properties();
+
+    private com.migration.common.security.CapLineCipher capCipher() {
+        if (capCipher == null) {
+            capCipher = new com.migration.common.security.CapLineCipher(taskProps);
+        }
+        return capCipher;
     }
 
     private int processFileIncremental(File binlogFile, boolean isNewest) throws Exception {
@@ -557,6 +585,9 @@ public class ContinuousExtractMain {
             heartbeat.addMetadata(SYNTHETIC_HEARTBEAT, Boolean.TRUE);
 
             currentThlWriter.writeEvent(heartbeat);
+            // 心跳的唯一作用就是让下游立刻看到"extract 还活着"，
+            // 它必须绕过攒批——躺在缓冲区里的心跳等于没有心跳。
+            currentThlWriter.flush();
 
             lastHeartbeatTime = now;
 
@@ -776,6 +807,11 @@ public class ContinuousExtractMain {
                     progress.linesRead++;
                     continue;
                 }
+
+                // .cap 行可能是密文（capture 侧逐行加密）。解密只看行首标记，
+                // 不看本任务的开关——同一个文件里明文行与密文行可以共存
+                // （开启加密的那次轮转之前写的行就是明文），断点因此不受影响。
+                line = capCipher().decryptLine(line);
 
                 byte[] eventBytes = line.getBytes("UTF-8");
                 THLEvent event = extractor.extract(eventBytes);

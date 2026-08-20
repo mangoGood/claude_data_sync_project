@@ -1,0 +1,19 @@
+{
+  "name": "synctask-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "同步平台控制台前端的构建。此前没有任何构建体系：375KB 的 admin-dashboard.js 与四个 dashboard 模块直接下发，未压缩、未分包、无缓存指纹；三个第三方库还从 cdn.jsdelivr.net 拉——既是供应链风险，也让产品无法离线部署。",
+  "scripts": {
+    "build": "node build-frontend.mjs",
+    "build:watch": "node build-frontend.mjs --watch",
+    "vendor": "node build-frontend.mjs --vendor-only"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "dependencies": {
+    "chart.js": "4.4.7",
+    "sockjs-client": "1.6.1",
+    "stompjs": "^2.3.3"
+  }
+}

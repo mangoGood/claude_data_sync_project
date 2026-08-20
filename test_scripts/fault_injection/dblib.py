@@ -36,11 +36,21 @@ def canon_key(row):
 
 
 def fp_from_rows(rows):
-    """顺序无关(XOR)、对每列敏感、天然按 id 去重的整表指纹。"""
-    x = 0
+    """顺序无关(SUM)、对每列敏感的整表指纹。
+
+    用加法而不是 XOR：两者都顺序无关，但 XOR 会让**任何成对出现的相同 crc32
+    互相抵消**——重复行抵消、以及 crc32 碰撞的两行一丢一多也抵消，结果是
+    "两端一致"的绿灯。实测 200,000 行规模下 crc32 碰撞对约 5 个，
+    虽然要恰好命中那几行才会误判（二阶事件），但加法一分钱不花就把这类
+    抵消彻底消掉。同仓库 sharding/api_route_content_compare_e2e.py 早就
+    因为分片汇聚场景改用了 SUM，这里与之统一。
+
+    截断到 64 位：Python 整数无限精度，不截断的话与 SQL 侧 SUM 的溢出行为不一致。
+    """
+    total = 0
     for r in rows:
-        x ^= zlib.crc32(canon_key(r).encode("utf-8"))
-    return (len(rows), x)
+        total = (total + zlib.crc32(canon_key(r).encode("utf-8"))) & 0xFFFFFFFFFFFFFFFF
+    return (len(rows), total)
 
 
 # ----------------------------------------------------------------- SQL 引擎（mysql/pg）

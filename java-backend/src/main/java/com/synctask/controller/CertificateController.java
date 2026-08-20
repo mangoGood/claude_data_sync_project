@@ -1,5 +1,7 @@
 package com.synctask.controller;
 
+import com.synctask.entity.AuditLog;
+import com.synctask.audit.Audited;
 import com.synctask.entity.DbCertificate;
 import com.synctask.security.UserPrincipal;
 import com.synctask.service.CertificateService;
@@ -37,6 +39,7 @@ public class CertificateController {
     private CertificateService certificateService;
 
     @PostMapping
+    @Audited(AuditLog.Action.UPLOAD_CERTIFICATE)
     public ResponseEntity<?> upload(
             @RequestParam("name") String name,
             @RequestParam(value = "caCert", required = false) MultipartFile caCert,
@@ -73,6 +76,7 @@ public class CertificateController {
     }
 
     @DeleteMapping("/{id}")
+    @Audited(value = AuditLog.Action.DELETE_CERTIFICATE, idArg = 0)
     public ResponseEntity<?> delete(@PathVariable String id, Authentication authentication) {
         UserPrincipal principal = (UserPrincipal) authentication.getPrincipal();
         try {

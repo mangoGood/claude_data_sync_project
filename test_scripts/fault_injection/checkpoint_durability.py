@@ -67,7 +67,7 @@ CREATE TABLE `{TABLE}` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
-FINGERPRINT = f"SELECT COUNT(*), BIT_XOR(CRC32(CONCAT_WS('|', id, grp, IFNULL(payload,'')))) FROM `{TABLE}`"
+FINGERPRINT = f"SELECT COUNT(*), SUM(CRC32(CONCAT_WS('|', id, grp, IFNULL(payload,'')))) FROM `{TABLE}`"
 
 
 # ------------------------------------------------------------------ 中心位点表

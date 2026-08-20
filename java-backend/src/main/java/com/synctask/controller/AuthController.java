@@ -7,9 +7,11 @@ import com.synctask.dto.RegisterRequest;
 import com.synctask.entity.AuditLog;
 import com.synctask.entity.User;
 import com.synctask.repository.UserRepository;
+import com.synctask.security.LoginAttemptGuard;
 import com.synctask.security.UserPrincipal;
 import com.synctask.service.AuditLogService;
 import com.synctask.service.AuthService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,7 +42,13 @@ public class AuthController {
     @Autowired
     private UserRepository userRepository;
 
+    @Autowired
+    private LoginAttemptGuard loginAttemptGuard;
+
     private String translateLoginError(Exception e) {
+        if (e instanceof LoginAttemptGuard.LockedException) {
+            return e.getMessage();
+        }
         if (e instanceof BadCredentialsException || e instanceof UsernameNotFoundException) {
             return "用户名或密码错误";
         } else if (e instanceof DisabledException) {
@@ -71,9 +79,15 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<?> login(@Valid @RequestBody LoginRequest request) {
+    public ResponseEntity<?> login(@Valid @RequestBody LoginRequest request,
+                                   HttpServletRequest httpRequest) {
+        // 登录是全站唯一"无需凭证的写接口"，而 ApiRateLimitFilter 按 principal 限流、
+        // 恰好在这里拿不到 principal 直接放行——不加这道就是无限撞库。
+        String clientIp = clientIp(httpRequest);
         try {
+            loginAttemptGuard.assertNotLocked(request.getUsername(), clientIp);
             JwtResponse response = authService.login(request);
+            loginAttemptGuard.recordSuccess(request.getUsername(), clientIp);
             // 审计日志：登录成功
             Optional<User> userOpt = userRepository.findByUsername(request.getUsername());
             Long userId = userOpt.map(User::getId).orElse(null);
@@ -82,14 +96,35 @@ public class AuthController {
             auditLogService.logSuccess(userId, AuditLog.Action.LOGIN, null, details);
             return ResponseEntity.ok(response);
         } catch (Exception e) {
+            // 已经被锁的请求不再计数，否则攻击者持续打就能把锁定期无限续期
+            if (!(e instanceof LoginAttemptGuard.LockedException)) {
+                loginAttemptGuard.recordFailure(request.getUsername(), clientIp);
+            }
             // 审计日志：登录失败
             Optional<User> userOpt = userRepository.findByUsername(request.getUsername());
             Long userId = userOpt.map(User::getId).orElse(null);
             Map<String, Object> details = new HashMap<>();
             details.put("username", request.getUsername());
+            details.put("clientIp", clientIp);
             auditLogService.logFailure(userId, AuditLog.Action.LOGIN, null, details, translateLoginError(e));
             return ResponseEntity.badRequest().body(new ApiResponse(false, translateLoginError(e)));
         }
+    }
+
+    /**
+     * 取客户端 IP。有反向代理时 remoteAddr 恒等于代理地址，按 IP 维度的节流会退化成
+     * 全局节流（把所有人一起锁掉），因此优先看 X-Forwarded-For 的第一跳。
+     *
+     * <p>该头可被客户端伪造，所以它只用于**节流分桶**，不用于任何授权判断——
+     * 伪造的后果仅仅是绕过 IP 维度，用户名维度仍然拦得住。
+     */
+    private static String clientIp(HttpServletRequest req) {
+        String xff = req.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            int comma = xff.indexOf(',');
+            return (comma > 0 ? xff.substring(0, comma) : xff).trim();
+        }
+        return req.getRemoteAddr();
     }
 
     @GetMapping("/me")

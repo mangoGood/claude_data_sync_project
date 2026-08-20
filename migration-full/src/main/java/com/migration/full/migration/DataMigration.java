@@ -1442,7 +1442,33 @@ public class DataMigration {
         return new int[]{(int) successCount, (int) failCount};
     }
 
+    /**
+     * 读一个列值。<b>全量侧的脱敏挂在这里</b>——它是行值的单一出口，
+     * 分页扫描与瘦行扫描两条路径都经过它。
+     *
+     * <p>脱敏必须全量与增量<b>共用同一份规则</b>：只在增量脱敏的话，
+     * 全量已经把原值整表搬过去了，等于没脱。
+     */
     private Object readColumnValue(ResultSet rs, int i, ResultSetMetaData metaData, TableInfo table) throws SQLException {
+        Object raw = readRawColumnValue(rs, i, metaData, table);
+        return maskIfNeeded(metaData, i, table, raw);
+    }
+
+    /** 按配置对列值脱敏；未配脱敏时零开销原样返回。 */
+    private Object maskIfNeeded(ResultSetMetaData metaData, int i, TableInfo table, Object raw)
+            throws SQLException {
+        if (columnProcessing == null || raw == null) {
+            return raw;
+        }
+        String srcDb = columnProcessingDbOf(table);
+        if (srcDb == null || !columnProcessing.hasMask(srcDb, table.getTableName())) {
+            return raw;
+        }
+        return columnProcessing.maskValue(srcDb, table.getTableName(),
+                metaData.getColumnName(i), raw);
+    }
+
+    private Object readRawColumnValue(ResultSet rs, int i, ResultSetMetaData metaData, TableInfo table) throws SQLException {
         int columnType = metaData.getColumnType(i);
         String columnTypeName = metaData.getColumnTypeName(i);
 

@@ -28,6 +28,24 @@ public class ContentCompareSession {
     }
 
     public static class TableCompareTask {
+        /**
+         * 因脱敏而<b>未参与对比</b>的列。
+         *
+         * <p>必须明示而不是悄悄少比：脱敏后目标端存的本来就不是源端的值，
+         * 拿它去比每行都会报差异；但若只是默默把这些列剔掉，用户会误以为
+         * "整表都比过了、结果一致"。前端据此提示"以下列因脱敏未参与对比"。
+         */
+        private java.util.List<String> maskedExcludedColumns = new java.util.ArrayList<>();
+
+        public java.util.List<String> getMaskedExcludedColumns() {
+            return maskedExcludedColumns;
+        }
+
+        public void setMaskedExcludedColumns(java.util.List<String> maskedExcludedColumns) {
+            this.maskedExcludedColumns = maskedExcludedColumns == null
+                    ? new java.util.ArrayList<>() : maskedExcludedColumns;
+        }
+
         private String sourceTable;
         private String targetTable;
         private String sourceDb;

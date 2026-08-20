@@ -198,20 +198,24 @@ def fmt(fp):
 
 # 灾备的源/目标恒为同引擎（mysql↔mysql / pg↔pg），无需 dblib 那种"跨引擎可比"的 Python 指纹——
 # 直接在库内算聚合指纹：内存 O(1)、耗时与行数近似线性但快一个数量级，才跑得动百万级全量数据量。
-# 语义与 dblib.fp_from_rows 一致：顺序无关(XOR)、对每列敏感、按主键天然去重。
+# 语义与 dblib.fp_from_rows 一致：顺序无关(SUM)、对每列敏感。
+# 用 SUM 而不是 BIT_XOR：XOR 会让成对出现的相同哈希互相抵消（重复行、
+# 以及哈希碰撞的两行一丢一多），抵消的结果是"两端一致"的绿灯。SUM 没有这个性质，
+# 且同样顺序无关、同样 O(1) 内存。与 sharding/api_route_content_compare_e2e.py 统一。
 _FP_SQL = {
-    "mysql": ("SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', id, grp, "
+    "mysql": ("SELECT COUNT(*), COALESCE(SUM(CRC32(CONCAT_WS('|', id, grp, "
               "IFNULL(val,''), IFNULL(payload,''), IFNULL(n,'')))), 0) FROM `%s`" % D.TABLE),
-    # PG 14+ 才有 bit_xor 聚合；hashtext 返回 int4，掩码成无符号便于打印比对
-    "pg": ("SELECT COUNT(*), COALESCE(bit_xor(hashtext(concat_ws('|', id, grp, "
-           "coalesce(val,''), coalesce(payload,''), coalesce(n::text,'')))), 0) FROM %s" % D.TABLE),
+    # PG：hashtext 返回有符号 int4，先转成无符号再求和，避免正负相消
+    "pg": ("SELECT COUNT(*), COALESCE(SUM(hashtext(concat_ws('|', id, grp, "
+           "coalesce(val,''), coalesce(payload,''), coalesce(n::text,'')))::bigint "
+           "& 4294967295), 0) FROM %s" % D.TABLE),
 }
 
 
 def fingerprint(ep):
-    """库内聚合指纹 (count, xor)。表不存在/查询失败返回 (-1,-1)（永不与真实指纹相等）。"""
+    """库内聚合指纹 (count, sum)。表不存在/查询失败返回 (-1,-1)（永不与真实指纹相等）。"""
     if getattr(ep, "kind", "") == "mongo":
-        # Mongo 没有 BIT_XOR 那样的聚合指纹，走 dblib 的 Python 版（顺序无关 XOR）。
+        # Mongo 没有 SUM(CRC32) 那样的库内聚合指纹，走 dblib 的 Python 版（顺序无关 SUM）。
         # 灾备用例的数据量按此选型控制在几万行级别，内存与耗时都可接受。
         try:
             return ep.fingerprint()

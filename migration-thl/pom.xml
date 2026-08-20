@@ -37,5 +37,13 @@
             <groupId>net.logstash.logback</groupId>
             <artifactId>logstash-logback-encoder</artifactId>
         </dependency>
+
+        <!-- 反序列化白名单（ThlObjectInputFilter）的判据要用。版本由根 pom 导入的
+             spring-boot-dependencies BOM 仲裁，与 mongo/elastic/redis 三个模块写法一致。 -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>

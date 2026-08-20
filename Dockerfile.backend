@@ -1,0 +1,62 @@
+# ============================================================
+# 控制面（java-backend，Spring Boot）
+#
+# 本仓库此前没有任何部署产物：唯一的启动路径 start.sh 里硬编码着 macOS 的
+# /usr/libexec/java_home 与 /Users/finn/Library/Java/...。平台已经做到集群化租约
+# 与跨机接管，却拿不出一个能交到运维手上的镜像——这个文件补的就是那一段。
+#
+# 构建: docker build -f Dockerfile.backend -t synctask/backend:1.0.0 .
+# ============================================================
+
+# ---------- 构建阶段 ----------
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /src
+
+# 先只拷 pom 预热依赖层：改代码不改依赖时这一层能命中缓存
+COPY java-backend/pom.xml java-backend/pom.xml
+RUN mvn -q -f java-backend/pom.xml dependency:go-offline -B || true
+
+COPY java-backend/src java-backend/src
+RUN mvn -q -f java-backend/pom.xml clean package -DskipTests -B
+
+# ---------- 运行阶段 ----------
+# JRE 而不是 JDK：镜像小一半，且容器里不需要编译器
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+
+# 不用 root 跑。后端会把 TLS 证书物化到 SYNCTASK_CERT_DIR（权限 0700），
+# 属主必须是运行用户，否则启动即失败。
+RUN groupadd -r synctask && useradd -r -g synctask -d /app synctask \
+ && mkdir -p /app/certs /app/logs \
+ && chown -R synctask:synctask /app \
+ && chmod 700 /app/certs
+
+COPY --from=build --chown=synctask:synctask /src/java-backend/target/*.jar /app/app.jar
+
+# 前端静态资源。WebMvcConfig 把 /** 映射到 file:../，因此它们要落在 /app 的上一级。
+# static/vendor 是落本地的第三方库（SockJS / STOMP / Chart.js）——正因为入了库，
+# 镜像构建不需要联网装 npm 包；static/js 是可选的压缩产物（APP_FRONTEND_DIST=true 时启用）。
+WORKDIR /
+COPY --chown=synctask:synctask *.html *.css *.js /
+COPY --chown=synctask:synctask static /static
+WORKDIR /app
+
+USER synctask
+
+# 8082 业务端口；8091 是 actuator/prometheus（application.yml 里默认只监听 127.0.0.1，
+# 容器内要被外部抓取时用 MANAGEMENT_ADDRESS=0.0.0.0 覆盖，并只在内网暴露）
+EXPOSE 8082 8091
+
+ENV SYNCTASK_CERT_DIR=/app/certs \
+    JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+
+# 三个密钥一律从外部注入，绝不打进镜像：
+#   SYNCTASK_MASTER_KEY  凭证静态加密主密钥（缺失会退化成内置开发默认并告警）
+#   JWT_SECRET           缺失则每次重启换随机密钥，所有 token 立即失效
+#   AGENT_API_TOKEN      缺失则 agent 的敏感接口一律 401
+# StartupSecurityValidator 会在启动时校验，这里不设默认值就是要让它拦住。
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["sh", "-c", "curl -fsS http://127.0.0.1:8082/api/health || exit 1"]
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

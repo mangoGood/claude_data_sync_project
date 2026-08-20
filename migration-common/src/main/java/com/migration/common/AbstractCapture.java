@@ -10,6 +10,31 @@ public abstract class AbstractCapture<T> implements Capture<T> {
     protected final Logger logger = LoggerFactory.getLogger(getClass());
 
     protected Properties props;
+
+    /** 逐行加密器（延迟初始化：未开加密时不做任何 KDF）。 */
+    private com.migration.common.security.CapLineCipher capCipher;
+
+    /**
+     * 创建 {@code .cap} 写入器。四个 capture 实现都用它，而不是各自 new BufferedWriter——
+     * 加密开关只在这一处生效，不会出现"某个引擎的 .cap 忘了加密"。
+     *
+     * <p>返回类型仍是 {@link java.io.BufferedWriter}，因此调用方的
+     * {@code write/flush/close} 一行都不用改。
+     */
+    protected java.io.BufferedWriter newCapWriter(java.io.File outputFile) throws java.io.IOException {
+        java.io.Writer raw = new java.io.OutputStreamWriter(
+                new java.io.FileOutputStream(outputFile), java.nio.charset.StandardCharsets.UTF_8);
+        return new com.migration.common.security.CapFileWriter(raw, capCipher());
+    }
+
+    /** 逐行加密器；未开加密时返回的实例 {@code isEnabled()==false}，写入即透传。 */
+    protected com.migration.common.security.CapLineCipher capCipher() {
+        if (capCipher == null) {
+            capCipher = new com.migration.common.security.CapLineCipher(
+                    props != null ? props : new Properties());
+        }
+        return capCipher;
+    }
     protected String currentPosition;
     protected volatile boolean running = false;
 

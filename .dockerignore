@@ -1,0 +1,22 @@
+# 构建上下文里不要带这些：既拖慢构建，也有把密钥/业务数据打进镜像的风险
+.git
+.claude
+target
+*/target
+files/
+logs/
+*.log
+certs/
+.synctask_master_key
+.synctask_jwt_secret
+.synctask_agent_token
+.venv_fi
+__pycache__
+*.pyc
+.DS_Store
+*.swp
+*.mv.db
+test_java
+autotest
+test_scripts
+markdown

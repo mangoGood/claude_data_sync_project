@@ -1,0 +1,69 @@
+# ============================================================
+# 产品自身的编排（区别于其它 docker-compose-synctask-*.yml —— 那些拉的是测试依赖库）。
+#
+# 起来: docker compose -f docker-compose-synctask-app.yml up -d
+# 前置: 先把三个密钥写进 .env（见下方 env_file 注释），不要用默认值上生产。
+# ============================================================
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: synctask/backend:1.0.0
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+      # actuator 只绑回环：Prometheus 抓取走宿主机内网，不对外
+      - "127.0.0.1:8091:8091"
+    environment:
+      # 元数据库。默认 DISABLED 是历史行为；这库里存着全部加密凭证、证书与审计日志，
+      # 生产应当设成 REQUIRED 及以上。
+      META_DB_SSL_MODE: "${META_DB_SSL_MODE:-REQUIRED}"
+      DB_URL: "${DB_URL:?元数据库连接串必须显式提供}"
+      DB_USERNAME: "${DB_USERNAME:?}"
+      DB_PASSWORD: "${DB_PASSWORD:?}"
+      KAFKA_BOOTSTRAP_SERVERS: "${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}"
+      CONTROL_PLANE_DB_SSL_MODE: "${CONTROL_PLANE_DB_SSL_MODE:-REQUIRED}"
+      MANAGEMENT_ADDRESS: "0.0.0.0"
+      # 三个密钥：缺一个都会让 StartupSecurityValidator 拦下或退化成不安全默认值
+      SYNCTASK_MASTER_KEY: "${SYNCTASK_MASTER_KEY:?凭证主密钥必须注入}"
+      JWT_SECRET: "${JWT_SECRET:?JWT 密钥必须注入，否则重启即全员掉线}"
+      AGENT_API_TOKEN: "${AGENT_API_TOKEN:?agent 令牌必须注入，否则 agent 敏感接口全部 401}"
+      # 前端来源白名单（CORS）。默认只放本机，生产改成实际域名。
+      APP_CORS_ALLOWED_ORIGINS: "${APP_CORS_ALLOWED_ORIGINS:-http://localhost:8082}"
+    volumes:
+      - backend-certs:/app/certs
+    networks: [synctask]
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: synctask/agent:1.0.0
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      MIGRATION_AGENT_KAFKA_BOOTSTRAP_SERVERS: "${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}"
+      MIGRATION_AGENT_MYSQL_DB_URL: "${DB_URL:?}"
+      MIGRATION_AGENT_MYSQL_DB_USER: "${DB_USERNAME:?}"
+      MIGRATION_AGENT_MYSQL_DB_PASSWORD: "${DB_PASSWORD:?}"
+      SYNCTASK_MASTER_KEY: "${SYNCTASK_MASTER_KEY:?}"
+      AGENT_API_TOKEN: "${AGENT_API_TOKEN:?}"
+    volumes:
+      # 任务目录必须持久化：里面是 .cap / .thl / checkpoint，
+      # 丢了等于所有运行中任务的断点作废，只能从头重跑全量。
+      - agent-files:/app/files
+      - agent-certs:/app/certs
+    depends_on: [backend]
+    networks: [synctask]
+
+volumes:
+  backend-certs:
+  agent-certs:
+  agent-files:
+
+networks:
+  synctask:
+    driver: bridge

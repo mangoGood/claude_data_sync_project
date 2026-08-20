@@ -121,7 +121,7 @@ def task_owner(task_id):
 
 
 def fingerprint(db):
-    return F.sql_fetch(CFG, db, "SELECT COUNT(*), BIT_XOR(CRC32(CONCAT_WS(',',id,val))) FROM acct")[0]
+    return F.sql_fetch(CFG, db, "SELECT COUNT(*), SUM(CRC32(CONCAT_WS(',',id,val))) FROM acct")[0]
 
 
 def main():

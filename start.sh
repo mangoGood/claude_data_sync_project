@@ -34,7 +34,13 @@ echo "[start] JAVA_HOME=$JAVA_HOME"
 # AgentConfig 的默认值都是 ${DB_URL:...sslMode=${META_DB_SSL_MODE}...} 形式——DB_URL 一旦导出，
 # 那两处默认值就永远轮不到生效，META_DB_SSL_MODE 设成什么都没用（设了以为开了，实际明文）。
 # 现在按 META_DB_SSL_MODE 拼；缺省 DISABLED，与之前逐字节等价。
+# 本机开发默认 DISABLED（容器 MySQL 未必配了可用证书，改默认会让谁都起不来）。
+# 但这库里存着**全部加密凭证、TLS 证书与审计日志**，明文连接是真实风险——
+# 生产必须设成 REQUIRED 及以上。docker-compose-synctask-app.yml 里默认就是 REQUIRED。
 export META_DB_SSL_MODE="${META_DB_SSL_MODE:-DISABLED}"
+if [ "$META_DB_SSL_MODE" = "DISABLED" ]; then
+  echo "[start] ⚠ 元数据库走明文连接（META_DB_SSL_MODE=DISABLED）。该库存有全部加密凭证与审计日志，生产环境请设为 REQUIRED。"
+fi
 if [ "$META_DB_SSL_MODE" = "DISABLED" ]; then
   META_DB_SSL_PARAM="useSSL=false"
 else
@@ -57,7 +63,12 @@ if [ "${SYNCTASK_TLS_ALL:-0}" = "1" ]; then
   export CONTROL_PLANE_DB_SSL_MODE="${CONTROL_PLANE_DB_SSL_MODE:-REQUIRED}"
   export BACKEND_TLS_ENABLED=true
   export BACKEND_TLS_KEYSTORE="${BACKEND_TLS_KEYSTORE:-$CERTS_DIR/backend-keystore.p12}"
+  # 默认口令 "synctask" 只适用于 create_env.sh 生成的本机自签证书。
+  # 换成自己的证书时必须同时给口令，否则会拿一个公开常量去开私钥库。
   export BACKEND_TLS_KEYSTORE_PASSWORD="${BACKEND_TLS_KEYSTORE_PASSWORD:-synctask}"
+  if [ "$BACKEND_TLS_KEYSTORE_PASSWORD" = "synctask" ]; then
+    echo "[start] ⚠ TLS keystore 使用默认口令 synctask（仅本机自签证书适用）。生产请注入 BACKEND_TLS_KEYSTORE_PASSWORD / AGENT_TLS_KEYSTORE_PASSWORD。"
+  fi
   export AGENT_TLS_KEYSTORE="${AGENT_TLS_KEYSTORE:-$CERTS_DIR/agent-keystore.p12}"
   export AGENT_TLS_KEYSTORE_PASSWORD="${AGENT_TLS_KEYSTORE_PASSWORD:-synctask}"
   # 后端要能信任 agent 的自签证书（监控页已改走后端代理，只有这一个客户端）

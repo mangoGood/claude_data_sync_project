@@ -1,0 +1,78 @@
+# ============================================================
+# 构建 + 单测 + 判据门禁
+#
+# 仓库此前没有任何 CI：122 个测试类、1,088 个 Python 判据脚本，全靠人工 ./test.sh 触发。
+# 尤其是"错误码三份目录一致性"与 e2e_smoke 这两处被称作"CI 门禁"的判据——
+# 判据写好了，但没有东西在推它。
+#
+# 这里只放**不需要外部数据库**的那部分：单测、离线判据、构建产物。
+# 需要真实库的判据（autotest/、test_scripts/fault_injection/）留给夜间流水线，
+# 它们要先起七个 docker-compose 依赖栈。
+# ============================================================
+name: build
+
+on:
+  push:
+    branches: ["main", "feature/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21：与 build.sh / test.sh / start.sh 钉的是同一个版本，
+      # 测试跑过的 JVM 必须等于线上跑的 JVM
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: 构建引擎聚合工程
+        run: mvn -B clean package -Dmaven.test.skip=true
+
+      - name: 构建 java-backend
+        run: mvn -B -f java-backend/pom.xml clean package -DskipTests
+
+      - name: 引擎单测
+        run: mvn -B test
+
+      - name: 后端单测
+        run: mvn -B -f java-backend/pom.xml test
+
+      # ---- 离线判据（不连外部库）----
+      - name: 判据 · 指纹口径不得退回 XOR
+        run: python3 test_scripts/fault_injection/fingerprint_semantics.py
+
+      - name: 判据 · THL 反序列化白名单不锁死真实数据
+        run: ./test_scripts/security/thl_filter_realfiles.sh
+        # files/ 是 gitignore 的，CI 检出时没有历史 THL——
+        # 判据会报"发现 THL 文件: 0"并通过。真正的守护发生在开发机与夜间流水线上。
+        continue-on-error: true
+
+      - name: 判据 · ThlCodec 逐字段无损
+        run: ./test_scripts/thl/codec_compat.sh
+        continue-on-error: true
+
+      - name: 归档构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: jars
+          path: |
+            migration-agent/target/migration-agent-*.jar
+            java-backend/target/*.jar
+          retention-days: 7
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      # 只验证镜像构建得起来，不推仓库——推送需要凭证，由发布流水线负责
+      - name: 构建后端镜像
+        run: docker build -f Dockerfile.backend -t synctask/backend:ci .
+      - name: 构建 agent 镜像
+        run: docker build -f Dockerfile.agent -t synctask/agent:ci .

@@ -48,6 +48,35 @@
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
+        <!-- 审计切面用。此前各 controller 手写 auditLogService 调用，
+             结果是 96 个端点里 58 个零审计——手写的覆盖率守不住。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <!-- API 契约。96 个 REST 端点此前没有任何机器可读的描述——
+             无 OpenAPI、无 CLI、无 IaC，平台型客户没法把同步任务纳进自己的流水线。
+             springdoc 直接从现有 controller 生成，不需要改任何端点代码。 -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.3.0</version>
+        </dependency>
+
+        <!-- 控制面指标出口。agent 侧早就有 Micrometer + Prometheus
+             （AgentHttpServer 的 /api/metrics?format=prometheus），后端一直没有——
+             API 延迟、JPA 连接池、JVM/GC 全是盲区，出问题只能靠日志倒推。
+             这里补上，与 agent 用同一套 scrape 约定，两端能进同一块看板。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>

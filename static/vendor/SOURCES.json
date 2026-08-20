@@ -1,0 +1,17 @@
+[
+  {
+    "file": "sockjs.min.js",
+    "npm": "node_modules/sockjs-client/dist/sockjs.min.js",
+    "replaces": "https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"
+  },
+  {
+    "file": "stomp.min.js",
+    "npm": "node_modules/stompjs/lib/stomp.min.js",
+    "replaces": "https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"
+  },
+  {
+    "file": "chart.umd.min.js",
+    "npm": "node_modules/chart.js/dist/chart.umd.js",
+    "replaces": "https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"
+  }
+]

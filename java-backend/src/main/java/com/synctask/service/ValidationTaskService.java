@@ -107,23 +107,38 @@ public class ValidationTaskService {
         return connectionStr + "/" + dbName;
     }
 
+    /**
+     * JDBC URL：只放标识符，驱动参数走 {@link #driverProps}。
+     * 见 {@link com.synctask.util.JdbcConnections} —— 库名来自用户连接串，
+     * 拼进查询串前面等于把驱动参数的控制权交出去。
+     */
     private String buildJdbcUrl(String type, String host, int port, String database) {
-        String db = (database != null && !database.isEmpty()) ? database : "";
+        String db = (database != null && !database.isEmpty()) ? database : null;
         if ("oracle".equalsIgnoreCase(type)) {
             // Oracle 的"库"是服务名/PDB，连接串里 host:port 后面那一段就是它
-            return String.format("jdbc:oracle:thin:@%s:%d/%s", host, port,
-                    db.isEmpty() ? "FREEPDB1" : db);
+            return String.format("jdbc:oracle:thin:@%s:%d/%s",
+                    com.synctask.util.JdbcUrlSafety.requireSafeHost(host),
+                    com.synctask.util.JdbcUrlSafety.requireSafePort(port),
+                    com.synctask.util.JdbcUrlSafety.requireSafeDatabase(db == null ? "FREEPDB1" : db));
         }
         if ("postgresql".equalsIgnoreCase(type)) {
-            if (!db.isEmpty()) {
-                return String.format("jdbc:postgresql://%s:%d/%s?stringtype=unspecified", host, port, db);
-            }
-            return String.format("jdbc:postgresql://%s:%d/?stringtype=unspecified", host, port);
+            return com.synctask.util.JdbcConnections.postgresUrl(host, port, db);
         }
-        if (!db.isEmpty()) {
-            return String.format("jdbc:mysql://%s:%d/%s?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", host, port, db);
+        return com.synctask.util.JdbcConnections.mysqlUrl(host, port, db);
+    }
+
+    /** 与 {@link #buildJdbcUrl} 配套的驱动参数。 */
+    private java.util.Properties driverProps(String type, String username, String password) {
+        if ("oracle".equalsIgnoreCase(type)) {
+            java.util.Properties p = new java.util.Properties();
+            if (username != null) p.setProperty("user", username);
+            p.setProperty("password", password == null ? "" : password);
+            return p;
         }
-        return String.format("jdbc:mysql://%s:%d/?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=UTC&characterEncoding=utf8&allowPublicKeyRetrieval=true", host, port);
+        if ("postgresql".equalsIgnoreCase(type)) {
+            return com.synctask.util.JdbcConnections.postgresProps(username, password, null);
+        }
+        return com.synctask.util.JdbcConnections.mysqlProps(username, password, null);
     }
 
     public List<Workflow> getIncrementalWorkflows(Long userId) {
@@ -276,7 +291,7 @@ public class ValidationTaskService {
                 boolean sourceIsPg = "postgresql".equalsIgnoreCase(sourceType);
                 try (Connection sourceDb = DataSourcePoolManager.getConnection(
                         buildJdbcUrl(sourceConn.type, sourceConn.host, sourceConn.port, null),
-                        sourceConn.username, sourceConn.password)) {
+                        sourceConn.username, sourceConn.password, driverProps(sourceConn.type, sourceConn.username, sourceConn.password))) {
                     List<String> allDatabases = getAllDatabaseNames(sourceDb, sourceIsPg);
                     addLog(taskId, ValidationTaskLog.LogLevel.INFO,
                         (isDrTask ? "灾备任务，对比源库和目标库的所有数据库: " : "sync_objects 为空，自动获取源库所有数据库: ") + allDatabases);
@@ -308,7 +323,7 @@ public class ValidationTaskService {
                     ParsedConnection sc = parseConnection(task.getSourceConnection());
                     boolean sourceIsPg = "postgresql".equalsIgnoreCase(sourceType);
                     try (Connection sourceDb = DataSourcePoolManager.getConnection(
-                            buildJdbcUrl(sc.type, sc.host, sc.port, null), sc.username, sc.password)) {
+                            buildJdbcUrl(sc.type, sc.host, sc.port, null), sc.username, sc.password, driverProps(sc.type, sc.username, sc.password))) {
                         for (Map.Entry<String, List<String>> e : syncObjectsMap.entrySet()) {
                             if (e.getValue().isEmpty()) {
                                 e.getValue().addAll(getTableNames(sourceDb, e.getKey(), sourceIsPg));
@@ -328,9 +343,22 @@ public class ValidationTaskService {
                 sourceType, targetType, syncObjectsMap,
                 parseTableMappings(task.getSyncObjects()),
                 parseDbMappings(task.getSyncObjects()),
-                routeConfig, routeNodeIdOf(routeConfig, parseConnection(task.getSourceConnection())));
+                routeConfig, routeNodeIdOf(routeConfig, parseConnection(task.getSourceConnection())),
+                parseMaskedColumns(task.getSyncObjects()));
 
             addLog(taskId, ValidationTaskLog.LogLevel.INFO, "内容对比会话已创建: " + session.getSessionId());
+            // 明示脱敏排除：不说出来，用户会以为整表都比过了
+            java.util.List<String> maskNotes = new ArrayList<>();
+            for (ContentCompareSession.TableCompareTask t : session.getTables()) {
+                if (!t.getMaskedExcludedColumns().isEmpty()) {
+                    maskNotes.add(t.getSourceTable() + ": " + String.join(", ", t.getMaskedExcludedColumns()));
+                }
+            }
+            if (!maskNotes.isEmpty()) {
+                addLog(taskId, ValidationTaskLog.LogLevel.WARNING,
+                        "以下列因配置了脱敏而未参与内容对比（目标端存的不是源端原值，比对必然报差异）: "
+                                + String.join(" | ", maskNotes));
+            }
 
             session = contentCompareService.runPhase1Checksum(session.getSessionId());
 
@@ -553,7 +581,7 @@ public class ValidationTaskService {
             try (Connection targetConnDb = DataSourcePoolManager.getConnection(
                     buildJdbcUrl(targetConn.type, targetConn.host, targetConn.port,
                         targetConn.database != null ? targetConn.database : targetDb),
-                    targetConn.username, targetConn.password)) {
+                    targetConn.username, targetConn.password, driverProps(targetConn.type, targetConn.username, targetConn.password))) {
 
                 for (Map<String, Object> diff : diffs) {
                     String diffType = (String) diff.get("diffType");
@@ -637,11 +665,11 @@ public class ValidationTaskService {
             try (Connection srcVerify = DataSourcePoolManager.getConnection(
                     buildJdbcUrl(sourceConn.type, sourceConn.host, sourceConn.port,
                         sourceConn.database != null ? sourceConn.database : sourceDb),
-                    sourceConn.username, sourceConn.password);
+                    sourceConn.username, sourceConn.password, driverProps(sourceConn.type, sourceConn.username, sourceConn.password));
                  Connection tgtVerify = DataSourcePoolManager.getConnection(
                     buildJdbcUrl(targetConn.type, targetConn.host, targetConn.port,
                         targetConn.database != null ? targetConn.database : targetDb),
-                    targetConn.username, targetConn.password)) {
+                    targetConn.username, targetConn.password, driverProps(targetConn.type, targetConn.username, targetConn.password))) {
                 newSourceCount = getRowCountSafe(srcVerify, sourceDb, sourceTable, null);
                 // 复核也要按路由后的落点数，否则汇聚会拿"整张合并表"、拆分会拿"第一片"跟源表比，
                 // 修得再对也永远显示没收敛
@@ -802,6 +830,49 @@ public class ValidationTaskService {
         return RouteConfigValidator.hasColumnProcessing(syncObjectsJson);
     }
 
+    /**
+     * 从 syncObjects 解析脱敏列（库 → 表 → 列名小写集合），供内容对比排除。
+     *
+     * <p>与 agent 的 {@code ConfigService#collectColumnMask} 读的是同一份 JSON——
+     * 两侧口径必须一致，否则会出现"引擎脱了、对比没排除"这种最坏组合：
+     * 每行都报差异，而差异是设计如此。
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Map<String, java.util.Set<String>>> parseMaskedColumns(String syncObjectsJson) {
+        Map<String, Map<String, java.util.Set<String>>> out = new java.util.LinkedHashMap<>();
+        if (syncObjectsJson == null || syncObjectsJson.isEmpty()) {
+            return out;
+        }
+        try {
+            Map<String, Object> root = new com.google.gson.Gson().fromJson(
+                    syncObjectsJson, java.util.LinkedHashMap.class);
+            if (root == null) {
+                return out;
+            }
+            for (Map.Entry<String, Object> e : root.entrySet()) {
+                if (!(e.getValue() instanceof Map)) continue;
+                Object maskObj = ((Map<String, Object>) e.getValue()).get("columnMask");
+                if (!(maskObj instanceof Map)) continue;
+                Map<String, java.util.Set<String>> byTable = new java.util.LinkedHashMap<>();
+                for (Map.Entry<String, Object> t : ((Map<String, Object>) maskObj).entrySet()) {
+                    if (!(t.getValue() instanceof List)) continue;
+                    java.util.Set<String> cols = new java.util.LinkedHashSet<>();
+                    for (Object item : (List<Object>) t.getValue()) {
+                        if (item instanceof Map) {
+                            Object c = ((Map<String, Object>) item).get("column");
+                            if (c != null) cols.add(String.valueOf(c).toLowerCase());
+                        }
+                    }
+                    if (!cols.isEmpty()) byTable.put(t.getKey(), cols);
+                }
+                if (!byTable.isEmpty()) out.put(e.getKey(), byTable);
+            }
+        } catch (Exception ex) {
+            logger.warn("解析脱敏配置失败（本次对比不排除任何列）: {}", ex.getMessage());
+        }
+        return out;
+    }
+
     @SuppressWarnings("unchecked")
     /**
      * 解析 syncObjects 里表级 entry 的表名映射：db → {源表: 目标表}。
@@ -932,10 +1003,10 @@ public class ValidationTaskService {
 
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(sourceConn.type, sourceConn.host, sourceConn.port, sourceConn.database),
-                sourceConn.username, sourceConn.password);
+                sourceConn.username, sourceConn.password, driverProps(sourceConn.type, sourceConn.username, sourceConn.password));
              Connection targetDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(targetConn.type, targetConn.host, targetConn.port, targetConn.database),
-                targetConn.username, targetConn.password)) {
+                targetConn.username, targetConn.password, driverProps(targetConn.type, targetConn.username, targetConn.password))) {
 
             boolean isDrTask = "DR".equals(task.getTaskType());
             if (isDrTask || syncObjects.isEmpty()) {
@@ -1217,7 +1288,7 @@ public class ValidationTaskService {
 
         try (Connection sourceDb = DataSourcePoolManager.getConnection(
                 buildJdbcUrl(sourceConn.type, sourceConn.host, sourceConn.port, null),
-                sourceConn.username, sourceConn.password)) {
+                sourceConn.username, sourceConn.password, driverProps(sourceConn.type, sourceConn.username, sourceConn.password))) {
 
             // 库级同步对象（空表清单占位）：按库枚举全部表——对比范围严格等于任务同步的库
             for (Map.Entry<String, Map<String, List<String>>> e : syncObjects.entrySet()) {

@@ -115,8 +115,12 @@ public class DataValidationService {
             loadDriver(srcParsed[3]);
             loadDriver(tgtParsed[3]);
 
-            sourceConn = DriverManager.getConnection(srcParsed[0], srcParsed[1], srcParsed[2]);
-            targetConn = DriverManager.getConnection(tgtParsed[0], tgtParsed[1], tgtParsed[2]);
+            // 这两条连接<b>刻意不走连接池</b>：校验会持有它们跨越整个比对过程（可达数分钟），
+            // 而池容量是 10——5 个并发校验就能把池占满，第 6 个阻塞 30 秒后失败。
+            // 裸连接的代价只是一次握手，池化的代价是并发校验直接不可用，孰轻孰重很清楚。
+            // （P-03 说的"93 处裸连接"里，这一类就是不该动的那部分。）
+            sourceConn = DriverManager.getConnection(srcParsed[0], driverProps(srcParsed[3], srcParsed[1], srcParsed[2]));
+            targetConn = DriverManager.getConnection(tgtParsed[0], driverProps(tgtParsed[3], tgtParsed[1], tgtParsed[2]));
 
             // 行数对比（根据数据库类型构造 SQL）
             // Oracle 的 schema 取自 sync_objects 的 key（如 APP_USER），而非 sourceDbName
@@ -258,8 +262,8 @@ public class DataValidationService {
                     ? getSchemaFromSyncObjects(workflow.getSyncObjects(), workflow.getSourceDbName())
                     : workflow.getSourceDbName();
 
-            try (Connection srcConn = DriverManager.getConnection(srcParsed[0], srcParsed[1], srcParsed[2]);
-                 Connection tgtConn = DriverManager.getConnection(tgtParsed[0], tgtParsed[1], tgtParsed[2])) {
+            try (Connection srcConn = DriverManager.getConnection(srcParsed[0], driverProps(srcParsed[3], srcParsed[1], srcParsed[2]));
+                 Connection tgtConn = DriverManager.getConnection(tgtParsed[0], driverProps(tgtParsed[3], tgtParsed[1], tgtParsed[2]))) {
 
                 for (String table : tables) {
                     // 检查表是否有 update_time 列
@@ -428,8 +432,14 @@ public class DataValidationService {
         }
 
         // 统一正则解析: protocol://user:pass@host:port[/database|/service]
+        //
+        // 库名组收到标识符字符集：原来是 (.*)，与 MetadataService 那份是同一个洞——
+        // 连接串里写 .../db?allowLoadLocalInfile=true 就能把驱动参数塞进 JDBC URL
+        // （恶意 MySQL 服务端可读走本机任意文件；PG 的 socketFactory 是 RCE 链）。
+        // 这是本仓库第二份连接串正则，两份都必须收紧。
         java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
-                "(?:mysql|postgresql|oracle)://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.*))?"
+                "(?:mysql|postgresql|oracle)://([^:@/]+):([^@]+)@"
+                        + "([A-Za-z0-9._\\-\\[\\]:]+):(\\d{1,5})(?:/([A-Za-z0-9_$.\\-]*))?"
         ).matcher(connStr);
         if (!matcher.matches()) {
             throw new IllegalArgumentException(
@@ -442,20 +452,41 @@ public class DataValidationService {
         int port = Integer.parseInt(matcher.group(4));
         String database = matcher.group(5);
 
+        // URL 只放标识符，驱动参数走 driverProps() 的 Properties
         String jdbcUrl;
         if ("postgresql".equals(dbType)) {
             String db = (database != null && !database.isEmpty()) ? database : "postgres";
-            jdbcUrl = "jdbc:postgresql://" + host + ":" + port + "/" + db +
-                    "?" + com.synctask.util.JdbcSslOptions.postgres() + "&stringtype=unspecified";
+            jdbcUrl = com.synctask.util.JdbcConnections.postgresUrl(host, port, db);
         } else if ("oracle".equals(dbType)) {
             String service = (database != null && !database.isEmpty()) ? database : "ORCL";
-            jdbcUrl = "jdbc:oracle:thin:@" + host + ":" + port + "/" + service;
+            jdbcUrl = "jdbc:oracle:thin:@"
+                    + com.synctask.util.JdbcUrlSafety.requireSafeHost(host) + ":"
+                    + com.synctask.util.JdbcUrlSafety.requireSafePort(port) + "/"
+                    + com.synctask.util.JdbcUrlSafety.requireSafeDatabase(service);
         } else {
-            String db = (database != null && !database.isEmpty()) ? database : "";
-            jdbcUrl = "jdbc:mysql://" + host + ":" + port + "/" + db +
-                    "?" + com.synctask.util.JdbcSslOptions.mysql() + "&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true";
+            jdbcUrl = com.synctask.util.JdbcConnections.mysqlUrl(host, port,
+                    (database != null && !database.isEmpty()) ? database : null);
         }
         return new String[]{jdbcUrl, username, password, dbType};
+    }
+
+    /**
+     * 与 {@link #parseConnectionUrl} 配套的驱动参数。
+     * 时区沿用本类历史取值 Asia/Shanghai（校验读的是业务时间列，改时区会改比对结果）。
+     */
+    private java.util.Properties driverProps(String dbType, String username, String password) {
+        if ("postgresql".equals(dbType)) {
+            return com.synctask.util.JdbcConnections.postgresProps(username, password, null);
+        }
+        if ("oracle".equals(dbType)) {
+            java.util.Properties p = new java.util.Properties();
+            if (username != null) p.setProperty("user", username);
+            p.setProperty("password", password == null ? "" : password);
+            return p;
+        }
+        java.util.Map<String, String> tz = new java.util.LinkedHashMap<>();
+        tz.put("serverTimezone", "Asia/Shanghai");
+        return com.synctask.util.JdbcConnections.mysqlProps(username, password, tz);
     }
 
     /**

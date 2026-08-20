@@ -47,9 +47,20 @@ public class DataSourcePoolManager {
     }
 
     private static HikariDataSource getOrCreatePool(String url, String username, String password) {
+        return getOrCreatePool(url, username, password, null);
+    }
+
+    private static HikariDataSource getOrCreatePool(String url, String username, String password,
+                                                    java.util.Properties driverProps) {
         // key 必须包含密码指纹：否则改密码后仍命中旧池，复用旧凭证建立的连接，
         // 造成"错误密码也能连接成功"的假象。密码变化时旧池会被替换关闭。
-        String key = url + "|" + username + "|" + passwordFingerprint(password);
+        //
+        // 驱动参数搬到 Properties 之后，key 也要带上它们的指纹：URL 不再区分
+        // "同一个库、不同 sslMode/超时"这两种连接，只按 URL 建池会让后来者
+        // 静默复用前一个参数集——包括**加密档位**，那是安全语义的静默降级。
+        String propsFp = driverPropsFingerprint(driverProps);
+        String key = url + "|" + username + "|" + passwordFingerprint(password)
+                + (propsFp.isEmpty() ? "" : "|" + propsFp);
         // 同 url+user 但密码不同的旧池：关闭并移除（旧密码已失效，池里连接过期后只会报错）
         String stalePrefix = url + "|" + username + "|";
         Iterator<Map.Entry<String, HikariDataSource>> it = pools.entrySet().iterator();
@@ -77,6 +88,17 @@ public class DataSourcePoolManager {
             config.setMaxLifetime(MAX_LIFETIME_MS);
             config.setLeakDetectionThreshold(LEAK_DETECTION_THRESHOLD_MS);
             config.setPoolName("backend-pool-" + k.hashCode());
+            if (driverProps != null) {
+                // user/password 由 Hikari 自己那两个 setter 负责，重复放进
+                // dataSourceProperties 只会让"口令到底从哪来"变得难查
+                java.util.Properties forDriver = new java.util.Properties();
+                for (String n : driverProps.stringPropertyNames()) {
+                    if (!"user".equals(n) && !"password".equals(n)) {
+                        forDriver.setProperty(n, driverProps.getProperty(n));
+                    }
+                }
+                config.setDataSourceProperties(forDriver);
+            }
             logger.info("Created HikariCP pool for: {}", url);
             return new HikariDataSource(config);
         });
@@ -85,6 +107,47 @@ public class DataSourcePoolManager {
     public static Connection getConnection(String url, String username, String password) throws SQLException {
         HikariDataSource ds = getOrCreatePool(url, username, password);
         return ds.getConnection();
+    }
+
+    /**
+     * 驱动参数走 {@link java.util.Properties} 的重载。
+     *
+     * <p>URL 里不再拼查询串（见 {@code JdbcConnections}），参数从这里进——
+     * 这样即便有人把 {@code ?allowLoadLocalInfile=true} 混进库名，
+     * 也只会得到一个"库不存在"，而不是一个被启用的危险驱动参数。
+     */
+    public static Connection getConnection(String url, String username, String password,
+                                           java.util.Properties driverProps) throws SQLException {
+        HikariDataSource ds = getOrCreatePool(url, username, password, driverProps);
+        return ds.getConnection();
+    }
+
+    /** 驱动参数指纹：让池 key 随参数集变化。空/null 返回空串（与旧行为一致）。 */
+    private static String driverPropsFingerprint(java.util.Properties props) {
+        if (props == null || props.isEmpty()) {
+            return "";
+        }
+        java.util.List<String> names = new java.util.ArrayList<>(props.stringPropertyNames());
+        java.util.Collections.sort(names);
+        StringBuilder sb = new StringBuilder();
+        for (String n : names) {
+            // 口令不入指纹：它已经由 passwordFingerprint 覆盖，不必在 key 里出现两次
+            if ("password".equals(n)) {
+                continue;
+            }
+            sb.append(n).append('=').append(props.getProperty(n)).append('&');
+        }
+        try {
+            byte[] h = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder out = new StringBuilder();
+            for (int i = 0; i < 6; i++) {
+                out.append(String.format("%02x", h[i]));
+            }
+            return out.toString();
+        } catch (Exception e) {
+            return String.valueOf(sb.toString().hashCode());
+        }
     }
 
     public static void closeAll() {

@@ -57,9 +57,9 @@ CREATE TABLE `{TABLE}` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
-# 指纹：顺序无关(BIT_XOR)、对增删改敏感(含每列)、天然去重(id 唯一)。ts 不入指纹（时区/精度风险）。
+# 指纹：顺序无关(SUM)、对增删改敏感(含每列)、天然去重(id 唯一)。ts 不入指纹（时区/精度风险）。
 FINGERPRINT = (f"SELECT COUNT(*) c, "
-               f"COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', id, grp, IFNULL(val,'∅'), "
+               f"COALESCE(SUM(CRC32(CONCAT_WS('|', id, grp, IFNULL(val,'∅'), "
                f"IFNULL(payload,'∅'), IFNULL(n,-1)))), 0) x FROM `{TABLE}`")
 
 

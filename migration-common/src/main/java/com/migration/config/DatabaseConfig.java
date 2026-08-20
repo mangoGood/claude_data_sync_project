@@ -1,5 +1,6 @@
 package com.migration.config;
 
+import com.migration.common.security.JdbcUrlSafety;
 import com.migration.common.ssl.SslMaterial;
 
 import java.util.LinkedHashMap;
@@ -29,17 +30,24 @@ public class DatabaseConfig {
     private final Map<String, String> extraJdbcOptions = new LinkedHashMap<>();
 
     public DatabaseConfig(String host, int port, String database, String username, String password) {
-        this.host = host;
-        this.port = port;
-        this.database = database;
-        this.username = username;
-        this.password = password;
+        this(host, port, database, username, password, null);
     }
 
+    /**
+     * host / port / database 在构造时就过闸门（{@link JdbcUrlSafety}）。
+     *
+     * <p>放在构造而不是 {@link #getJdbcUrl()}：这三段有四条拼装路径
+     * （MySQL / PG / Oracle TCPS / root 连接），逐条加校验必然漏；而且构造期报错
+     * 指向的是"任务配置里那个值不对"，连接期报错则会伪装成"目标库连不上"。
+     *
+     * <p>拦的是把驱动参数塞进 JDBC URL 那类注入——{@code allowLoadLocalInfile}
+     * 能让恶意服务端读走本机任意文件，{@code socketFactory} / {@code autoDeserialize}
+     * 直接是 RCE。
+     */
     public DatabaseConfig(String host, int port, String database, String username, String password, String dbType) {
-        this.host = host;
-        this.port = port;
-        this.database = database;
+        this.host = JdbcUrlSafety.requireSafeHost(host);
+        this.port = JdbcUrlSafety.requireSafePort(port);
+        this.database = JdbcUrlSafety.requireSafeDatabase(database);
         this.username = username;
         this.password = password;
         this.dbType = dbType != null ? dbType : "mysql";
@@ -90,9 +98,19 @@ public class DatabaseConfig {
         this.schema = schema;
     }
 
-    /** 追加一个 JDBC URL 参数（Oracle 忽略）。同名参数覆盖。 */
+    /**
+     * 追加一个 JDBC URL 参数（Oracle 忽略）。同名参数覆盖。
+     *
+     * <p><b>危险参数一律拒绝</b>。目前所有调用方传的都是硬编码字面量
+     * （{@code rewriteBatchedStatements} / {@code reWriteBatchedInserts}），
+     * 没有用户输入能走到这里——这道校验挡的是<b>将来</b>：
+     * 一旦有人把任务配置里的某个字段接到这里，{@code socketFactory} /
+     * {@code allowLoadLocalInfile} 就会立刻变成一条可用的注入路径，
+     * 而那时候没人会想起来这个方法直接拼进 JDBC URL。
+     */
     public void setJdbcOption(String key, String value) {
         if (key != null && !key.isEmpty() && value != null) {
+            JdbcUrlSafety.requireSafeUrl("jdbc:x://h/db?" + key + "=" + value);
             extraJdbcOptions.put(key, value);
         }
     }
@@ -156,7 +174,24 @@ public class DatabaseConfig {
         return ssl.enabled();
     }
 
+    /**
+     * 完整 JDBC URL。
+     *
+     * <p>URL 这里仍然带查询串（与后端不同）——引擎侧没有走 Properties 改造，
+     * 理由是这边<b>没有开放的注入面</b>：host/port/database 在构造时已过
+     * {@link JdbcUrlSafety}，加密参数由 {@code SslMaterial} 按枚举档位生成，
+     * 额外参数只接受白名单外可拒的硬编码字面量。而 LOB 流式参数
+     * （{@code LobJdbc.withStreamingParams}）与两个判据都依赖 URL 带查询串，
+     * 强行改成 Properties 是在数据面上冒无收益的风险。
+     *
+     * <p>出口再过一次 {@code requireSafeUrl} 作为兜底：将来若有人新增了一条
+     * 拼装路径并绕过了构造期校验，这里会拦下。
+     */
     public String getJdbcUrl() {
+        return JdbcUrlSafety.requireSafeUrl(buildJdbcUrl());
+    }
+
+    private String buildJdbcUrl() {
         if ("postgresql".equals(dbType)) {
             String currentSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
             return withExtraOptions(String.format(
@@ -205,6 +240,10 @@ public class DatabaseConfig {
      * 此前这里硬编码 {@code useSSL=false}，等于"业务连接加密了、建库那一跳明文"。
      */
     public String getRootJdbcUrl() {
+        return JdbcUrlSafety.requireSafeUrl(buildRootJdbcUrl());
+    }
+
+    private String buildRootJdbcUrl() {
         if ("postgresql".equals(dbType)) {
             return String.format("jdbc:postgresql://%s:%d/postgres?stringtype=unspecified&%s",
                                  host, port, ssl.pgUrlParams());

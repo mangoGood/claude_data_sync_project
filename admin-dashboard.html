@@ -4,9 +4,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>实时同步管理</title>
-    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <!-- 第三方库落本地（static/vendor/，版本与原 CDN 逐一对应，见 SOURCES.json）。
+         原来从 cdn.jsdelivr.net 拉：既是供应链风险——CDN 被投毒等于在控制面执行任意脚本，
+         也让产品无法在离线/内网环境部署。落本地后 CSP 的 script-src 可以收回 'self'。 -->
+    <script src="static/vendor/sockjs.min.js"></script>
+    <script src="static/vendor/stomp.min.js"></script>
+    <script src="static/vendor/chart.umd.min.js"></script>
     <link rel="stylesheet" href="admin-dashboard.css">
 </head>
 <body>
@@ -45,6 +48,12 @@
                     <div class="menu-item" data-page="metrics" onclick="switchPage('metrics')">实时监控指标</div>
                 </div>
 
+                <div class="menu-section">
+                    <div class="menu-title">数据治理</div>
+                    <div class="menu-item" data-page="lineage" onclick="switchPage('lineage')">字段级血缘</div>
+                    <div class="menu-item" data-page="classification" onclick="switchPage('classification')">数据分级</div>
+                    <div class="menu-item" data-page="schemaApproval" onclick="switchPage('schemaApproval')">Schema 审批</div>
+                </div>
                 <div class="menu-section">
                     <div class="menu-title">安全</div>
                     <div class="menu-item" data-page="audit" onclick="switchPage('audit')">审计日志</div>
@@ -603,6 +612,104 @@
                 </div>
             </div>
 
+            <!-- ============ 字段级血缘 ============ -->
+            <div id="lineagePage" style="display: none;">
+                <header class="header">
+                    <div class="header-left"><h1 class="header-title">字段级血缘</h1></div>
+                    <div class="header-right">
+                        <div class="user-info" style="display:flex;align-items:center;gap:8px;font-size:13px;color:#666;">
+                            <span class="username-display" onclick="openAccountSettings()" style="cursor:pointer;color:#1890ff;" title="账号设置"></span>
+                            <button class="btn-logout" onclick="logout()" style="padding:4px 12px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:4px;cursor:pointer;font-size:12px;">退出</button>
+                        </div>
+                    </div>
+                </header>
+                <div class="content">
+                    <div class="card" style="margin-bottom:16px;">
+                        <div style="font-size:12px;color:#999;margin-bottom:12px;">
+                            血缘不需要额外采集——它由任务配置（库表映射、列名映射、脱敏、过滤、附加列、分片路由）直接推导。
+                            改一个源列会波及下游哪些字段，这里能直接答。保存任务配置时自动重建。
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                            <input type="text" class="form-input" id="lnDb" placeholder="库名" style="width:150px;height:34px;">
+                            <input type="text" class="form-input" id="lnTable" placeholder="表名" style="width:150px;height:34px;">
+                            <input type="text" class="form-input" id="lnColumn" placeholder="列名" style="width:150px;height:34px;">
+                            <select class="form-input" id="lnDirection" style="width:150px;height:34px;">
+                                <option value="impact">下游影响面</option>
+                                <option value="upstream">上游追溯</option>
+                            </select>
+                            <button type="button" class="btn-test" onclick="lnQuery()">查询</button>
+                        </div>
+                    </div>
+                    <div class="card"><div id="lnResult" style="font-size:13px;color:#999;">输入库/表/列后查询</div></div>
+                </div>
+            </div>
+
+            <!-- ============ 数据分级 ============ -->
+            <div id="classificationPage" style="display: none;">
+                <header class="header">
+                    <div class="header-left"><h1 class="header-title">数据分级</h1></div>
+                    <div class="header-right">
+                        <div class="user-info" style="display:flex;align-items:center;gap:8px;font-size:13px;color:#666;">
+                            <span class="username-display" onclick="openAccountSettings()" style="cursor:pointer;color:#1890ff;" title="账号设置"></span>
+                            <button class="btn-logout" onclick="logout()" style="padding:4px 12px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:4px;cursor:pointer;font-size:12px;">退出</button>
+                        </div>
+                    </div>
+                </header>
+                <div class="content">
+                    <div class="card" style="margin-bottom:16px;">
+                        <div style="font-size:12px;color:#999;margin-bottom:12px;">
+                            级别自低到高：PUBLIC &lt; INTERNAL &lt; SENSITIVE &lt; RESTRICTED。
+                            单独打标用处有限，价值在<b>与血缘联动</b>——查"高敏列流到了哪里"、校验"目标端级别不得低于源端"。
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                            <select class="form-input" id="clLevel" style="width:180px;height:34px;">
+                                <option value="RESTRICTED">RESTRICTED（最高）</option>
+                                <option value="SENSITIVE">SENSITIVE</option>
+                                <option value="INTERNAL">INTERNAL</option>
+                                <option value="PUBLIC">PUBLIC</option>
+                            </select>
+                            <button type="button" class="btn-test" onclick="clLoadFlows()">查该级别的流向</button>
+                            <span style="width:20px;"></span>
+                            <select class="form-input" id="clPolicyTask" style="width:260px;height:34px;"></select>
+                            <button type="button" class="btn-test" onclick="clCheckPolicy()">策略校验</button>
+                        </div>
+                    </div>
+                    <div class="card" style="margin-bottom:16px;">
+                        <div style="font-weight:500;margin-bottom:10px;">自动分级规则</div>
+                        <div id="clRules" style="font-size:13px;color:#999;">加载中…</div>
+                    </div>
+                    <div class="card"><div id="clResult" style="font-size:13px;color:#999;">选择级别后查询</div></div>
+                </div>
+            </div>
+
+            <!-- ============ Schema 审批 ============ -->
+            <div id="schemaApprovalPage" style="display: none;">
+                <header class="header">
+                    <div class="header-left"><h1 class="header-title">Schema 演进审批</h1></div>
+                    <div class="header-right">
+                        <div class="user-info" style="display:flex;align-items:center;gap:8px;font-size:13px;color:#666;">
+                            <span class="username-display" onclick="openAccountSettings()" style="cursor:pointer;color:#1890ff;" title="账号设置"></span>
+                            <button class="btn-logout" onclick="logout()" style="padding:4px 12px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:4px;cursor:pointer;font-size:12px;">退出</button>
+                        </div>
+                    </div>
+                </header>
+                <div class="content">
+                    <div class="card" style="margin-bottom:16px;">
+                        <div style="font-size:12px;color:#999;">
+                            DDL 应用策略为 <b>MANUAL</b> 时，引擎不再只是记一条日志，而是把这条变更挂起等审批。
+                            <b>批准即由平台应用到目标库并留痕</b>——不再是"人工去库上敲一遍、平台不知道敲没敲"。
+                            单子上的"受影响的列"来自血缘，"敏感级别"来自分级。
+                        </div>
+                        <div style="margin-top:12px;display:flex;gap:8px;align-items:center;">
+                            <button type="button" class="btn-test" onclick="saLoad()">刷新待审批</button>
+                            <select class="form-input" id="saSyncTask" style="width:260px;height:34px;"></select>
+                            <button type="button" class="btn-test" onclick="saSync()">从任务同步</button>
+                        </div>
+                    </div>
+                    <div class="card"><div id="saList" style="font-size:13px;color:#999;">点击"刷新待审批"</div></div>
+                </div>
+            </div>
+
             <!-- 审计日志页面 -->
             <div id="auditPage" style="display: none;">
                 <header class="header">
@@ -1073,13 +1180,15 @@
                     </div>
                     <div id="cfgColProcBody">
                         <div style="font-size: 12px; color: #999; margin-bottom: 10px;">
-                            可选步骤：对选中的表配置列名过滤、列名映射或新增附加列；什么都不做则与原有同步行为完全一致。
-                            <span style="color: #fa8c16;">配置了列处理的任务无法进行内容对比和行数对比。</span>
+                            可选步骤：对选中的表配置列名过滤、列名映射、新增附加列或数据脱敏；什么都不做则与原有同步行为完全一致。
+                            <span style="color: #fa8c16;">配置了列名过滤／列名映射／附加列的任务无法进行内容对比和行数对比。</span>
+                            <span style="color: #fa8c16;">如果选择了脱敏，则无法完成脱敏列内容对比（其余列与行数对比不受影响）。</span>
                         </div>
                         <div class="colproc-tabs">
                             <div class="colproc-tab active" id="cfgColTabFilterBtn" onclick="cfgSwitchColTab('filter')">列名过滤</div>
                             <div class="colproc-tab" id="cfgColTabMappingBtn" onclick="cfgSwitchColTab('mapping')">列名映射</div>
                             <div class="colproc-tab" id="cfgColTabExtraBtn" onclick="cfgSwitchColTab('extra')">新增附加列</div>
+                            <div class="colproc-tab" id="cfgColTabMaskBtn" onclick="cfgSwitchColTab('mask')">数据脱敏</div>
                             <div class="colproc-tab" id="cfgColTabRouteBtn" onclick="cfgSwitchColTab('route')">分库分表路由</div>
                         </div>
 
@@ -1134,6 +1243,43 @@
                                 <button type="button" class="btn-test" onclick="cfgAddExtraColumn()">添加</button>
                             </div>
                             <div id="cfgExtraList" style="font-size: 13px;"></div>
+                        </div>
+
+                        <!-- 数据脱敏：可选项。选了之后被脱敏的列不再参与内容对比 -->
+                        <div class="colproc-pane" id="cfgColPaneMask">
+                            <div style="background:#fffbe6;border:1px solid #ffe58f;border-radius:4px;padding:10px 12px;margin-bottom:10px;font-size:12px;color:#874d00;">
+                                <b>如果选择了脱敏，则无法完成脱敏列内容对比。</b>
+                                脱敏发生在写入目标端之前，目标端存的本来就不是源端的值——拿它去比每行都会报差异。
+                                因此配了脱敏的列会被<b>自动排除</b>在内容对比之外；<b>行数对比与其余列的内容对比不受影响</b>。
+                                <br>主键列不可脱敏：主键是两端配对行的依据，脱敏后无从配对。
+                            </div>
+                            <div style="font-size: 12px; color: #999; margin-bottom: 8px;">
+                                规则：<b>整体遮蔽</b>=整值替换；<b>保留首尾</b>=保留前 N 后 M 位（手机号/身份证常用）；
+                                <b>哈希</b>=不可逆但同值同结果，跨表关联仍成立；<b>置空</b>=写 NULL（列须可空）；
+                                <b>假数据</b>=生成同型的假值。所有规则都是确定性的，同一原值恒得到同一结果。
+                            </div>
+                            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+                                <select class="form-input" id="cfgMaskTableSelect" style="width: 200px; height: 34px;" onchange="cfgOnColProcTableChange('mask')"></select>
+                                <select class="form-input" id="cfgMaskColumnSelect" style="width: 180px; height: 34px;"></select>
+                                <select class="form-input" id="cfgMaskRuleSelect" style="width: 190px; height: 34px;" onchange="cfgOnMaskRuleChange()">
+                                    <option value="MASK_ALL">整体遮蔽</option>
+                                    <option value="MASK_PARTIAL">保留首尾</option>
+                                    <option value="HASH">哈希（可关联）</option>
+                                    <option value="NULLIFY">置空</option>
+                                    <option value="FAKE">假数据</option>
+                                </select>
+                                <input type="number" class="form-input" id="cfgMaskPrefixInput" placeholder="保留前" min="0" max="64" value="3" style="width: 90px; height: 34px; display: none;">
+                                <input type="number" class="form-input" id="cfgMaskSuffixInput" placeholder="保留后" min="0" max="64" value="4" style="width: 90px; height: 34px; display: none;">
+                                <select class="form-input" id="cfgMaskFakeSelect" style="width: 150px; height: 34px; display: none;">
+                                    <option value="NAME">姓名</option>
+                                    <option value="EMAIL">邮箱</option>
+                                    <option value="PHONE">手机号</option>
+                                    <option value="ADDRESS">地址</option>
+                                    <option value="ID_CARD">身份证号</option>
+                                </select>
+                                <button type="button" class="btn-test" onclick="cfgAddMaskRule()">添加</button>
+                            </div>
+                            <div id="cfgMaskList" style="font-size: 13px;"></div>
                         </div>
 
                         <!-- 分库分表路由（汇聚 N:1 / 拆分 1:N）；不启用 = 与原有 1:1 同步完全一致 -->

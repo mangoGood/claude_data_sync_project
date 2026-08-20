@@ -15,11 +15,11 @@ import static org.junit.jupiter.api.Assertions.*;
 class CredentialCipherTest {
 
     @Test
-    @DisplayName("往返：加密后能解回原文，且密文带 ENC: 前缀、不等于原文")
+    @DisplayName("往返：加密后能解回原文，且密文带当前前缀、不等于原文")
     void roundTrip() {
         String plain = "mysql://root:rootpassword@localhost:33306";
         String enc = CredentialCipher.encrypt(plain);
-        assertTrue(enc.startsWith(CredentialCipher.PREFIX), "密文应带 ENC: 前缀");
+        assertTrue(enc.startsWith(CredentialCipher.PREFIX), "密文应带当前前缀 " + CredentialCipher.PREFIX);
         assertNotEquals(plain, enc);
         assertEquals(plain, CredentialCipher.decrypt(enc));
     }
@@ -45,14 +45,14 @@ class CredentialCipherTest {
     }
 
     @Test
-    @DisplayName("兼容旧明文：无 ENC: 前缀的历史值 decrypt 原样返回")
+    @DisplayName("兼容旧明文：无前缀的历史值 decrypt 原样返回")
     void decryptLegacyPlaintext() {
         assertEquals("plainpwd", CredentialCipher.decrypt("plainpwd"));
         assertNull(CredentialCipher.decrypt(null));
     }
 
     @Test
-    @DisplayName("decryptProperties：仅解密 ENC: 值，其余（含明文口令）保持不变")
+    @DisplayName("decryptProperties：仅解密密文值，其余（含明文口令）保持不变")
     void decryptPropertiesInPlace() {
         Properties p = new Properties();
         p.setProperty("source.db.password", CredentialCipher.encrypt("s3cr3t"));
@@ -77,5 +77,59 @@ class CredentialCipherTest {
         raw[idx] ^= 0x01;
         String tampered = prefix + java.util.Base64.getEncoder().encodeToString(raw);
         assertThrows(RuntimeException.class, () -> CredentialCipher.decrypt(tampered));
+    }
+
+    @Test
+    @DisplayName("向后兼容：ENC: 老密文（裸 SHA-256 派生）仍能解开")
+    void decryptsLegacyCiphertext() throws Exception {
+        // 用历史算法手工造一条 ENC: 密文：SHA-256(主密钥) 前 32 字节 + AES-GCM，
+        // 格式 ENC:base64(iv[12] || ct+tag)。库里与 files/*/config.properties 里
+        // 存量全是这个形状，解不开就等于所有历史任务的凭证全部作废。
+        String plain = "legacy-secret";
+        byte[] key = java.security.MessageDigest.getInstance("SHA-256")
+                .digest("synctask-dev-master-key-change-me".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        byte[] iv = new byte[12];
+        new java.security.SecureRandom().nextBytes(iv);
+        javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+        c.init(javax.crypto.Cipher.ENCRYPT_MODE,
+                new javax.crypto.spec.SecretKeySpec(java.util.Arrays.copyOf(key, 32), "AES"),
+                new javax.crypto.spec.GCMParameterSpec(128, iv));
+        byte[] ct = c.doFinal(plain.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        byte[] all = new byte[iv.length + ct.length];
+        System.arraycopy(iv, 0, all, 0, iv.length);
+        System.arraycopy(ct, 0, all, iv.length, ct.length);
+        String legacy = CredentialCipher.PREFIX_LEGACY + java.util.Base64.getEncoder().encodeToString(all);
+
+        assertEquals(plain, CredentialCipher.decrypt(legacy), "老密文必须仍可解");
+        assertTrue(CredentialCipher.isEncrypted(legacy), "老前缀也算已加密");
+        assertEquals(legacy, CredentialCipher.encrypt(legacy), "老密文不应被二次加密");
+    }
+
+    @Test
+    @DisplayName("新密文携带 keyId，是轮转的前提")
+    void newCiphertextCarriesKeyId() {
+        String enc = CredentialCipher.encrypt("x");
+        byte[] raw = java.util.Base64.getDecoder()
+                .decode(enc.substring(CredentialCipher.PREFIX.length()));
+        assertEquals(1, raw[0], "默认 keyId 应为 1");
+        // keyId(1) + iv(12) + ct(1) + tag(16)
+        assertEquals(1 + 12 + 1 + 16, raw.length, "密文布局应为 keyId||iv||ct+tag");
+    }
+
+    @Test
+    @DisplayName("两代前缀不会互相误认——老密文首字节是随机 IV，不能靠首字节区分版本")
+    void prefixesAreDistinct() {
+        assertNotEquals(CredentialCipher.PREFIX, CredentialCipher.PREFIX_LEGACY);
+        assertFalse(CredentialCipher.PREFIX_LEGACY.startsWith(CredentialCipher.PREFIX));
+        // 关键：新前缀必须以老前缀无法匹配的方式开头，否则 startsWith 判断会串
+        assertTrue(CredentialCipher.PREFIX.startsWith("ENC"));
+        assertNotEquals(CredentialCipher.PREFIX.charAt(3), ':');
+    }
+
+    @Test
+    @DisplayName("PBKDF2 迭代轮数不低于 OWASP 推荐下限")
+    void kdfStrength() {
+        assertTrue(CredentialCipher.PBKDF2_ITERATIONS >= 310_000,
+                "PBKDF2-HMAC-SHA256 至少 310,000 轮，实际 " + CredentialCipher.PBKDF2_ITERATIONS);
     }
 }

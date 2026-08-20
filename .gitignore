@@ -15,3 +15,10 @@ __pycache__/
 .DS_Store
 # 判据生成的自签证书（含私钥），仅本地联调用
 test_scripts/ssl/out/
+
+# ---- 前端构建 ----
+node_modules/
+# 构建产物：由 npm run build 生成，不入库（源文件才是正本）
+static/js/
+# static/vendor/ **要入库**：落本地第三方库的意义就是部署时不依赖外网与 npm，
+# 不入库就等于把 CDN 依赖换成了 npm 依赖，白做。

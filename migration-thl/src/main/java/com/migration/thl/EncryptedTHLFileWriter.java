@@ -44,12 +44,9 @@ public class EncryptedTHLFileWriter extends THLFileWriter {
 
     @Override
     public void writeEvent(THLEvent event) throws IOException {
-        // 序列化事件为字节数组
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
-            oos.writeObject(event);
-        }
-        byte[] bytes = baos.toByteArray();
+        // 编码事件为字节数组。与明文写入器同一套 ThlCodec：
+        // 原生序列化每条重写类描述符，实测占 38%，加密之后这部分还要跟着一起加密与落盘。
+        byte[] bytes = ThlCodec.encode(event);
 
         if (encryptionEnabled) {
             byte[] encrypted = encryptionService.encryptRecord(bytes);
