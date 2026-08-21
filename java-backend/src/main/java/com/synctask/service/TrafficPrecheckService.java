@@ -581,18 +581,13 @@ public class TrafficPrecheckService {
      * {@code postgresql://user:pass@host:port/db} / {@code oracle://user:pass@host:port/service}。
      */
     private Connection open(String connStr, String sslMode) throws SQLException {
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("^(\\w+)://([^:]+):([^@]*)@([^:/]+):(\\d+)(?:/([^?]*))?").matcher(connStr);
-        if (!m.find()) {
-            throw new SQLException("连接串格式不正确: " + connStr.replaceAll(":[^:@]*@", ":***@"));
-        }
-        String scheme = m.group(1);
-        String user = m.group(2);
-        String pass = m.group(3);
-        String host = m.group(4);
-        String port = m.group(5);
-        String db = m.group(6);
-        String engine = normalizeEngine(scheme);
+        Parsed p = parse(connStr);
+        String user = p.username;
+        String pass = p.password;
+        String host = p.host;
+        String port = p.port;
+        String db = p.database;
+        String engine = normalizeEngine(p.scheme);
         if (engine == null) engine = "mysql";
 
         String url;
@@ -612,6 +607,44 @@ public class TrafficPrecheckService {
                         host, port, JdbcSslOptions.mysql(sslMode, null));
         }
         return DriverManager.getConnection(url, user, pass);
+    }
+
+    /** {@link #parse} 的结果。拆出来只为让解析本身能被单测覆盖——open() 需要真实库。 */
+    record Parsed(String scheme, String username, String password,
+                  String host, String port, String database) {
+    }
+
+    /**
+     * 拆解连接串。
+     *
+     * <p>口令组是贪婪的 {@code (.*)}、主机字符集排除 {@code @}：两者合起来等价于按
+     * <b>最后一个</b> {@code @} 切 userinfo，也就是 URI 的通行做法。原来的 {@code [^@]*}
+     * 在第一个 {@code @} 就停，口令里带 {@code @} 的实例会被报成"连接串格式不正确"。
+     */
+    static Parsed parse(String connStr) throws SQLException {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^(\\w+)://([^:]+):(.*)@([^:/@]+):(\\d+)(?:/([^?]*))?").matcher(connStr);
+        if (!m.find()) {
+            throw new SQLException("连接串格式不正确: " + maskPassword(connStr));
+        }
+        return new Parsed(m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6));
+    }
+
+    /**
+     * 遮蔽连接串里的口令。按<b>最后一个</b> {@code @} 切：口令自身可能含 {@code @}，
+     * 旧写法 {@code ":[^:@]*@"} 只吃到第一个 {@code @}，会把口令的后半段原样留在报错里。
+     */
+    static String maskPassword(String connStr) {
+        if (connStr == null) {
+            return null;
+        }
+        String masked = connStr.replaceAll("^([A-Za-z][A-Za-z0-9+.\\-]*://[^:@/]+):.*@", "$1:***@");
+        if (masked.equals(connStr)) {
+            // 没有 @ 的残缺串（如 mysql://root:secret）也要盖：这个函数正是给**解析失败**的
+            // 报错用的，"解析不出来"恰恰是最容易漏口令的那一种输入。
+            masked = connStr.replaceAll("^([A-Za-z][A-Za-z0-9+.\\-]*://[^:@/]+):.+$", "$1:***");
+        }
+        return masked;
     }
 
     /** 预检自身的查询不该进语句日志——它跑在可能已经开着 general_log 的源库上。 */

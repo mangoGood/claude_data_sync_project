@@ -1,6 +1,13 @@
 // dashboard-advanced.js —— 高级功能（/api/advanced：调度/告警/慢SQL/诊断/配置版本/克隆/批量
 //   + 位点可视化 + 死信裁决）独立 ES module。自有模块作用域，与主脚本及其它特性隔离。
 //   共享依赖经主脚本设置的 window.__dash 取得；onclick 引用的函数在末尾显式挂 window。
+//
+// 转义约定（本文件八张表全按这个来，别再整体套一层）：
+//   escapeHtml 只用在**单元格取值**上（`<td>${escapeHtml(x.name)}</td>`），
+//   拼好的 `rows` 已经是 HTML 片段，插进 <tbody> 时必须原样插。
+//   曾经写成 `<tbody>${escapeHtml(rows)}</tbody>`，结果是把 <tr>/<td> 一起转义掉：
+//   浏览器把整串当文本、又因为 <tbody> 里不允许裸文本而把它提到表格外面，
+//   页面上就是"表头是空的，上方糊着一大段 &lt;tr&gt; 源码"——告警管理页最先被看出来。
 const __dash = window.__dash;
 const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtml, escapeAttr, fetchWorkflows } = __dash;
 
@@ -94,7 +101,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>名称</th><th>任务</th><th>类型</th><th>cron</th><th>状态</th><th>上次触发</th><th>下次触发</th><th>已触发</th><th>操作</th>
-                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+                </tr></thead><tbody>${rows}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -170,7 +177,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>策略名</th><th>任务</th><th>错误类型</th><th>最大次数</th><th>重试间隔</th><th>退避</th><th>状态</th><th>操作</th>
-                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+                </tr></thead><tbody>${rows}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -230,7 +237,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>上游任务</th><th>下游任务</th><th>触发条件</th><th>已触发</th><th>上次触发</th><th>操作</th>
-                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+                </tr></thead><tbody>${rows}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -331,7 +338,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>规则名</th><th>任务</th><th>触发条件</th><th>渠道</th><th>状态</th><th>已告警</th><th>最近告警</th><th>操作</th>
-                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+                </tr></thead><tbody>${rows}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -404,7 +411,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>时间</th><th>规则</th><th>任务</th><th>指标值/阈值</th><th>消息</th><th>通知结果</th>
-                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+                </tr></thead><tbody>${rows}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -452,7 +459,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                 });
                 container.innerHTML = `<table><thead><tr>
                     <th>时间</th><th>任务</th><th>表</th><th>类型</th><th>耗时</th><th>SQL</th>
-                </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+                </tr></thead><tbody>${rows}</tbody></table>`;
             } catch (e) {
                 container.innerHTML = '<div class="adv-empty">加载失败</div>';
             }
@@ -522,7 +529,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             });
             container.innerHTML = `<table><thead><tr>
                 <th>版本</th><th>时间</th><th>变更描述</th><th>创建人</th><th>操作</th>
-            </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+            </tr></thead><tbody>${rows}</tbody></table>`;
         }
 
         async function advRollbackConfig(versionNumber) {
@@ -618,7 +625,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
             });
             container.innerHTML = `<table><thead><tr>
                 <th>seqno</th><th>跳过时间</th><th>表</th><th>事件类型</th><th>未应用的 SQL</th>
-            </tr></thead><tbody>${escapeHtml(rows)}</tbody></table>`;
+            </tr></thead><tbody>${rows}</tbody></table>`;
         }
 
         // ---------- 同步位点可视化 ----------

@@ -35,9 +35,20 @@ public class MetadataService {
      * {@code db?allowLoadLocalInfile=true&…} 这类 payload 完整通过校验并被拼进 JDBC URL；
      * 后者让 {@code :99999999999} 走到 {@code Integer.parseInt} 才炸出难懂的
      * NumberFormatException。这里把两处都收到字符集/长度上。
+     *
+     * <p>口令组是<b>贪婪的 {@code (.*)}</b>，不是 {@code [^@]*}：口令里出现 {@code @}
+     * 是完全合法的（{@code ^XVCGjd=Ax@1u#+X7fmLQuNM} 这类随机口令很常见），而 {@code [^@]*}
+     * 会在第一个 {@code @} 就停下，剩下的 {@code 1u#+X7fmLQuNM@host} 落到主机位、
+     * 撞上主机字符集后整体匹配失败，报成"连接串格式不正确"——用户看到的是格式错，
+     * 真正的原因却是口令。贪婪 {@code .*} 配合"主机字符集不含 {@code @}"，
+     * 等价于按<b>最后一个</b> {@code @} 切分 userinfo，这也是 URI 的通行做法。
+     *
+     * <p>放宽的只有口令组：host/port/database 三组的字符集与长度约束原样不动，
+     * 且都仍要过 {@code JdbcUrlSafety}，注入面没有变大——口令从不进 JDBC URL，
+     * 它只作为 {@code Properties} 里的一个值交给驱动。
      */
     private static final Pattern CONNECTION_PATTERN = Pattern.compile(
-        "(?:mysql|postgresql|oracle|mongodb|elastic|redis)://([^:@/]+):([^@]*)@"
+        "(?:mysql|postgresql|oracle|mongodb|elastic|redis)://([^:@/]+):(.*)@"
             + "([A-Za-z0-9._\\-\\[\\]:]+):(\\d{1,5})(?:/([A-Za-z0-9_$.\\-]*))?"
     );
 

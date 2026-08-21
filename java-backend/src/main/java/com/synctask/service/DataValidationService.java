@@ -417,8 +417,11 @@ public class DataValidationService {
      * 解析连接串，支持 mysql://、postgresql://、oracle:// 三种格式。
      * 返回 String[4]: {jdbcUrl, username, password, dbType}
      * dbType 为 "mysql" / "postgresql" / "oracle"
+     *
+     * <p>包内可见（而非 private）是为了让单测直接覆盖解析本身——调用方 compareRowCounts
+     * 需要两端真实库，靠它间接测等于测不到。
      */
-    private String[] parseConnectionUrl(String connStr) {
+    String[] parseConnectionUrl(String connStr) {
         if (connStr == null || connStr.isEmpty()) {
             throw new IllegalArgumentException("连接串不能为空");
         }
@@ -437,8 +440,12 @@ public class DataValidationService {
         // 连接串里写 .../db?allowLoadLocalInfile=true 就能把驱动参数塞进 JDBC URL
         // （恶意 MySQL 服务端可读走本机任意文件；PG 的 socketFactory 是 RCE 链）。
         // 这是本仓库第二份连接串正则，两份都必须收紧。
+        //
+        // 口令组是贪婪的 (.*) 而非 [^@]+：口令里可以有 @（也可以为空，如默认装的 TiDB root）。
+        // 主机字符集不含 @，所以贪婪回溯的落点必然是**最后一个** @，等价于按 URI 惯例切 userinfo。
+        // 与 MetadataService.CONNECTION_PATTERN 保持同一套口径——两份正则必须一起改。
         java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
-                "(?:mysql|postgresql|oracle)://([^:@/]+):([^@]+)@"
+                "(?:mysql|postgresql|oracle)://([^:@/]+):(.*)@"
                         + "([A-Za-z0-9._\\-\\[\\]:]+):(\\d{1,5})(?:/([A-Za-z0-9_$.\\-]*))?"
         ).matcher(connStr);
         if (!matcher.matches()) {

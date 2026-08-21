@@ -231,7 +231,9 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                             sourceInfo = `${sc.host}:${sc.port}`;
                         }
                     } catch(e) {
-                        const m = (task.source_connection || '').match(/@([^:]+):(\d+)/);
+                        // 前置 .* 强制落到**最后一个** @：口令里含 @ 时，从第一个 @ 起匹配
+                        // 会把口令后半段当成主机名显示出来——口令直接漏在任务详情页上。
+                        const m = (task.source_connection || '').match(/.*@([^:@/]+):(\d+)/);
                         sourceInfo = m ? `${m[1]}:${m[2]}` : (task.source_connection || '-');
                     }
                     try {
@@ -240,7 +242,7 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
                             targetInfo = `${tc.host}:${tc.port}`;
                         }
                     } catch(e) {
-                        const m = (task.target_connection || '').match(/@([^:]+):(\d+)/);
+                        const m = (task.target_connection || '').match(/.*@([^:@/]+):(\d+)/);
                         targetInfo = m ? `${m[1]}:${m[2]}` : (task.target_connection || '-');
                     }
                     
