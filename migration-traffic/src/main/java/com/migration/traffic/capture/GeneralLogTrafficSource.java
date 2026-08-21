@@ -122,7 +122,13 @@ public final class GeneralLogTrafficSource implements TrafficSource {
         logger.info("general_log 捕获已开启: url={}, t0={}us, 轮转间隔={}ms", jdbcUrl, t0Micros, rotateIntervalMs);
     }
 
+    @Override
+    public String captureBackend() {
+        return "GENERAL_LOG";
+    }
+
     /** 录制原点（源库 epoch 微秒）。 */
+    @Override
     public long t0Micros() {
         return t0Micros;
     }
@@ -182,6 +188,7 @@ public final class GeneralLogTrafficSource implements TrafficSource {
     }
 
     private void readFingerprint() throws SQLException {
+        fingerprint.engine = com.migration.traffic.model.TrafficEngine.MYSQL.wireName();
         try (Statement st = conn.createStatement()) {
             fingerprint.serverUuid = scalar(st, "SELECT @@server_uuid");
             fingerprint.version = scalar(st, "SELECT VERSION()");
@@ -351,6 +358,7 @@ public final class GeneralLogTrafficSource implements TrafficSource {
      * "No database selected"，或者更糟——落到目标连接碰巧选中的另一个库上。
      * 而连接池恰恰是生产上的常态。
      */
+    @Override
     public java.util.Map<Long, String> snapshotSessionSchemas() {
         java.util.Map<Long, String> out = new java.util.LinkedHashMap<>();
         try (Statement st = conn.createStatement();
@@ -366,8 +374,30 @@ public final class GeneralLogTrafficSource implements TrafficSource {
     }
 
     /** 源库开关是否确认已还原。false = 需要 agent 兜底。 */
+    @Override
     public boolean isRestored() {
         return restored;
+    }
+
+    /** 续录时按上一轮落盘的原值还原，而不是按本轮读到的（那可能是我们自己留下的 ON）。 */
+    @Override
+    public void overrideRestoreState(java.util.Map<String, String> original) {
+        if (original == null || original.isEmpty()) return;
+        String gl = original.get("general_log");
+        if (gl != null) originalGeneralLog = gl;
+        String lo = original.get("log_output");
+        if (lo != null) originalLogOutput = lo;
+        logger.info("按上一轮落盘的原值还原: general_log={}, log_output={}",
+                originalGeneralLog, originalLogOutput);
+    }
+
+    /** MySQL 要还原的就是两个全局变量。 */
+    @Override
+    public java.util.Map<String, String> restoreState() {
+        java.util.Map<String, String> m = new java.util.LinkedHashMap<>();
+        m.put("general_log", originalGeneralLog == null ? "" : originalGeneralLog);
+        m.put("log_output", originalLogOutput == null ? "" : originalLogOutput);
+        return m;
     }
 
     /** 源库上要还原的两个值，供上层落库做兜底还原。 */

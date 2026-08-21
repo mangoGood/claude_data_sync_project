@@ -458,7 +458,13 @@
             'E3123': { desc: '录制文件损坏或不可用', solution: '录制缺 manifest、分段对不上或校验和不符。多因捕获被强杀未封口、跨机取文件中断或文件被清理。请重新同步录制元数据；确已损坏只能重录——语句流没有位点可续' },
             'E3124': { desc: '回放目标就是录制源库', solution: '目标与录制源的 server_uuid 相同。回放会把源库已发生的操作再做一遍：自增翻倍、重复插入、DROP 是真的删。请换独立实例；确需如此时显式打开 traffic.replay.allow.same.instance' },
             'E3125': { desc: '回放错误率超过阈值', solution: '目标库上失败语句占比超过 traffic.replay.abort.error.rate，已停止以免继续制造破坏。常见原因：目标缺库/表、字符集或 sql_mode 与源库不一致、权限不足。请看回放报告的错误明细' },
-            'E3126': { desc: '源库语句日志未能还原', solution: '任务结束但没能确认把源库 general_log/log_output 改回原值，源库会一直写日志表直到磁盘满。请立刻手工执行 SET GLOBAL general_log=<原值>; SET GLOBAL log_output=<原值>，原值见任务详情' },
+            'E3126': { desc: '源端语句日志/审计未能还原', solution: '任务结束但没能确认把源端改回原样，三种引擎的后果都是把源端撑爆：MySQL 一直写 mysql.general_log 直到 datadir 满、PG 的 log_statement=all 写满日志盘、Oracle 的审计策略把记录堆进 AUDSYS(SYSAUX)。请按任务详情里的原值人工还原，或用 migration-traffic --mode restore 兜底' },
+            'E3127': { desc: '源端语句流通道不可用', solution: 'PG 的 logging_collector 是 postmaster 参数，关着就读不到语句日志，需由 DBA 执行 ALTER SYSTEM SET logging_collector=on 并重启实例；若已是 on，检查 pg_current_logfile() 是否为空、采集账号是否有 pg_monitor 与 pg_read_server_files' },
+            'E3128': { desc: '语句日志开关已下发但未生效', solution: 'ALTER SYSTEM 会被命令行参数或 include 文件静默压过（SQL 成功、值不变、无告警），继续跑只会录出空文件。用 SELECT name,setting,source FROM pg_settings 看来源，清掉源库启动命令行/配置文件里硬写的 log_statement、log_destination' },
+            'E3129': { desc: '审计策略创建或启用失败', solution: 'Oracle 的语句流靠统一审计策略产生。确认账号有 AUDIT_ADMIN 角色、实例 Unified Auditing=TRUE，且上一轮同名策略已清理（可用 migration-traffic --mode restore 兜底清理）' },
+            'E3130': { desc: '审计记录清理失败', solution: '已消费的审计记录清不掉会一路堆进 AUDSYS（默认在 SYSAUX），SYSAUX 满会影响整个实例。确认账号有 AUDIT_ADMIN 且能执行 DBMS_AUDIT_MGMT；确需保留审计记录请关闭清理开关并自行安排清理' },
+            'E3131': { desc: '录制引擎与回放目标不一致', solution: '录制文件自带引擎标记，回放目标必须同引擎。SQL 方言无法自动翻译，跨引擎回放会在目标库上留下一堆半成功的破坏。请换同引擎的目标库或换一份同引擎的录制' },
+            'E3132': { desc: '绑定参数解析失败', solution: 'PG 的 Parameters 明细或 Oracle 的 SQL_BINDS 形态不认识。这类语句不能当作『没有参数』放过去——占位符原样送到目标库，PG 报缺参数，Oracle 可能沿用上次的绑定值静默写错数据。请提供录制样本以便适配该形态' },
             'E4001': { desc: '全量同步失败', solution: '请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常' },
             'E4002': { desc: '全量同步超时', solution: '请检查数据量是否过大，考虑分批同步或优化网络带宽' },
             'E4003': { desc: '目标数据库写入失败', solution: '请检查目标数据库磁盘空间、表结构是否与源库一致、是否有写入权限' },
@@ -2047,7 +2053,8 @@
 
                     // 连接信息只展示类型与地址，不暴露连接串（含账号口令）
                     const extractHostPort = (conn) => {
-                        const m = (conn || '').match(/@([^:/@]+):(\d+)/);
+                        // 前置 .* 强制落到最后一个 @（口令里可以有 @），主机组也排除 @
+                        const m = (conn || '').match(/.*@([^:/@]+):(\d+)/);
                         return m ? `${m[1]}:${m[2]}` : '-';
                     };
                     const sourceTypeLabel = formatDbTypeLabel(task.source_type);
@@ -2499,9 +2506,12 @@
                 const p95 = t.p95_ms || 0;
                 const p99 = t.p99_ms || 0;
                 const maxV = t.max_ms || 0;
+                // 表名要在**单元格里**转义（onclick 实参走 escapeAttr）：拼好的 rows 是
+                // HTML 片段，插进 <tbody> 时不能再整体 escapeHtml——那样会把 <tr>/<td>
+                // 一起转义成文本，表格变空、源码糊在表外。
                 return `
-                    <tr onclick="toggleLatencyChart('${t.table}')" style="cursor:pointer;">
-                        <td style="font-weight:500;">${t.table}</td>
+                    <tr onclick="toggleLatencyChart('${escapeAttr(t.table)}')" style="cursor:pointer;">
+                        <td style="font-weight:500;">${escapeHtml(t.table)}</td>
                         <td>${advLatencyCell(p50)}</td>
                         <td>${advLatencyCell(p95)}</td>
                         <td>${advLatencyCell(p99)}</td>
@@ -2533,7 +2543,7 @@
                             <th>表名</th><th>P50</th><th>P95</th><th>P99</th><th>最大</th><th>级别</th>
                         </tr>
                     </thead>
-                    <tbody>${escapeHtml(rows)}</tbody>
+                    <tbody>${rows}</tbody>
                 </table>
                 <div id="latencyChartArea" style="margin-top:12px;display:none;"></div>
             `;
@@ -2635,10 +2645,12 @@
                     status = '✗ 失败';
                     statusColor = '#f5222d';
                 }
+                // 取值在**单元格里**转义；拼好的 items 是 HTML 片段，插进容器时不能再整体
+                // escapeHtml——那样会把 <div> 一起转义成文本，时间线变成一大段源码。
                 return `
                     <div class="adv-timeline-item">
-                        <div class="adv-timeline-time">${formatDateTime(log.created_at)} · ${log.level || 'INFO'}</div>
-                        <div class="adv-timeline-content">${msg}</div>
+                        <div class="adv-timeline-time">${escapeHtml(formatDateTime(log.created_at))} · ${escapeHtml(log.level || 'INFO')}</div>
+                        <div class="adv-timeline-content">${escapeHtml(msg)}</div>
                         <div style="margin-top:2px;font-size:12px;color:${statusColor};font-weight:500;">${status}</div>
                     </div>
                 `;
@@ -2646,7 +2658,7 @@
 
             el.innerHTML = `
                 <div style="font-size:12px;color:#666;margin-bottom:12px;">共 ${escapeHtml(ddlLogs.length)} 条DDL变更记录</div>
-                <div class="adv-timeline">${escapeHtml(items)}</div>
+                <div class="adv-timeline">${items}</div>
             `;
         }
 
@@ -2705,7 +2717,7 @@
                 ${skewed ? `<div style="margin:0 12px 8px;padding:6px 10px;background:#fffbe6;border:1px solid #ffe58f;border-radius:4px;font-size:12px;color:#fa8c16;">
                     分布偏斜：最大的${isSplit ? '分片' : '来源'}行数超过均值 2 倍，${isSplit ? '分片键可能选得不均匀' : '某个分库数据量明显更大'}。
                 </div>` : ''}
-                ${escapeHtml(rows)}
+                ${rows}
                 <div style="font-size:11px;color:#bbb;padding:8px 12px;">数据来自增量应用进程，每 5 秒刷新一次；仅统计增量阶段应用的行。</div>
             `;
         }
@@ -2869,6 +2881,18 @@
                 notification.classList.remove('show');
             }, 3000);
         }
+
+        // showNotification 的别名。血缘/分级/Schema 审批那几页、以及 fetchWithAuth 的 403 分支
+        // 一共 19 处调的是 showToast，而这个函数从来没有被定义过——调到就是 ReferenceError，
+        // 直接把所在的 async 函数掀掉：
+        //   · 数据分级页不选任务点"策略校验"，本该弹"请先选择任务"，实际是静默什么都不发生，
+        //     结果框里还留着上一次"查该级别的流向"的结果，看起来就像"没选任务也查出了东西"；
+        //   · 403 时本该提示"当前角色无权执行该操作"，实际是页面白掉。
+        // 补上定义即可，语义与 showNotification 完全一致（type: success / error / warning）。
+        function showToast(message, type) {
+            showNotification(message, type);
+        }
+        window.showToast = showToast;
         
         // ===== 一致性语义（创建任务时选定，创建后不可修改）=====
         // 三个创建入口（同步/订阅/灾备）共用这组函数，前缀区分弹窗：sync / sub / dr。
@@ -4060,7 +4084,10 @@
         function cfgParseConnectionString(type, connStr) {
             const dbType = (type === 'source') ? cfgSourceType : cfgTargetType;
             const protocol = cfgProtocolFor(dbType);
-            const regex = new RegExp(protocol + ':\\/\\/([^:]+):([^@]+)@([^:]+):(\\d+)(?:\\/(.+))?', 'i');
+            // 口令组贪婪 (.*) + 主机组排除 @：等价于按**最后一个** @ 切 userinfo。
+            // 用 [^@]+ 时，口令含 @（如 ^XVCGjd=Ax@1u#+X7fmLQuNM）整条正则匹配不上，
+            // 表现是打开任务配置后连接信息四个框全是空的——与后端那几份正则同一个口径。
+            const regex = new RegExp(protocol + ':\\/\\/([^:]+):(.*)@([^:@\\/]+):(\\d+)(?:\\/(.+))?', 'i');
             const match = connStr.match(regex);
             if (match) {
                 document.getElementById('cfg' + capitalize(type) + 'Username').value = match[1];
@@ -5151,7 +5178,11 @@
             const column = document.getElementById('lnColumn').value.trim();
             const dir = document.getElementById('lnDirection').value;
             const box = document.getElementById('lnResult');
-            if (!db || !table || !column) { showToast('库/表/列都要填', 'warning'); return; }
+            if (!db || !table || !column) {
+                showToast('库/表/列都要填', 'warning');
+                box.innerHTML = '<span style="color:#fa8c16;">库、表、列三项都填全后再查询。</span>';
+                return;
+            }
             box.innerHTML = '<span style="color:#999;">查询中…</span>';
             try {
                 const q = `?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}&depth=5`;
@@ -5246,14 +5277,26 @@
         window.clCheckPolicy = async function() {
             const wid = document.getElementById('clPolicyTask').value;
             const box = document.getElementById('clResult');
-            if (!wid) { showToast('请先选择任务', 'warning'); return; }
+            // 结果框是与"查该级别的流向"共用的。没选任务时只弹一句提示、box 原样不动的话，
+            // 上一次流向查询的结果会一直挂在那儿——用户看到的就是"没选任务也查出了结果"。
+            // 所以这里要把框清成提示语：任何一次查询的结果框，必须只属于这一次查询。
+            if (!wid) {
+                showToast('请先选择任务', 'warning');
+                box.innerHTML = '<span style="color:#fa8c16;">请先在上方选择任务，再点「策略校验」。</span>';
+                return;
+            }
             box.innerHTML = '<span style="color:#999;">校验中…</span>';
             try {
                 const r = await govApi('/governance/classification/policy/' + encodeURIComponent(wid));
                 const d = r.data || {};
-                let html = d.hasViolation
-                    ? '<div style="color:#f5222d;font-weight:500;margin-bottom:12px;">发现策略违规</div>'
-                    : '<div style="color:#52c41a;font-weight:500;margin-bottom:12px;">未发现策略违规</div>';
+                // 结果里点明是哪个任务：这个框同时承载"级别流向"（与任务无关）的结果，
+                // 不写清楚就分不出眼前这份到底属于谁。
+                const taskLabel = document.getElementById('clPolicyTask')
+                    .selectedOptions[0].textContent;
+                let html = `<div style="font-size:12px;color:#999;margin-bottom:8px;">任务：${escapeHtml(taskLabel)}</div>`
+                    + (d.hasViolation
+                        ? '<div style="color:#f5222d;font-weight:500;margin-bottom:12px;">发现策略违规</div>'
+                        : '<div style="color:#52c41a;font-weight:500;margin-bottom:12px;">未发现策略违规</div>');
                 const section = (title, items, color) => items && items.length
                     ? `<div style="margin-bottom:12px;"><div style="font-size:13px;color:${color};margin-bottom:6px;">${title}（${items.length}）</div>`
                       + items.map(x => `<div style="padding:4px 8px;background:#fafafa;border-left:2px solid ${color};margin-bottom:4px;font-family:monospace;font-size:12px;">${escapeHtml(x)}</div>`).join('')

@@ -869,8 +869,9 @@ public class DiagnosticService {
 
     private Connection openOracleConn(String connStr) throws Exception {
         // oracle://user:pass@host:port/service
+        // 按**最后一个** @ 切 userinfo：口令自身可以含 @，indexOf 会把口令后半段当成主机。
         String rest = connStr.substring("oracle://".length());
-        int at = rest.indexOf('@');
+        int at = rest.lastIndexOf('@');
         String[] up = rest.substring(0, at).split(":", 2);
         String hostPortService = rest.substring(at + 1);
         String service = hostPortService.contains("/")
@@ -1632,7 +1633,9 @@ public class DiagnosticService {
      */
     private HostPortDb splitHostPortDb(String connStr, String scheme, int defaultPort) {
         String url = connStr.startsWith(scheme) ? connStr.substring(scheme.length()) : connStr;
-        int at = url.indexOf('@');
+        // lastIndexOf 而非 indexOf：口令里含 @ 是合法的，按第一个 @ 切会把口令的后半段
+        // 当成主机名交给 JdbcUrlSafety，报出来的是"主机非法"，真正的原因却是口令。
+        int at = url.lastIndexOf('@');
         if (at < 0) {
             throw new IllegalArgumentException("连接串缺少 '@'：" + scheme + "user:pass@host:port/db");
         }

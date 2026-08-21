@@ -37,6 +37,25 @@ public final class TrafficJson {
             sb.append(",\"q\":");
             escape(sb, r.q);
         }
+        if (r.b != null && !r.b.isEmpty()) {
+            // 绑定参数数组：null 元素写成 JSON null，表示 SQL NULL。
+            // 不能写成空串——PG 的 $1 = NULL 与 $1 = '' 是两回事，Oracle 的 #1(0): 亦然。
+            sb.append(",\"b\":[");
+            for (int i = 0; i < r.b.size(); i++) {
+                if (i > 0) sb.append(',');
+                String v = r.b.get(i);
+                if (v == null) {
+                    sb.append("null");
+                } else {
+                    escape(sb, v);
+                }
+            }
+            sb.append(']');
+        }
+        if (r.sn != null && !r.sn.isEmpty()) {
+            sb.append(",\"sn\":");
+            escape(sb, r.sn);
+        }
         if (r.rd) {
             sb.append(",\"rd\":true");
         }
@@ -44,7 +63,12 @@ public final class TrafficJson {
             sb.append(",\"e\":{\"errno\":").append(r.errno)
               .append(",\"rows\":").append(r.rows)
               .append(",\"aff\":").append(r.aff)
-              .append(",\"us\":").append(r.us).append('}');
+              .append(",\"us\":").append(r.us);
+            if (r.state != null && !r.state.isEmpty()) {
+                sb.append(",\"st\":");
+                escape(sb, r.state);
+            }
+            sb.append('}');
         }
         sb.append('}');
     }
@@ -68,6 +92,22 @@ public final class TrafficJson {
                     case "db": r.db = jr.nextString(); break;
                     case "u": r.u = jr.nextString(); break;
                     case "q": r.q = jr.nextString(); break;
+                    case "b": {
+                        java.util.List<String> binds = new java.util.ArrayList<>();
+                        jr.beginArray();
+                        while (jr.hasNext()) {
+                            if (jr.peek() == com.google.gson.stream.JsonToken.NULL) {
+                                jr.nextNull();
+                                binds.add(null);        // SQL NULL，不是空串
+                            } else {
+                                binds.add(jr.nextString());
+                            }
+                        }
+                        jr.endArray();
+                        r.b = binds;
+                        break;
+                    }
+                    case "sn": r.sn = jr.nextString(); break;
                     case "rd": r.rd = jr.nextBoolean(); break;
                     case "e":
                         r.hasEnrich = true;
@@ -79,6 +119,7 @@ public final class TrafficJson {
                                 case "rows": r.rows = jr.nextLong(); break;
                                 case "aff": r.aff = jr.nextLong(); break;
                                 case "us": r.us = jr.nextLong(); break;
+                                case "st": r.state = jr.nextString(); break;
                                 default: jr.skipValue();
                             }
                         }

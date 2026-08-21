@@ -396,9 +396,19 @@ public class MetadataController {
         }
     }
 
-    private String maskConnection(String connectionStr) {
+    /**
+     * 日志用的连接串遮蔽。按<b>最后一个</b> {@code @} 切 userinfo——口令里带 {@code @}
+     * 是合法的，旧写法 {@code ":[^:@]+@"} 只吃到第一个 {@code @}，
+     * 口令 {@code p@ssw0rd} 会被打成 {@code :****@sw0rd@host}，后半段明文进日志。
+     */
+    static String maskConnection(String connectionStr) {
         if (connectionStr == null) return "null";
-        return connectionStr.replaceAll(":[^:@]+@", ":****@");
+        String masked = connectionStr.replaceAll("^([A-Za-z][A-Za-z0-9+.\\-]*://[^:@/]+):.*@", "$1:****@");
+        if (masked.equals(connectionStr)) {
+            // 没有 @ 的残缺串（如 mysql://root:secret）也要盖住口令段
+            masked = connectionStr.replaceAll("^([A-Za-z][A-Za-z0-9+.\\-]*://[^:@/]+):.+$", "$1:****");
+        }
+        return masked;
     }
 
     @PostMapping("/compare-content/start")

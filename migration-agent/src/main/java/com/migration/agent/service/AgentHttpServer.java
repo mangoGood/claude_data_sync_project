@@ -339,6 +339,11 @@ public class AgentHttpServer {
             out.put("durationMs", numOf(manifest.get("durationMs")));
             out.put("sealed", Boolean.TRUE.equals(manifest.get("sealed")));
             out.put("sha256", manifest.get("sha256"));
+            // 引擎与捕获通道要一路带回后端：回放向导按引擎过滤可选录制，
+            // 跨引擎回放是硬拦的（E3131）
+            out.put("format", manifest.get("format"));
+            out.put("engine", manifest.get("engine"));
+            out.put("captureBackend", manifest.get("captureBackend"));
             out.put("source", manifest.get("source"));
             out.put("stats", manifest.get("stats"));
             Object segs = manifest.get("segments");

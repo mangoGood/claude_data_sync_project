@@ -1,17 +1,18 @@
 package com.migration.traffic.replay;
 
-import com.migration.traffic.capture.StatementClassifier;
 import com.migration.traffic.model.SourceFingerprint;
 import com.migration.traffic.model.StatementClass;
 import com.migration.traffic.model.TrafficRecord;
+import com.migration.traffic.replay.dialect.TargetDialect;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Properties;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -33,9 +34,10 @@ final class SessionRunner {
     private static final Logger logger = LoggerFactory.getLogger(SessionRunner.class);
 
     private final long sourceSessionId;
-    private final String jdbcUrl;
-    private final String user;
-    private final String password;
+    private final Properties props;
+    private final TargetDialect dialect;
+    /** 本会话连的库。PG 的连接终生绑定一个库，所以它在建连时就定死。 */
+    private final String database;
     private final SourceFingerprint fingerprint;
     private final ReplayOptions options;
     private final ReplayReporter reporter;
@@ -54,14 +56,14 @@ final class SessionRunner {
     private volatile long lastActiveMs = System.currentTimeMillis();
     private volatile boolean failed;
 
-    SessionRunner(long sourceSessionId, String jdbcUrl, String user, String password,
+    SessionRunner(long sourceSessionId, Properties props, TargetDialect dialect, String database,
                   SourceFingerprint fingerprint, ReplayOptions options,
                   ReplayReporter reporter, DangerousStatementFilter dangerFilter,
                   ReplayScheduler scheduler) {
         this.sourceSessionId = sourceSessionId;
-        this.jdbcUrl = jdbcUrl;
-        this.user = user;
-        this.password = password;
+        this.props = props;
+        this.dialect = dialect;
+        this.database = database;
         this.fingerprint = fingerprint;
         this.options = options;
         this.reporter = reporter;
@@ -133,10 +135,15 @@ final class SessionRunner {
     }
 
     private void execute(TrafficRecord r, long plannedMicros) {
-        // MySQL 抹掉的口令谁也拿不到；把 <secret> 当字面量执行会建出一个口令是 "<secret>" 的账号
+        // 被抹掉的口令谁也拿不到；把占位符当字面量执行会建出一个口令是占位符的账号
         if (r.rd) {
             reporter.record(ReplayOutcome.UNREPLAYABLE_REDACTED, r, 0, plannedMicros,
-                    "MySQL 在写日志时抹掉了口令，无法忠实回放");
+                    "语句里的口令已被抹除（源库写日志时抹的，或捕获侧脱敏），无法忠实回放");
+            return;
+        }
+        String noBinds = dialect.unreplayableReason(r);
+        if (noBinds != null) {
+            reporter.record(ReplayOutcome.UNREPLAYABLE_NO_BINDS, r, 0, plannedMicros, noBinds);
             return;
         }
         String block = dangerFilter.blockReason(r.q);
@@ -190,20 +197,35 @@ final class SessionRunner {
      * 服务端的排序/临时表/网络传输都不会真的发生，回放出来的负载与源库不是一回事。
      */
     private long runStatement(TrafficRecord r) throws SQLException {
+        if (dialect.needsPrepared(r)) {
+            // PG / Oracle：参数没被替换进 SQL 文本，必须绑上去。
+            // 没参数的语句一律走普通 Statement —— simple query 里可能是多条语句串在一起
+            // （PG 实测 "SET …; SELECT …" 会被记成一行），PreparedStatement 送不出去。
+            com.migration.traffic.replay.dialect.PreparedPlan plan = dialect.prepare(r.q, r.b);
+            try (PreparedStatement ps = conn.prepareStatement(plan.sql())) {
+                dialect.bind(ps, plan.binds());
+                boolean hasResultSet = ps.execute();
+                return hasResultSet ? drain(ps.getResultSet()) : Math.max(0, ps.getUpdateCount());
+            }
+        }
         try (Statement st = conn.createStatement()) {
             boolean hasResultSet = st.execute(r.q);
             if (!hasResultSet) {
                 return Math.max(0, st.getUpdateCount());
             }
-            long rows = 0;
-            try (ResultSet rs = st.getResultSet()) {
-                while (rs.next()) {
-                    rows++;
-                    if (options.maxFetchRows > 0 && rows >= options.maxFetchRows) break;
-                }
-            }
-            return rows;
+            return drain(st.getResultSet());
         }
+    }
+
+    private long drain(ResultSet rs) throws SQLException {
+        long rows = 0;
+        try (ResultSet r = rs) {
+            while (r.next()) {
+                rows++;
+                if (options.maxFetchRows > 0 && rows >= options.maxFetchRows) break;
+            }
+        }
+        return rows;
     }
 
     /**
@@ -214,71 +236,31 @@ final class SessionRunner {
      * 录制里根本没有对应的切库语句）。这里按记录自带的 db 自愈，且是幂等的。
      */
     private void alignSchema(TrafficRecord r) throws SQLException {
-        if (r.db == null || r.db.isEmpty() || r.db.equals(currentDb)) return;
-        try (Statement st = conn.createStatement()) {
-            st.execute("USE `" + r.db.replace("`", "``") + "`");
-            currentDb = r.db;
-        } catch (SQLException e) {
-            // 目标库可能还没建这个库（录制里的 CREATE DATABASE 稍后才会回放）。
-            // 不能因此让整条会话失败，交给语句自己去报错。
-            logger.debug("[s{}] 切库到 {} 失败: {}", sourceSessionId, r.db, e.getMessage());
-        }
+        // PG 的库由连接决定（连接终生绑定一个库），能切的只有 search_path
+        String wanted = dialect.connectionBoundToDatabase() ? r.sn : r.db;
+        if (wanted == null || wanted.isEmpty() || wanted.equals(currentDb)) return;
+        String applied = dialect.switchSchema(conn, r.db, r.sn);
+        currentDb = applied != null ? wanted : currentDb;
     }
 
     private void trackTransaction(TrafficRecord r) {
-        if (r.k != StatementClass.TCL) return;
-        int s = StatementClassifier.skipLeadingPublic(r.q);
-        String w0 = StatementClassifier.wordAtPublic(r.q, s, 0);
-        if ("BEGIN".equals(w0) || "START".equals(w0)) {
-            inTransaction = true;
-        } else if ("COMMIT".equals(w0) || "ROLLBACK".equals(w0)) {
-            inTransaction = false;
+        switch (dialect.txEffect(r.q, r.k)) {
+            case OPEN: inTransaction = true; break;
+            case CLOSE: inTransaction = false; break;
+            default: break;
         }
     }
 
     private void ensureConnection() throws SQLException {
         if (conn != null && !conn.isClosed()) return;
-        conn = DriverManager.getConnection(jdbcUrl, user, password);
+        conn = dialect.connect(props, database);
         currentDb = null;
         inTransaction = false;
-        applySessionEnvironment();
-    }
-
-    /**
-     * 对齐源库的语义环境。
-     *
-     * <p>同一条 SQL 在 {@code sql_mode}/{@code time_zone} 不同的两个实例上行为就是不一样的
-     * （严格模式下报错的插入，宽松模式下会被截断后写进去）。不对齐的话，回放报告里的
-     * "差异"有一半是环境差异，没法用。
-     */
-    private void applySessionEnvironment() {
-        if (fingerprint == null) return;
-        exec("SET SESSION sql_mode = '" + esc(fingerprint.sqlMode) + "'", fingerprint.sqlMode);
-        if (fingerprint.timeZone != null && !fingerprint.timeZone.isEmpty()
-                && !"SYSTEM".equalsIgnoreCase(fingerprint.timeZone)) {
-            exec("SET SESSION time_zone = '" + esc(fingerprint.timeZone) + "'", fingerprint.timeZone);
-        }
-        if (fingerprint.charset != null && !fingerprint.charset.isEmpty()) {
-            exec("SET NAMES " + fingerprint.charset.replaceAll("[^A-Za-z0-9_]", ""), fingerprint.charset);
-        }
-    }
-
-    private void exec(String sql, String value) {
-        if (value == null || value.isEmpty()) return;
-        try (Statement st = conn.createStatement()) {
-            st.execute(sql);
-        } catch (SQLException e) {
-            logger.warn("[s{}] 会话环境对齐失败（{}）: {}", sourceSessionId, sql, e.getMessage());
-        }
-    }
-
-    private static String esc(String s) {
-        return s == null ? "" : s.replace("\\", "\\\\").replace("'", "''");
+        dialect.onConnect(conn, fingerprint);
     }
 
     private void handleConnectionLoss(SQLException e) {
-        String state = e.getSQLState();
-        if (state != null && (state.startsWith("08") || "HY000".equals(state) && e.getErrorCode() == 2013)) {
+        if (dialect.isConnectionLost(e)) {
             closeConnection();
         }
     }

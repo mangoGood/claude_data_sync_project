@@ -76,8 +76,21 @@ public class GuardedCaptureRunner extends TrafficCaptureRunner {
         existing.source = source.fingerprint();
         applyFilterToManifest(existing);
 
+        // PG 的语句流落在服务端日志文件里，(文件名, 字节偏移) 是<b>真位点</b>：
+        // 只要那个文件还没被轮转清掉，停摆期间的语句还在，能接着读回来，不产生空洞。
+        // MySQL 的 general_log 被读一次就没了、Oracle 的审计记录会被清理，那两家没有这个选项。
+        boolean resumed = false;
+        if (existing.checkpoint != null && existing.checkpoint.file != null) {
+            source.resumeFrom(existing.checkpoint);
+            resumed = source.checkpoint() != null;
+            if (resumed) {
+                logger.info("从位点续读，停摆期间的语句可以补回来: file={}, offset={}",
+                        existing.checkpoint.file, existing.checkpoint.offset);
+            }
+        }
+
         long resumeAtT = nowSourceOffsetMicros();
-        if (resumeAtT > scan.lastT) {
+        if (!resumed && resumeAtT > scan.lastT) {
             existing.gaps.add(new RecordingManifest.Gap(scan.lastT, resumeAtT, "CAPTURE_RESUMED"));
             logger.warn("时间轴空洞: {}us ~ {}us（约 {}s）—— 这段时间源库执行的语句已永久丢失，"
                             + "语句流没有位点可续，只能如实记为空洞",
@@ -105,22 +118,66 @@ public class GuardedCaptureRunner extends TrafficCaptureRunner {
             writer.rollSegment();
         }
         TrafficSourceState state = new TrafficSourceState();
+        state.engine = engine.wireName();
         state.host = props.getProperty("source.db.host", "localhost");
-        state.port = props.getProperty("source.db.port", "3306");
+        state.port = props.getProperty("source.db.port", defaultPort());
         state.username = props.getProperty("source.db.username", "root");
         state.password = props.getProperty("source.db.password", "");
-        state.urlParams = SslMaterial.from(props, "source").mysqlUrlParams();
-        state.generalLog = source.originalGeneralLog();
-        state.logOutput = source.originalLogOutput();
+        state.urlParams = sourceUrlParams();
+        state.database = props.getProperty("source.db.database", "");
+
+        java.util.Map<String, String> restore = source.restoreState();
+
+        // 续录时<b>必须沿用上一次落盘的原值</b>，不能用刚读到的当前值。
+        //
+        // 上一轮如果是被 kill -9 掉的，源端的开关还是我们改过的那副样子（general_log=ON /
+        // log_statement=all / 审计策略还开着）。这一轮再去读"原值"，读到的就是<b>我们自己留下的痕迹</b>——
+        // 于是收尾时忠实地把它"还原"成开着，源端从此再也回不去了，而且全程零报错。
+        // 状态文件才是"我们动手之前它长什么样"的唯一权威。
+        TrafficSourceState prior = TrafficSourceState.load(recordingDir);
+        if (prior != null && state.engine.equalsIgnoreCase(prior.engine) && !prior.attrs.isEmpty()) {
+            logger.warn("发现上一轮遗留的源端状态文件（上次多半是崩溃退出的），"
+                    + "沿用它记录的原值而不是当前值: {}", prior.attrs);
+            restore = prior.attrs;
+        }
+
+        state.attrs.putAll(restore);
+        // MySQL 的两个键有独立的落盘位置（老状态文件的格式），保持兼容
+        state.generalLog = restore.get("general_log");
+        state.logOutput = restore.get("log_output");
         state.save(recordingDir);
-        logger.info("源库原始开关已落盘（兜底还原依据）: general_log={}, log_output={}",
-                state.generalLog, state.logOutput);
+        logger.info("源端原始状态已落盘（兜底还原依据）: engine={}, {}", state.engine, restore);
+        // 引擎自己也要按这份原值还原，否则子进程正常收尾时仍会还原成"当前值"
+        source.overrideRestoreState(restore);
+    }
+
+    /** 兜底还原要用的 JDBC 参数段。Oracle 的 thin URL 没有查询串，信任材料走连接属性。 */
+    private String sourceUrlParams() {
+        SslMaterial ssl = SslMaterial.from(props, "source");
+        switch (engine) {
+            case POSTGRESQL: return ssl.pgUrlParams();
+            case ORACLE: return "";
+            default: return ssl.mysqlUrlParams();
+        }
+    }
+
+    private String defaultPort() {
+        switch (engine) {
+            case POSTGRESQL: return "5432";
+            case ORACLE: return "1521";
+            default: return "3306";
+        }
     }
 
     /** 体量护栏。到顶即停，但这是<b>正常结束</b>。 */
     @Override
     protected boolean onTick() {
         checkBacklog();
+        // 位点每轮更新进 manifest：崩溃后的续读依据就是它，只在封口时写等于白写
+        RecordingManifest.Checkpoint cp = source.checkpoint();
+        if (cp != null) {
+            writer.manifest().checkpoint = cp;
+        }
         long elapsed = System.currentTimeMillis() - startedAtMs;
         if (maxDurationMs > 0 && elapsed >= maxDurationMs) {
             return reachLimit("已达最大录制时长 " + maxDurationMs + "ms");

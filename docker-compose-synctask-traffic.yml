@@ -1,0 +1,29 @@
+# 流量复制与回放的判据环境（PG / Oracle 扩展）。
+#
+# 为什么要单独一套而不是复用 docker-compose-synctask-db.yml 里的 postgres_db：
+#   * 捕获要求源库 logging_collector=on，而它是 **postmaster 参数**——
+#     改它必须重启实例，不能在别人正在跑用例的库上干这事；
+#   * 回放目标必须与录制源是**不同实例**（产品硬拦 E3124），所以要成对起。
+#
+# 启动: docker compose -f docker-compose-synctask-traffic.yml up -d
+services:
+  trf-pg-src:
+    image: docker.1ms.run/postgres:16
+    container_name: trf-pg-src
+    environment:
+      POSTGRES_PASSWORD: trafficpass
+      POSTGRES_DB: trfdb
+    # logging_collector 只能在启动时开。log_destination/log_statement 由捕获任务
+    # 自己用 ALTER SYSTEM 改（并在结束时还原），这里不预设——判据要覆盖那条链路。
+    command: ["postgres", "-c", "logging_collector=on", "-c", "log_filename=postgresql-%Y-%m-%d_%H%M%S.log"]
+    ports:
+      - "55480:5432"
+
+  trf-pg-tgt:
+    image: docker.1ms.run/postgres:16
+    container_name: trf-pg-tgt
+    environment:
+      POSTGRES_PASSWORD: trafficpass
+      POSTGRES_DB: trfdb
+    ports:
+      - "55481:5432"

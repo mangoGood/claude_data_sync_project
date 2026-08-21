@@ -31,6 +31,24 @@ public class TrafficTaskConfig {
     @Column(name = "capture_backend", length = 20)
     private String captureBackend = "GENERAL_LOG";
 
+    /**
+     * 源端/目标端引擎：{@code mysql} / {@code postgresql} / {@code oracle}。
+     *
+     * <p>三种引擎的捕获通道没有一行共用代码，录制格式也自带引擎标记——
+     * 回放向导要靠它把异引擎的录制过滤掉（跨引擎回放是硬拦的，见 E3131）。
+     */
+    @Column(length = 20)
+    private String engine = "mysql";
+
+    /**
+     * 源端被改动的原始状态（JSON），兜底还原的依据。
+     *
+     * <p>MySQL 是两个全局变量、PG 是四个 GUC 的原值与来源、
+     * Oracle 是两条审计策略名与启用范围——形状完全不同，所以不再往表上加列。
+     */
+    @Column(name = "src_state_before", columnDefinition = "TEXT")
+    private String srcStateBefore;
+
     @Column(name = "capture_databases", columnDefinition = "TEXT")
     private String captureDatabases;
 
@@ -127,6 +145,12 @@ public class TrafficTaskConfig {
 
     public String getTaskId() { return taskId; }
     public void setTaskId(String taskId) { this.taskId = taskId; }
+    public String getEngine() { return engine; }
+    public void setEngine(String v) { this.engine = v; }
+
+    public String getSrcStateBefore() { return srcStateBefore; }
+    public void setSrcStateBefore(String v) { this.srcStateBefore = v; }
+
     public String getCaptureBackend() { return captureBackend; }
     public void setCaptureBackend(String v) { this.captureBackend = v; }
     public String getCaptureDatabases() { return captureDatabases; }

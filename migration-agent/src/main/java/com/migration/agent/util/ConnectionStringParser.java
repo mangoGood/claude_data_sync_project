@@ -8,24 +8,30 @@ import java.util.regex.Pattern;
 public class ConnectionStringParser {
     // 口令部分用 * 而非 +：空口令实例（如默认安装的 TiDB root）连接串形如
     // mysql://root:@host:port，用 + 会整体匹配失败并抛 IllegalArgumentException。
-    // 非空口令的匹配结果不受影响（[^@] 仍然贪婪吃到 @ 之前）。
+    //
+    // 口令组是贪婪的 (.*)，不是 [^@]*：口令里出现 @ 完全合法（随机生成的口令里很常见），
+    // 而 [^@]* 会在第一个 @ 就停下，把口令的后半段推到主机位上，整体匹配失败——
+    // 表现是任务派下来就报"Invalid connection string format"，看着像格式错、实为口令。
+    // 主机组同时排除 @ 与 /，于是贪婪回溯的落点必然是**最后一个** @：
+    // 等价于按 URI 惯例切 userinfo。后端 MetadataService.CONNECTION_PATTERN 是同一套口径，
+    // 两边必须一起改，否则会出现"测连通过、任务起不来"。
     private static final Pattern MYSQL_PATTERN =
-        Pattern.compile("mysql://([^:]+):([^@]*)@([^:]+):(\\d+)(?:/(.+))?");
+        Pattern.compile("mysql://([^:]+):(.*)@([^:@/]+):(\\d+)(?:/(.+))?");
     
     private static final Pattern PG_PATTERN = 
-        Pattern.compile("postgresql://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+        Pattern.compile("postgresql://([^:]+):(.*)@([^:@/]+):(\\d+)(?:/(.+))?");
     
     private static final Pattern ORACLE_PATTERN =
-        Pattern.compile("oracle://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+        Pattern.compile("oracle://([^:]+):(.*)@([^:@/]+):(\\d+)(?:/(.+))?");
 
     private static final Pattern MONGO_PATTERN =
-        Pattern.compile("mongodb://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+        Pattern.compile("mongodb://([^:]+):(.*)@([^:@/]+):(\\d+)(?:/(.+))?");
 
     private static final Pattern ELASTIC_PATTERN =
-        Pattern.compile("elastic://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+        Pattern.compile("elastic://([^:]+):(.*)@([^:@/]+):(\\d+)(?:/(.+))?");
 
     private static final Pattern REDIS_PATTERN =
-        Pattern.compile("redis://([^:]+):([^@]+)@([^:]+):(\\d+)(?:/(.+))?");
+        Pattern.compile("redis://([^:]+):(.*)@([^:@/]+):(\\d+)(?:/(.+))?");
     
     private static final Pattern JDBC_MYSQL_PATTERN =
         Pattern.compile("jdbc:mysql://([^:]+):(\\d+)/([^?]+)(?:\\?.*)?");

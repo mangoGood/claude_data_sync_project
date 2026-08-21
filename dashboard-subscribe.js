@@ -385,7 +385,9 @@ const { API_BASE_URL, fetchWithAuth, getAuthHeaders, showNotification, escapeHtm
 
         function subParseConnectionString(connStr) {
             if (!connStr) return;
-            const match = connStr.match(/^(?:mysql|postgresql|oracle|mongodb):\/\/([^:]+):([^@]+)@([^:]+):(\d+)(?:\/(.*))?$/);
+            // 口令组贪婪 (.*) + 主机组排除 @：等价于按最后一个 @ 切 userinfo。
+            // 用 [^@]+ 时口令含 @ 就整条匹配不上，表现是编辑订阅任务后连接信息四个框全空。
+            const match = connStr.match(/^(?:mysql|postgresql|oracle|mongodb):\/\/([^:]+):(.*)@([^:@\/]+):(\d+)(?:\/(.*))?$/);
             if (!match) return;
             document.getElementById('subSourceUsername').value = match[1];
             document.getElementById('subSourcePassword').value = match[2];

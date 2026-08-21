@@ -87,6 +87,9 @@ public class TrafficTaskService {
             throw new RuntimeException("只能修改配置中的任务，当前状态: " + w.getStatus().name());
         }
         TrafficTaskConfig c = getOrCreateConfig(taskId);
+        // 引擎跟随任务本身的库类型：复制看源、回放看目标。
+        // 不让前端单独传，避免"配置里写 pg、任务连的是 mysql"这种自相矛盾的状态
+        c.setEngine(engineOf(w));
 
         applyString(body, "captureBackend", c::setCaptureBackend);
         applyJsonArray(body, "captureDatabases", c::setCaptureDatabases);
@@ -115,6 +118,17 @@ public class TrafficTaskService {
         return configRepository.save(c);
     }
 
+    /** 任务的引擎：复制取源库类型、回放取目标库类型。 */
+    static String engineOf(Workflow w) {
+        String raw = TYPE_REPLAY.equals(w.getTaskType()) ? w.getTargetType() : w.getSourceType();
+        if (raw == null || raw.isBlank()) return "mysql";
+        switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "postgresql": case "postgres": case "pg": return "postgresql";
+            case "oracle": return "oracle";
+            default: return "mysql";
+        }
+    }
+
     private void validate(Workflow w, TrafficTaskConfig c) {
         if (c.getCaptureSampleRate() != null
                 && (c.getCaptureSampleRate().signum() <= 0
@@ -135,6 +149,15 @@ public class TrafficTaskService {
             }
             if (!Boolean.TRUE.equals(rec.getSealed())) {
                 throw new RuntimeException("该录制尚未封口（对应的流量复制任务还在跑或异常终止），不能回放");
+            }
+            // 跨引擎回放硬拦（E3131）：SQL 方言无法自动翻译，
+            // "让它跑跑看"只会在目标库上留下一堆半成功的破坏
+            String recEngine = rec.getEngine() == null || rec.getEngine().isBlank()
+                    ? "mysql" : rec.getEngine();
+            String tgtEngine = engineOf(w);
+            if (!recEngine.equalsIgnoreCase(tgtEngine)) {
+                throw new RuntimeException("该录制来自 " + recEngine + "，而回放目标是 " + tgtEngine
+                        + "。SQL 方言无法自动翻译，跨引擎回放已被拒绝（E3131）");
             }
         }
     }
@@ -269,6 +292,10 @@ public class TrafficTaskService {
         rec.setSessionCount((int) lng(manifest.get("sessions")));
         rec.setGapCount((int) lng(manifest.get("gaps")));
         rec.setSha256(str(manifest.get("sha256")));
+        // manifest 里没有 engine = v1 格式的老录制，那时只有 MySQL
+        String eng = str(manifest.get("engine"));
+        rec.setEngine(eng == null || eng.isBlank() ? "mysql" : eng);
+        rec.setCaptureBackend(str(manifest.get("captureBackend")));
         rec.setSealed(Boolean.TRUE.equals(manifest.get("sealed")));
         rec.setStatsJson(writeJson(manifest.get("stats")));
         rec.setSourceFingerprint(writeJson(manifest.get("source")));
@@ -381,6 +408,8 @@ public class TrafficTaskService {
         m.put("gapCount", r.getGapCount());
         m.put("sha256", r.getSha256());
         m.put("sealed", r.getSealed());
+        m.put("engine", r.getEngine());
+        m.put("captureBackend", r.getCaptureBackend());
         m.put("createdAt", r.getCreatedAt());
         m.put("stats", readJson(r.getStatsJson()));
         m.put("source", readJson(r.getSourceFingerprint()));
