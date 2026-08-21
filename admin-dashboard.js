@@ -452,6 +452,13 @@
             'E3014': { desc: '位点回灌失败', solution: '本地没有位点、又读不到中心库里的位点，无法判断这是首次启动还是跨机接管；按首次启动去取源库当前位点会静默跳过崩溃到接管之间的全部变更，因此任务停在这里。请检查 agent 到元数据库的连通性（agent.properties 的 mysql.db.*）后重启任务' },
             'E3101': { desc: 'Elastic同步进程启动失败', solution: '请检查Agent日志，确认elastic模块JAR包存在且配置正确' },
             'E3102': { desc: 'Elastic同步失败', solution: '请检查Agent日志，确认Elasticsearch连接正常、索引可写且源库binlog可访问' },
+            'E3120': { desc: '源库语句日志开启失败', solution: '流量复制要把源库 general_log 打开、log_output 切到 TABLE 才拿得到语句流（binlog 里没有 SELECT），改这两个全局变量需要 SUPER 或 SYSTEM_VARIABLES_ADMIN，只读副本上也改不了。请补权限或换一个可写实例作为源' },
+            'E3121': { desc: '源库语句日志轮转失败', solution: 'mysql.general_log 只能靠 RENAME 换表轮转（日志表不支持 DELETE），需要 mysql 库上的 CREATE/DROP/ALTER 权限。轮转做不了，这张表会在源库上一直涨到把磁盘写满。请补权限后重启任务' },
+            'E3122': { desc: '捕获追不上源库产生速度', solution: '源库产生语句比捕获消费快，日志表会越堆越大并拖慢源库。请降低 traffic.capture.sample.rate 按会话采样、缩小库/语句类别白名单，或改在低峰期录制' },
+            'E3123': { desc: '录制文件损坏或不可用', solution: '录制缺 manifest、分段对不上或校验和不符。多因捕获被强杀未封口、跨机取文件中断或文件被清理。请重新同步录制元数据；确已损坏只能重录——语句流没有位点可续' },
+            'E3124': { desc: '回放目标就是录制源库', solution: '目标与录制源的 server_uuid 相同。回放会把源库已发生的操作再做一遍：自增翻倍、重复插入、DROP 是真的删。请换独立实例；确需如此时显式打开 traffic.replay.allow.same.instance' },
+            'E3125': { desc: '回放错误率超过阈值', solution: '目标库上失败语句占比超过 traffic.replay.abort.error.rate，已停止以免继续制造破坏。常见原因：目标缺库/表、字符集或 sql_mode 与源库不一致、权限不足。请看回放报告的错误明细' },
+            'E3126': { desc: '源库语句日志未能还原', solution: '任务结束但没能确认把源库 general_log/log_output 改回原值，源库会一直写日志表直到磁盘满。请立刻手工执行 SET GLOBAL general_log=<原值>; SET GLOBAL log_output=<原值>，原值见任务详情' },
             'E4001': { desc: '全量同步失败', solution: '请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常' },
             'E4002': { desc: '全量同步超时', solution: '请检查数据量是否过大，考虑分批同步或优化网络带宽' },
             'E4003': { desc: '目标数据库写入失败', solution: '请检查目标数据库磁盘空间、表结构是否与源库一致、是否有写入权限' },
@@ -5342,7 +5349,7 @@
                 item.classList.toggle('active', item.dataset.page === page);
             });
 
-            ['syncPage', 'validationPage', 'drPage', 'subscribePage', 'metricsPage',
+            ['syncPage', 'validationPage', 'drPage', 'subscribePage', 'trafficPage', 'metricsPage',
              'auditPage', 'automationPage', 'alertPage', 'slowsqlPage',
              'lineagePage', 'classificationPage', 'schemaApprovalPage'].forEach(id => {
                 const el = document.getElementById(id);
@@ -5377,6 +5384,9 @@
             } else if (page === 'subscribe') {
                 document.getElementById('subscribePage').style.display = 'block';
                 fetchSubscribeTasks();
+            } else if (page === 'traffic') {
+                document.getElementById('trafficPage').style.display = 'block';
+                fetchTrafficTasks();
             } else if (page === 'metrics') {
                 document.getElementById('metricsPage').style.display = 'block';
                 loadMetricsTaskList().then(() => {

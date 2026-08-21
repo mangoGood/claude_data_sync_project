@@ -90,6 +90,11 @@ public class AgentHttpServer {
             server.createContext("/api/diagnostics", this::handleDiagnostics);
             server.createContext("/api/agent/deadletter", this::handleDeadletter);
             server.createContext("/api/agent/conflicts", this::handleConflicts);
+            // 流量复制/回放：录制清单、录制打包下载、回放错误明细、回放报告
+            server.createContext("/api/traffic/recordings", this::handleTrafficRecording);
+            server.createContext("/api/traffic/bundle", this::handleTrafficBundle);
+            server.createContext("/api/traffic/replay-errors", this::handleTrafficReplayErrors);
+            server.createContext("/api/traffic/replay-report", this::handleTrafficReplayReport);
 
             server.start();
             logger.info("Agent HTTP Server started on port {}", port);
@@ -304,6 +309,221 @@ public class AgentHttpServer {
      * 死信记录查询：GET /api/agent/deadletter/{taskId}
      * 读取增量进程写入的 files/{taskId}/deadletter.jsonl（人工裁决跳过的事件），按行解析返回。
      */
+    // ==================== 流量复制与回放 ====================
+
+    /** 录制元数据：GET /api/traffic/recordings/{captureTaskId}，返回 manifest 摘要。 */
+    private void handleTrafficRecording(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+        String taskId = trafficTaskIdOf(exchange, 4);
+        if (taskId == null) return;
+        try {
+            java.io.File mf = new java.io.File("./files/" + taskId + "/traffic/manifest.json");
+            if (!mf.isFile()) {
+                sendResponse(exchange, 404, Map.of("success", false,
+                        "message", "该任务没有录制文件（尚未开始录制，或文件已被清理）"));
+                return;
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> manifest = gson.fromJson(new String(
+                    java.nio.file.Files.readAllBytes(mf.toPath()), StandardCharsets.UTF_8), Map.class);
+            Map<String, Object> out = new java.util.HashMap<>();
+            out.put("success", true);
+            out.put("taskId", taskId);
+            out.put("t0Wall", manifest.get("t0Wall"));
+            out.put("endWall", manifest.get("endWall"));
+            out.put("durationMs", numOf(manifest.get("durationMs")));
+            out.put("sealed", Boolean.TRUE.equals(manifest.get("sealed")));
+            out.put("sha256", manifest.get("sha256"));
+            out.put("source", manifest.get("source"));
+            out.put("stats", manifest.get("stats"));
+            Object segs = manifest.get("segments");
+            long records = 0;
+            long bytes = 0;
+            if (segs instanceof java.util.List<?> list) {
+                for (Object o : list) {
+                    if (o instanceof Map<?, ?> m) {
+                        records += numOf(m.get("records"));
+                        bytes += numOf(m.get("bytes"));
+                    }
+                }
+                out.put("segments", list.size());
+            }
+            out.put("records", records);
+            out.put("bytes", bytes);
+            Object gaps = manifest.get("gaps");
+            out.put("gaps", gaps instanceof java.util.List<?> g ? g.size() : 0);
+            out.put("gapDetail", gaps);
+            Object stats = manifest.get("stats");
+            if (stats instanceof Map<?, ?> sm) {
+                out.put("sessions", numOf(sm.get("maxConcurrentSessions")));
+            }
+            sendResponse(exchange, 200, out);
+        } catch (Exception e) {
+            logger.error("Error handling traffic recording request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    /** 录制打包下载：GET /api/traffic/bundle/{captureTaskId} → zip（manifest + 全部分段）。 */
+    private void handleTrafficBundle(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+        String taskId = trafficTaskIdOf(exchange, 4);
+        if (taskId == null) return;
+        try {
+            java.io.File dir = new java.io.File("./files/" + taskId + "/traffic");
+            java.io.File[] files = dir.listFiles(f -> f.isFile()
+                    && (f.getName().equals("manifest.json") || f.getName().endsWith(".trf.gz")));
+            if (files == null || files.length == 0) {
+                sendResponse(exchange, 404, Map.of("success", false, "message", "没有可下载的录制文件"));
+                return;
+            }
+            java.util.Arrays.sort(files, java.util.Comparator.comparing(java.io.File::getName));
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(buf)) {
+                for (java.io.File f : files) {
+                    zos.putNextEntry(new java.util.zip.ZipEntry(f.getName()));
+                    java.nio.file.Files.copy(f.toPath(), zos);
+                    zos.closeEntry();
+                }
+            }
+            byte[] zip = buf.toByteArray();
+            exchange.getResponseHeaders().set("Content-Type", "application/zip");
+            exchange.getResponseHeaders().set("Content-Disposition",
+                    "attachment; filename=\"traffic-" + taskId + ".trfz\"");
+            exchange.sendResponseHeaders(200, zip.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(zip);
+            }
+        } catch (Exception e) {
+            logger.error("Error handling traffic bundle request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    /** 回放错误明细：GET /api/traffic/replay-errors/{taskId}?page=&pageSize= */
+    private void handleTrafficReplayErrors(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+        String taskId = trafficTaskIdOf(exchange, 4);
+        if (taskId == null) return;
+        try {
+            Map<String, String> q = parseQuery(exchange.getRequestURI().getRawQuery());
+            int page = Math.max(1, intOf(q.get("page"), 1));
+            int pageSize = Math.min(500, Math.max(1, intOf(q.get("pageSize"), 50)));
+            java.io.File f = new java.io.File("./files/" + taskId + "/traffic/replay_errors.jsonl");
+            java.util.List<Object> all = new java.util.ArrayList<>();
+            if (f.isFile()) {
+                try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(
+                        new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        if (line.isBlank()) continue;
+                        try {
+                            all.add(gson.fromJson(line, Map.class));
+                        } catch (Exception ex) {
+                            all.add(Map.of("raw", line));
+                        }
+                    }
+                }
+            }
+            int from = Math.min(all.size(), (page - 1) * pageSize);
+            int to = Math.min(all.size(), from + pageSize);
+            sendResponse(exchange, 200, Map.of("success", true, "taskId", taskId,
+                    "total", all.size(), "page", page, "pageSize", pageSize,
+                    "records", all.subList(from, to)));
+        } catch (Exception e) {
+            logger.error("Error handling traffic replay errors request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    /** 回放报告：GET /api/traffic/replay-report/{taskId} */
+    private void handleTrafficReplayReport(HttpExchange exchange) throws IOException {
+        if (handleCorsPreflight(exchange)) return;
+        if (!checkAuthOptional(exchange)) return;
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, Map.of("success", false, "message", "Method not allowed"));
+            return;
+        }
+        String taskId = trafficTaskIdOf(exchange, 4);
+        if (taskId == null) return;
+        try {
+            java.io.File f = new java.io.File("./files/" + taskId + "/traffic/replay_report.properties");
+            if (!f.isFile()) {
+                sendResponse(exchange, 404, Map.of("success", false, "message", "回放报告尚未生成（回放还没结束）"));
+                return;
+            }
+            java.util.Properties p = new java.util.Properties();
+            try (java.io.InputStream in = new java.io.FileInputStream(f)) {
+                p.load(in);
+            }
+            Map<String, Object> out = new java.util.HashMap<>();
+            out.put("success", true);
+            out.put("taskId", taskId);
+            for (String name : p.stringPropertyNames()) {
+                out.put(name, p.getProperty(name));
+            }
+            sendResponse(exchange, 200, out);
+        } catch (Exception e) {
+            logger.error("Error handling traffic replay report request", e);
+            sendResponse(exchange, 500, Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    /** 取出并校验 URL 里的 taskId；不合法时已回响应并返回 null。 */
+    private String trafficTaskIdOf(HttpExchange exchange, int index) throws IOException {
+        String[] parts = exchange.getRequestURI().getPath().split("/");
+        if (parts.length <= index || parts[index].isEmpty()) {
+            sendResponse(exchange, 400, Map.of("success", false, "message", "taskId required"));
+            return null;
+        }
+        String taskId = parts[index];
+        // taskId 来自 URL，拼路径前拦掉路径穿越
+        if (taskId.contains("..") || taskId.contains("/") || taskId.contains("\\")) {
+            sendResponse(exchange, 400, Map.of("success", false, "message", "invalid taskId"));
+            return null;
+        }
+        return taskId;
+    }
+
+    private static long numOf(Object o) {
+        return o instanceof Number n ? n.longValue() : 0L;
+    }
+
+    private static int intOf(String s, int def) {
+        try {
+            return s == null || s.isBlank() ? def : Integer.parseInt(s.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static Map<String, String> parseQuery(String raw) {
+        Map<String, String> out = new java.util.HashMap<>();
+        if (raw == null || raw.isEmpty()) return out;
+        for (String kv : raw.split("&")) {
+            int i = kv.indexOf('=');
+            if (i > 0) {
+                out.put(kv.substring(0, i), java.net.URLDecoder.decode(kv.substring(i + 1), StandardCharsets.UTF_8));
+            }
+        }
+        return out;
+    }
+
     private void handleDeadletter(HttpExchange exchange) throws IOException {
         if (handleCorsPreflight(exchange)) return;
         if (!checkAuthOptional(exchange)) return;

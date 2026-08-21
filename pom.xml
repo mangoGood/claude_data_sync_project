@@ -24,6 +24,7 @@
         <module>migration-mongo</module>
         <module>migration-elastic</module>
         <module>migration-redis</module>
+        <module>migration-traffic</module>
         <module>migration-agent</module>
     </modules>
 

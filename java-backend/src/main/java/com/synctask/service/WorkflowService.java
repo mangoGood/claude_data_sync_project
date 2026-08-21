@@ -65,7 +65,19 @@ public class WorkflowService {
      *   <li>Elasticsearch 只能作为目标，且源必须是 MySQL（binlog 增量捕获），仅实时同步。</li>
      * </ul>
      */
+    /** 流量复制与回放目前只做 MySQL：其它库的语句捕获机制完全不同，不是同一套代码。 */
+    private void validateTrafficTypePairing(String sourceType, String targetType, String taskType) {
+        if (!TrafficTaskService.isTrafficTask(taskType)) {
+            return;
+        }
+        String probe = TrafficTaskService.TYPE_REPLAY.equals(taskType) ? targetType : sourceType;
+        if (probe != null && !"mysql".equalsIgnoreCase(probe)) {
+            throw new RuntimeException("流量复制与回放目前仅支持 MySQL");
+        }
+    }
+
     private void validateMongoTypePairing(String sourceType, String targetType, String taskType) {
+        validateTrafficTypePairing(sourceType, targetType, taskType);
         boolean srcMongo = "mongodb".equalsIgnoreCase(sourceType);
         boolean tgtMongo = "mongodb".equalsIgnoreCase(targetType);
         boolean srcEs = "elasticsearch".equalsIgnoreCase(sourceType);
@@ -138,6 +150,12 @@ public class WorkflowService {
     private AgentClusterService agentClusterService;
 
     @Autowired
+    private TrafficTaskService trafficTaskService;
+
+    @Autowired
+    private TrafficPrecheckService trafficPrecheckService;
+
+    @Autowired
     private CheckpointCentralService checkpointCentralService;
 
     // 用 @Lazy 打断 WorkflowService ↔ DiagnosticService 的构造期循环依赖
@@ -161,7 +179,11 @@ public class WorkflowService {
     private void runPrecheckGate(Workflow workflow, Long userId, boolean force) {
         Map<String, Object> result;
         try {
-            result = diagnosticService.schemaPrecheck(workflow.getId(), userId);
+            // 流量任务不走对象级预检：它没有"同步对象"，schemaPrecheck 的每一项
+            // （表结构差异、主键、字符集…）对它都不适用，跑出来的 FAIL 全是假阳性。
+            result = TrafficTaskService.isTrafficTask(workflow.getTaskType())
+                    ? trafficPrecheckService.precheck(workflow, userId)
+                    : diagnosticService.schemaPrecheck(workflow.getId(), userId);
         } catch (Exception e) {
             logger.warn("启动前预检执行失败（不阻断启动）: {}", e.getMessage());
             precheckResultService.record(workflow, "ERROR", force, "预检执行失败: " + e.getMessage(), null);
@@ -222,6 +244,11 @@ public class WorkflowService {
      * 普通同步默认<b>最终一致</b>（吞吐优先，源事务可被打散合并）。
      */
     public static String defaultConsistencyMode(String taskType) {
+        if (TrafficTaskService.isTrafficTask(taskType)) {
+            // 流量任务不走增量投递管线，一致性语义对它没有意义；
+            // 给 TRANSACTIONAL 只是为了不让页面显示成"最终一致"引起误解
+            return "TRANSACTIONAL";
+        }
         if ("SUBSCRIBE".equals(taskType) || "DR".equals(taskType) || "DR_SHADOW".equals(taskType)) {
             return "TRANSACTIONAL";
         }
@@ -795,13 +822,15 @@ public class WorkflowService {
             throw new RuntimeException("只能启动配置中的任务，当前状态: " + workflow.getStatus().name());
         }
         
-        if (workflow.getSourceConnection() == null || workflow.getSourceConnection().isEmpty()) {
+        // 流量回放任务没有"源库"——它的输入是一个录制文件，源端信息在 manifest 里
+        if (!TrafficTaskService.TYPE_REPLAY.equals(workflow.getTaskType())
+                && (workflow.getSourceConnection() == null || workflow.getSourceConnection().isEmpty())) {
             throw new RuntimeException("请先完成源库连接信息配置");
         }
-        
+
         boolean isSubscribeTask = "SUBSCRIBE".equals(workflow.getTaskType());
         
-        if (!isSubscribeTask) {
+        if (!isSubscribeTask && !TrafficTaskService.isTrafficTask(workflow.getTaskType())) {
             if (workflow.getTargetConnection() == null || workflow.getTargetConnection().isEmpty()) {
                 throw new RuntimeException("请先完成目标库连接信息配置");
             }
@@ -814,8 +843,29 @@ public class WorkflowService {
         }
         
         boolean isDrTask = "DR".equals(workflow.getTaskType());
-        
-        if (!isDrTask && !isSubscribeTask) {
+        boolean isTrafficTask = TrafficTaskService.isTrafficTask(workflow.getTaskType());
+
+        if (isTrafficTask) {
+            // 流量复制只连源库、流量回放只连目标库，各自不需要对端；
+            // 也没有"同步对象"的概念（录的是语句流，不是某几张表）。
+            if (TrafficTaskService.TYPE_CAPTURE.equals(workflow.getTaskType())) {
+                if (workflow.getSourceConnection() == null || workflow.getSourceConnection().isEmpty()) {
+                    throw new RuntimeException("请先完成源库连接信息配置");
+                }
+                workflow.setMigrationMode("trafficCapture");
+            } else {
+                if (workflow.getTargetConnection() == null || workflow.getTargetConnection().isEmpty()) {
+                    throw new RuntimeException("请先完成目标库连接信息配置");
+                }
+                workflow.setMigrationMode("trafficReplay");
+            }
+            if (workflow.getSyncObjects() == null || workflow.getSyncObjects().isEmpty()) {
+                workflow.setSyncObjects("{\"_all\":true}");
+            }
+            trafficTaskService.assertLaunchable(workflow);
+        }
+
+        if (!isDrTask && !isSubscribeTask && !isTrafficTask) {
             if (workflow.getSyncObjects() == null || workflow.getSyncObjects().isEmpty()) {
                 throw new RuntimeException("请先选择同步对象");
             }

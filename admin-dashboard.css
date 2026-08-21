@@ -2289,3 +2289,44 @@
             color: #999;
             margin-top: 6px;
         }
+
+/* ===================== 流量复制与回放 ===================== */
+.traffic-input {
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid #d9d9d9;
+    border-radius: 4px;
+    font-size: 13px;
+    box-sizing: border-box;
+}
+
+.traffic-type-card:hover {
+    border-color: #1890ff;
+}
+
+.traffic-type-card.selected {
+    border-color: #1890ff;
+    background: #f0f8ff;
+}
+
+/* 复制中 / 回放中：与"增量同步中"同一套呼吸点，一眼看出是运行态 */
+.status-traffic-capturing {
+    color: #722ed1;
+    background: #f9f0ff;
+}
+
+.status-traffic-replaying {
+    color: #13c2c2;
+    background: #e6fffb;
+}
+
+/* 时间轴空洞：捕获停摆期间源库的语句永久丢失，列表里要显眼 */
+.traffic-gap-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: #fff7e6;
+    border: 1px solid #ffd591;
+    color: #ad6800;
+    font-size: 11px;
+}

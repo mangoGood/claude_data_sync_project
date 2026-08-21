@@ -67,6 +67,9 @@ public class TaskMessage implements Serializable {
     private String targetSslMode;
     private String targetSslCertId;
 
+    /** 流量复制/回放的专属配置（JSON），由 ConfigService 展开成 traffic.* 属性。 */
+    private String trafficConfig;
+
     public String getTargetAgentId() {
         return targetAgentId;
     }
@@ -392,4 +395,12 @@ public class TaskMessage implements Serializable {
     public void setTargetSslMode(String targetSslMode) { this.targetSslMode = targetSslMode; }
     public String getTargetSslCertId() { return targetSslCertId; }
     public void setTargetSslCertId(String targetSslCertId) { this.targetSslCertId = targetSslCertId; }
+
+    public String getTrafficConfig() {
+        return trafficConfig;
+    }
+
+    public void setTrafficConfig(String trafficConfig) {
+        this.trafficConfig = trafficConfig;
+    }
 }

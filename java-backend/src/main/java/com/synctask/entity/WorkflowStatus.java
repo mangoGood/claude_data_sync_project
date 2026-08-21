@@ -9,6 +9,8 @@ public enum WorkflowStatus {
     FULL_COMPLETED,     // 全量同步完成
     INCREMENT_RUNNING,  // 增量同步中
     SUBSCRIBE_RUNNING,  // 数据订阅中
+    TRAFFIC_CAPTURING,  // 流量复制中
+    TRAFFIC_REPLAYING,  // 流量回放中
     SWITCHING,          // 主备倒换中
     // 子进程短期重试已耗尽、agent 正在长期重连（目标库维护窗口等可自愈场景）。
     // 与 FAILED 的区别：RECONNECTING 不是终态，重连成功会自己回到 *_RUNNING，无需人工介入。
@@ -41,9 +43,11 @@ public enum WorkflowStatus {
             case STARTING:           return 30;
             case FULL_MIGRATING:     return 40;
             case FULL_COMPLETED:     return 50;
-            // 增量与订阅是两条并列的"运行态"，同阶段：一个任务不会两者兼有
+            // 增量 / 订阅 / 流量复制 / 流量回放 是并列的"运行态"，同阶段：一个任务只会是其中之一
             case INCREMENT_RUNNING:
-            case SUBSCRIBE_RUNNING:  return 60;
+            case SUBSCRIBE_RUNNING:
+            case TRAFFIC_CAPTURING:
+            case TRAFFIC_REPLAYING:  return 60;
             case COMPLETED:          return 100;
             default:                 return PHASE_CONTROL;
         }

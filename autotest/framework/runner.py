@@ -24,7 +24,8 @@ PROFILES = {
     "quick": ["sync_mysql2mysql", "dr_mysql_uni", "subscribe_mysql"],
     # 主干：跑得起量又不占太久，实测 ≈5 分钟
     "standard": ["sync_mysql2mysql", "sync_mysql2pg", "sync_pg2pg", "sync_pg2mysql",
-                 "sync_mongo2mongo", "dr_mysql_uni", "dr_mysql_bidi", "subscribe_mysql"],
+                 "sync_mongo2mongo", "dr_mysql_uni", "dr_mysql_bidi", "subscribe_mysql",
+                 "traffic_timeline"],
     # 默认：所有已有链路的端到端覆盖，实测 ≈13 分钟（默认预算 30 分钟，留足余量）
     "full": None,   # None = 全部已注册 suite
 }
@@ -64,7 +65,7 @@ def select(profile, patterns, groups):
                 raise SystemExit("用例集 %s 引用了不存在的用例: %s" % (profile, missing))
             chosen = list(want)
 
-    order = {"sync": 0, "dr": 1, "subscribe": 2, "feature": 3}
+    order = {"sync": 0, "dr": 1, "subscribe": 2, "traffic": 3, "feature": 4}
     chosen.sort(key=lambda k: (order.get(SUITES[k].group, 9), k))
     return [SUITES[k] for k in chosen]
 

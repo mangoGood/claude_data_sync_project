@@ -220,7 +220,15 @@ public class TaskMessageHandler {
     private boolean isSingleProcessEngine(TaskMessage taskMessage) {
         return "mongodb".equalsIgnoreCase(taskMessage.getSourceType())
                 || "elasticsearch".equalsIgnoreCase(taskMessage.getTargetType())
-                || "redis".equalsIgnoreCase(taskMessage.getSourceType());
+                || "redis".equalsIgnoreCase(taskMessage.getSourceType())
+                // 流量复制/回放同样是单进程引擎：落到 legacy MigrationTaskManager 会去跑
+                // SQL 全量迁移，对它们毫无意义且不产出任何东西
+                || isTrafficTask(taskMessage);
+    }
+
+    private static boolean isTrafficTask(TaskMessage taskMessage) {
+        String t = taskMessage.getTaskType();
+        return "TRAFFIC_CAPTURE".equals(t) || "TRAFFIC_REPLAY".equals(t);
     }
 
     private void processTask(TaskMessage taskMessage, String taskId, String migrationMode) {

@@ -19,6 +19,29 @@ import java.util.concurrent.CompletableFuture;
 @Service
 public class KafkaProducerService {
 
+    /**
+     * 流量任务的专属配置。用 {@code @Lazy} 打断循环依赖：
+     * WorkflowService → KafkaProducerService → TrafficTaskService → （仓储）→ 无环，
+     * 但 TrafficTaskService 也会被 WorkflowService 注入，Spring 的构造顺序上仍可能成环。
+     */
+    @org.springframework.context.annotation.Lazy
+    @Autowired(required = false)
+    private TrafficTaskService trafficTaskService;
+
+    /** 把流量任务的侧表配置序列化进派发消息。非流量任务返回 null。 */
+    private String trafficConfigJson(Workflow workflow) {
+        if (trafficTaskService == null || !TrafficTaskService.isTrafficTask(workflow.getTaskType())) {
+            return null;
+        }
+        try {
+            return trafficTaskService.toDispatchJson(workflow.getId());
+        } catch (Exception e) {
+            logger.warn("流量任务配置序列化失败，将按默认档位下发: {}", e.getMessage());
+            return null;
+        }
+    }
+
+
     private static final Logger logger = LoggerFactory.getLogger(KafkaProducerService.class);
     private static final Gson gson = new Gson();
 
@@ -72,6 +95,7 @@ public class KafkaProducerService {
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());
         message.setKafkaTopicStrategy(workflow.getKafkaTopicStrategy());
         message.setSubscribeFormat(workflow.getSubscribeFormat());
+        message.setTrafficConfig(trafficConfigJson(workflow));
         message.setSyncAccount(workflow.getSyncAccount());
         message.setSyncAccountSuperPrivilege(workflow.getSyncAccountSuperPrivilege());
         // 集群化：任务已指派给某台 agent 时随消息下发，其它 agent 见到不是自己就放行
@@ -140,6 +164,7 @@ public class KafkaProducerService {
         message.setKafkaTopicPrefix(workflow.getKafkaTopicPrefix());
         message.setKafkaTopicStrategy(workflow.getKafkaTopicStrategy());
         message.setSubscribeFormat(workflow.getSubscribeFormat());
+        message.setTrafficConfig(trafficConfigJson(workflow));
         message.setSyncAccount(workflow.getSyncAccount());
         message.setSyncAccountSuperPrivilege(workflow.getSyncAccountSuperPrivilege());
         // 集群化：任务已指派给某台 agent 时随消息下发，其它 agent 见到不是自己就放行

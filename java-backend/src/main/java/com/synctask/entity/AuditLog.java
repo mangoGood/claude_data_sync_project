@@ -115,7 +115,16 @@ public class AuditLog {
         /** 批准 Schema 变更——批准即应用到目标库，必须留痕 */
         APPROVE_SCHEMA_CHANGE,
         /** 驳回 Schema 变更 */
-        REJECT_SCHEMA_CHANGE
+        REJECT_SCHEMA_CHANGE,
+
+        // ---- V22 流量复制与回放 ----
+        /**
+         * 下载流量录制文件。
+         *
+         * <p>录制里是源库上跑过的<b>明文 SQL</b>，也就必然含业务数据
+         * （{@code INSERT ... VALUES ('张三','13800138000')}），下载等同于导出数据，必须留痕。
+         */
+        DOWNLOAD_TRAFFIC_RECORDING
     }
 
     /** 操作结果枚举 */

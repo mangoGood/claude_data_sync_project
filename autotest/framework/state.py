@@ -15,7 +15,8 @@ import time
 from . import config as C
 
 SPECS = {
-    "MYSQL": C.MYSQL, "PG": C.PG, "MONGO_A": C.MONGO_A, "MONGO_B": C.MONGO_B,
+    "MYSQL": C.MYSQL, "MYSQL_B": C.MYSQL_B, "PG": C.PG,
+    "MONGO_A": C.MONGO_A, "MONGO_B": C.MONGO_B,
     "REDIS_A": C.REDIS_A, "REDIS_B": C.REDIS_B, "ES": C.ES, "TIDB": C.TIDB,
     "ORACLE": C.ORACLE, "DR_MYSQL_A": C.DR_MYSQL_A, "DR_MYSQL_B": C.DR_MYSQL_B,
     "DR_PG_A": C.DR_PG_A, "DR_PG_B": C.DR_PG_B,

@@ -35,6 +35,7 @@ pkill -f 'migration-redis/target/migration-redis-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-subscribe/target/migration-subscribe-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-mongo/target/migration-mongo-1.0.0.jar' 2>/dev/null || true
 pkill -f 'migration-elastic/target/migration-elastic-1.0.0.jar' 2>/dev/null || true
+pkill -f 'migration-traffic/target/migration-traffic-1.0.0.jar' 2>/dev/null || true
 if [ -f "$LOG_DIR/agent.pid" ]; then kill "$(cat "$LOG_DIR/agent.pid")" 2>/dev/null || true; fi
 
 echo "[stop] 停止 Docker 基础设施 (mysql / kafka / zookeeper)，不删除容器..."

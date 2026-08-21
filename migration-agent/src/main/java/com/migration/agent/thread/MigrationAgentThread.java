@@ -63,6 +63,13 @@ public class MigrationAgentThread implements Runnable {
         logger.info("[{}] 创建任务执行器, taskType={}, skipFullMigration={}",
                 taskMessage.getTaskId(), taskType, skipFullMigration);
 
+        // 流量复制/回放：各自一个独立子进程，不走 capture/extract/increment 的 SQL 管线
+        if ("TRAFFIC_CAPTURE".equals(taskType)) {
+            return new TrafficCaptureTask(taskMessage, kafkaProducer, taskStateService, config);
+        }
+        if ("TRAFFIC_REPLAY".equals(taskType)) {
+            return new TrafficReplayTask(taskMessage, kafkaProducer, taskStateService, config);
+        }
         if ("SUBSCRIBE".equals(taskType)) {
             // MongoDB 源没有可落成 THL 的物理日志，订阅出口就是 Change Streams：走单进程
             // MongoSubscribeTask，而不是 capture/extract/subscribe 三进程的 SQL 管线。

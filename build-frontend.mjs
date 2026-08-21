@@ -56,6 +56,7 @@ const ENTRIES = [
   { file: 'dashboard-advanced.js', kind: 'module' },
   { file: 'dashboard-subscribe.js', kind: 'module' },
   { file: 'dashboard-dr.js', kind: 'module' },
+  { file: 'dashboard-traffic.js', kind: 'module' },
 ];
 
 const args = process.argv.slice(2);

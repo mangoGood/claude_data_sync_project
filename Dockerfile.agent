@@ -1,8 +1,11 @@
 # ============================================================
 # 执行面（migration-agent + 各 migration-* 子进程）
 #
-# agent 会 fork 出 capture / extract / increment / full 等子进程，
-# 它们跑的是同一个 fat jar，因此镜像里只需要 migration-agent 那一个产物。
+# agent 会 fork 出 capture / extract / increment / full 等子进程。它们**不是**跑
+# agent 的 fat jar，而是各自独立的 jar：AgentConfig 里的 jar.*.path 形如
+# migration-capture/target/migration-capture-1.0.0.jar（相对 user.dir，即 /app），
+# ProcessManager.start() 起进程前还会先 File.exists() 校验。所以运行镜像里必须按
+# 同样的目录结构带上每个引擎的 jar，少一个，那类任务一派下来就是 Jar file not found。
 #
 # 构建: docker build -f Dockerfile.agent -t synctask/agent:1.0.0 .
 # ============================================================
@@ -21,6 +24,7 @@ COPY migration-subscribe/pom.xml  migration-subscribe/pom.xml
 COPY migration-mongo/pom.xml      migration-mongo/pom.xml
 COPY migration-elastic/pom.xml    migration-elastic/pom.xml
 COPY migration-redis/pom.xml      migration-redis/pom.xml
+COPY migration-traffic/pom.xml    migration-traffic/pom.xml
 COPY migration-agent/pom.xml      migration-agent/pom.xml
 RUN mvn -q -B dependency:go-offline || true
 
@@ -34,10 +38,21 @@ COPY migration-subscribe  migration-subscribe
 COPY migration-mongo      migration-mongo
 COPY migration-elastic    migration-elastic
 COPY migration-redis      migration-redis
+COPY migration-traffic    migration-traffic
 COPY migration-agent      migration-agent
 # clean package 而不是 package：改了 migration-common 之后 fat jar 必须重打，
 # 否则 shade 进去的还是旧类（本仓库踩过这个坑）
 RUN mvn -q -B clean package -Dmaven.test.skip=true
+
+# 归拢到 /out，保持 migration-<x>/target/ 的相对结构不变（这正是 jar.*.path 期待的形状）。
+# 用通配符而不是逐个列举：新增模块时这里不需要改，否则又是一处会悄悄漂移的手工清单
+# ——本仓库刚因为 COPY 列表漏登记 migration-traffic 而挂过一次 CI。
+# shade 留下的 original-*.jar 不匹配该通配（它以 original- 开头），不会被带进镜像。
+RUN mkdir -p /out && \
+    for jar in /src/migration-*/target/migration-*-1.0.0.jar; do \
+      mod=$(basename "$(dirname "$(dirname "$jar")")"); \
+      mkdir -p "/out/$mod/target" && cp "$jar" "/out/$mod/target/"; \
+    done
 
 FROM eclipse-temurin:21-jre
 WORKDIR /app
@@ -49,6 +64,10 @@ RUN groupadd -r synctask && useradd -r -g synctask -d /app synctask \
 
 COPY --from=build --chown=synctask:synctask \
      /src/migration-agent/target/migration-agent-1.0.0.jar /app/agent.jar
+
+# 子进程引擎 jar（full / capture / extract / increment / subscribe / mongo /
+# elastic / redis / traffic）。落到 /app/migration-<x>/target/ 下，与 jar.*.path 对齐。
+COPY --from=build --chown=synctask:synctask /out/ /app/
 
 USER synctask
 EXPOSE 8083

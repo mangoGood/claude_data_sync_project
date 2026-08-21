@@ -29,6 +29,7 @@
                     <div class="menu-item active" data-page="sync" onclick="switchPage('sync')">实时同步管理</div>
                     <div class="menu-item" data-page="dr" onclick="switchPage('dr')">灾备任务管理</div>
                     <div class="menu-item" data-page="subscribe" onclick="switchPage('subscribe')">数据订阅管理</div>
+                    <div class="menu-item" data-page="traffic" onclick="switchPage('traffic')">流量复制与回放</div>
                 </div>
 
                 <div class="menu-section">
@@ -381,6 +382,105 @@
                                 <button class="page-btn" id="subscribePrevPageBtn" onclick="subscribeGoToPage(subscribeCurrentPage - 1)">‹</button>
                                 <div id="subscribePageNumbers"></div>
                                 <button class="page-btn" id="subscribeNextPageBtn" onclick="subscribeGoToPage(subscribeCurrentPage + 1)">›</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 流量复制与回放页面 -->
+            <div id="trafficPage" style="display: none;">
+                <header class="header">
+                    <div class="header-left">
+                        <h1 class="header-title">流量复制与回放</h1>
+                    </div>
+                    <div class="header-right">
+                        <div class="user-info" style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #666;">
+                            <span class="username-display" onclick="openAccountSettings()" style="cursor: pointer; color: #1890ff;" title="账号设置"></span>
+                            <button class="btn-logout" onclick="logout()" style="padding: 4px 12px; background: #f5f5f5; border: 1px solid #d9d9d9; border-radius: 4px; cursor: pointer; font-size: 12px;">退出</button>
+                        </div>
+                        <button class="btn-default" id="trafficRecordingsBtn" style="margin-right: 8px;">录制文件</button>
+                        <button class="btn-primary" id="createTrafficTaskBtn">创建流量任务</button>
+                    </div>
+                </header>
+
+                <div class="content">
+                    <!-- 源库开关未还原告警：本功能最大的运维风险，必须显式露出来 -->
+                    <div id="trafficRestoreAlert" style="display:none; margin-bottom:12px; padding:10px 14px; border:1px solid #ffa39e; background:#fff1f0; border-radius:4px; font-size:13px; color:#a8071a;"></div>
+
+                    <div class="toolbar">
+                        <div class="toolbar-row">
+                            <div class="search-box-wrapper">
+                                <div class="search-box" id="trafficSearchBox">
+                                    <span class="search-icon">🔍</span>
+                                    <input type="text" class="search-input" id="trafficSearchInput" placeholder="任务名称/ID（回车或点刷新查询）">
+                                </div>
+                                <div class="filter-dropdown" id="trafficFilterDropdown">
+                                    <div class="filter-option" data-filter="status">
+                                        <span class="filter-icon">📊</span>
+                                        <span>状态</span>
+                                    </div>
+                                    <div class="filter-option" data-filter="taskType">
+                                        <span class="filter-icon">🎬</span>
+                                        <span>任务类型</span>
+                                    </div>
+                                </div>
+                                <div class="status-dropdown" id="trafficStatusDropdown">
+                                    <div class="status-option" data-status="CONFIGURING">配置中</div>
+                                    <div class="status-option" data-status="PENDING">启动中</div>
+                                    <div class="status-option" data-status="TRAFFIC_CAPTURING">复制中</div>
+                                    <div class="status-option" data-status="TRAFFIC_REPLAYING">回放中</div>
+                                    <div class="status-option" data-status="PAUSED">已暂停</div>
+                                    <div class="status-option" data-status="FAILED">异常</div>
+                                    <div class="status-option" data-status="COMPLETED">已完成</div>
+                                </div>
+                                <div class="status-dropdown" id="trafficTaskTypeDropdown">
+                                    <div class="status-option type-option" data-task-type="TRAFFIC_CAPTURE">流量复制</div>
+                                    <div class="status-option type-option" data-task-type="TRAFFIC_REPLAY">流量回放</div>
+                                </div>
+                            </div>
+                            <div class="toolbar-actions">
+                                <button class="icon-btn" id="trafficRefreshBtn" title="刷新" onclick="trafficApplyKeywordAndRefresh()">↻</button>
+                            </div>
+                        </div>
+                        <div class="toolbar-row filter-tags-row">
+                            <div class="filter-tags" id="trafficFilterTags"></div>
+                        </div>
+                    </div>
+
+                    <div class="table-container">
+                        <div class="table-header">
+                            <div class="table-header-cell col-name">名称/ID</div>
+                            <div class="table-header-cell col-status">状态</div>
+                            <div class="table-header-cell col-source">类型</div>
+                            <div class="table-header-cell col-kafka">库</div>
+                            <div class="table-header-cell col-topic">进度</div>
+                            <div class="table-header-cell col-delay">时间轴偏差</div>
+                            <div class="table-header-cell col-action">操作</div>
+                        </div>
+                        <div class="table-body" id="trafficTableBody">
+                            <div class="empty-state" id="trafficEmptyState">
+                                <div class="empty-icon">
+                                    <svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                        <rect x="14" y="22" width="52" height="36" rx="3" stroke="#d9d9d9" stroke-width="2" fill="none"/>
+                                        <circle cx="30" cy="40" r="6" stroke="#d9d9d9" stroke-width="2" fill="none"/>
+                                        <path d="M44 34 L58 40 L44 46 Z" stroke="#d9d9d9" stroke-width="2" fill="none"/>
+                                    </svg>
+                                </div>
+                                <div class="empty-text">暂无流量任务</div>
+                            </div>
+                        </div>
+                        <div class="pagination">
+                            <div class="pagination-info" id="trafficPaginationInfo">总条数：0</div>
+                            <div class="pagination-controls" id="trafficPaginationControls">
+                                <select class="page-size" id="trafficPageSizeSelect">
+                                    <option value="10" selected>10条/页</option>
+                                    <option value="20">20条/页</option>
+                                    <option value="50">50条/页</option>
+                                </select>
+                                <button class="page-btn" id="trafficPrevPageBtn" onclick="trafficGoToPage(trafficCurrentPage - 1)">‹</button>
+                                <div id="trafficPageNumbers"></div>
+                                <button class="page-btn" id="trafficNextPageBtn" onclick="trafficGoToPage(trafficCurrentPage + 1)">›</button>
                             </div>
                         </div>
                     </div>
@@ -1701,6 +1801,167 @@
         </div>
     </div>
 
+    <!-- ===================== 流量复制与回放 ===================== -->
+
+    <!-- 步骤 1：任务名称 + 任务类型 -->
+    <div class="modal" id="trafficCreateModal">
+        <div class="modal-content" style="width: 560px;">
+            <div class="modal-header">
+                <h3 class="modal-title">创建流量任务</h3>
+                <button class="modal-close" id="trafficCreateClose">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">任务名称</label>
+                    <input type="text" id="trafficTaskName" placeholder="请输入任务名称" style="width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; box-sizing: border-box;">
+                </div>
+                <div class="form-group" style="margin-top: 16px;">
+                    <label class="form-label">任务类型</label>
+                    <div style="display: flex; gap: 12px; margin-top: 8px;">
+                        <div class="traffic-type-card selected" data-traffic-type="TRAFFIC_CAPTURE" style="flex:1; border:2px solid #1890ff; border-radius:6px; padding:12px; cursor:pointer;">
+                            <div style="font-weight:600; font-size:14px;">🎬 流量复制</div>
+                            <div style="font-size:12px; color:#888; margin-top:6px;">记录源库从此刻起的所有操作（查询/DML/DDL/DCL）及其发生时刻，产出一个可下载的录制文件</div>
+                        </div>
+                        <div class="traffic-type-card" data-traffic-type="TRAFFIC_REPLAY" style="flex:1; border:2px solid #e8e8e8; border-radius:6px; padding:12px; cursor:pointer;">
+                            <div style="font-weight:600; font-size:14px;">▶️ 流量回放</div>
+                            <div style="font-size:12px; color:#888; margin-top:6px;">把一份录制按<b>原顺序与原时间间隔</b>在目标库重放一遍</div>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top: 12px; font-size: 12px; color: #999;">目前仅支持 MySQL。</div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" id="trafficCreateCancel">取消</button>
+                <button class="btn-confirm" id="trafficCreateConfirm">下一步</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 步骤 2：配置 -->
+    <div class="modal" id="trafficConfigModal">
+        <div class="modal-content" style="width: 760px;">
+            <div class="modal-header">
+                <h3 class="modal-title" id="trafficConfigTitle">流量任务配置</h3>
+                <button class="modal-close" id="trafficConfigClose">×</button>
+            </div>
+            <div class="modal-body" style="max-height: 62vh; overflow-y: auto;">
+
+                <!-- 复制：源库 -->
+                <div id="trafficCaptureSection">
+                    <div style="font-weight:600; margin-bottom:10px;">源库连接</div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                        <div class="form-group"><label class="form-label">地址</label><input type="text" id="trafficSrcHost" placeholder="127.0.0.1" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">端口</label><input type="text" id="trafficSrcPort" placeholder="3306" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">用户名</label><input type="text" id="trafficSrcUser" placeholder="root" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">口令</label><input type="password" id="trafficSrcPass" class="traffic-input"></div>
+                    </div>
+
+                    <div style="font-weight:600; margin:18px 0 10px;">捕获范围</div>
+                    <div class="form-group"><label class="form-label">库白名单（逗号分隔，留空=全部）</label><input type="text" id="trafficCaptureDbs" placeholder="order_db,user_db" class="traffic-input"></div>
+                    <div class="form-group" style="margin-top:12px;">
+                        <label class="form-label">语句类别</label>
+                        <div style="display:flex; gap:16px; margin-top:6px; font-size:13px;">
+                            <label><input type="checkbox" class="traffic-cap-class" value="SELECT" checked> 查询</label>
+                            <label><input type="checkbox" class="traffic-cap-class" value="DML" checked> DML</label>
+                            <label><input type="checkbox" class="traffic-cap-class" value="DDL" checked> DDL</label>
+                            <label><input type="checkbox" class="traffic-cap-class" value="DCL"> DCL</label>
+                        </div>
+                        <div style="font-size:12px; color:#999; margin-top:6px;">SET / USE / 事务控制属于会话状态，无论怎么选都会录 —— 少了它们录制就不可回放。</div>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-top:12px;">
+                        <div class="form-group"><label class="form-label">最长录制（分钟）</label><input type="text" id="trafficMaxMinutes" value="120" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">最大体积（GB）</label><input type="text" id="trafficMaxGb" value="20" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">会话采样率</label><input type="text" id="trafficSampleRate" value="1.0" class="traffic-input"></div>
+                    </div>
+                    <div style="margin-top:14px; padding:10px 12px; background:#fffbe6; border:1px solid #ffe58f; border-radius:4px; font-size:12px; color:#874d00;">
+                        <b>会改动源库参数。</b>捕获期间会把源库的 <code>general_log</code> 打开并把 <code>log_output</code> 切到 TABLE，
+                        任务结束时自动还原。高 QPS 的库上这会带来可观的写开销，请确认后再启动。
+                    </div>
+                </div>
+
+                <!-- 回放：录制 + 目标库 -->
+                <div id="trafficReplaySection" style="display:none;">
+                    <div style="font-weight:600; margin-bottom:10px;">选择录制文件</div>
+                    <select id="trafficRecordingSelect" class="traffic-input" style="width:100%;"></select>
+                    <div id="trafficRecordingInfo" style="margin-top:8px; font-size:12px; color:#888;"></div>
+
+                    <div style="font-weight:600; margin:18px 0 10px;">目标库连接</div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                        <div class="form-group"><label class="form-label">地址</label><input type="text" id="trafficTgtHost" placeholder="127.0.0.1" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">端口</label><input type="text" id="trafficTgtPort" placeholder="3306" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">用户名</label><input type="text" id="trafficTgtUser" placeholder="root" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">口令</label><input type="password" id="trafficTgtPass" class="traffic-input"></div>
+                    </div>
+
+                    <div style="font-weight:600; margin:18px 0 10px;">回放选项</div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                        <div class="form-group"><label class="form-label">倍速</label><input type="text" id="trafficReplaySpeed" value="1.0" class="traffic-input"></div>
+                        <div class="form-group"><label class="form-label">并发会话上限</label><input type="text" id="trafficMaxSessions" value="200" class="traffic-input"></div>
+                        <div class="form-group">
+                            <label class="form-label">落后处置</label>
+                            <select id="trafficLagPolicy" class="traffic-input">
+                                <option value="WAIT">WAIT — 保序等待，绝不丢语句（默认）</option>
+                                <option value="SKIP">SKIP — 丢弃过期太久的语句，维持压力形状</option>
+                                <option value="STRETCH">STRETCH — 拉长时间轴，只保顺序</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">时间轴空洞</label>
+                            <select id="trafficGapPolicy" class="traffic-input">
+                                <option value="PRESERVE">PRESERVE — 按原时长等待（默认）</option>
+                                <option value="COMPRESS">COMPRESS — 压成 0，尽快跑完</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group" style="margin-top:12px;">
+                        <label class="form-label">回放语句类别</label>
+                        <div style="display:flex; gap:16px; margin-top:6px; font-size:13px;">
+                            <label><input type="checkbox" class="traffic-rep-class" value="SELECT" checked> 查询</label>
+                            <label><input type="checkbox" class="traffic-rep-class" value="DML" checked> DML</label>
+                            <label><input type="checkbox" class="traffic-rep-class" value="DDL"> DDL</label>
+                            <label><input type="checkbox" id="trafficAllowDcl"> DCL（危险）</label>
+                        </div>
+                    </div>
+                    <div style="margin-top:14px; padding:10px 12px; background:#fff1f0; border:1px solid #ffa39e; border-radius:4px; font-size:12px; color:#a8071a;">
+                        <b>回放会真的写目标库。</b>DROP DATABASE / SET GLOBAL / SHUTDOWN 等破坏性语句默认被拦下；
+                        目标库若与录制源是<b>同一个实例</b>，启动会被直接拒绝——那等于把源库上发生过的操作再做一遍。
+                        <label style="display:block; margin-top:8px;"><input type="checkbox" id="trafficAllowDangerous"> 我明白风险，放行破坏性语句</label>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" id="trafficConfigCancel">取消</button>
+                <button class="btn-confirm" id="trafficConfigSave">保存并启动</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 录制文件列表 -->
+    <div class="modal" id="trafficRecordingsModal">
+        <div class="modal-content" style="width: 900px;">
+            <div class="modal-header">
+                <h3 class="modal-title">录制文件</h3>
+                <button class="modal-close" id="trafficRecordingsClose">×</button>
+            </div>
+            <div class="modal-body" style="max-height: 66vh; overflow-y: auto;">
+                <div id="trafficRecordingsList"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 回放报告 -->
+    <div class="modal" id="trafficReportModal">
+        <div class="modal-content" style="width: 900px;">
+            <div class="modal-header">
+                <h3 class="modal-title" id="trafficReportTitle">回放报告</h3>
+                <button class="modal-close" id="trafficReportClose">×</button>
+            </div>
+            <div class="modal-body" style="max-height: 66vh; overflow-y: auto;">
+                <div id="trafficReportBody"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- 创建灾备任务模态框 - 步骤1 -->
     <div class="modal" id="createDrTaskModal">
         <div class="modal-content" style="width: 500px;">
@@ -2042,5 +2303,6 @@
     <script type="module" src="dashboard-advanced.js"></script>
     <script type="module" src="dashboard-subscribe.js"></script>
     <script type="module" src="dashboard-dr.js"></script>
+    <script type="module" src="dashboard-traffic.js"></script>
 </body>
 </html>

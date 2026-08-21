@@ -84,6 +84,16 @@ public abstract class AbstractTaskExecutor implements Runnable {
     /** 子类返回运行中状态名，如 INCREMENT_RUNNING / SUBSCRIBE_RUNNING */
     protected abstract String getRunningStatus();
 
+    /**
+     * 本任务是否走位点（checkpoint）体系。
+     *
+     * <p>默认 true。流量复制/回放返回 false：它们的输入是语句流与录制文件，
+     * 没有可续的物理日志位点，位点回灌对它们只会带来副作用。
+     */
+    protected boolean usesCheckpoint() {
+        return true;
+    }
+
     /** 子类实现具体执行流程 */
     protected abstract void doRun() throws Exception;
 
@@ -110,11 +120,16 @@ public abstract class AbstractTaskExecutor implements Runnable {
             // Mongo/ES/Redis 这些单进程链路根本不走 initCheckpoint()，
             // 只在那里挂钩会让它们在跨机接管时悄悄从"源库当前位点"重来。
             // 放在 try 内是为了让 finally 照常收尾（MDC 不清会串到线程池里的下一个任务）。
-            if (!hydrateCheckpoint(threadName)) {
-                stopped.set(true);
-                return;
+            // 流量复制/回放没有"位点"这个概念：录的是语句流，不是可续的物理日志。
+            // 硬套位点回灌会去查/写一份对它毫无意义的 checkpoint，
+            // 而且中心库回灌失败时会把一个本可以正常跑的任务判死。
+            if (usesCheckpoint()) {
+                if (!hydrateCheckpoint(threadName)) {
+                    stopped.set(true);
+                    return;
+                }
+                hydrateFullProgress(threadName);
             }
-            hydrateFullProgress(threadName);
 
             doRun();
 
