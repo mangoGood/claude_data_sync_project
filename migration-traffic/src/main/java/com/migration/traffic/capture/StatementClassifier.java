@@ -1,6 +1,7 @@
 package com.migration.traffic.capture;
 
 import com.migration.traffic.model.StatementClass;
+import com.migration.traffic.model.TrafficEngine;
 
 /**
  * 语句分类：只做<b>前缀识别</b>，不解析 SQL。
@@ -100,7 +101,101 @@ public final class StatementClassifier {
         return Character.isLetterOrDigit(c) || c == '_' || c == '$';
     }
 
-    /** 对一条语句原文分类。{@code null}/空 → OTHER。 */
+    /**
+     * 按引擎分类。
+     *
+     * <p>三家的关键字大体重合，但有<b>几处必须分开</b>，错了会直接改变回放语义：
+     * <ul>
+     *   <li><b>Oracle 的 {@code BEGIN} 是匿名 PL/SQL 块的开头，不是事务开始</b>
+     *       （Oracle 压根没有 BEGIN 事务语句）。按 MySQL 那套判成 TCL，
+     *       整块 PL/SQL 会被当成事务控制语句，既不受"只回放 DML"的筛选约束，
+     *       还会把事务状态跟踪带偏。</li>
+     *   <li><b>PG 的 {@code END} 是 COMMIT 的同义词</b>，MySQL 没有这个用法。</li>
+     *   <li><b>PG 的 {@code SET ROLE} 是会话状态</b>（必须恒回放），
+     *       而 MySQL 的 {@code SET ROLE} 归 DCL（可被"不回放 DCL"滤掉）。</li>
+     * </ul>
+     */
+    public static StatementClass classify(TrafficEngine engine, String sql) {
+        StatementClass base = classify(sql);
+        if (engine == null) return base;
+        switch (engine) {
+            case POSTGRESQL: return adjustPg(sql, base);
+            case ORACLE: return adjustOracle(sql, base);
+            default: return base;
+        }
+    }
+
+    private static StatementClass adjustPg(String sql, StatementClass base) {
+        if (sql == null) return base;
+        int s = skipLeading(sql);
+        if (s >= sql.length()) return base;
+        String w0 = wordAt(sql, s, 0);
+        switch (w0) {
+            case "END":                 // PG 里 END 就是 COMMIT
+                return StatementClass.TCL;
+            case "COPY":
+                return StatementClass.DML;
+            case "VACUUM": case "REINDEX": case "CLUSTER": case "REFRESH": case "ANALYZE":
+                return StatementClass.DDL;      // 维护类，划进 DDL 便于按类别筛选
+            case "LISTEN": case "UNLISTEN": case "NOTIFY":
+                return StatementClass.OTHER;
+            case "DISCARD":
+                return StatementClass.SET;      // 清会话状态，属于会话状态类
+            case "SET": {
+                String w1 = wordAt(sql, s, 1);
+                // PG 的 SET ROLE / SET SESSION AUTHORIZATION 是会话状态，不是授权操作
+                if ("ROLE".equals(w1) || "SESSION".equals(w1)) return StatementClass.SET;
+                return base;
+            }
+            case "CREATE": case "ALTER": case "DROP": {
+                String w1 = wordAt(sql, s, 1);
+                if ("GROUP".equals(w1)) return StatementClass.DCL;
+                return base;
+            }
+            default:
+                return base;
+        }
+    }
+
+    private static StatementClass adjustOracle(String sql, StatementClass base) {
+        if (sql == null) return base;
+        int s = skipLeading(sql);
+        if (s >= sql.length()) return base;
+        String w0 = wordAt(sql, s, 0);
+        switch (w0) {
+            case "BEGIN": case "DECLARE":
+                // 匿名 PL/SQL 块。Oracle 没有 BEGIN 事务语句，判成 TCL 是错的
+                return StatementClass.DML;
+            case "MERGE":
+                return StatementClass.DML;
+            case "LOCK":
+                return StatementClass.OTHER;
+            case "ALTER": {
+                String w1 = wordAt(sql, s, 1);
+                // ALTER SESSION 是会话状态（NLS/CURRENT_SCHEMA），必须恒回放
+                if ("SESSION".equals(w1)) return StatementClass.SET;
+                if ("USER".equals(w1) || "ROLE".equals(w1) || "PROFILE".equals(w1)) return StatementClass.DCL;
+                return base;
+            }
+            case "CREATE": case "DROP": {
+                String w1 = wordAt(sql, s, 1);
+                if ("PROFILE".equals(w1)) return StatementClass.DCL;
+                return base;
+            }
+            case "SET": {
+                String w1 = wordAt(sql, s, 1);
+                if ("TRANSACTION".equals(w1) || "CONSTRAINT".equals(w1) || "CONSTRAINTS".equals(w1)) {
+                    return StatementClass.TCL;
+                }
+                if ("ROLE".equals(w1)) return StatementClass.DCL;
+                return base;
+            }
+            default:
+                return base;
+        }
+    }
+
+    /** 对一条语句原文分类（MySQL 口径）。{@code null}/空 → OTHER。 */
     public static StatementClass classify(String sql) {
         if (sql == null) return StatementClass.OTHER;
         int s = skipLeading(sql);

@@ -9,7 +9,7 @@
   <artifactId>migration-traffic</artifactId>
   <name>Migration Traffic</name>
   <version>1.0.0</version>
-  <description>MySQL traffic capture (general_log) and time-faithful replay</description>
+  <description>Traffic capture (MySQL general_log / PostgreSQL server log / Oracle unified audit) and time-faithful replay</description>
   <build>
     <plugins>
       <plugin>

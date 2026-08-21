@@ -32,8 +32,30 @@ public final class TrafficRecord {
     public String q;
 
     /**
-     * MySQL 在写日志时抹掉了口令（{@code IDENTIFIED BY <secret>}）。
-     * 这类语句<b>物理上不可忠实回放</b>——占位符是 MySQL 自己写进去的，谁也拿不到原文。
+     * 绑定参数，按占位符序号排列；{@code null} 表示这条语句没有参数。
+     *
+     * <p><b>为什么必须有这个字段</b>：三种引擎里只有 MySQL 把参数替换进了 SQL 文本
+     * （{@code Execute} 行给的是参数已替换的完整语句）。PG 记的是
+     * {@code execute <unnamed>: SELECT $1} + 另一份 {@code Parameters: $1 = 'x'}，
+     * Oracle 记的是 {@code INSERT ... VALUES (:b1)} + {@code SQL_BINDS = #1(1):x}。
+     * 没有这个字段，PG/Oracle 录下来的就是一条回放必然报错的半截语句。
+     *
+     * <p>元素为 {@code null} 表示 <b>SQL NULL</b>，与空串 {@code ""} 严格区分——
+     * PG 的 {@code $1 = NULL} vs {@code $1 = ''}、Oracle 的 {@code #1(0):}。
+     * 绑错了在 NOT NULL 列上报错、在可空列上静默写错。
+     */
+    public java.util.List<String> b;
+
+    /**
+     * 该语句执行时的 schema 上下文快照：PG 的 {@code search_path}、Oracle 的 {@code CURRENT_SCHEMA}。
+     * MySQL 不用（它的库上下文在 {@link #db}）。只在变化时写出，回放侧按会话保持最后一次的值。
+     */
+    public String sn;
+
+    /**
+     * MySQL/Oracle 在写日志时抹掉了口令（{@code IDENTIFIED BY <secret>} / {@code IDENTIFIED BY *}），
+     * 或 PG 侧由我们自己脱敏过。
+     * 这类语句<b>物理上不可忠实回放</b>——占位符不是原文，谁也还原不回去。
      */
     public boolean rd;
 
@@ -47,6 +69,8 @@ public final class TrafficRecord {
     public long aff;
     /** 源端耗时（微秒）。 */
     public long us;
+    /** 源端 SQLSTATE（PG 的 {@code state_code}）；MySQL/Oracle 用 {@link #errno}。 */
+    public String state;
 
     public static final String CMD_QUERY = "Q";
     public static final String CMD_EXECUTE = "E";

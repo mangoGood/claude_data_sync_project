@@ -18,6 +18,8 @@ let trafficPendingType = 'TRAFFIC_CAPTURE';
 let trafficCurrentTaskId = null;
 let trafficCurrentTaskType = null;
 let trafficRecordings = [];
+/** 回放任务的引擎：由所选录制决定，用户改不了（跨引擎回放是硬拦的）。 */
+let trafficReplayEngine = 'mysql';
 
 const trafficStatusMap = {
     'CONFIGURING':       { text: '配置中',   class: 'status-configuring', icon: '⚙' },
@@ -183,6 +185,57 @@ async function loadPendingRestores() {
     }
 }
 
+// ==================== 引擎 ====================
+
+/**
+ * 三种引擎的差异集中在这里。每一项都不是装饰：
+ *   * 连接串 scheme 决定后端怎么建 JDBC 连接；
+ *   * PG 的连接<b>终生绑定一个库</b>、Oracle 要服务名，所以它们必须填库名，MySQL 不用；
+ *   * 捕获会改动的源端状态三家完全不同，告警文案必须跟着换 —— 这是本功能最大的运维风险，
+ *     文案含糊等于让用户在不知情的情况下改了自己的生产库。
+ */
+const TRAFFIC_ENGINES = {
+    mysql: {
+        label: 'MySQL', scheme: 'mysql', port: '3306', needsDb: false, dbLabel: '数据库',
+        warn: '<b>会改动源库参数。</b>捕获期间会把源库的 <code>general_log</code> 打开并把 '
+            + '<code>log_output</code> 切到 TABLE，任务结束时自动还原。'
+            + '高 QPS 的库上这会带来可观的写开销，请确认后再启动。'
+    },
+    postgresql: {
+        label: 'PostgreSQL', scheme: 'postgresql', port: '5432', needsDb: true, dbLabel: '数据库',
+        warn: '<b>会改动源库参数。</b>捕获期间会把 <code>log_statement</code> 打到 all、'
+            + '<code>log_destination</code> 切到 jsonlog，任务结束时自动还原。'
+            + '<br><b>前置条件：源库的 <code>logging_collector</code> 必须已经是 on</b> —— '
+            + '它是 postmaster 参数，只能由 DBA 重启实例才能改；关着的时候语句日志不落文件，我们无处可读。'
+            + '<br>另外 PG 会把 <code>PASSWORD \'…\'</code> 明文写进日志，捕获侧会在落盘前脱敏。'
+    },
+    oracle: {
+        label: 'Oracle', scheme: 'oracle', port: '1521', needsDb: true, dbLabel: '服务名 / PDB',
+        warn: '<b>会在源库上创建审计策略。</b>捕获期间会建两条统一审计策略（一条 ACTIONS ALL、'
+            + '一条针对所选 schema 的对象级 SELECT），任务结束时自动停用并删除。'
+            + '<br><b>多表 SELECT（join）只有对象级策略才抓得到</b>，所以请在「库白名单」里填上要录的 schema；'
+            + '而且它只覆盖策略创建时<b>已经存在</b>的表。'
+            + '<br>审计记录堆在 AUDSYS（默认在 SYSAUX），任务会按已消费位点定期清理。'
+    }
+};
+
+function trafficEngine(name) {
+    return TRAFFIC_ENGINES[name] || TRAFFIC_ENGINES.mysql;
+}
+
+/** 源库引擎变化：端口占位、库名可见性、告警文案一起跟上。 */
+function onTrafficSrcEngineChange() {
+    const eng = trafficEngine(val('trafficSrcEngine'));
+    const portEl = document.getElementById('trafficSrcPort');
+    portEl.placeholder = eng.port;
+    if (!portEl.value || Object.values(TRAFFIC_ENGINES).some(e => e.port === portEl.value)) {
+        portEl.value = eng.port;
+    }
+    document.getElementById('trafficSrcDbGroup').style.display = eng.needsDb ? '' : 'none';
+    document.getElementById('trafficSrcDbLabel').textContent = eng.dbLabel;
+    document.getElementById('trafficCaptureWarn').innerHTML = eng.warn;
+}
+
 // ==================== 创建向导 ====================
 
 function openTrafficCreate() {
@@ -239,7 +292,9 @@ async function trafficOpenConfig(taskId, taskTypeHint) {
     document.getElementById('trafficCaptureSection').style.display = isCapture ? '' : 'none';
     document.getElementById('trafficReplaySection').style.display = isCapture ? 'none' : '';
 
-    if (!isCapture) {
+    if (isCapture) {
+        onTrafficSrcEngineChange();
+    } else {
         await loadRecordingOptions();
     }
     document.getElementById('trafficConfigModal').classList.add('show');
@@ -261,7 +316,7 @@ async function loadRecordingOptions() {
             return;
         }
         sel.innerHTML = trafficRecordings.map(r =>
-            `<option value="${escapeAttr(r.id)}">${escapeHtml(r.name)} — ${r.recordCount} 条 / ${fmtBytes(r.byteSize)} / ${fmtDuration(r.durationMs)}</option>`
+            `<option value="${escapeAttr(r.id)}">[${escapeHtml(trafficEngine(r.engine).label)}] ${escapeHtml(r.name)} — ${r.recordCount} 条 / ${fmtBytes(r.byteSize)} / ${fmtDuration(r.durationMs)}</option>`
         ).join('');
         renderRecordingInfo();
         sel.onchange = renderRecordingInfo;
@@ -277,34 +332,66 @@ function renderRecordingInfo() {
     if (!rec) { box.textContent = ''; return; }
     const src = rec.source || {};
     const stats = rec.stats || {};
+
+    // 目标库引擎由录制决定：跨引擎回放会被后端硬拦（E3131），
+    // 这里直接把表单跟着切过去，免得用户填完一屏才被拒
+    trafficReplayEngine = rec.engine || 'mysql';
+    const eng = trafficEngine(trafficReplayEngine);
+    document.getElementById('trafficTgtEngineLabel').textContent = eng.label;
+    const tgtPort = document.getElementById('trafficTgtPort');
+    tgtPort.placeholder = eng.port;
+    if (!tgtPort.value || Object.values(TRAFFIC_ENGINES).some(e => e.port === tgtPort.value)) {
+        tgtPort.value = eng.port;
+    }
+    document.getElementById('trafficTgtDbGroup').style.display = eng.needsDb ? '' : 'none';
+    document.getElementById('trafficTgtDbLabel').textContent = eng.dbLabel;
+
     let html = `录制窗口：${formatDateTime(rec.t0Wall)} ~ ${formatDateTime(rec.endWall)}　`
-        + `源库：MySQL ${escapeHtml(src.version || '?')}　`
+        + `源库：${escapeHtml(eng.label)} ${escapeHtml(shortVersion(src.version))}　`
+        + `通道：${escapeHtml(rec.captureBackend || '-')}　`
         + `语句：查询 ${stats.select || 0} / DML ${stats.dml || 0} / DDL ${stats.ddl || 0} / DCL ${stats.dcl || 0}`;
     if (rec.gapCount > 0) {
         html += `<br><span class="traffic-gap-badge">时间轴空洞 ${rec.gapCount} 处</span>`
             + ' —— 捕获中断过，那几段时间源库执行的语句已永久丢失，回放时会按原时长静默等待。';
     }
     if (stats.redacted > 0) {
-        html += `<br>其中 ${stats.redacted} 条带口令的语句被 MySQL 抹成 &lt;secret&gt;，无法回放，会记进报告。`;
+        html += `<br>其中 ${stats.redacted} 条语句的口令已被抹除（数据库自己抹的或捕获侧脱敏），无法回放，会记进报告。`;
     }
     box.innerHTML = html;
 }
 
-function connString(host, port, user, pass) {
-    return `mysql://${user}:${pass}@${host}:${port}`;
+/** PG/Oracle 的 version() 是一长串，列表里只取前 60 个字符。 */
+function shortVersion(v) {
+    if (!v) return '?';
+    return v.length > 60 ? v.slice(0, 60) + '…' : v;
+}
+
+function connString(engine, host, port, user, pass, db) {
+    const eng = trafficEngine(engine);
+    const tail = eng.needsDb && db ? `/${db}` : '';
+    return `${eng.scheme}://${user}:${pass}@${host}:${port}${tail}`;
 }
 
 async function trafficSaveAndLaunch() {
     if (!trafficCurrentTaskId) return;
     const isCapture = trafficCurrentTaskType === 'TRAFFIC_CAPTURE';
     const cfgBody = {};
-    const wfBody = { sourceType: 'mysql', targetType: 'mysql' };
+    const engineName = isCapture ? (val('trafficSrcEngine') || 'mysql') : trafficReplayEngine;
+    // 复制任务两端都记成源引擎、回放任务两端都记成录制引擎：
+    // 流量任务只有一侧是真的，另一侧留着是为了复用既有的 workflows 表与校验
+    const wfBody = { sourceType: engineName, targetType: engineName };
 
     if (isCapture) {
         const host = val('trafficSrcHost'), port = val('trafficSrcPort');
         const user = val('trafficSrcUser'), pass = val('trafficSrcPass');
+        const db = val('trafficSrcDb');
         if (!host || !port || !user) { showNotification('请填写完整的源库连接信息', 'warning'); return; }
-        wfBody.sourceConnection = connString(host, port, user, pass);
+        if (trafficEngine(engineName).needsDb && !db) {
+            showNotification('请填写' + trafficEngine(engineName).dbLabel, 'warning');
+            return;
+        }
+        wfBody.sourceConnection = connString(engineName, host, port, user, pass, db);
+        if (db) wfBody.sourceDbName = db;
         wfBody.migrationMode = 'trafficCapture';
         const dbs = val('trafficCaptureDbs');
         if (dbs) wfBody.sourceDbName = dbs.split(',')[0].trim();
@@ -316,10 +403,16 @@ async function trafficSaveAndLaunch() {
     } else {
         const host = val('trafficTgtHost'), port = val('trafficTgtPort');
         const user = val('trafficTgtUser'), pass = val('trafficTgtPass');
+        const db = val('trafficTgtDb');
         const recId = document.getElementById('trafficRecordingSelect').value;
         if (!recId) { showNotification('请选择要回放的录制文件', 'warning'); return; }
         if (!host || !port || !user) { showNotification('请填写完整的目标库连接信息', 'warning'); return; }
-        wfBody.targetConnection = connString(host, port, user, pass);
+        if (trafficEngine(engineName).needsDb && !db) {
+            showNotification('请填写' + trafficEngine(engineName).dbLabel, 'warning');
+            return;
+        }
+        wfBody.targetConnection = connString(engineName, host, port, user, pass, db);
+        if (db) wfBody.targetDbName = db;
         wfBody.migrationMode = 'trafficReplay';
         cfgBody.replayRecordingId = recId;
         cfgBody.replaySpeed = num('trafficReplaySpeed', 1);
@@ -416,6 +509,7 @@ async function openTrafficRecordings() {
         box.innerHTML = `<table style="width:100%; border-collapse:collapse; font-size:13px;">
             <thead><tr style="background:#fafafa;">
               <th style="text-align:left;padding:8px;">名称</th>
+              <th style="text-align:center;padding:8px;">引擎</th>
               <th style="text-align:left;padding:8px;">录制窗口</th>
               <th style="text-align:right;padding:8px;">条数</th>
               <th style="text-align:right;padding:8px;">体积</th>
@@ -425,6 +519,8 @@ async function openTrafficRecordings() {
               <tr style="border-top:1px solid #f0f0f0;">
                 <td style="padding:8px;">${escapeHtml(r.name)}
                     ${r.gapCount > 0 ? ` <span class="traffic-gap-badge">空洞 ${r.gapCount}</span>` : ''}</td>
+                <td style="padding:8px;text-align:center;">${escapeHtml(trafficEngine(r.engine).label)}
+                    <br><span style="color:#999;font-size:11px;">${escapeHtml(r.captureBackend || '-')}</span></td>
                 <td style="padding:8px;">${formatDateTime(r.t0Wall)}<br><span style="color:#999;">时长 ${fmtDuration(r.durationMs)}</span></td>
                 <td style="padding:8px;text-align:right;">${r.recordCount}</td>
                 <td style="padding:8px;text-align:right;">${fmtBytes(r.byteSize)}</td>
@@ -600,6 +696,7 @@ function bindTrafficEvents() {
     on('trafficConfigClose', 'click', closeTrafficConfig);
     on('trafficConfigCancel', 'click', closeTrafficConfig);
     on('trafficConfigSave', 'click', trafficSaveAndLaunch);
+    on('trafficSrcEngine', 'change', onTrafficSrcEngineChange);
     on('trafficRecordingsBtn', 'click', openTrafficRecordings);
     on('trafficRecordingsClose', 'click',
         () => document.getElementById('trafficRecordingsModal').classList.remove('show'));

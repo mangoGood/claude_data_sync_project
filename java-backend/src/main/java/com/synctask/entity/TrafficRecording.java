@@ -57,6 +57,14 @@ public class TrafficRecording {
     @Column(name = "gap_count")
     private Integer gapCount = 0;
 
+    /** 录制来自哪种引擎。回放只能选同引擎的录制（跨引擎回放硬拦，E3131）。 */
+    @Column(length = 20)
+    private String engine = "mysql";
+
+    /** 捕获通道：GENERAL_LOG / PG_JSONLOG / PG_CSVLOG / ORA_UNIFIED_AUDIT。 */
+    @Column(name = "capture_backend", length = 32)
+    private String captureBackend;
+
     @Column(name = "stats_json", columnDefinition = "TEXT")
     private String statsJson;
 
@@ -106,6 +114,12 @@ public class TrafficRecording {
     public void setSessionCount(Integer v) { this.sessionCount = v; }
     public Integer getGapCount() { return gapCount; }
     public void setGapCount(Integer v) { this.gapCount = v; }
+    public String getEngine() { return engine; }
+    public void setEngine(String v) { this.engine = v; }
+
+    public String getCaptureBackend() { return captureBackend; }
+    public void setCaptureBackend(String v) { this.captureBackend = v; }
+
     public String getStatsJson() { return statsJson; }
     public void setStatsJson(String v) { this.statsJson = v; }
     public String getSourceFingerprint() { return sourceFingerprint; }

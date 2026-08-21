@@ -1,20 +1,17 @@
 package com.migration.traffic.replay;
 
-import com.migration.common.crypto.CredentialCipher;
-import com.migration.common.ssl.SslMaterial;
 import com.migration.traffic.TrafficMetrics;
 import com.migration.traffic.model.RecordingManifest;
 import com.migration.traffic.model.SourceFingerprint;
+import com.migration.traffic.model.TrafficEngine;
 import com.migration.traffic.model.TrafficRecord;
+import com.migration.traffic.replay.dialect.TargetDialect;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -59,9 +56,7 @@ public final class TrafficReplayRunner {
     private DangerousStatementFilter dangerFilter;
     private RecordingReader reader;
 
-    private String jdbcUrl;
-    private String user;
-    private String password;
+    private TargetDialect dialect;
     private SourceFingerprint fingerprint;
 
     /** 访问顺序的 LinkedHashMap：淘汰时天然从最久未用的开始找。 */
@@ -107,7 +102,6 @@ public final class TrafficReplayRunner {
     private void start() throws Exception {
         options = ReplayOptions.from(props);
         metrics = new TrafficMetrics(taskId, "traffic_replay_liveness");
-        dangerFilter = new DangerousStatementFilter(options.allowDangerous);
         if (!outDir.exists() && !outDir.mkdirs()) {
             logger.warn("回放输出目录创建失败: {}", outDir.getAbsolutePath());
         }
@@ -116,26 +110,38 @@ public final class TrafficReplayRunner {
         reader = new RecordingReader(recordingDir);
         RecordingManifest manifest = reader.manifest();
         fingerprint = manifest.source;
-        logger.info("录制: 分段={}, 记录={}, 空洞={}, 源={} {}",
+
+        TrafficEngine recordedEngine = manifest.engineOf();
+        guardAgainstEngineMismatch(recordedEngine);
+        dialect = TargetDialect.of(recordedEngine);
+        dangerFilter = new DangerousStatementFilter(options.allowDangerous, dialect);
+
+        logger.info("录制: 引擎={}, 通道={}, 分段={}, 记录={}, 空洞={}, 源={} {}",
+                recordedEngine.wireName(), manifest.captureBackend,
                 manifest.segments.size(), manifest.totalRecords(), manifest.gaps.size(),
                 fingerprint == null ? "?" : fingerprint.version,
-                fingerprint == null ? "" : fingerprint.serverUuid);
+                fingerprint == null ? "" : fingerprint.identity());
 
-        buildTargetUrl();
         guardAgainstSameInstance();
 
         scheduler = new ReplayScheduler(options, manifest);
     }
 
-    private void buildTargetUrl() {
-        String host = props.getProperty("target.db.host", "localhost");
-        String port = props.getProperty("target.db.port", "3306");
-        user = props.getProperty("target.db.username", "root");
-        password = CredentialCipher.decrypt(props.getProperty("target.db.password", ""));
-        jdbcUrl = String.format("jdbc:mysql://%s:%s/?%s"
-                        + "&serverTimezone=UTC&characterEncoding=utf8&allowMultiQueries=false"
-                        + "&allowPublicKeyRetrieval=true&connectTimeout=15000&socketTimeout=600000",
-                host, port, SslMaterial.from(props, "target").mysqlUrlParams());
+    /**
+     * 硬拦截：录制引擎与回放目标引擎不一致。
+     *
+     * <p>SQL 方言不可能自动翻译。"让它跑跑看"的结果是目标库上一堆半成功的破坏：
+     * 一部分语句碰巧兼容执行了，一部分报错，事务边界错位——比直接拒绝糟糕得多。
+     */
+    private void guardAgainstEngineMismatch(TrafficEngine recorded) throws SQLException {
+        String targetType = props.getProperty("target.db.type", "");
+        if (targetType.isBlank()) return;      // 没配就按录制引擎走（老配置文件没有这个键）
+        TrafficEngine target = TrafficEngine.parse(targetType);
+        if (target == recorded) return;
+        String msg = "录制来自 " + recorded.displayName() + "，回放目标却是 " + target.displayName()
+                + "。SQL 方言无法自动翻译，跨引擎回放只会在目标库上制造一堆半成功的破坏，已拒绝启动";
+        com.migration.traffic.TrafficErrorStatus.report(taskId, "E3131", msg);
+        throw new SQLException(msg);
     }
 
     /**
@@ -146,18 +152,18 @@ public final class TrafficReplayRunner {
      * {@code DROP TABLE} 是真的删。灾备任务早就有同类的"源目标隔离"检查，这里是它的对应物。
      */
     private void guardAgainstSameInstance() throws SQLException {
-        if (fingerprint == null || fingerprint.serverUuid == null || fingerprint.serverUuid.isEmpty()) {
-            logger.warn("录制里没有源库 server_uuid，无法判定目标是否就是源库本身");
+        String recorded = fingerprint == null ? null : fingerprint.identity();
+        if (recorded == null) {
+            logger.warn("录制里没有源库身份信息，无法判定目标是否就是源库本身");
             return;
         }
-        String targetUuid;
-        try (Connection c = DriverManager.getConnection(jdbcUrl, user, password);
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery("SELECT @@server_uuid")) {
-            targetUuid = rs.next() ? rs.getString(1) : null;
+        String targetIdentity;
+        try (Connection c = dialect.connect(props, defaultDatabase())) {
+            targetIdentity = dialect.identity(c);
         }
-        if (fingerprint.serverUuid.equals(targetUuid)) {
-            String msg = "回放目标与录制源是同一个 MySQL 实例（server_uuid=" + targetUuid
+        if (recorded.equals(targetIdentity)) {
+            String msg = "回放目标与录制源是同一个 " + dialect.engine().displayName()
+                    + " 实例（身份=" + targetIdentity
                     + "）。回放会把源库上已经发生过的操作再做一遍——自增累加会翻倍、"
                     + "DROP 是真的删。已拒绝启动；确需如此请显式开启 traffic.replay.allow.same.instance";
             if (!options.allowSameInstance) {
@@ -166,6 +172,18 @@ public final class TrafficReplayRunner {
             }
             logger.error("！！{}（已被显式放行）", msg);
         }
+    }
+
+    /**
+     * 身份互锁与预热连接用的库名。
+     *
+     * <p>PG 的连接必须指定一个存在的库；录制里的 {@code source.dbName} 是最贴切的选择
+     * （回放目标要求同名 schema），配置里显式配了 {@code target.db.database} 则以配置为准。
+     */
+    private String defaultDatabase() {
+        String cfg = props.getProperty("target.db.database", "");
+        if (!cfg.isBlank()) return cfg;
+        return fingerprint == null ? null : fingerprint.dbName;
     }
 
     private void replay() throws Exception {
@@ -254,7 +272,11 @@ public final class TrafficReplayRunner {
         if (sessions.size() >= options.maxSessions && !evictOne()) {
             return null;
         }
-        s = new SessionRunner(r.s, jdbcUrl, user, password, fingerprint, options, reporter,
+        // PG 的连接终生绑定一个库：会话连哪个库由录制里这条语句的 db 决定
+        String db = dialect.connectionBoundToDatabase()
+                ? (r.db != null && !r.db.isEmpty() ? r.db : defaultDatabase())
+                : null;
+        s = new SessionRunner(r.s, props, dialect, db, fingerprint, options, reporter,
                 dangerFilter, scheduler);
         sessions.put(r.s, s);
         return s;

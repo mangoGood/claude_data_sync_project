@@ -63,8 +63,26 @@ public enum SyncErrorCode {
             "目标库与录制源的 server_uuid 相同。回放会把源库上已经发生过的操作<b>再做一遍</b>：自增累加会翻倍、INSERT 会重复插入、DROP 是真的删。请换一个独立实例作为回放目标；确需如此（例如目标是从该实例恢复出来的克隆）时，显式打开 traffic.replay.allow.same.instance"),
     TRAFFIC_REPLAY_ERROR_RATE("E3125", "回放错误率超过阈值",
             "目标库上失败的语句占比超过 traffic.replay.abort.error.rate，已停止回放以免继续制造破坏。常见原因：目标库缺少录制里用到的库/表、字符集或 sql_mode 与源库不一致、账号权限不足。请看回放报告里的错误明细定位；确认这些错误可以接受时，调高该阈值"),
-    TRAFFIC_SOURCE_RESTORE_FAILED("E3126", "源库语句日志未能还原",
-            "任务已结束，但没能确认把源库的 general_log/log_output 改回原值。源库会继续把每一条语句写进 mysql.general_log，直到把它的磁盘写满——这是本功能最严重的运维风险。请立刻在源库上手工执行 SET GLOBAL general_log=<原值>; SET GLOBAL log_output='<原值>'，原值可在任务详情里查到"),
+    TRAFFIC_SOURCE_RESTORE_FAILED("E3126", "源端语句日志/审计未能还原",
+            "任务已结束，但没能确认把源端改回原样——这是本功能最严重的运维风险，三种引擎的后果都是把源端撑爆：MySQL 会继续把每条语句写进 mysql.general_log 直到 datadir 满；PostgreSQL 的 log_statement=all 会把日志盘写满；Oracle 的审计策略会继续把记录堆进 AUDSYS（默认在 SYSAUX），SYSAUX 满会影响整个实例。请立刻按任务详情里记录的原值人工还原，或用 migration-traffic 的 --mode restore 兜底"),
+
+    TRAFFIC_SOURCE_LOG_UNAVAILABLE("E3127", "源端语句流通道不可用",
+            "PostgreSQL 的 logging_collector 是 postmaster 参数，关着的时候语句日志不落文件，我们无处可读——它只能由 DBA 执行 ALTER SYSTEM SET logging_collector=on 并重启实例后才能开启。若 logging_collector 已是 on 而仍报此错，多半是 pg_current_logfile() 返回空（日志收集器没有产出文件），或采集账号读不到日志目录（需要 pg_monitor 与 pg_read_server_files）"),
+
+    TRAFFIC_LOG_SWITCH_INEFFECTIVE("E3128", "语句日志开关已下发但未生效",
+            "ALTER SYSTEM 会被命令行参数或 include 文件静默压过：SQL 返回成功、pg_settings.setting 纹丝不动、一个警告都没有。继续跑只会录出一个空文件，所以这里直接拒绝启动。请检查源库启动命令行与 postgresql.conf 里是否硬写了 log_statement / log_destination，并用 SELECT name,setting,source FROM pg_settings 确认来源"),
+
+    TRAFFIC_AUDIT_POLICY_FAILED("E3129", "审计策略创建或启用失败",
+            "Oracle 的语句流靠统一审计策略产生。请确认账号具备 AUDIT_ADMIN 角色、实例的 Unified Auditing 为 TRUE，以及上一轮的同名策略已经清理干净（可用 migration-traffic 的 --mode restore 兜底清理）"),
+
+    TRAFFIC_AUDIT_PURGE_FAILED("E3130", "审计记录清理失败",
+            "已消费的审计记录清不掉，会一路堆进 AUDSYS（默认在 SYSAUX 表空间），SYSAUX 满会影响整个实例。请确认账号具备 AUDIT_ADMIN 且能执行 DBMS_AUDIT_MGMT；确需保留审计记录时，请关闭 traffic.capture.oracle.purge 并自行安排清理"),
+
+    TRAFFIC_ENGINE_MISMATCH("E3131", "录制引擎与回放目标不一致",
+            "录制文件自带引擎标记，回放目标必须是同一种引擎。SQL 方言无法自动翻译，跨引擎回放只会在目标库上制造一堆半成功的破坏——一部分语句碰巧执行了、一部分报错、事务边界错位。请换一个同引擎的目标库，或换一份同引擎的录制"),
+
+    TRAFFIC_BIND_PARSE_FAILED("E3132", "绑定参数解析失败",
+            "PostgreSQL 的 Parameters 明细或 Oracle 的 SQL_BINDS 形态不认识。不能当成\"没有参数\"放过去：那样回放时占位符会原样送到目标库，PG 直接报缺参数，而 Oracle 在某些形态下会沿用上一次的绑定值，静默执行一条参数错误的 DML"),
 
     FULL_MIGRATION_FAILED("E4001", "全量同步失败", "请检查Agent日志，确认源库和目标库连接正常，表结构和数据无异常"),
     FULL_MIGRATION_TIMEOUT("E4002", "全量同步超时", "请检查数据量是否过大，考虑分批同步或优化网络带宽"),

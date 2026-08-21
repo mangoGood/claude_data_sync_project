@@ -399,7 +399,6 @@
                             <span class="username-display" onclick="openAccountSettings()" style="cursor: pointer; color: #1890ff;" title="账号设置"></span>
                             <button class="btn-logout" onclick="logout()" style="padding: 4px 12px; background: #f5f5f5; border: 1px solid #d9d9d9; border-radius: 4px; cursor: pointer; font-size: 12px;">退出</button>
                         </div>
-                        <button class="btn-default" id="trafficRecordingsBtn" style="margin-right: 8px;">录制文件</button>
                         <button class="btn-primary" id="createTrafficTaskBtn">创建流量任务</button>
                     </div>
                 </header>
@@ -441,6 +440,10 @@
                             </div>
                             <div class="toolbar-actions">
                                 <button class="icon-btn" id="trafficRefreshBtn" title="刷新" onclick="trafficApplyKeywordAndRefresh()">↻</button>
+                            </div>
+                            <!-- 录制文件：贴查询行最右侧，与右边距留 4px -->
+                            <div class="toolbar-actions" style="margin-left: auto; margin-right: 4px;">
+                                <button class="btn-default" id="trafficRecordingsBtn" style="height: 32px; padding: 0 16px; font-size: 13px;">录制文件</button>
                             </div>
                         </div>
                         <div class="toolbar-row filter-tags-row">
@@ -1850,10 +1853,22 @@
                 <div id="trafficCaptureSection">
                     <div style="font-weight:600; margin-bottom:10px;">源库连接</div>
                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                        <div class="form-group">
+                            <label class="form-label">数据库类型</label>
+                            <select id="trafficSrcEngine" class="traffic-input" style="width:100%;">
+                                <option value="mysql">MySQL</option>
+                                <option value="postgresql">PostgreSQL</option>
+                                <option value="oracle">Oracle</option>
+                            </select>
+                        </div>
                         <div class="form-group"><label class="form-label">地址</label><input type="text" id="trafficSrcHost" placeholder="127.0.0.1" class="traffic-input"></div>
                         <div class="form-group"><label class="form-label">端口</label><input type="text" id="trafficSrcPort" placeholder="3306" class="traffic-input"></div>
                         <div class="form-group"><label class="form-label">用户名</label><input type="text" id="trafficSrcUser" placeholder="root" class="traffic-input"></div>
                         <div class="form-group"><label class="form-label">口令</label><input type="password" id="trafficSrcPass" class="traffic-input"></div>
+                        <div class="form-group" id="trafficSrcDbGroup" style="display:none;">
+                            <label class="form-label"><span id="trafficSrcDbLabel">数据库</span></label>
+                            <input type="text" id="trafficSrcDb" placeholder="postgres" class="traffic-input">
+                        </div>
                     </div>
 
                     <div style="font-weight:600; margin:18px 0 10px;">捕获范围</div>
@@ -1873,10 +1888,7 @@
                         <div class="form-group"><label class="form-label">最大体积（GB）</label><input type="text" id="trafficMaxGb" value="20" class="traffic-input"></div>
                         <div class="form-group"><label class="form-label">会话采样率</label><input type="text" id="trafficSampleRate" value="1.0" class="traffic-input"></div>
                     </div>
-                    <div style="margin-top:14px; padding:10px 12px; background:#fffbe6; border:1px solid #ffe58f; border-radius:4px; font-size:12px; color:#874d00;">
-                        <b>会改动源库参数。</b>捕获期间会把源库的 <code>general_log</code> 打开并把 <code>log_output</code> 切到 TABLE，
-                        任务结束时自动还原。高 QPS 的库上这会带来可观的写开销，请确认后再启动。
-                    </div>
+                    <div id="trafficCaptureWarn" style="margin-top:14px; padding:10px 12px; background:#fffbe6; border:1px solid #ffe58f; border-radius:4px; font-size:12px; color:#874d00;"></div>
                 </div>
 
                 <!-- 回放：录制 + 目标库 -->
@@ -1886,11 +1898,19 @@
                     <div id="trafficRecordingInfo" style="margin-top:8px; font-size:12px; color:#888;"></div>
 
                     <div style="font-weight:600; margin:18px 0 10px;">目标库连接</div>
+                    <div style="font-size:12px; color:#888; margin-bottom:8px;">
+                        目标库类型跟随所选录制 —— 录制文件自带引擎标记，跨引擎回放会被拒绝（SQL 方言无法自动翻译）。
+                        当前：<b id="trafficTgtEngineLabel">MySQL</b>
+                    </div>
                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                         <div class="form-group"><label class="form-label">地址</label><input type="text" id="trafficTgtHost" placeholder="127.0.0.1" class="traffic-input"></div>
                         <div class="form-group"><label class="form-label">端口</label><input type="text" id="trafficTgtPort" placeholder="3306" class="traffic-input"></div>
                         <div class="form-group"><label class="form-label">用户名</label><input type="text" id="trafficTgtUser" placeholder="root" class="traffic-input"></div>
                         <div class="form-group"><label class="form-label">口令</label><input type="password" id="trafficTgtPass" class="traffic-input"></div>
+                        <div class="form-group" id="trafficTgtDbGroup" style="display:none;">
+                            <label class="form-label"><span id="trafficTgtDbLabel">数据库</span></label>
+                            <input type="text" id="trafficTgtDb" placeholder="postgres" class="traffic-input">
+                        </div>
                     </div>
 
                     <div style="font-weight:600; margin:18px 0 10px;">回放选项</div>

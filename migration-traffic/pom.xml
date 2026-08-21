@@ -17,7 +17,7 @@
     <packaging>jar</packaging>
 
     <name>Migration Traffic</name>
-    <description>MySQL traffic capture (general_log) and time-faithful replay</description>
+    <description>Traffic capture (MySQL general_log / PostgreSQL server log / Oracle unified audit) and time-faithful replay</description>
 
     <dependencies>
         <dependency>
@@ -25,10 +25,20 @@
             <artifactId>migration-common</artifactId>
         </dependency>
 
-        <!-- 源库/目标库都是 MySQL：捕获走 general_log 表，回放走普通 JDBC。 -->
+        <!-- 三种源/目标引擎各有一条完全不同的捕获通道：
+             MySQL 走 mysql.general_log 表、PG 走服务端日志文件（pg_read_binary_file）、
+             Oracle 走 UNIFIED_AUDIT_TRAIL。回放侧都是普通 JDBC。 -->
         <dependency>
             <groupId>mysql</groupId>
             <artifactId>mysql-connector-java</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.oracle.database.jdbc</groupId>
+            <artifactId>ojdbc8</artifactId>
         </dependency>
 
         <!-- manifest 与录制行的 JSON。写路径是热路径，手写序列化（TrafficJson）；

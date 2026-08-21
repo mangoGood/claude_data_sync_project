@@ -81,17 +81,34 @@ public class TrafficPrecheckService {
         boolean isReplay = TrafficTaskService.TYPE_REPLAY.equals(workflow.getTaskType());
         String engine = isReplay ? workflow.getTargetType() : workflow.getSourceType();
 
-        if (engine != null && !"mysql".equalsIgnoreCase(engine)) {
-            items.add(new Item("库类型", "FAIL", "流量复制与回放目前仅支持 MySQL", "当前: " + engine));
+        String eng = normalizeEngine(engine);
+        if (eng == null) {
+            items.add(new Item("库类型", "FAIL",
+                    "流量复制与回放支持 MySQL / PostgreSQL / Oracle", "当前: " + engine));
             return summarize(items);
         }
 
         if (isReplay) {
-            checkReplay(workflow, items);
+            checkReplay(workflow, eng, items);
         } else {
-            checkCapture(workflow, items);
+            switch (eng) {
+                case "postgresql": checkCapturePg(workflow, items); break;
+                case "oracle": checkCaptureOracle(workflow, items); break;
+                default: checkCapture(workflow, items); break;
+            }
         }
         return summarize(items);
+    }
+
+    /** 归一引擎名；不支持的引擎返回 null。 */
+    static String normalizeEngine(String raw) {
+        if (raw == null || raw.isBlank()) return "mysql";
+        switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "mysql": case "mariadb": case "tidb": return "mysql";
+            case "postgresql": case "postgres": case "pg": return "postgresql";
+            case "oracle": return "oracle";
+            default: return null;
+        }
     }
 
     // ==================== 复制 ====================
@@ -154,9 +171,146 @@ public class TrafficPrecheckService {
         }
     }
 
+    // ==================== 复制：PostgreSQL ====================
+
+    /**
+     * PG 侧的预检。三项 error 级检查全是<b>实测踩出来的静默陷阱</b>，不拦住就会得到
+     * 一个"任务全绿、录出空文件"的结果：
+     * <ol>
+     *   <li>{@code logging_collector} 是 postmaster 参数，关着就没有日志文件可读，
+     *       而且此时把 {@code log_destination} 设成 jsonlog <b>会被接受</b>——
+     *       {@code pg_settings.setting} 确实变了，但什么都不产生；</li>
+     *   <li>{@code ALTER SYSTEM} 会被命令行参数压过（{@code source='command line'}），
+     *       SQL 成功、值不变、零告警；</li>
+     *   <li>采集账号的权限缺一项就少一段功能，且各自报的错完全不像同一回事。</li>
+     * </ol>
+     */
+    private void checkCapturePg(Workflow workflow, List<Item> items) {
+        String conn = workflow.getSourceConnection();
+        if (conn == null || conn.isEmpty()) {
+            items.add(new Item("源库连接", "FAIL", "未配置源库连接", null));
+            return;
+        }
+        try (Connection c = open(conn, workflow.getSourceSslMode())) {
+            items.add(new Item("源库连接", "PASS", "源库连接成功", null));
+            try (Statement st = c.createStatement()) {
+                String collector = pgSetting(st, "logging_collector");
+                boolean on = "on".equalsIgnoreCase(collector);
+                items.add(new Item("日志收集器", on ? "PASS" : "FAIL",
+                        on ? "logging_collector=on，语句日志会落到文件"
+                                : "logging_collector=" + collector + "，语句流无处可读（E3127）",
+                        on ? null : "它是 postmaster 参数，必须由 DBA 执行 "
+                                + "ALTER SYSTEM SET logging_collector=on 并重启实例；"
+                                + "注意此时把 log_destination 设成 jsonlog 会被接受但什么都不产生"));
+
+                if (on) {
+                    String cur = pgScalar(st, "SELECT pg_current_logfile()");
+                    items.add(new Item("当前日志文件", cur != null && !cur.isBlank() ? "PASS" : "FAIL",
+                            cur != null && !cur.isBlank() ? "当前日志文件: " + cur
+                                    : "pg_current_logfile() 为空，日志收集器没有产出文件（E3127）", null));
+                }
+
+                int ver = (int) longOf(pgScalar(st, "SHOW server_version_num")) / 10000;
+                items.add(new Item("服务端版本", ver >= 15 ? "PASS" : "WARN",
+                        "PostgreSQL " + ver + (ver >= 15 ? "，将使用 jsonlog" : "，将降级使用 csvlog"),
+                        ver >= 15 ? null : "csvlog 是按列位取值的，列集合随版本增删；"
+                                + "而且多行 SQL 在文件里就是多行，解析成本更高"));
+
+                boolean superuser = "on".equalsIgnoreCase(pgScalar(st, "SHOW is_superuser"));
+                List<String> lacks = new ArrayList<>();
+                if (!superuser) {
+                    if (!pgCan(st, "SELECT count(*) FROM pg_ls_logdir()")) lacks.add("pg_ls_logdir（需 pg_monitor）");
+                    if (!pgCan(st, "SELECT pg_current_logfile()")) lacks.add("pg_current_logfile（需单独 GRANT EXECUTE）");
+                    if (!pgCan(st, "SELECT pg_reload_conf()")) lacks.add("pg_reload_conf（需 GRANT EXECUTE）");
+                }
+                items.add(new Item("采集账号权限", lacks.isEmpty() ? "PASS" : "FAIL",
+                        lacks.isEmpty() ? (superuser ? "超级用户，权限充足" : "权限充足")
+                                : "缺少: " + String.join("、", lacks),
+                        lacks.isEmpty() ? null
+                                : "非超级用户需要: GRANT pg_monitor / pg_read_server_files；"
+                                + "GRANT EXECUTE ON FUNCTION pg_read_binary_file, pg_current_logfile, pg_reload_conf；"
+                                + "以及 PG15+ 的 GRANT ALTER SYSTEM/SET ON PARAMETER log_statement 等"));
+
+                String src = pgSettingSource(st, "log_statement");
+                items.add(new Item("日志开关来源", "command line".equalsIgnoreCase(src) ? "FAIL" : "PASS",
+                        "log_statement 当前来源: " + src,
+                        "command line".equalsIgnoreCase(src)
+                                ? "命令行参数会静默压过 ALTER SYSTEM：下发成功、值不变、零告警，"
+                                  + "结果是录出一个空文件（E3128）。请从启动命令行里去掉它"
+                                : null));
+
+                long qps = pgQps(st);
+                items.add(new Item("源库负载", qps > QPS_WARN_THRESHOLD ? "WARN" : "PASS",
+                        "源库当前约 " + qps + " TPS",
+                        qps > QPS_WARN_THRESHOLD
+                                ? "log_statement=all 会把每条语句写进日志盘，这个量级下日志增长很快，"
+                                  + "建议缩小库白名单或在低峰期录制" : null));
+            }
+        } catch (SQLException e) {
+            items.add(new Item("源库连接", "FAIL", "源库连接失败: " + e.getMessage(), null));
+        }
+    }
+
+    // ==================== 复制：Oracle ====================
+
+    /**
+     * Oracle 侧的预检。
+     *
+     * <p>特别提醒那条<b>没法靠权限解决</b>的天花板：{@code ACTIONS ALL} 抓不到多表 SELECT，
+     * 要靠对象级审计补，而对象级审计只覆盖策略创建时<b>已经存在</b>的表。
+     */
+    private void checkCaptureOracle(Workflow workflow, List<Item> items) {
+        String conn = workflow.getSourceConnection();
+        if (conn == null || conn.isEmpty()) {
+            items.add(new Item("源库连接", "FAIL", "未配置源库连接", null));
+            return;
+        }
+        try (Connection c = open(conn, workflow.getSourceSslMode())) {
+            items.add(new Item("源库连接", "PASS", "源库连接成功", null));
+            try (Statement st = c.createStatement()) {
+                String unified = scalar(st, "SELECT value FROM v$option WHERE parameter = 'Unified Auditing'");
+                boolean ok = unified == null || "TRUE".equalsIgnoreCase(unified);
+                items.add(new Item("统一审计", ok ? "PASS" : "FAIL",
+                        ok ? "实例已启用统一审计" : "Unified Auditing=" + unified + "，无法捕获语句流（E3129）",
+                        ok ? null : "12c 以下或以混合模式运行的实例没有这条通道；"
+                                + "传统审计的 SQL_TEXT 只有 VARCHAR2(4000)，会静默截断"));
+
+                boolean auditAdmin = hasRole(st, "AUDIT_ADMIN");
+                items.add(new Item("审计管理权限", auditAdmin ? "PASS" : "FAIL",
+                        auditAdmin ? "账号具备 AUDIT_ADMIN" : "账号缺少 AUDIT_ADMIN，建不了审计策略（E3129）",
+                        auditAdmin ? null : "GRANT AUDIT_ADMIN, AUDIT_VIEWER TO <采集账号>"));
+
+                String leftover = scalar(st, "SELECT COUNT(*) FROM audit_unified_enabled_policies "
+                        + "WHERE policy_name LIKE 'SYNCTASK_TRF%'");
+                boolean clean = leftover == null || "0".equals(leftover.trim());
+                items.add(new Item("残留审计策略", clean ? "PASS" : "FAIL",
+                        clean ? "没有上一轮残留的审计策略"
+                                : "发现 " + leftover + " 条残留的 SYNCTASK_TRF* 策略（E3129）",
+                        clean ? null : "上一轮任务没还原干净，审计记录还在往 AUDSYS 堆。"
+                                + "用 migration-traffic 的 --mode restore 兜底清理，或手工 NOAUDIT + DROP AUDIT POLICY"));
+
+                items.add(new Item("多表 SELECT 覆盖", "WARN",
+                        "系统级 ACTIONS ALL 抓不到多表 SELECT（join）",
+                        "这是统一审计的行为，不是权限问题：实测单表 SELECT 会被审计、join 一行都不出。"
+                                + "任务会为『已选库(schema)』下的表额外建一条对象级 SELECT 审计策略来补上；"
+                                + "但只覆盖策略创建时已经存在的表，捕获期间新建的表仍然抓不到 join"));
+
+                String tbs = scalar(st, "SELECT ROUND(SUM(bytes)/1024/1024) FROM dba_free_space "
+                        + "WHERE tablespace_name = 'SYSAUX'");
+                long freeMb = longOf(tbs);
+                items.add(new Item("SYSAUX 余量", freeMb > 0 && freeMb < 512 ? "FAIL" : "PASS",
+                        freeMb > 0 ? "SYSAUX 剩余约 " + freeMb + " MB" : "SYSAUX 余量未知",
+                        freeMb > 0 && freeMb < 512
+                                ? "审计记录堆在 AUDSYS（默认在 SYSAUX），撑爆会影响整个实例（E3130）" : null));
+            }
+        } catch (SQLException e) {
+            items.add(new Item("源库连接", "FAIL", "源库连接失败: " + e.getMessage(), null));
+        }
+    }
+
     // ==================== 回放 ====================
 
-    private void checkReplay(Workflow workflow, List<Item> items) {
+    private void checkReplay(Workflow workflow, String engine, List<Item> items) {
         TrafficTaskConfig cfg = configRepository.findById(workflow.getId()).orElse(null);
         TrafficRecording rec = null;
         if (cfg != null && cfg.getReplayRecordingId() != null) {
@@ -182,6 +336,17 @@ public class TrafficPrecheckService {
                             + "PRESERVE 档会按原时长静默等待，COMPRESS 档会把空洞压成 0"));
         }
 
+        // 跨引擎回放是硬拦：SQL 方言不可能自动翻译，"让它跑跑看"只会在目标库上
+        // 留下一堆半成功的破坏
+        String recEngine = normalizeEngine(rec.getEngine());
+        if (recEngine != null && !recEngine.equals(engine)) {
+            items.add(new Item("引擎一致性", "FAIL",
+                    "录制来自 " + recEngine + "，回放目标却是 " + engine + "（E3131）",
+                    "请换一个同引擎的目标库，或换一份同引擎的录制"));
+            return;
+        }
+        items.add(new Item("引擎一致性", "PASS", "录制与目标库都是 " + engine, null));
+
         Map<String, Object> src = parseFingerprint(rec.getSourceFingerprint());
 
         String conn = workflow.getTargetConnection();
@@ -192,16 +357,27 @@ public class TrafficPrecheckService {
         try (Connection c = open(conn, workflow.getTargetSslMode())) {
             items.add(new Item("目标库连接", "PASS", "目标库连接成功", null));
             try (Statement st = c.createStatement()) {
-                String tgtUuid = scalar(st, "SELECT @@server_uuid");
-                String srcUuid = str(src.get("serverUuid"));
+                String tgtUuid = targetIdentity(st, engine);
+                String srcUuid = recordedIdentity(src, engine);
                 boolean allowSame = cfg != null && Boolean.TRUE.equals(cfg.getReplayAllowSameInstance());
                 if (srcUuid != null && srcUuid.equals(tgtUuid)) {
                     items.add(new Item("目标实例隔离", allowSame ? "WARN" : "FAIL",
-                            "回放目标与录制源是同一个 MySQL 实例（E3124）",
+                            "回放目标与录制源是同一个实例（E3124）",
                             "回放会把源库上已经发生过的操作再做一遍：自增累加翻倍、重复插入、DROP 是真的删。"
                                     + (allowSame ? "已显式放行，风险自负" : "请换一个独立实例")));
                 } else {
                     items.add(new Item("目标实例隔离", "PASS", "目标库与录制源是不同实例", null));
+                }
+
+                if (!"mysql".equals(engine)) {
+                    checkReplayNonMysql(st, engine, src, items);
+                    boolean allowDangerous0 = cfg != null && Boolean.TRUE.equals(cfg.getReplayAllowDangerous());
+                    if (allowDangerous0) {
+                        items.add(new Item("破坏性语句", "WARN",
+                                "已放行 DROP DATABASE / ALTER SYSTEM 等破坏性语句",
+                                "录制里若含这类语句，会在目标库上真的执行"));
+                    }
+                    return;
                 }
 
                 // 大小写敏感性不同 = DDL 会以不同的名字落地，之后所有语句都对不上。
@@ -265,22 +441,176 @@ public class TrafficPrecheckService {
         }
     }
 
+    /** PG / Oracle 回放侧的环境比对。不一致的项多半不报错、只是结果不同，所以必须摆出来。 */
+    private void checkReplayNonMysql(Statement st, String engine, Map<String, Object> src, List<Item> items)
+            throws SQLException {
+        if ("postgresql".equals(engine)) {
+            String tgtEnc = pgSetting(st, "server_encoding");
+            String srcEnc = str(src.get("serverEncoding"));
+            if (srcEnc != null && !srcEnc.equalsIgnoreCase(tgtEnc)) {
+                items.add(new Item("字符集", "WARN", "两端 server_encoding 不同（源 " + srcEnc
+                        + " / 目标 " + tgtEnc + "）", "非 UTF8 端会丢字符，而且不报错"));
+            } else {
+                items.add(new Item("字符集", "PASS", "两端 server_encoding 一致（" + tgtEnc + "）", null));
+            }
+            String srcStyle = str(src.get("dateStyle"));
+            String tgtStyle = pgSetting(st, "DateStyle");
+            if (srcStyle != null && !srcStyle.equals(tgtStyle)) {
+                items.add(new Item("日期格式", "WARN", "两端 DateStyle 不同（源 " + srcStyle
+                        + " / 目标 " + tgtStyle + "）",
+                        "回放会按录制值覆盖会话设置；不覆盖的话 '01/02/2026' 会被解释成两个不同的日期，且不报错"));
+            }
+            long maxConn = longOf(pgSetting(st, "max_connections"));
+            items.add(new Item("连接数上限", "PASS", "目标库 max_connections=" + maxConn, null));
+        } else if ("oracle".equals(engine)) {
+            String tgtCs = scalar(st, "SELECT value FROM nls_database_parameters "
+                    + "WHERE parameter = 'NLS_CHARACTERSET'");
+            String srcCs = str(src.get("characterSet"));
+            if (srcCs != null && !srcCs.equalsIgnoreCase(tgtCs)) {
+                items.add(new Item("字符集", "WARN", "两端 NLS_CHARACTERSET 不同（源 " + srcCs
+                        + " / 目标 " + tgtCs + "）", "非 AL32UTF8 端会丢字符，而且不报错"));
+            } else {
+                items.add(new Item("字符集", "PASS", "两端 NLS_CHARACTERSET 一致（" + tgtCs + "）", null));
+            }
+            String srcFmt = str(src.get("nlsDateFormat"));
+            String tgtFmt = scalar(st, "SELECT value FROM nls_session_parameters "
+                    + "WHERE parameter = 'NLS_DATE_FORMAT'");
+            if (srcFmt != null && !srcFmt.equals(tgtFmt)) {
+                items.add(new Item("日期格式", "WARN", "两端 NLS_DATE_FORMAT 不同（源 " + srcFmt
+                        + " / 目标 " + tgtFmt + "）",
+                        "回放会按录制值 ALTER SESSION 对齐；不对齐时 TO_DATE('01-02-26') 在两边是两个不同的日期，"
+                                + "不报错、值不一样"));
+            }
+            long sessions = longOf(scalar(st, "SELECT value FROM v$parameter WHERE name = 'sessions'"));
+            if (sessions > 0) {
+                items.add(new Item("连接数上限", "PASS", "目标库 sessions=" + sessions, null));
+            }
+        }
+    }
+
+    /** 目标实例身份。与引擎侧 {@code SourceFingerprint.identity()} <b>必须同形</b>。 */
+    private static String targetIdentity(Statement st, String engine) throws SQLException {
+        switch (engine) {
+            case "postgresql":
+                return scalar(st, "SELECT system_identifier FROM pg_control_system()");
+            case "oracle": {
+                String dbid = scalarQuiet(st, "SELECT dbid FROM v$database");
+                if (dbid == null || dbid.isEmpty()) {
+                    dbid = scalarQuiet(st, "SELECT SYS_CONTEXT('USERENV','DB_NAME') FROM dual");
+                }
+                if (dbid == null) return null;
+                String con = scalarQuiet(st, "SELECT SYS_CONTEXT('USERENV','CON_NAME') FROM dual");
+                return dbid + "/" + (con == null ? "" : con);
+            }
+            default:
+                return scalar(st, "SELECT @@server_uuid");
+        }
+    }
+
+    /** 录制里的身份。与 {@link #targetIdentity} 一一对应。 */
+    private static String recordedIdentity(Map<String, Object> src, String engine) {
+        switch (engine) {
+            case "postgresql":
+                return str(src.get("systemIdentifier"));
+            case "oracle": {
+                String dbid = str(src.get("dbid"));
+                if (dbid == null || dbid.isEmpty()) return null;
+                String con = str(src.get("conName"));
+                return dbid + "/" + (con == null ? "" : con);
+            }
+            default:
+                return str(src.get("serverUuid"));
+        }
+    }
+
+    private static String pgSetting(Statement st, String name) throws SQLException {
+        return scalar(st, "SELECT setting FROM pg_settings WHERE name = '"
+                + name.replace("'", "''") + "'");
+    }
+
+    private static String pgSettingSource(Statement st, String name) throws SQLException {
+        return scalar(st, "SELECT source FROM pg_settings WHERE name = '"
+                + name.replace("'", "''") + "'");
+    }
+
+    private static String pgScalar(Statement st, String sql) {
+        return scalarQuiet(st, sql);
+    }
+
+    private static boolean pgCan(Statement st, String sql) {
+        try (ResultSet rs = st.executeQuery(sql)) {
+            return true;
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /** 两次采样事务数估 TPS。取样间隔短，够当量级判断用。 */
+    private static long pgQps(Statement st) {
+        try {
+            long a = longOf(scalarQuiet(st,
+                    "SELECT SUM(xact_commit + xact_rollback) FROM pg_stat_database"));
+            Thread.sleep(1000);
+            long b = longOf(scalarQuiet(st,
+                    "SELECT SUM(xact_commit + xact_rollback) FROM pg_stat_database"));
+            return Math.max(0, b - a);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return 0;
+        }
+    }
+
+    private static boolean hasRole(Statement st, String role) {
+        String c = scalarQuiet(st, "SELECT COUNT(*) FROM session_roles WHERE role = '"
+                + role.replace("'", "''") + "'");
+        return c != null && !"0".equals(c.trim());
+    }
+
+    private static String scalarQuiet(Statement st, String sql) {
+        try (ResultSet rs = st.executeQuery(sql)) {
+            return rs.next() ? rs.getString(1) : null;
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
     // ==================== 内部 ====================
 
-    /** 连接串形如 {@code mysql://user:pass@host:port}。 */
+    /**
+     * 连接串形如 {@code mysql://user:pass@host:port} /
+     * {@code postgresql://user:pass@host:port/db} / {@code oracle://user:pass@host:port/service}。
+     */
     private Connection open(String connStr, String sslMode) throws SQLException {
         java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("^\\w+://([^:]+):([^@]*)@([^:/]+):(\\d+)").matcher(connStr);
+                .compile("^(\\w+)://([^:]+):([^@]*)@([^:/]+):(\\d+)(?:/([^?]*))?").matcher(connStr);
         if (!m.find()) {
             throw new SQLException("连接串格式不正确: " + connStr.replaceAll(":[^:@]*@", ":***@"));
         }
-        String user = m.group(1);
-        String pass = m.group(2);
-        String host = m.group(3);
-        String port = m.group(4);
-        String url = String.format("jdbc:mysql://%s:%s/?%s&serverTimezone=UTC&characterEncoding=utf8"
-                        + "&allowPublicKeyRetrieval=true&connectTimeout=8000&socketTimeout=15000",
-                host, port, JdbcSslOptions.mysql(sslMode, null));
+        String scheme = m.group(1);
+        String user = m.group(2);
+        String pass = m.group(3);
+        String host = m.group(4);
+        String port = m.group(5);
+        String db = m.group(6);
+        String engine = normalizeEngine(scheme);
+        if (engine == null) engine = "mysql";
+
+        String url;
+        switch (engine) {
+            case "postgresql":
+                url = String.format("jdbc:postgresql://%s:%s/%s?%s&connectTimeout=8&socketTimeout=15",
+                        host, port, db == null || db.isBlank() ? "postgres" : db,
+                        JdbcSslOptions.postgres(sslMode, null));
+                break;
+            case "oracle":
+                url = String.format("jdbc:oracle:thin:@%s:%s/%s",
+                        host, port, db == null || db.isBlank() ? "ORCL" : db);
+                break;
+            default:
+                url = String.format("jdbc:mysql://%s:%s/?%s&serverTimezone=UTC&characterEncoding=utf8"
+                                + "&allowPublicKeyRetrieval=true&connectTimeout=8000&socketTimeout=15000",
+                        host, port, JdbcSslOptions.mysql(sslMode, null));
+        }
         return DriverManager.getConnection(url, user, pass);
     }
 

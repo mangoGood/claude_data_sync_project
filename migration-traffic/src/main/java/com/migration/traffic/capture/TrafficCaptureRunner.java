@@ -3,6 +3,7 @@ package com.migration.traffic.capture;
 import com.migration.traffic.TrafficMetrics;
 import com.migration.traffic.model.RecordingManifest;
 import com.migration.traffic.model.StatementClass;
+import com.migration.traffic.model.TrafficEngine;
 import com.migration.traffic.model.TrafficRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,7 +41,9 @@ public class TrafficCaptureRunner {
      */
     private final CountDownLatch finished = new CountDownLatch(1);
 
-    protected GeneralLogTrafficSource source;
+    protected TrafficSource source;
+    /** 源端引擎。捕获通道按它分派，录制头里也要写进去。 */
+    protected TrafficEngine engine;
     protected TrafficWriter writer;
     protected SessionSchemaTracker schemaTracker;
     protected CaptureFilter filter;
@@ -87,7 +90,9 @@ public class TrafficCaptureRunner {
                 (int) longProp("traffic.capture.max.tracked.sessions", 20_000L));
         metrics = new TrafficMetrics(taskId, "traffic_capture_liveness");
 
-        source = new GeneralLogTrafficSource();
+        engine = TrafficEngine.parse(props.getProperty("source.db.type",
+                props.getProperty("traffic.engine", "mysql")));
+        source = newSource(engine);
         source.open(props);
         t0Micros = source.t0Micros();
         startedAtMs = System.currentTimeMillis();
@@ -106,6 +111,20 @@ public class TrafficCaptureRunner {
     }
 
     /**
+     * 按引擎选捕获通道。三条通道之间没有任何共用代码——
+     * MySQL 读 {@code mysql.general_log} 表、PG 读服务端日志文件、Oracle 读统一审计视图。
+     */
+    protected TrafficSource newSource(TrafficEngine eng) {
+        switch (eng) {
+            case MYSQL: return new GeneralLogTrafficSource();
+            case POSTGRESQL: return new PgLogTrafficSource();
+            case ORACLE: return new OracleAuditTrafficSource();
+            default: throw new UnsupportedOperationException(
+                    "该引擎的语句流捕获尚未接入: " + eng.wireName());
+        }
+    }
+
+    /**
      * 建立本次运行要用的 manifest。默认是全新录制；
      * 子类可覆盖成"续录"（沿用原时间轴 + 记一条时间轴空洞）。
      */
@@ -113,6 +132,8 @@ public class TrafficCaptureRunner {
         RecordingManifest manifest = TrafficWriter.newManifest(taskId,
                 props.getProperty("task.name", taskId), source.fingerprint(),
                 wallOf(t0Micros), t0Micros);
+        manifest.engine = engine.wireName();
+        manifest.captureBackend = source.captureBackend();
         applyFilterToManifest(manifest);
         return manifest;
     }
@@ -202,12 +223,17 @@ public class TrafficCaptureRunner {
         }
         // SQL 语法预处理的三行噪声（PREPARE 的文本被 MySQL 抹成 "..."、EXECUTE/DEALLOCATE
         // 引用的句柄在目标库不存在）。可回放的只有 Execute 命令类型那一行。
-        if (!isExecute && StatementClassifier.isPreparedStatementNoise(sql)) {
+        //
+        // <b>只对 MySQL 成立</b>：PG 与 Oracle 的 SQL 级 PREPARE/EXECUTE 在日志/审计里
+        // 是完整原文，且 PREPARE 本身也会被录下来、回放时在同一条会话上先执行——
+        // 照 MySQL 的规矩丢掉它们，等于把这类语句整批删掉。
+        if (engine == TrafficEngine.MYSQL && !isExecute
+                && StatementClassifier.isPreparedStatementNoise(sql)) {
             return;
         }
 
         schemaTracker.onQuery(raw.threadId, sql);
-        StatementClass k = StatementClassifier.classify(sql);
+        StatementClass k = StatementClassifier.classify(engine, sql);
         emit(raw, isExecute ? TrafficRecord.CMD_EXECUTE : TrafficRecord.CMD_QUERY,
                 k, sql, StatementClassifier.isRedacted(sql));
     }
@@ -218,7 +244,10 @@ public class TrafficCaptureRunner {
             writer.manifest().stats.filtered++;
             return;
         }
-        String db = schemaTracker.schemaOf(raw.threadId);
+        // 库名的来源按引擎不同：PG 的每行日志自带 dbname、Oracle 自带 schema，
+        // 它们直接给在 raw.database 上；MySQL 没有，只能靠 SessionSchemaTracker 推导。
+        String db = raw.database != null && !raw.database.isEmpty()
+                ? raw.database : schemaTracker.schemaOf(raw.threadId);
         if (k != null && !filter.accept(k, db, raw.userHost)) {
             writer.manifest().stats.filtered++;
             return;
@@ -233,7 +262,17 @@ public class TrafficCaptureRunner {
         r.db = db;
         r.u = raw.userHost;
         r.q = sql;
-        r.rd = redacted;
+        r.b = raw.binds;
+        r.sn = raw.schema;
+        r.rd = redacted || raw.redacted;
+        // PG 的 SQLSTATE 与 Oracle 的 RETURN_CODE 都是日志/审计里自带的，
+        // 不像 MySQL 那样要另开 performance_schema 富化通道
+        if (raw.errorCode != 0 || raw.sqlState != null || raw.durationUs >= 0) {
+            r.hasEnrich = true;
+            r.errno = raw.errorCode;
+            r.state = raw.sqlState;
+            r.us = Math.max(0L, raw.durationUs);
+        }
         writer.write(r);
     }
 

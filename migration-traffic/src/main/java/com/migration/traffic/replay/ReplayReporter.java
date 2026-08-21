@@ -76,7 +76,8 @@ public final class ReplayReporter implements AutoCloseable {
 
     private static boolean needsDetail(ReplayOutcome o) {
         return o == ReplayOutcome.REPLAY_ERROR || o == ReplayOutcome.BLOCKED
-                || o == ReplayOutcome.UNREPLAYABLE_REDACTED || o == ReplayOutcome.SESSION_EXHAUSTED
+                || o == ReplayOutcome.UNREPLAYABLE_REDACTED || o == ReplayOutcome.UNREPLAYABLE_NO_BINDS
+                || o == ReplayOutcome.SESSION_EXHAUSTED
                 || o == ReplayOutcome.ROWCOUNT_MISMATCH || o == ReplayOutcome.SKIPPED_LATE;
     }
 
